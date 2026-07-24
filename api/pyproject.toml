@@ -24,7 +24,7 @@ openai = ">=1.76.2"
 ollama = ">=0.4.8"
 aiohttp = ">=3.8.4"
 websockets = ">=11.0.3"
-cognee = { version = "*", extras = ["postgres-binary"] }
+cognee = { version = "==1.2.2", extras = ["postgres-binary"] }
 fast-rlm = "*"
 sqlalchemy = ">=2.0"
 psycopg = { version = ">=3.1", extras = ["binary"] }

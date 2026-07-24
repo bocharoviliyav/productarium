@@ -2,6 +2,7 @@ import adalflow as adal
 from adalflow.core.types import Document, List
 from adalflow.components.data_process import TextSplitter, ToEmbeddings
 import os
+import shutil
 import subprocess
 import json
 import tiktoken
@@ -63,7 +64,39 @@ def count_tokens(text: str, embedder_type: str = None, is_ollama_embedder: bool 
         # Rough approximation: 4 characters per token
         return len(text) // 4
 
-def download_repo(repo_url: str, local_path: str, repo_type: str = None, access_token: str = None) -> str:
+def _sanitize_git_stderr(text: str, access_token: str) -> str:
+    """Strip raw + URL-encoded access tokens from a git stderr/stdout string."""
+    if not access_token or not text:
+        return text
+    encoded_token = quote(access_token, safe='')
+    return text.replace(access_token, "***TOKEN***").replace(encoded_token, "***TOKEN***")
+
+
+def _is_git_repo(path: str) -> bool:
+    """True if ``path`` looks like the root of a valid git working tree."""
+    return bool(path) and os.path.isdir(os.path.join(path, ".git"))
+
+
+def _build_authed_clone_url(repo_url: str, repo_type: str, access_token: str) -> str:
+    """Inject an access token into a GitHub/GitLab HTTPS URL for clone/fetch."""
+    if not access_token:
+        return repo_url
+    parsed = urlparse(repo_url)
+    encoded_token = quote(access_token, safe='')
+    if repo_type == "github":
+        return urlunparse((parsed.scheme, f"{encoded_token}@{parsed.netloc}", parsed.path, '', '', ''))
+    if repo_type == "gitlab":
+        return urlunparse((parsed.scheme, f"oauth2:{encoded_token}@{parsed.netloc}", parsed.path, '', '', ''))
+    return repo_url
+
+
+def download_repo(
+    repo_url: str,
+    local_path: str,
+    repo_type: str = None,
+    access_token: str = None,
+    force_refresh: bool = False,
+) -> str:
     """
     Downloads a Git repository (GitHub or GitLab) to a specified local path.
 
@@ -72,6 +105,11 @@ def download_repo(repo_url: str, local_path: str, repo_type: str = None, access_
         repo_url (str): The URL of the Git repository to clone.
         local_path (str): The local directory where the repository will be cloned.
         access_token (str, optional): Access token for private repositories.
+        force_refresh (bool): When True and ``local_path`` already holds a valid
+            git repo, fetch the latest tip and hard-reset the working tree so a
+            (re)generation reads the current remote commit instead of the stale
+            first clone. Required for artifact regeneration freshness; left False
+            on the Ask/RAG path to avoid a per-request fetch.
 
     Returns:
         str: The output message from the `git` command.
@@ -86,30 +124,73 @@ def download_repo(repo_url: str, local_path: str, repo_type: str = None, access_
             stderr=subprocess.PIPE,
         )
 
-        # Check if repository already exists
-        if os.path.exists(local_path) and os.listdir(local_path):
-            # Directory exists and is not empty
-            logger.warning(f"Repository already exists at {local_path}. Using existing repository.")
-            return f"Using existing repository at {local_path}"
+        dir_exists = os.path.exists(local_path) and os.listdir(local_path)
+
+        # Existing valid repo: either refresh it (force_refresh) or reuse as-is.
+        if dir_exists and _is_git_repo(local_path):
+            if force_refresh:
+                # Update the shallow clone to the latest remote tip. Best-effort:
+                # on any failure we fall back to the existing checkout rather than
+                # failing the whole generation, then optionally re-clone fresh.
+                try:
+                    fetch_url = _build_authed_clone_url(repo_url, repo_type, access_token)
+                    logger.info("Refreshing existing repository (force_refresh): %s", local_path)
+                    subprocess.run(
+                        ["git", "-C", local_path, "fetch", "--depth=1", "origin", fetch_url],
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    subprocess.run(
+                        ["git", "-C", local_path, "reset", "--hard", "FETCH_HEAD"],
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    # Drop untracked/ignored files so removed files don't linger.
+                    subprocess.run(
+                        ["git", "-C", local_path, "clean", "-fdx"],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    logger.info("Repository refreshed to latest remote tip.")
+                    return f"Refreshed existing repository at {local_path}"
+                except subprocess.CalledProcessError as e:
+                    err = _sanitize_git_stderr(e.stderr.decode('utf-8'), access_token)
+                    logger.warning(
+                        "force_refresh fetch/reset failed for %s (%s); removing and "
+                        "re-cloning fresh.", local_path, err,
+                    )
+                    shutil.rmtree(local_path, ignore_errors=True)
+                    # Fall through to the fresh-clone path below.
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning(
+                        "force_refresh refresh raised for %s (%s); removing and "
+                        "re-cloning fresh.", local_path, e,
+                    )
+                    shutil.rmtree(local_path, ignore_errors=True)
+            else:
+                logger.info("Repository already exists at %s. Using existing repository.", local_path)
+                return f"Using existing repository at {local_path}"
+        elif dir_exists:
+            # Directory exists but is not a valid git repo (corrupt/partial copy).
+            if force_refresh:
+                logger.warning(
+                    "Existing path %s is not a git repo; removing and re-cloning.",
+                    local_path,
+                )
+                shutil.rmtree(local_path, ignore_errors=True)
+            else:
+                logger.warning("Repository already exists at %s. Using existing repository.", local_path)
+                return f"Using existing repository at {local_path}"
 
         # Ensure the local path exists
         os.makedirs(local_path, exist_ok=True)
 
         # Prepare the clone URL with access token if provided
-        clone_url = repo_url
+        clone_url = _build_authed_clone_url(repo_url, repo_type, access_token)
         if access_token:
-            parsed = urlparse(repo_url)
-            # URL-encode the token to handle special characters
-            encoded_token = quote(access_token, safe='')
-            # Determine the repository type and format the URL accordingly
-            if repo_type == "github":
-                # Format: https://{token}@{domain}/owner/repo.git
-                # Works for both github.com and enterprise GitHub domains
-                clone_url = urlunparse((parsed.scheme, f"{encoded_token}@{parsed.netloc}", parsed.path, '', '', ''))
-            elif repo_type == "gitlab":
-                # Format: https://oauth2:{token}@gitlab.com/owner/repo.git
-                clone_url = urlunparse((parsed.scheme, f"oauth2:{encoded_token}@{parsed.netloc}", parsed.path, '', '', ''))
-
             logger.info("Using access token for authentication")
 
         # Clone the repository
@@ -126,14 +207,7 @@ def download_repo(repo_url: str, local_path: str, repo_type: str = None, access_
         return result.stdout.decode("utf-8")
 
     except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.decode('utf-8')
-        # Sanitize error message to remove any tokens (both raw and URL-encoded)
-        if access_token:
-            # Remove raw token
-            error_msg = error_msg.replace(access_token, "***TOKEN***")
-            # Also remove URL-encoded token to prevent leaking encoded version
-            encoded_token = quote(access_token, safe='')
-            error_msg = error_msg.replace(encoded_token, "***TOKEN***")
+        error_msg = _sanitize_git_stderr(e.stderr.decode('utf-8'), access_token)
         raise ValueError(f"Error during cloning: {error_msg}")
     except Exception as e:
         raise ValueError(f"An unexpected error occurred: {str(e)}")
@@ -686,7 +760,13 @@ class DatabaseManager:
             repo_name = url_parts[-1].replace(".git", "")
         return repo_name
 
-    def _create_repo(self, repo_url_or_path: str, repo_type: str = None, access_token: str = None) -> None:
+    def _create_repo(
+        self,
+        repo_url_or_path: str,
+        repo_type: str = None,
+        access_token: str = None,
+        force_refresh: bool = False,
+    ) -> None:
         """
         Download and prepare all paths.
         Paths:
@@ -697,6 +777,10 @@ class DatabaseManager:
             repo_type(str): Type of repository
             repo_url_or_path (str): The URL or local path of the repository
             access_token (str, optional): Access token for private repositories
+            force_refresh (bool): forwarded to ``download_repo`` so an existing
+                clone is fetched+reset to the latest remote tip instead of being
+                reused as-is. Used by artifact (re)generation; the Ask/RAG path
+                leaves it False.
         """
         logger.info(f"Preparing repo storage for {repo_url_or_path}...")
 
@@ -715,12 +799,16 @@ class DatabaseManager:
 
                 save_repo_dir = os.path.join(root_path, "repos", repo_name)
 
-                # Check if the repository directory already exists and is not empty
-                if not (os.path.exists(save_repo_dir) and os.listdir(save_repo_dir)):
-                    # Only download if the repository doesn't exist or is empty
-                    download_repo(repo_url_or_path, save_repo_dir, repo_type, access_token)
-                else:
-                    logger.info(f"Repository already exists at {save_repo_dir}. Using existing repository.")
+                # download_repo now handles both fresh clones AND refresh of an
+                # existing clone when force_refresh is set, so we always call it;
+                # with force_refresh=False it short-circuits on an existing dir.
+                download_repo(
+                    repo_url_or_path,
+                    save_repo_dir,
+                    repo_type,
+                    access_token,
+                    force_refresh=force_refresh,
+                )
             else:  # local path
                 repo_name = os.path.basename(repo_url_or_path)
                 save_repo_dir = repo_url_or_path

@@ -251,6 +251,18 @@ os.environ.setdefault("GRAPH_DATABASE_PORT", DB_PORT)
 os.environ.setdefault("GRAPH_DATABASE_NAME", DB_NAME)
 os.environ.setdefault("GRAPH_DATABASE_USERNAME", DB_USERNAME)
 os.environ.setdefault("GRAPH_DATABASE_PASSWORD", DB_PASSWORD)
+# Set the vector DB credentials EXPLICITLY. cognee's VectorEngine warns
+# ("PGVector credentials are not fully configured; falling back to the
+# relational database configuration") whenever VECTOR_DB_HOST/PORT/NAME/
+# USERNAME/PASSWORD are all unset, even though it then falls back to DB_*.
+# Mirroring DB_* here silences that warning and makes the pgvector backend
+# use the SAME Postgres instance intentionally (relational + vector + graph
+# in one DB). All via setdefault so explicit env / compose wins.
+os.environ.setdefault("VECTOR_DB_HOST", DB_HOST)
+os.environ.setdefault("VECTOR_DB_PORT", DB_PORT)
+os.environ.setdefault("VECTOR_DB_NAME", DB_NAME)
+os.environ.setdefault("VECTOR_DB_USERNAME", DB_USERNAME)
+os.environ.setdefault("VECTOR_DB_PASSWORD", DB_PASSWORD)
 # --- Fix #2: asyncpg cross-loop termination --------------------------------
 # cognee's relational + graph Postgres engines use SQLAlchemy's
 # AsyncAdaptedQueuePool with asyncpg. A pooled asyncpg connection is bound to
@@ -903,6 +915,30 @@ def _is_likely_text_file(file_path: str) -> bool:
     return ext in _COGNEE_TEXT_EXTENSIONS
 
 
+def _looks_like_file_path(payload: str) -> bool:
+    """True if ``payload`` is an existing file cognee should load from disk.
+
+    ``add_and_index_document`` accepts BOTH genuine file/dir paths (which
+    cognee's file loader reads from disk) AND raw text blobs (the repo text we
+    read ourselves, or markdown from a caller). The two need different
+    treatment when wrapping in ``DataItem``: a file path must stay a string so
+    cognee opens the file, while a text blob must be wrapped in ``DataItem``
+    (see cat 4 in ``add_and_index_document``) or the pipeline crashes with
+    ``'str' object has no attribute '__dict__'``.
+
+    We treat a payload as a file path only when it is a short-ish string that
+    resolves to an EXISTING file on disk. Multi-KB text blobs (even if they
+    happen to contain a newline-free path-like substring) never satisfy this.
+    """
+    import os as _os
+    if not payload or len(payload) > 4096 or "\n" in payload:
+        return False
+    try:
+        return _os.path.isfile(payload)
+    except (OSError, ValueError):
+        return False
+
+
 def _read_repo_text_for_cognee(repo_dir: str) -> str:
     """Walk ``repo_dir`` and return a concatenated text blob of text files.
 
@@ -956,12 +992,20 @@ async def add_and_index_document(content_or_path: str, dataset_name: str):
     knowledge graph. NEVER raises: errors are logged so callers (e.g.
     background docgen) are not crashed by cognee import/timeout issues.
 
-    Two robustness fixes over the naive ``cognee.add(content_or_path)``:
+    Robustness fixes over the naive ``cognee.add(content_or_path)``:
     - **Directory input** (cat 2): when ``content_or_path`` is a directory
       (the cloned repo), cognee's text loader would traverse ``.git/index``
       and raise ``UnicodeDecodeError`` on the binary file. Instead we read the
       text files ourselves (allow-listed extensions, skip ``.git``/binary) and
       hand cognee a concatenated text blob.
+    - **Wrap text in DataItem** (cat 4): newer cognee (>=1.3) introspects each
+      data item as an object in the pipeline (provenance stamping, DLT
+      resolution) and raises ``'str' object has no attribute '__dict__'`` when a
+      raw ``str`` reaches the pipeline. ``cognee.tasks.ingestion.data_item.
+      DataItem`` is the documented object wrapper and is explicitly handled at
+      every pipeline stage, so we wrap our text payload in it before calling
+      ``cognee.add``. Falls back to the raw payload if DataItem is unavailable
+      (older cognee / import guard).
     - **Re-index duplicate key** (cat 3): re-docgen re-adds the same content
       to an existing dataset, which raises ``UniqueViolationError`` on cognee
       1.2.x's ``data`` table (fixed content hash -> fixed PK). On that error
@@ -991,9 +1035,23 @@ async def add_and_index_document(content_or_path: str, dataset_name: str):
             len(blob), content_or_path, dataset_name,
         )
 
+    # Cat 4: newer cognee pipelines introspect data items as objects and crash
+    # on a raw ``str`` payload (``'str' object has no attribute '__dict__'``).
+    # Wrap text payloads in ``DataItem`` so every pipeline stage handles them
+    # explicitly. We wrap ONLY text (str) payloads; genuine file paths are
+    # left as strings so cognee's file loader can read them from disk.
+    ingest_payload = payload
+    if isinstance(payload, str) and not _looks_like_file_path(payload):
+        try:
+            from cognee.tasks.ingestion.data_item import DataItem
+            ingest_payload = DataItem(data=payload)
+            logger.debug("cognee add: wrapped text payload (%d chars) in DataItem.", len(payload))
+        except Exception as _wrap_err:  # pragma: no cover - defensive
+            logger.debug("cognee add: DataItem unavailable, passing raw str: %s", _wrap_err)
+
     try:
         logger.info(f"Ingesting into Cognee (dataset: {dataset_name})...")
-        await cognee.add(payload, dataset_name=dataset_name)
+        await cognee.add(ingest_payload, dataset_name=dataset_name)
         await cognee.cognify(datasets=[dataset_name])
         logger.info(f"Cognee: Ingested and cognified dataset '{dataset_name}' successfully.")
     except Exception as e:
@@ -1050,7 +1108,7 @@ async def add_and_index_document(content_or_path: str, dataset_name: str):
             )
             return
         try:
-            await cognee.add(payload, dataset_name=dataset_name)
+            await cognee.add(ingest_payload, dataset_name=dataset_name)
             await cognee.cognify(datasets=[dataset_name])
             logger.info(
                 "Cognee: re-ingested dataset '%s' successfully after %s.",

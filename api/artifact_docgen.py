@@ -1059,7 +1059,11 @@ async def generate_codebase_docs(
     model = model or resolved_model
 
     db_manager = DatabaseManager()
-    db_manager._create_repo(repo_url, repo_type, token)
+    # force_refresh=True so every (re)generation fetches the latest remote tip
+    # instead of reusing the stale first clone — otherwise regenerating an
+    # already-documented codebase re-reads the original checkout and the UI
+    # shows unchanged ("old") docs even though the job reported success.
+    db_manager._create_repo(repo_url, repo_type, token, force_refresh=True)
     repo_dir = (db_manager.repo_paths or {}).get("save_repo_dir")
     if not repo_dir or not os.path.isdir(repo_dir):
         raise ValueError(f"Repository not available locally at {repo_dir!r} after clone.")
