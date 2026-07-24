@@ -1,0 +1,194 @@
+services:
+  postgres:
+    container_name: postgres
+    image: pgvector/pgvector:pg18-trixie
+    environment:
+      - POSTGRES_USER=cognee
+      - POSTGRES_PASSWORD=cognee
+      - POSTGRES_DB=cognee_db
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cognee -d cognee_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  deepwiki:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${PORT:-8001}:${PORT:-8001}"  # API port
+      - "3000:3000"  # Next.js port
+    env_file:
+      - .env
+    environment:
+      - PORT=${PORT:-8001}
+      - NODE_ENV=production
+      - SERVER_BASE_URL=http://localhost:${PORT:-8001}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FILE_PATH=${LOG_FILE_PATH:-api/logs/application.log}
+      # --- Postgres + pgvector for cognee ---
+      - DB_PROVIDER=postgres
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=cognee_db
+      - DB_USERNAME=cognee
+      - DB_PASSWORD=cognee
+      - VECTOR_DB_PROVIDER=pgvector
+      # --- LM Studio (OpenAI-compatible server on the host, port 1234) ---
+      # extra_hosts below maps host.docker.internal to the host gateway (Linux).
+      # On Docker Desktop (macOS/Windows) host.docker.internal already resolves.
+      # LM Studio exposes /v1/chat/completions, /v1/embeddings, /v1/models.
+      # We keep the OLLAMA_HOST var pointing at LM Studio too, because some
+      # code paths (cognee_manager, RAG fallback) still key off OLLAMA_HOST.
+      - OLLAMA_HOST=${LM_STUDIO_HOST:-http://host.docker.internal:1234}
+      - LOCAL_OPENAI_BASE_URL=${LM_STUDIO_HOST:-http://host.docker.internal:1234}/v1
+      - LOCAL_OPENAI_API_KEY=${LOCAL_OPENAI_API_KEY:-not-needed}
+      - LOCAL_OPENAI_MODEL=${LOCAL_OPENAI_MODEL:-qwen/qwen3.6-27b}
+      # --- DeepWiki-wide defaults (used by api.py / settings_store / etc.) ---
+      - DEEPWIKI_DEFAULT_PROVIDER=${DEEPWIKI_DEFAULT_PROVIDER:-openai_local}
+      - DEEPWIKI_DEFAULT_MODEL=${DEEPWIKI_DEFAULT_MODEL:-qwen/qwen3.6-27b}
+      - DEEPWIKI_EMBEDDER_TYPE=${DEEPWIKI_EMBEDDER_TYPE:-openai_local}
+      # --- cognee -> LM Studio (OpenAI-compatible; NO cloud API key) ---
+      # cognee's LLM provider "openai" POSTs to {LLM_ENDPOINT}/chat/completions.
+      # CRITICAL: embeddings provider MUST be "openai_compatible" (NOT "openai").
+      # cognee's create_embedding_engine routes only "openai_compatible" and
+      # "ollama" to safe engines; "openai" falls through to LiteLLMEmbeddingEngine,
+      # which calls tiktoken.encoding_for_model(<nomic model>) and raises KeyError,
+      # breaking every cognee.add()/cognify(). OpenAICompatibleEmbeddingEngine uses
+      # the openai SDK directly and falls back to cl100k_base when transformers is
+      # not installed.
+      # Structured output: cognee's cognify uses instructor with a Pydantic model.
+      # LLM_INSTRUCTOR_MODE=markdown_json_mode is the only mode LM Studio accepts
+      # (JSON_SCHEMA/JSON/TOOLS raise BadRequestError: Invalid tool_choice).
+      - LLM_PROVIDER=openai
+      - LLM_ENDPOINT=${LM_STUDIO_HOST:-http://host.docker.internal:1234}/v1
+      - LLM_MODEL=${LLM_MODEL:-qwen/qwen3.6-27b}
+      - LLM_API_KEY=${LOCAL_OPENAI_API_KEY:-not-needed}
+      - LLM_INSTRUCTOR_MODE=${LLM_INSTRUCTOR_MODE:-markdown_json_mode}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-openai_compatible}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-nomic-embed-text-v1.5}
+      - EMBEDDING_ENDPOINT=${LM_STUDIO_HOST:-http://host.docker.internal:1234}/v1
+      - EMBEDDING_DIMENSIONS=768
+      - HUGGINGFACE_TOKENIZER=${HUGGINGFACE_TOKENIZER:-nomic-ai/nomic-embed-text-v1.5}
+      # cognee graph engine. Default is "ladybug" (an embedded LanceDB-like
+      # store) whose first run tries to DOWNLOAD its json extension from
+      # extension.ladybugdb.com -- impossible offline in this container, so
+      # cognify fails with "IO exception: Failed to load library .../libjson.
+      # lbug_extension". Use Postgres (same DB as relational + vector) instead;
+      # GRAPH_DATABASE_* fall back to the relational DB_* config when unset.
+      - GRAPH_DATABASE_PROVIDER=${GRAPH_DATABASE_PROVIDER:-postgres}
+      # --- fast-rlm (iterative reasoning) -> LM Studio (NO cloud key) ---
+      # RLM talks to an OpenAI-compatible endpoint. Point it at LM Studio on the
+      # host (host.docker.internal in Docker) with the "/v1" path. Without this,
+      # rlm_runner falls back to http://localhost:11434/v1, which inside the
+      # container is the container itself -- nothing is there, so RLM fails
+      # with "Connection error".
+      - RLM_MODEL_BASE_URL=${LM_STUDIO_HOST:-http://host.docker.internal:1234}/v1
+      - RLM_MODEL_API_KEY=${LOCAL_OPENAI_API_KEY:-not-needed}
+      - RLM_MODEL_NAME=${RLM_MODEL_NAME:-qwen/qwen3.6-27b}
+      # --- Productarium auth + settings ---
+      - AUTH_PROVIDER=${AUTH_PROVIDER:-local}
+      - BOOTSTRAP_ADMIN_USERNAME=${BOOTSTRAP_ADMIN_USERNAME:-admin}
+      - BOOTSTRAP_ADMIN_PASSWORD=${BOOTSTRAP_ADMIN_PASSWORD:-change-me}
+      - SETTINGS_SECRET_KEY=${SETTINGS_SECRET_KEY:-}
+      # Skip cognee's blocking LLM connection test (item 10 bug fix).
+      - COGNEE_SKIP_CONNECTION_TEST=true
+      # Persist the Deno + fast-rlm (npm/jsr + Pyodide) cache so the one-time
+      # first-run download happens only once, not on every container restart.
+      - DENO_DIR=/root/.deno
+    # Allow the container to reach Ollama running on the host (Linux compatible).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ~/.adalflow:/root/.adalflow      # Persist repository and embedding data
+      - ./api/logs:/app/api/logs          # Persist log files across container restarts
+      - deno_cache:/root/.deno            # Persist Deno + fast-rlm package cache
+    # Resource limits for docker-compose up (not Swarm mode)
+    mem_limit: 6g
+    mem_reservation: 2g
+    networks:
+      - app-network
+
+    # Health check configuration
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-8001}/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # --- Keycloak database (separate postgres) ---
+  kkdb:
+    container_name: kkdb
+    image: postgres:17
+    environment:
+      - POSTGRES_USER=${KEYCLOAK_DB_USER:-keycloak}
+      - POSTGRES_PASSWORD=${KEYCLOAK_DB_PASSWORD:-keycloak}
+      - POSTGRES_DB=${KEYCLOAK_DB_NAME:-keycloak}
+    volumes:
+      - keycloak_pg_data:/var/lib/postgresql/data
+    # Host port 5433 maps to the container's default postgres port 5432.
+      # Keycloak connects to kkdb:5432 internally (KC_DB_URL below), so the
+      # container MUST listen on 5432 — do NOT add `command: postgres -p 5433`,
+      # which would make postgres listen on 5433 and break Keycloak's connection.
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${KEYCLOAK_DB_USER:-keycloak} -d ${KEYCLOAK_DB_NAME:-keycloak}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  # --- Keycloak (OIDC provider) ---
+  keycloak:
+    container_name: keycloak
+    image: quay.io/keycloak/keycloak:26.3
+    depends_on:
+      kkdb:
+        condition: service_healthy
+    command: ["start-dev", "--import-realm"]
+    environment:
+      - KEYCLOAK_ADMIN=${KEYCLOAK_ADMIN:-admin}
+      - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD:-change-me}
+      - KC_DB=postgres
+      - KC_DB_URL=jdbc:postgresql://kkdb:5432/${KEYCLOAK_DB_NAME:-keycloak}
+      - KC_DB_USERNAME=${KEYCLOAK_DB_USER:-keycloak}
+      - KC_DB_PASSWORD=${KEYCLOAK_DB_PASSWORD:-keycloak}
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080; echo -e 'GET /health/ready HTTP/1.1\r\nhost: localhost\r\nConnection: close\r\n\r' >&3; cat <&3 | head -1 | grep -q '200'"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - app-network
+
+volumes:
+  postgres_data:
+  keycloak_pg_data:
+  keycloak_data:
+  deno_cache:
+
+networks:
+    app-network:
+        driver: bridge

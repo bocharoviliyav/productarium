@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "note": "This is a placeholder. When a codebase artifact is documented via the generate endpoint, the backend produces a wiki JSON structure with metadata + pages (7 sections). See api/wiki_generator.py and api/artifact_docgen.py.",
+    "sections": [
+      "overview",
+      "architecture",
+      "functional",
+      "technical",
+      "cicd",
+      "lld",
+      "datamodel"
+    ]
+  },
+  "pages": []
+}

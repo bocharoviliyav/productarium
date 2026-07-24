@@ -1,0 +1,50 @@
+[project]
+name = "open-deepwiki-api"
+version = "1.0.0"
+description = "Backend API for DeepWiki, providing smart code analysis and AI-powered documentation generation."
+license = {text = "MIT License"}
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.15"
+fastapi = ">=0.95.0"
+uvicorn = { extras = ["standard"], version = ">=0.21.1" }
+pydantic = ">=2.0.0"
+tiktoken = ">=0.5.0"
+adalflow = ">=0.1.0"
+numpy = ">=1.24.0"
+faiss-cpu = ">=1.7.4"
+requests = ">=2.28.0"
+jinja2 = ">=3.1.2"
+pyyaml = ">=6.0"
+python-dotenv = ">=1.0.0"
+openai = ">=1.76.2"
+ollama = ">=0.4.8"
+aiohttp = ">=3.8.4"
+websockets = ">=11.0.3"
+cognee = { version = "*", extras = ["postgres-binary"] }
+fast-rlm = "*"
+sqlalchemy = ">=2.0"
+psycopg = { version = ">=3.1", extras = ["binary"] }
+
+# --- Productarium foundation: auth, settings, integrations ---
+# Auth: local (passlib bcrypt) + Keycloak (authlib OIDC) + JWT session cookies.
+authlib = ">=1.2.0"
+passlib = { version = ">=1.7.4", extras = ["bcrypt"] }
+pyjwt = ">=2.8.0"
+# Settings store: Fernet encryption of admin-configured secrets.
+cryptography = ">=41.0.0"
+# Form uploads (markitdown file conversion).
+python-multipart = ">=0.0.6"
+# markitdown converts uploaded/ingested files (docx/pdf/pptx/html/xlsx) to MD.
+markitdown = ">=0.0.1"
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.0.0"

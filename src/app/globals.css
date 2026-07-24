@@ -1,0 +1,319 @@
+@import "tailwindcss";
+
+/* ------------------------------------------------------------------
+   Productarium — minimalist-ui design system (Notion / Linear editorial)
+   Warm monochrome palette, 1px #EAEAEA dividers, no gradients /
+   heavy shadows, desaturated pastel accents only for tags & badges.
+   ------------------------------------------------------------------ */
+
+/* Dark mode variant driven by next-themes (data-theme attribute). */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+:root {
+  /* Warm monochrome surfaces */
+  --canvas: #f7f6f3;       /* app background (warm off-white) */
+  --surface: #ffffff;      /* cards / panels */
+  --surface-2: #f9f9f8;    /* subtle inset surfaces */
+  --foreground: #111111;   /* off-black ink */
+  --foreground-muted: #787774; /* secondary / meta text */
+  --divider: #eaeaea;      /* 1px hairline borders */
+  --border: #eaeaea;
+
+  /* Desaturated pastel accents — tags / inline code / badges only */
+  --tag-red-bg: #fdebec;    --tag-red-fg: #9f2f2d;
+  --tag-blue-bg: #e1f3fe;   --tag-blue-fg: #1f6c9f;
+  --tag-green-bg: #edf3ec;  --tag-green-fg: #346538;
+  --tag-yellow-bg: #fbf3db; --tag-yellow-fg: #956400;
+  --tag-neutral-bg: #f2f1ef; --tag-neutral-fg: #54524f;
+
+  /* Solid ink buttons (no shadow) */
+  --button-bg: #111111;
+  --button-fg: #ffffff;
+  --button-hover: #333333;
+
+  /* Quiet hover lift (the only shadow allowed) */
+  --shadow-quiet: 0 2px 8px rgba(0, 0, 0, 0.04);
+  --shadow-color: rgba(0, 0, 0, 0.04);
+
+  /* Fonts: Geist (self-hosted via the `geist` package) + system serif */
+  --font-geist-sans: var(--font-geist-sans); /* resolved by GeistSans.variable */
+  --font-geist-mono: var(--font-geist-mono);
+  --font-serif: ui-serif, Georgia, "Iowan Old Style", "Apple Garamond",
+    "Times New Roman", serif;
+
+  /* ----------------------------------------------------------------
+     Backward-compatible aliases.
+     Legacy live components (Mermaid, Ask, theme-toggle, the
+     ModelSelectionModal subtree) reference these names directly, so
+     they are mapped onto the new monochrome palette to keep them
+     rendering on-brand without rewriting them.
+     ---------------------------------------------------------------- */
+  --background: var(--canvas);
+  --card-bg: var(--surface);
+  --border-color: var(--divider);
+  --muted: var(--foreground-muted);
+  --accent-primary: #111111;        /* ink replaces the old purple */
+  --accent-secondary: var(--foreground-muted);
+  --highlight: var(--tag-red-fg);   /* used for error borders */
+  --link-color: #111111;
+  --input-bg: var(--surface);
+  --button-disabled-bg: #ececec;
+  --button-disabled-text: #9c9a97;
+}
+
+html[data-theme="dark"] {
+  --canvas: #1a1a19;
+  --surface: #1f1e1d;
+  --surface-2: #252422;
+  --foreground: #edecea;
+  --foreground-muted: #9b9a97;
+  --divider: #2d2c2a;
+  --border: #2d2c2a;
+
+  --tag-red-bg: #3a2326;    --tag-red-fg: #f2b4b2;
+  --tag-blue-bg: #14323d;   --tag-blue-fg: #a7d8f5;
+  --tag-green-bg: #1d2a1d;  --tag-green-fg: #b6d4ad;
+  --tag-yellow-bg: #332a12; --tag-yellow-fg: #ecd49a;
+  --tag-neutral-bg: #2a2927; --tag-neutral-fg: #b4b2af;
+
+  --button-bg: #edecea;
+  --button-fg: #111111;
+  --button-hover: #d5d4d2;
+
+  --shadow-quiet: 0 2px 8px rgba(0, 0, 0, 0.32);
+  --shadow-color: rgba(0, 0, 0, 0.32);
+
+  --background: var(--canvas);
+  --card-bg: var(--surface);
+  --border-color: var(--divider);
+  --muted: var(--foreground-muted);
+  --accent-primary: #edecea;
+  --accent-secondary: var(--foreground-muted);
+  --highlight: var(--tag-red-fg);
+  --link-color: #edecea;
+  --input-bg: var(--surface-2);
+  --button-disabled-bg: #2d2c2a;
+  --button-disabled-text: #6f6d6a;
+}
+
+/* Fix for unreadable <select> options in Chrome's dark mode */
+[data-theme="dark"] select option {
+  background: var(--surface);
+  color: var(--foreground);
+}
+
+/* Tailwind v4 theme tokens — exposes bg-canvas / text-ink / border-divider /
+   font-serif / bg-tag-blue-bg etc. to utility classes. */
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-ink: var(--foreground);
+  --color-muted: var(--foreground-muted);
+  --color-divider: var(--divider);
+  --color-border: var(--divider);
+
+  --color-tag-red-bg: var(--tag-red-bg);
+  --color-tag-red-fg: var(--tag-red-fg);
+  --color-tag-blue-bg: var(--tag-blue-bg);
+  --color-tag-blue-fg: var(--tag-blue-fg);
+  --color-tag-green-bg: var(--tag-green-bg);
+  --color-tag-green-fg: var(--tag-green-fg);
+  --color-tag-yellow-bg: var(--tag-yellow-bg);
+  --color-tag-yellow-fg: var(--tag-yellow-fg);
+  --color-tag-neutral-bg: var(--tag-neutral-bg);
+  --color-tag-neutral-fg: var(--tag-neutral-fg);
+
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-serif: var(--font-serif);
+}
+
+body {
+  background: var(--canvas);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Editorial serif headings (hero / section titles). */
+.font-editorial {
+  font-family: var(--font-serif);
+  letter-spacing: -0.01em;
+}
+
+/* Quiet card hover lift — the only shadow the system permits. */
+.card-hover {
+  transition: box-shadow 200ms cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.card-hover:hover {
+  box-shadow: var(--shadow-quiet);
+}
+
+/* Faux-OS window chrome for software mockups. */
+.window-chrome {
+  background: var(--surface);
+  border: 1px solid var(--divider);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.window-chrome__bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--divider);
+  background: var(--surface-2);
+}
+.window-chrome__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 9999px;
+  background: #e3e1dd;
+}
+
+/* Scroll-entry reveal (IntersectionObserver, transform/opacity only). */
+.reveal {
+  opacity: 0;
+  transform: translateY(12px);
+  transition: opacity 600ms cubic-bezier(0.16, 1, 0.3, 1),
+    transform 600ms cubic-bezier(0.16, 1, 0.3, 1);
+  transition-delay: var(--reveal-delay, 0ms);
+  will-change: transform, opacity;
+}
+.reveal.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Editorial prose helpers for the artifact docs viewer. */
+.prose-editorial h1,
+.prose-editorial h2,
+.prose-editorial h3 {
+  font-family: var(--font-serif);
+  letter-spacing: -0.01em;
+  color: var(--foreground);
+}
+.prose-editorial a {
+  color: var(--foreground);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: var(--divider);
+}
+.prose-editorial a:hover {
+  text-decoration-color: var(--foreground);
+}
+
+/* ------------------------------------------------------------------
+   Legacy utility classes kept for backward compatibility with live
+   components (Mermaid modal, Ask inputs, theme-toggle). They now ride
+   on the monochrome tokens above.
+   ------------------------------------------------------------------ */
+.shadow-custom {
+  box-shadow: var(--shadow-quiet);
+}
+.paper-texture {
+  background-color: var(--card-bg);
+}
+.btn-japanese {
+  background-color: var(--button-bg);
+  color: var(--button-fg);
+  border: none;
+  border-radius: 6px;
+  padding: 0.5rem 1.25rem;
+  font-weight: 500;
+  transition: background-color 200ms ease;
+}
+.btn-japanese:hover {
+  background-color: var(--button-hover);
+}
+.btn-japanese:before {
+  content: none;
+}
+.input-japanese {
+  background-color: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 0.5rem 1rem;
+  transition: border-color 200ms ease;
+}
+.input-japanese:focus {
+  border-color: var(--foreground);
+  box-shadow: none;
+  outline: none;
+}
+.card-japanese {
+  background-color: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  overflow: hidden;
+  transition: box-shadow 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.card-japanese:hover {
+  box-shadow: var(--shadow-quiet);
+}
+
+/* Indeterminate generation progress bar (bottom of codebase artifact card). */
+@keyframes gen-progress {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
+}
+.gen-progress-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  overflow: hidden;
+}
+.gen-progress-bar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 25%;
+  background-color: var(--tag-blue-fg);
+  animation: gen-progress 1.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+/* Toast entrance / exit (opacity + translate). */
+@keyframes toast-in {
+  0% {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.98);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+.toast-enter {
+  animation: toast-in 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Line clamp utilities (Tailwind v4 ships these, kept as a safety net). */
+.line-clamp-1 {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+}
+.line-clamp-2 {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.line-clamp-3 {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}

@@ -1,0 +1,24 @@
+{
+  "embedder_ollama": {
+    "client_class": "OllamaClient",
+    "model_kwargs": {
+      "model": "nomic-embed-text"
+    }
+  },
+  "embedder_openai_local": {
+    "batch_size": 100,
+    "client_class": "OpenAIClient",
+    "model_kwargs": {
+      "encoding_format": "float",
+      "model": "text-embedding-nomic-embed-text-v1.5"
+    }
+  },
+  "retriever": {
+    "top_k": 20
+  },
+  "text_splitter": {
+    "chunk_overlap": 100,
+    "chunk_size": 350,
+    "split_by": "word"
+  }
+}

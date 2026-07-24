@@ -1,0 +1,64 @@
+{
+  "default_provider": "openai_local",
+  "providers": {
+    "openai_local": {
+      "client_class": "OpenAIClient",
+      "default_model": "qwen/qwen3.6-27b",
+      "supportsCustomModel": true,
+      "models": {
+        "qwen/qwen3.6-27b": {
+          "temperature": 0.1,
+          "top_p": 0.9,
+          "seed": 42
+        },
+        "google/gemma-4-e4b": {
+          "temperature": 0.1,
+          "top_p": 0.9,
+          "seed": 42
+        },
+        "gpt-oss:20b": {
+          "temperature": 0.1,
+          "top_p": 0.9,
+          "seed": 42
+        },
+        "gemma3:12b": {
+          "temperature": 0.1,
+          "top_p": 0.9,
+          "seed": 42
+        },
+        "llama3:8b": {
+          "temperature": 0.1,
+          "top_p": 0.9,
+          "seed": 42
+        },
+        "mistral:7b": {
+          "temperature": 0.1,
+          "top_p": 0.9,
+          "seed": 42
+        }
+      }
+    },
+    "ollama": {
+      "default_model": "qwen3.5:9b",
+      "supportsCustomModel": true,
+      "models": {
+        "qwen3.5:9b": {
+          "options": {
+            "temperature": 0.1,
+            "top_p": 0.9,
+            "num_ctx": 32000,
+            "seed": 42
+          }
+        },
+        "qwen3.5:35b-a3b": {
+          "options": {
+            "temperature": 0.1,
+            "top_p": 0.9,
+            "num_ctx": 32000,
+            "seed": 42
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "supported_languages": {
+    "en": "English",
+    "ru": "Русский (Russian)"
+  },
+  "default": "ru"
+}
