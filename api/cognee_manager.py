@@ -239,6 +239,44 @@ os.environ.setdefault("LLM_INSTRUCTOR_MODE", "markdown_json_mode")
 # already use for relational + vector storage. GRAPH_DATABASE_* credentials
 # fall back to the relational DB_* config when unset, so no extra env needed.
 os.environ.setdefault("GRAPH_DATABASE_PROVIDER", "postgres")
+# Set the graph DB credentials EXPLICITLY. cognee's GraphEngine warns
+# ("Postgres graph credentials are not fully configured; falling back to the
+# relational database configuration") whenever GRAPH_DATABASE_HOST/PORT/NAME/
+# USERNAME/PASSWORD are all unset, even though it then falls back to DB_*.
+# Mirroring DB_* here silences that warning and makes the graph backend use
+# the SAME Postgres instance intentionally (relational + vector + graph in
+# one DB). All via setdefault so explicit env / compose wins.
+os.environ.setdefault("GRAPH_DATABASE_HOST", DB_HOST)
+os.environ.setdefault("GRAPH_DATABASE_PORT", DB_PORT)
+os.environ.setdefault("GRAPH_DATABASE_NAME", DB_NAME)
+os.environ.setdefault("GRAPH_DATABASE_USERNAME", DB_USERNAME)
+os.environ.setdefault("GRAPH_DATABASE_PASSWORD", DB_PASSWORD)
+# --- Fix #2: asyncpg cross-loop termination --------------------------------
+# cognee's relational + graph Postgres engines use SQLAlchemy's
+# AsyncAdaptedQueuePool with asyncpg. A pooled asyncpg connection is bound to
+# the event loop that first checked it out; when the pool later tries to
+# terminate/recycle that connection from a DIFFERENT loop (which happens here
+# because cognee's own background tasks, the FastAPI request loop, and
+# asyncio.to_thread worker threads all touch the shared pool), asyncpg raises
+# ``RuntimeError: ... got Future ... attached to a different loop`` during
+# ``do_terminate`` -> ``_terminate_graceful_close``. The noise is benign (the
+# connection is being torn down anyway) but floods the logs.
+#
+# The robust fix is to disable connection pooling on cognee's async engines
+# (NullPool): each checkout opens a fresh asyncpg connection on the current
+# loop, so no connection ever crosses loops. The cost is one TCP round-trip
+# per DB operation, which is acceptable for a single-user local instance and
+# far cheaper than the cross-loop crashes. cognee reads these as JSON objects
+# (see RelationalConfig.pool_args / database_connect_args), and its adapter
+# maps poolclass="nullpool" -> sqlalchemy.pool.NullPool. Overridable via env.
+os.environ.setdefault(
+    "POOL_ARGS",
+    '{"poolclass": "nullpool", "pool_pre_ping": true}',
+)
+os.environ.setdefault(
+    "DATABASE_POOL_ARGS",
+    '{"poolclass": "nullpool", "pool_pre_ping": true}',
+)
 
 # --- Skip cognee's blocking LLM connection test (item 10 bug fix) -------------
 # cognee runs a blocking LLM connection test during cognify() that times out
@@ -345,6 +383,20 @@ async def init_cognee():
             logger.info("Cognee exposes no run_startup_migrations/init; nothing to do.")
     except Exception as e:
         logger.warning(f"Could not complete Cognee database migrations: {e}. Falling back to SQLite/LanceDB if postgres fails.")
+    # Some cognee versions expose a dedicated ``setup()`` that actually creates
+    # the relational schema (``init()``/``run_startup_migrations()`` may only
+    # register the engine lazily, so the very first query raises
+    # ``DatabaseNotCreatedError: The database has not been created yet. Please
+    # call `await setup()` first``). Call it defensively when present so the
+    # stale-data reconciler below does not trip over a not-yet-created schema.
+    # Best-effort and non-fatal: cognee itself creates tables on first write,
+    # so a missing setup() just defers schema creation slightly.
+    if hasattr(cognee, "setup"):
+        try:
+            await cognee.setup()
+            logger.info("Cognee setup() completed (schema created/migrated if needed).")
+        except Exception as e:  # pragma: no cover - depends on cognee version
+            logger.debug("Cognee setup() failed (non-fatal; tables created lazily): %s", e)
     # Reconcile stale ``Data`` rows whose backing ``text_<hash>.txt`` files were
     # lost when the old ephemeral data root was wiped. Runs once per startup so a
     # rebuild no longer leaves cognify pointing at vanished files. Non-fatal.
@@ -721,6 +773,27 @@ async def _reconcile_stale_cognee_data() -> None:
         if datasets_obj is None:
             return
         datasets = await datasets_obj.list_datasets()
+    except Exception as e:
+        # On a fresh DB the schema may not have been created yet when this runs
+        # (cognee.init()/setup() can defer table creation to the first write).
+        # cognee raises ``DatabaseNotCreatedError: The database has not been
+        # created yet. Please call `await setup()` first`` in that case. There
+        # is nothing stale to reconcile on a fresh DB, so log at debug (not
+        # error) and bail out cleanly instead of spamming the startup log.
+        msg = str(e)
+        if (
+            "DatabaseNotCreatedError" in type(e).__name__
+            or "has not been created" in msg
+            or "call `await setup()`" in msg
+            or "DatabaseNotCreatedError" in msg
+        ):
+            logger.debug(
+                "cognee stale-data reconciliation skipped: relational schema not "
+                "created yet (nothing stale on a fresh DB). Detail: %s", e,
+            )
+            return
+        raise
+    try:
         # Collect stale data_ids first, then delete in one session.
         stale_ids = []
         for d in datasets:

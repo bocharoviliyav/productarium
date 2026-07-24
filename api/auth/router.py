@@ -66,6 +66,12 @@ _COOKIE_KWARGS = {"httponly": True, "samesite": "lax", "secure": False, "path": 
 
 
 def _user_out(user: UserORM) -> UserOut:
+    # ``must_change_password`` may be missing OR explicitly ``None`` on a
+    # transient user built from token claims (see api.auth.deps.get_current_user,
+    # which constructs a bare UserORM for a Keycloak sub not yet persisted and
+    # never sets that field). UserOut.must_change_password is a strict ``bool``
+    # and rejects ``None`` with a ValidationError (``Input should be a valid
+    # boolean [input_value=None]``), so coerce to ``False`` here.
     return UserOut(
         id=user.id,
         username=user.username,
@@ -73,7 +79,7 @@ def _user_out(user: UserORM) -> UserOut:
         role=user.role,
         provider=user.provider,
         created_at=user.created_at,
-        must_change_password=getattr(user, "must_change_password", False),
+        must_change_password=bool(getattr(user, "must_change_password", None) or False),
     )
 
 

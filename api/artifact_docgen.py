@@ -104,6 +104,37 @@ RLM_MAX_FAILURES = int(os.environ.get("RLM_MAX_FAILURES", "1"))
 # split the codebase into per-call chunks that each fit in what remains.
 # Tunable via env. See ``_resolve_codebase_chunk_budget``.
 RLM_PROMPT_RESERVE_TOKENS = int(os.environ.get("RLM_PROMPT_RESERVE_TOKENS", "40000"))
+# The MODEL'S ACTUAL context window (``num_ctx``) is what caps a single LLM
+# call -- NOT fast-rlm's ``max_prompt_tokens`` (that is just a budget fast-rlm
+# thinks it can use). A local Ollama model's effective ``num_ctx`` defaults to
+# 2048/4096/8192/32768 depending on the model, which is FAR below fast-rlm's
+# 200k default. Sending a 160k-token chunk (200k - 40k reserve) to an 8k-window
+# model overflows it and the gateway returns
+# ``litellm.BadRequestError: ... Context size has been exceeded``.
+#
+# Resolve the real ceiling here: ``RLM_MODEL_CONTEXT_WINDOW`` >
+# ``OLLAMA_NUM_CTX`` > fast-rlm ``max_prompt_tokens``. When the context window
+# is smaller than max_prompt_tokens we also scale the reserve down so the
+# effective per-chunk budget stays proportional (a 40k reserve makes no sense
+# on an 8k window). See ``_resolve_codebase_chunk_budget``.
+def _resolve_rlm_context_window() -> Optional[int]:
+    """Resolve the model's actual context-window ceiling in tokens, if known.
+
+    Precedence: ``RLM_MODEL_CONTEXT_WINDOW`` > ``OLLAMA_NUM_CTX`` > ``None``
+    (unknown -> fall back to fast-rlm's max_prompt_tokens everywhere).
+    Returns ``None`` when neither env is set so the caller keeps the legacy
+    behaviour (max_prompt_tokens is the only ceiling).
+    """
+    for env_key in ("RLM_MODEL_CONTEXT_WINDOW", "OLLAMA_NUM_CTX"):
+        raw = os.environ.get(env_key)
+        if raw:
+            try:
+                val = int(str(raw).strip())
+                if val > 0:
+                    return val
+            except (TypeError, ValueError):
+                continue
+    return None
 # Token-counting is approximate by design: we need a budget estimate, not an
 # exact count. tiktoken cl100k_base (the Ollama path in data_pipeline.count_tokens)
 # is a good fit for the local models used here; if tiktoken is unavailable we
@@ -136,10 +167,16 @@ def _count_tokens(text: str) -> int:
 def _resolve_codebase_chunk_budget() -> int:
     """Resolve the per-call codebase token budget for RLM.
 
-    = ``max_prompt_tokens`` (admin models.docgen.max_prompt_tokens > env
-      RLM_MAX_PROMPT_TOKENS > fast-rlm default 200000) minus
-      ``RLM_PROMPT_RESERVE_TOKENS`` (for the section prompt + fast-rlm
-      recursive accumulation).
+    The effective ceiling is the SMALLER of:
+      - the model's ACTUAL context window (``RLM_MODEL_CONTEXT_WINDOW`` /
+        ``OLLAMA_NUM_CTX``) -- what the gateway will accept before returning
+        ``Context size has been exceeded``; and
+      - fast-rlm's ``max_prompt_tokens`` (admin models.docgen.max_prompt_tokens
+        > env RLM_MAX_PROMPT_TOKENS > fast-rlm default 200000) -- the budget
+        fast-rlm thinks it can use.
+    minus a reserve (for the section prompt + fast-rlm recursive accumulation).
+    The reserve is clamped to a sane share of the ceiling so a small context
+    window (e.g. 8192) isn't consumed entirely by the default 40k reserve.
 
     Floors the result at a sane minimum so a tiny/zero admin value can't
     produce an unusable (zero/negative) budget -- in that degenerate case we
@@ -158,7 +195,16 @@ def _resolve_codebase_chunk_budget() -> int:
             max_prompt = None
     if max_prompt is None:
         max_prompt = 200_000  # fast-rlm default
-    budget = max_prompt - RLM_PROMPT_RESERVE_TOKENS
+    # The model's real context window (num_ctx) is the hard ceiling the gateway
+    # enforces. When known and smaller than fast-rlm's max_prompt_tokens, it is
+    # the binding constraint; without it we'd compute a 160k-token chunk for an
+    # 8k-window model and overflow it (``Context size has been exceeded``).
+    context_window = _resolve_rlm_context_window()
+    ceiling = min(context_window or max_prompt, max_prompt)
+    # Scale the reserve with the ceiling so a small window keeps usable headroom:
+    # at most 20% of the ceiling, capped at the configured RLM_PROMPT_RESERVE_TOKENS.
+    reserve = min(RLM_PROMPT_RESERVE_TOKENS, max(2_000, ceiling // 5))
+    budget = ceiling - reserve
     # Floor: never let a misconfigured budget collapse chunking. 4k tokens is
     # enough for a few files per chunk; below that we'd split every file into
     # its own call which is wasteful without helping the budget.
@@ -1067,11 +1113,14 @@ async def generate_codebase_docs(
     # the standard LLM.
     rlm_state: Dict[str, int] = {"failures": 0}
 
+    _resolved_ctx_window = _resolve_rlm_context_window()
     logger.info(
         "Codebase docgen: repo=%s files=%d blob_chars=%d use_rlm=%s chunks=%d "
-        "chunk_budget_tokens=%d provider=%s base_url=%s",
+        "chunk_budget_tokens=%d provider=%s base_url=%s "
+        "model_context_window=%s",
         repo_url, len(documents), len(codebase_blob), use_rlm, len(codebase_chunks),
         chunk_budget, provider, (resolved_base_url or "<env default>"),
+        _resolved_ctx_window or "unset (no clamp; relies on max_prompt_tokens)",
     )
 
     sections: Dict[str, str] = {}

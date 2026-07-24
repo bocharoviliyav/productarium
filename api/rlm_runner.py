@@ -133,10 +133,50 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
         except ValueError:
             pass
 
+    # --- Clamp budgets to the MODEL'S REAL context window (item 6 fix) --------
+    # fast-rlm's ``max_prompt_tokens`` (default 200000) is a BUDGET fast-rlm
+    # believes it can use, NOT the model's actual ``num_ctx``. A local Ollama
+    # model's effective ``num_ctx`` is often 2048/4096/8192/32768 -- far below
+    # 200k. When fast-rlm sends a prompt larger than the gateway's real window,
+    # the gateway returns HTTP 400
+    # ``litellm.BadRequestError: ... Context size has been exceeded`` and every
+    # section fails.
+    #
+    # If the real window is known (``RLM_MODEL_CONTEXT_WINDOW`` or
+    # ``OLLAMA_NUM_CTX``), clamp both ``max_prompt_tokens`` and
+    # ``max_completion_tokens`` so their SUM never exceeds the window. This is
+    # the root-cause fix: it stops fast-rlm from ever assembling a prompt the
+    # gateway will reject. When neither env is set we leave the budgets alone
+    # (legacy behaviour, since the chunker in artifact_docgen still clamps per
+    # call from its own env reading).
+    _model_ctx = None
+    for _env_key in ("RLM_MODEL_CONTEXT_WINDOW", "OLLAMA_NUM_CTX"):
+        _raw = os.environ.get(_env_key)
+        if _raw:
+            try:
+                _model_ctx = int(str(_raw).strip())
+                if _model_ctx > 0:
+                    break
+            except (TypeError, ValueError):
+                _model_ctx = None
+    if _model_ctx and _model_ctx > 0:
+        # Reserve room for the completion within the same window. Use the
+        # configured completion budget if it already fits, else shrink it to a
+        # quarter of the window (keep some for the prompt).
+        _completion_budget = int(getattr(config, "max_completion_tokens", 50000) or 50000)
+        if _completion_budget >= _model_ctx:
+            _completion_budget = max(1024, _model_ctx // 4)
+        config.max_completion_tokens = _completion_budget
+        _prompt_cap = max(1024, _model_ctx - _completion_budget)
+        if int(getattr(config, "max_prompt_tokens", 0) or 0) > _prompt_cap:
+            config.max_prompt_tokens = _prompt_cap
+
     logger.info(
         f"Triggering fast-rlm task reasoning. Model: {resolved_model}, "
         f"base_url: {base_url}, api_timeout_ms: {config.api_timeout_ms}, "
-        f"max_prompt_tokens: {config.max_prompt_tokens}"
+        f"max_prompt_tokens: {config.max_prompt_tokens}, "
+        f"max_completion_tokens: {getattr(config, 'max_completion_tokens', '?')}, "
+        f"model_context_window: {_model_ctx or 'unset (no clamp)'}"
     )
     try:
         result = run(query, config=config, verbose=True)
@@ -146,7 +186,20 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
             "success": True
         }
     except Exception as e:
-        logger.error(f"Error executing RLM reasoning: {e}", exc_info=True)
+        # Surface a targeted hint for the common ``Context size has been
+        # exceeded`` failure so the operator knows which env to set rather than
+        # guessing from a bare litellm BadRequestError traceback.
+        _emsg = str(e)
+        if "Context size has been exceeded" in _emsg or "context length" in _emsg.lower():
+            logger.error(
+                "RLM failed: the model's context window was exceeded. Set "
+                "RLM_MODEL_CONTEXT_WINDOW (or OLLAMA_NUM_CTX) to the model's "
+                "actual num_ctx so prompt/completion budgets are clamped. "
+                "Error: %s",
+                e,
+            )
+        else:
+            logger.error(f"Error executing RLM reasoning: {e}", exc_info=True)
         return {
             "results": f"Failed to execute RLM task: {str(e)}",
             "usage": {},
