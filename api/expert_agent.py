@@ -218,11 +218,21 @@ class _ExpertLLM:
             # ``TypeError: Generator.call() got an unexpected keyword argument
             # 'input_str'`` (see api/wiki_generator.py:283 for the pattern).
             result = self.generator(prompt_kwargs={"input_str": prompt})
-            for attr in ("response", "answer", "raw_response", "output"):
+            # On a model error (e.g. 401 / connection refused) adalflow returns
+            # a GeneratorOutput with ``error`` set and ``data=None`` but stores
+            # the full prompt on ``input`` for tracing. Returning
+            # ``str(result)`` would leak the entire prompt (system prompt +
+            # retrieved context + query) into the expert chat/doc. Treat any
+            # error as "no generation" so the caller surfaces a graceful
+            # failure message instead of the raw prompt.
+            if getattr(result, "error", None):
+                logger.warning("Expert LLM returned an error: %s", result.error)
+                return ""
+            for attr in ("data", "response", "answer", "raw_response", "output"):
                 val = getattr(result, attr, None)
                 if val:
                     return str(val)
-            return str(result)
+            return ""
 
         return await asyncio.to_thread(_call)
 
@@ -448,7 +458,7 @@ def _fallback_artifact_docs(product_id: str) -> str:
 
 async def _retrieve_product_knowledge(product_id: str, query: str) -> str:
     """Retrieve product knowledge from cognee (prod_{product_id}); fall back to
-    concatenated artifact docs. Never raises; returns "" if nothing available.
+    concatenated artifact docs or live Confluence. Never raises; returns "" if nothing available.
     """
     dataset = f"prod_{product_id}"
     try:
@@ -463,7 +473,27 @@ async def _retrieve_product_knowledge(product_id: str, query: str) -> str:
         logger.info("Expert: cognee recall empty for %r; using artifact fallback.", dataset)
     except Exception as e:
         logger.warning("Expert: cognee recall failed for %r: %s", dataset, e)
-    return _fallback_artifact_docs(product_id)
+
+    fallback_docs = _fallback_artifact_docs(product_id)
+    if fallback_docs:
+        return fallback_docs
+
+    # Fallback to live Confluence (direct or MCP) if configured
+    try:
+        from api.integrations.registry import get_connector
+        c_connector = get_connector("confluence")
+        if c_connector and c_connector.is_configured():
+            spaces = c_connector.list_spaces()
+            if spaces:
+                sp_id = spaces[0].get("key") or spaces[0].get("id")
+                if sp_id:
+                    pulled = c_connector.pull(sp_id, opts={"recursive": False})
+                    if pulled and pulled.get("markdown"):
+                        return pulled["markdown"]
+    except Exception as e:
+        logger.debug("Expert live Confluence fallback skipped for %s: %s", product_id, e)
+
+    return ""
 
 
 def _format_history(messages: List[Dict[str, Any]]) -> str:
@@ -492,6 +522,10 @@ def _build_prompt(
     history: str,
     query: str,
     language_name: Optional[str] = None,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> str:
     """Assemble the full expert prompt from a loaded template body.
 
@@ -499,6 +533,9 @@ def _build_prompt(
     ``{product_name}`` / ``{language_name}`` placeholders. Knowledge, history,
     and the query are appended as structured blocks (NOT substituted into the
     template) so the template body stays small and Mermaid/JSON-safe.
+    
+    Dynamically clamps knowledge and history to fit the target model's actual
+    context window.
     """
     system = _safe_replace(
         template,
@@ -507,21 +544,39 @@ def _build_prompt(
             "language_name": language_name or _DEFAULT_LANGUAGE_NAME,
         },
     )
-    # Append the unified verification guard (grounding/citation/no-line-numbers/
-    # unverified-flag rules) on top of the expert template's own <grounding>
-    # block. Read fresh from api.prompts at call time so a hot-reload via the
-    # admin panel takes effect without a process restart.
     try:
         from api.prompts import VERIFICATION_GUARD as _guard
     except Exception:  # pragma: no cover - import-safe
         _guard = ""
     if _guard:
         system = system + "\n\n" + _guard
-    prompt = system + "\n\n"
+
+    try:
+        from api.model_utils import get_model_context_window, clamp_text_by_tokens, _count_tokens
+        ctx_win = get_model_context_window(provider=provider, base_url=base_url, model_name=model, api_key=api_key, task="expert")
+    except Exception:
+        ctx_win = 8192
+        from api.model_utils import clamp_text_by_tokens, _count_tokens
+
+    # Reserve 2048 tokens for system instructions, query, and LLM output completion
+    avail_tokens = max(1024, ctx_win - 2048)
+    
+    # 1. Clamp history to at most 1/3 of available prompt budget
+    clamped_history = ""
     if history:
-        prompt += f"<conversation_history>\n{history}\n</conversation_history>\n\n"
-    if knowledge:
-        prompt += f"<product_knowledge>\n{_cap(knowledge, KNOWLEDGE_MAX_CHARS)}\n</product_knowledge>\n\n"
+        history_budget = max(512, avail_tokens // 3)
+        clamped_history = clamp_text_by_tokens(history, history_budget, preserve_tail=True)
+
+    # 2. Clamp knowledge to the remaining prompt budget
+    history_tokens = _count_tokens(clamped_history)
+    knowledge_budget = max(512, avail_tokens - history_tokens)
+    clamped_knowledge = clamp_text_by_tokens(knowledge, knowledge_budget, preserve_tail=False)
+
+    prompt = system + "\n\n"
+    if clamped_history:
+        prompt += f"<conversation_history>\n{clamped_history}\n</conversation_history>\n\n"
+    if clamped_knowledge:
+        prompt += f"<product_knowledge>\n{clamped_knowledge}\n</product_knowledge>\n\n"
     else:
         prompt += (
             "<note>No indexed product knowledge was available. Answer honestly: "
@@ -543,10 +598,17 @@ async def _rlm_generate(prompt: str, model: Optional[str]) -> str:
     falls back to the standard LLM.
     """
     try:
+        from api.model_utils import get_model_context_window, clamp_text_by_tokens
+        ctx_win = get_model_context_window(model_name=model, task="expert")
+        completion_res = max(1024, min(4096, ctx_win // 4))
+        max_prompt_limit = max(1024, ctx_win - completion_res)
+        safe_prompt_limit = max(2000, max_prompt_limit - 6000)
+        safe_prompt = clamp_text_by_tokens(prompt, safe_prompt_limit)
+
         from api.rlm_runner import run_rlm_task  # lazy: fast_rlm is optional
 
         res = await asyncio.wait_for(
-            run_rlm_task(prompt, model), timeout=RLM_EXPERT_TIMEOUT
+            run_rlm_task(safe_prompt, model), timeout=RLM_EXPERT_TIMEOUT
         )
         if isinstance(res, dict) and res.get("success") and res.get("results"):
             return _clean_llm_text(str(res["results"]))
@@ -656,7 +718,8 @@ async def _run_expert_chat_collect(
     knowledge = await _retrieve_product_knowledge(product_id, query)
     history = _format_history(messages)
     prompt = _build_prompt(
-        EXPERT_SYSTEM_PROMPT, _product_name_by_id(product_id), knowledge, history, query
+        EXPERT_SYSTEM_PROMPT, _product_name_by_id(product_id), knowledge, history, query,
+        provider=provider, base_url=base_url, model=resolved_model, api_key=api_key,
     )
     use_rlm_resolved = _resolve_use_rlm(use_rlm, "expert", len(prompt))
     logger.info(
@@ -682,7 +745,8 @@ async def _run_expert_chat_stream(
     knowledge = await _retrieve_product_knowledge(product_id, query)
     history = _format_history(messages)
     prompt = _build_prompt(
-        EXPERT_SYSTEM_PROMPT, _product_name_by_id(product_id), knowledge, history, query
+        EXPERT_SYSTEM_PROMPT, _product_name_by_id(product_id), knowledge, history, query,
+        provider=provider, base_url=base_url, model=resolved_model, api_key=api_key,
     )
     use_rlm_resolved = _resolve_use_rlm(use_rlm, "expert", len(prompt))
     logger.info(
@@ -743,7 +807,8 @@ async def run_expert_doc(
     provider, resolved_model, base_url, api_key = _resolve_expert_model(model)
     knowledge = await _retrieve_product_knowledge(product_id, query)
     prompt = _build_prompt(
-        EXPERT_DOC_PROMPT, _product_name_by_id(product_id), knowledge, "", query
+        EXPERT_DOC_PROMPT, _product_name_by_id(product_id), knowledge, "", query,
+        provider=provider, base_url=base_url, model=resolved_model, api_key=api_key,
     )
     use_rlm_resolved = _resolve_use_rlm(use_rlm, "expert", len(prompt))
     logger.info(

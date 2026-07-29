@@ -262,6 +262,7 @@ export default function ProductDetailPage() {
       // read, RLM) to a worker thread, so we poll the status endpoint until
       // the job succeeds or fails (max ~15 min).
       notify({ tone: "info", title: t.genTitle ?? "Generation", message: t.genStarted ?? "Generation started…" });
+      let notifiedIndexingStart = false;
       const maxWaitMs = 15 * 60 * 1000;
       const startedAt = Date.now();
       while (Date.now() - startedAt < maxWaitMs) {
@@ -280,7 +281,23 @@ export default function ProductDetailPage() {
         }
         const st = await stRes.json().catch(() => ({}));
         if (st.status === "succeeded") {
-          notify({ tone: "success", title: t.genTitle ?? "Generation", message: t.genDone ?? "Documentation generated." });
+          if (st.indexing_status === "indexing") {
+            if (!notifiedIndexingStart) {
+              notify({
+                tone: "info",
+                title: t.genTitle ?? "Generation",
+                message: st.indexing_message || "Документы сгенерированы. Обновляется граф знаний (cognee)...",
+              });
+              notifiedIndexingStart = true;
+              await fetchProduct();
+            }
+            continue;
+          }
+          notify({
+            tone: st.indexing_status === "failed" ? "warning" : "success",
+            title: t.genTitle ?? "Generation",
+            message: st.indexing_message || (t.genDone ?? "Documentation generated."),
+          });
           await fetchProduct();
           return;
         }

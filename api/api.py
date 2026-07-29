@@ -1697,6 +1697,8 @@ async def _run_docgen_job_async(
     own event loop."""
     job = _docgen_jobs[job_id]
     job["status"] = "running"
+    job["indexing_status"] = "idle"
+    job["indexing_message"] = "Генерация документации..."
     job["started_at"] = time.time()
     db = SessionLocal()
     try:
@@ -1723,15 +1725,19 @@ async def _run_docgen_job_async(
         )
         db.commit()
         job["status"] = "succeeded"
+        job["indexing_status"] = "indexing"
+        job["indexing_message"] = "Документы сгенерированы. Обновляется граф знаний (cognee)..."
         job["finished_at"] = time.time()
         job["docs_chars"] = len(docs or "")
-        logger.info("Docgen job %s succeeded for artifact %s", job_id, artifact_id)
+        logger.info("Docgen job %s succeeded for artifact %s; cognee indexing in progress.", job_id, artifact_id)
     except Exception as e:
         try:
             db.rollback()
         except Exception:
             pass
         job["status"] = "failed"
+        job["indexing_status"] = "failed"
+        job["indexing_message"] = f"Ошибка генерации документации: {e}"
         job["error"] = str(e)
         job["finished_at"] = time.time()
         logger.error("Docgen job %s failed: %s", job_id, e, exc_info=True)
@@ -1757,6 +1763,7 @@ def _run_docgen_job(
     the loop is closed, so indexing is not cancelled by loop teardown."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    job = _docgen_jobs.get(job_id)
     try:
         loop.run_until_complete(
             _run_docgen_job_async(job_id, product_id, artifact_id, provider, model, language)
@@ -1774,9 +1781,19 @@ def _run_docgen_job(
 
         try:
             loop.run_until_complete(_drain())
+            if job and job.get("status") == "succeeded":
+                job["indexing_status"] = "succeeded"
+                job["indexing_message"] = "Документы сгенерированы и граф знаний успешно обновлён."
+                logger.info("Cognee indexing completed for job %s.", job_id)
         except asyncio.TimeoutError:
+            if job and job.get("status") == "succeeded":
+                job["indexing_status"] = "failed"
+                job["indexing_message"] = "Документы сгенерированы. Превышено время ожидания индексации графа знаний."
             logger.warning("Docgen background drain timed out for job %s; non-fatal.", job_id)
         except Exception as e:  # pragma: no cover - defensive
+            if job and job.get("status") == "succeeded":
+                job["indexing_status"] = "failed"
+                job["indexing_message"] = f"Документы сгенерированы. Ошибка индексации графа знаний: {e}"
             logger.warning("Docgen background drain error for job %s: %s", job_id, e)
     finally:
         try:
@@ -1842,13 +1859,7 @@ async def get_docgen_status(
     artifact_id: str,
     job_id: str = Query(..., description="Docgen job id returned by the generate endpoint"),
 ):
-    """Poll the status of an asynchronous docgen job.
-
-    Returns ``{job_id, status, error, created_at, started_at, finished_at,
-    docs_chars}`` where ``status`` is one of ``queued|running|succeeded|failed``.
-    The generated docs themselves are persisted onto the artifact; clients
-    should refetch the product on ``succeeded`` rather than read them here.
-    """
+    """Poll the status of an asynchronous docgen job and cognee indexing."""
     job = _docgen_jobs.get(job_id)
     if (
         job is None
@@ -1859,6 +1870,8 @@ async def get_docgen_status(
     return {
         "job_id": job["job_id"],
         "status": job["status"],
+        "indexing_status": job.get("indexing_status", "idle"),
+        "indexing_message": job.get("indexing_message", ""),
         "error": job.get("error"),
         "created_at": job.get("created_at"),
         "started_at": job.get("started_at"),

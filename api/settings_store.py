@@ -379,11 +379,16 @@ def get_git_creds(host: str) -> Dict[str, Optional[str]]:
 
 
 def get_confluence_creds() -> Dict[str, Optional[str]]:
-    """Resolve Confluence credentials: {base_url, token, space}."""
+    """Resolve Confluence configuration: {mode, base_url, token, username, space, mcp_server, mcp_tool}."""
+    mode = get_setting("confluence.mode") or os.environ.get("CONFLUENCE_MODE", "direct")
     return {
-        "base_url": get_setting("confluence.base_url"),
-        "token": get_secret("confluence.token"),
-        "space": get_setting("confluence.space"),
+        "mode": mode.lower().strip(),
+        "base_url": get_setting("confluence.base_url") or os.environ.get("CONFLUENCE_BASE_URL"),
+        "token": get_secret("confluence.token") or os.environ.get("CONFLUENCE_TOKEN"),
+        "username": get_setting("confluence.username") or os.environ.get("CONFLUENCE_USERNAME"),
+        "space": get_setting("confluence.space") or os.environ.get("CONFLUENCE_SPACE"),
+        "mcp_server": get_setting("confluence.mcp_server") or os.environ.get("CONFLUENCE_MCP_SERVER", "confluence"),
+        "mcp_tool": get_setting("confluence.mcp_tool") or os.environ.get("CONFLUENCE_MCP_TOOL"),
     }
 
 

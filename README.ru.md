@@ -369,6 +369,8 @@ JSON-файлы поддерживают `${ENV_VAR}`-плейсхолдеры, 
 
 ## 12. Пайплайн генерации документации
 
+Подробное техническое описание алгоритма генерации документации кодовой базы, индексации в cognee, MCP-интеграции и поллинга в UI см. в документе [`docs/CODEBASE_DOCGEN_PIPELINE.md`](docs/CODEBASE_DOCGEN_PIPELINE.md).
+
 ```mermaid
 flowchart TD
   G([POST /generate]) --> Disp{Тип артефакта?}

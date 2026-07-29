@@ -170,6 +170,26 @@ def _knowledge_as_markdown(
     return "\n".join(lines)
 
 
+# --- GET /api/public/products ------------------------------------------------
+@router.get("/products")
+def list_public_products(
+    tok: ApiTokenORM = Depends(require_api_token),
+    db: Session = Depends(get_db),
+):
+    """List all products available for public knowledge export/chat."""
+    products = db.query(ProductORM).all()
+    return [
+        {
+            "id": p.id,
+            "name": p.name,
+            "summary": p.summary,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+            "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+        }
+        for p in products
+    ]
+
+
 # --- GET /api/public/products/{product_id}/knowledge ------------------------
 @router.get("/products/{product_id}/knowledge")
 def export_knowledge(

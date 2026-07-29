@@ -258,6 +258,14 @@ class WikiGenerator:
         from api.prompts import VERIFICATION_GUARD as _guard
         if _guard:
             formatted = formatted + "\n\n" + _guard
+
+        try:
+            from api.model_utils import get_model_context_window, clamp_text_by_tokens
+            ctx_win = get_model_context_window(provider=self.provider, model_name=self.model, task="docgen")
+            formatted = clamp_text_by_tokens(formatted, max(1024, ctx_win - 2048))
+        except Exception:
+            pass
+
         return formatted
     
     def generate_section(

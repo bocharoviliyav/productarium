@@ -133,43 +133,40 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
         except ValueError:
             pass
 
-    # --- Clamp budgets to the MODEL'S REAL context window (item 6 fix) --------
+    # --- Clamp budgets to the MODEL'S REAL context window ----------------------
     # fast-rlm's ``max_prompt_tokens`` (default 200000) is a BUDGET fast-rlm
-    # believes it can use, NOT the model's actual ``num_ctx``. A local Ollama
-    # model's effective ``num_ctx`` is often 2048/4096/8192/32768 -- far below
-    # 200k. When fast-rlm sends a prompt larger than the gateway's real window,
-    # the gateway returns HTTP 400
+    # believes it can use, NOT the model's actual ``num_ctx``. A local Ollama/
+    # LM Studio / vLLM model's effective ``num_ctx`` defaults to e.g. 8192/32768
+    # -- far below 200k. When fast-rlm sends a prompt larger than the gateway's
+    # real window, the gateway returns HTTP 400
     # ``litellm.BadRequestError: ... Context size has been exceeded`` and every
     # section fails.
     #
-    # If the real window is known (``RLM_MODEL_CONTEXT_WINDOW`` or
-    # ``OLLAMA_NUM_CTX``), clamp both ``max_prompt_tokens`` and
-    # ``max_completion_tokens`` so their SUM never exceeds the window. This is
-    # the root-cause fix: it stops fast-rlm from ever assembling a prompt the
-    # gateway will reject. When neither env is set we leave the budgets alone
-    # (legacy behaviour, since the chunker in artifact_docgen still clamps per
-    # call from its own env reading).
+    # Dynamically query/detect the model's actual context window and clamp both
+    # ``max_prompt_tokens`` and ``max_completion_tokens`` so their SUM never
+    # exceeds the window.
     _model_ctx = None
-    for _env_key in ("RLM_MODEL_CONTEXT_WINDOW", "OLLAMA_NUM_CTX"):
-        _raw = os.environ.get(_env_key)
-        if _raw:
-            try:
-                _model_ctx = int(str(_raw).strip())
-                if _model_ctx > 0:
-                    break
-            except (TypeError, ValueError):
-                _model_ctx = None
+    try:
+        from api.model_utils import get_model_context_window
+        _model_ctx = get_model_context_window(
+            base_url=base_url,
+            model_name=resolved_model,
+            api_key=admin_api_key,
+            task="docgen",
+        )
+    except Exception as _ctx_err:
+        logger.debug("Could not resolve model context window in rlm_runner: %s", _ctx_err)
+
     if _model_ctx and _model_ctx > 0:
-        # Reserve room for the completion within the same window. Use the
-        # configured completion budget if it already fits, else shrink it to a
-        # quarter of the window (keep some for the prompt).
+        # Reserve room for the completion within the same window (e.g. up to 4096
+        # tokens or a quarter of the window). Keep the rest for prompt tokens so
+        # fast-rlm subagents have maximum prompt headroom.
         _completion_budget = int(getattr(config, "max_completion_tokens", 50000) or 50000)
         if _completion_budget >= _model_ctx:
-            _completion_budget = max(1024, _model_ctx // 4)
+            _completion_budget = max(1024, min(4096, _model_ctx // 4))
         config.max_completion_tokens = _completion_budget
         _prompt_cap = max(1024, _model_ctx - _completion_budget)
-        if int(getattr(config, "max_prompt_tokens", 0) or 0) > _prompt_cap:
-            config.max_prompt_tokens = _prompt_cap
+        config.max_prompt_tokens = _prompt_cap
 
     logger.info(
         f"Triggering fast-rlm task reasoning. Model: {resolved_model}, "

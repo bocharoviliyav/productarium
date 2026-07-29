@@ -267,6 +267,56 @@ async def from_integration(
         )
 
     if target == "node":
+        pulled_pages = pulled.get("pages") or []
+        created_nodes: List[KnowledgeNodeORM] = []
+        indexed_texts: List[str] = []
+
+        if isinstance(pulled_pages, list) and len(pulled_pages) > 1:
+            # Multi-page Confluence tree: create root node + child nodes
+            page_id_to_node_id: Dict[str, str] = {}
+            for i, p in enumerate(pulled_pages):
+                p_title = p.get("title") or f"Page {i+1}"
+                p_html = p.get("html") or ""
+                p_id = str(p.get("id") or i)
+                p_parent = p.get("parent_id")
+
+                node_id = _new_id("node")
+                page_id_to_node_id[p_id] = node_id
+
+                parent_node_id = page_id_to_node_id.get(str(p_parent)) if p_parent else (created_nodes[0].id if created_nodes else None)
+                if i == 0:
+                    parent_node_id = None  # root page
+
+                knode = KnowledgeNodeORM(
+                    id=node_id,
+                    product_id=product_id,
+                    parent_id=parent_node_id,
+                    title=p_title,
+                    slug=_slugify(p_title),
+                    content_md=p_html or p_title,
+                    node_type="page",
+                    source="api",
+                    created_by=getattr(user, "id", None),
+                )
+                db.add(knode)
+                created_nodes.append(knode)
+                if p_html and p_html.strip():
+                    indexed_texts.append(p_html)
+            
+            try:
+                db.commit()
+                for kn in created_nodes:
+                    db.refresh(kn)
+            except Exception as e:
+                db.rollback()
+                logger.error("Failed to create KnowledgeNode tree from integration: %s", e)
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Persist failed")
+            
+            if indexed_texts:
+                _index_in_background(product_id, "\n\n".join(indexed_texts))
+            return _knowledge_node_pydantic(created_nodes[0])
+
+        # Single page node
         node = KnowledgeNodeORM(
             id=_new_id("node"),
             product_id=product_id,

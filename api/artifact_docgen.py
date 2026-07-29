@@ -90,11 +90,9 @@ LLM_CONTENT_MAX_CHARS = 50_000
 RLM_SECTION_TIMEOUT = float(os.environ.get("RLM_SECTION_TIMEOUT", "1200"))
 # Max RLM failures within a single generate run before skipping RLM for the
 # remaining sections. fast-rlm runs the model inside a Pyodide Python REPL;
-# some local models emit broken Python there (e.g. "unterminated string
-# literal") on EVERY section, wasting ~3 min/section before the standard-LLM
-# fallback fires. After this many failures we stop trying RLM and go straight
-# to the standard LLM for the rest of the run. Tunable via env.
-RLM_MAX_FAILURES = int(os.environ.get("RLM_MAX_FAILURES", "1"))
+# after this many failures we stop trying RLM and go straight to the standard
+# LLM for the rest of the run. Default 2 failures.
+RLM_MAX_FAILURES = int(os.environ.get("RLM_MAX_FAILURES", "2"))
 # fast-rlm's default ``max_prompt_tokens`` (200000) is the hard ceiling a single
 # RLM call must stay under (the whole codebase blob + fast-rlm's recursive
 # subagent outputs count toward it). On large repos the full blob alone can
@@ -118,23 +116,18 @@ RLM_PROMPT_RESERVE_TOKENS = int(os.environ.get("RLM_PROMPT_RESERVE_TOKENS", "400
 # effective per-chunk budget stays proportional (a 40k reserve makes no sense
 # on an 8k window). See ``_resolve_codebase_chunk_budget``.
 def _resolve_rlm_context_window() -> Optional[int]:
-    """Resolve the model's actual context-window ceiling in tokens, if known.
+    """Resolve the model's actual context-window ceiling in tokens.
 
-    Precedence: ``RLM_MODEL_CONTEXT_WINDOW`` > ``OLLAMA_NUM_CTX`` > ``None``
-    (unknown -> fall back to fast-rlm's max_prompt_tokens everywhere).
-    Returns ``None`` when neither env is set so the caller keeps the legacy
-    behaviour (max_prompt_tokens is the only ceiling).
+    Uses ``get_model_context_window(task="docgen")`` which checks explicit env
+    vars, admin settings, live API metadata (/api/show or /v1/models), model name
+    heuristics, and a safe default (8192).
     """
-    for env_key in ("RLM_MODEL_CONTEXT_WINDOW", "OLLAMA_NUM_CTX"):
-        raw = os.environ.get(env_key)
-        if raw:
-            try:
-                val = int(str(raw).strip())
-                if val > 0:
-                    return val
-            except (TypeError, ValueError):
-                continue
-    return None
+    try:
+        from api.model_utils import get_model_context_window
+        return get_model_context_window(task="docgen")
+    except Exception as e:
+        logger.debug("Could not resolve context window in artifact_docgen: %s", e)
+        return 8192
 # Token-counting is approximate by design: we need a budget estimate, not an
 # exact count. tiktoken cl100k_base (the Ollama path in data_pipeline.count_tokens)
 # is a good fit for the local models used here; if tiktoken is unavailable we
@@ -167,20 +160,18 @@ def _count_tokens(text: str) -> int:
 def _resolve_codebase_chunk_budget() -> int:
     """Resolve the per-call codebase token budget for RLM.
 
-    The effective ceiling is the SMALLER of:
-      - the model's ACTUAL context window (``RLM_MODEL_CONTEXT_WINDOW`` /
-        ``OLLAMA_NUM_CTX``) -- what the gateway will accept before returning
-        ``Context size has been exceeded``; and
-      - fast-rlm's ``max_prompt_tokens`` (admin models.docgen.max_prompt_tokens
-        > env RLM_MAX_PROMPT_TOKENS > fast-rlm default 200000) -- the budget
-        fast-rlm thinks it can use.
-    minus a reserve (for the section prompt + fast-rlm recursive accumulation).
-    The reserve is clamped to a sane share of the ceiling so a small context
-    window (e.g. 8192) isn't consumed entirely by the default 40k reserve.
+    The codebase chunk budget must account for both:
+      1. the model's actual context window (``num_ctx``) minus completion reserve;
+      2. fast-rlm's REPL subagent recursion overhead (section prompt + system
+         instructions + Pyodide code execution outputs).
 
-    Floors the result at a sane minimum so a tiny/zero admin value can't
-    produce an unusable (zero/negative) budget -- in that degenerate case we
-    keep a single chunk and let RLM/the fallback handle it as today.
+    If the codebase chunk is too large (e.g. 26k tokens on a 32k window), fast-rlm
+    subagents will exceed `max_prompt_tokens` (e.g. 24,576) on their first
+    recursive step and raise `Prompt token budget exceeded: 28,887 used, limit 24,576`.
+
+    We therefore reserve ~35-40% of max_prompt_tokens (or at least 6,000-12,000
+    tokens) for fast-rlm recursion headroom, ensuring that codebase chunks leave
+    ample room for fast-rlm subagents to complete.
     """
     max_prompt = None
     try:
@@ -193,22 +184,17 @@ def _resolve_codebase_chunk_budget() -> int:
             max_prompt = int(os.environ["RLM_MAX_PROMPT_TOKENS"])
         except ValueError:
             max_prompt = None
-    if max_prompt is None:
-        max_prompt = 200_000  # fast-rlm default
-    # The model's real context window (num_ctx) is the hard ceiling the gateway
-    # enforces. When known and smaller than fast-rlm's max_prompt_tokens, it is
-    # the binding constraint; without it we'd compute a 160k-token chunk for an
-    # 8k-window model and overflow it (``Context size has been exceeded``).
-    context_window = _resolve_rlm_context_window()
-    ceiling = min(context_window or max_prompt, max_prompt)
-    # Scale the reserve with the ceiling so a small window keeps usable headroom:
-    # at most 20% of the ceiling, capped at the configured RLM_PROMPT_RESERVE_TOKENS.
-    reserve = min(RLM_PROMPT_RESERVE_TOKENS, max(2_000, ceiling // 5))
-    budget = ceiling - reserve
-    # Floor: never let a misconfigured budget collapse chunking. 4k tokens is
-    # enough for a few files per chunk; below that we'd split every file into
-    # its own call which is wasteful without helping the budget.
-    return max(budget, 4_000)
+
+    context_window = _resolve_rlm_context_window() or 8192
+    completion_reserve = max(1024, min(4096, context_window // 4))
+    max_prompt_tokens = max(1024, context_window - completion_reserve)
+    if max_prompt and max_prompt > 0:
+        max_prompt_tokens = min(max_prompt_tokens, max_prompt)
+
+    # Reserve headroom for fast-rlm's recursive subagent execution history (35-40%)
+    recursion_reserve = max(3000, min(12000, int(max_prompt_tokens * 0.4)))
+    budget = max_prompt_tokens - recursion_reserve
+    return max(budget, 3000)
 
 _CODEBASE_BLOCK_HEADER = (
     "\n\n<context_codebase>\n"
@@ -454,11 +440,22 @@ class _StandardLLM:
             # whenever RLM failed (see api/wiki_generator.py:283 for the
             # correct pattern).
             result = self.generator(prompt_kwargs={"input_str": prompt})
-            for attr in ("response", "answer", "raw_response", "output"):
+            # On a model error (e.g. 401 / connection refused) adalflow returns
+            # a GeneratorOutput with ``error`` set and ``data=None`` but, crucially,
+            # ``input=prompt_str`` (the full prompt is stored on the output for
+            # tracing). Returning ``str(result)`` here would embed the entire
+            # prompt -- including the section template + codebase blob -- onto
+            # the wiki page. Treat any error as "no generation" so the caller
+            # substitutes the "(section not generated)" placeholder instead.
+            if getattr(result, "error", None):
+                logger.warning("Standard LLM returned an error: %s", result.error)
+                return ""
+            # Prefer the parsed answer (``data``) over raw response fields.
+            for attr in ("data", "response", "answer", "raw_response", "output"):
                 val = getattr(result, attr, None)
                 if val:
                     return str(val)
-            return str(result)
+            return ""
 
         return await asyncio.to_thread(_call)
 
@@ -561,33 +558,56 @@ def _make_repair_llm(
 # ---------------------------------------------------------------------------
 # Codebase reading + lightweight analysis (feeds WikiSectionContext)
 # ---------------------------------------------------------------------------
-def _build_file_blocks(documents: List[Any]) -> List[str]:
-    """Build the per-file code blocks (each capped at ``PER_FILE_MAX_CHARS``).
+def _split_large_file_into_parts(path: str, text: str, max_tokens: int) -> List[str]:
+    """Split a single large file into multi-part blocks with Part X of N headers.
 
-    Shared by the single-blob path (``_build_codebase_blob``) and the
-    chunked path (``_chunk_file_blocks``) so the two produce identical blocks.
-    ``CODEBASE_BLOB_MAX_CHARS`` is honored as an overall cap so a pathologically
-    large repo still produces a bounded result (the chunker would otherwise
-    emit more, smaller chunks than necessary).
+    Preserves 100% of source lines without character truncation.
+    """
+    lines = text.splitlines(keepends=True)
+    parts: List[List[str]] = []
+    current_lines: List[str] = []
+    base_header_tokens = _count_tokens(f"### File: {path} (Part 99 of 99)\n```\n\n```\n")
+    current_tokens = base_header_tokens
+
+    for line in lines:
+        line_tokens = _count_tokens(line)
+        if current_lines and current_tokens + line_tokens > max_tokens:
+            parts.append(current_lines)
+            current_lines = [line]
+            current_tokens = base_header_tokens + line_tokens
+        else:
+            current_lines.append(line)
+            current_tokens += line_tokens
+    if current_lines:
+        parts.append(current_lines)
+
+    total_parts = len(parts)
+    blocks: List[str] = []
+    for i, part_lines in enumerate(parts, 1):
+        part_text = "".join(part_lines)
+        part_header = f" (Part {i} of {total_parts})" if total_parts > 1 else ""
+        blocks.append(f"### File: {path}{part_header}\n```\n{part_text}\n```\n")
+    return blocks
+
+
+def _build_file_blocks(documents: List[Any], max_file_chunk_tokens: int = 8000) -> List[str]:
+    """Build per-file code blocks without character truncation.
+
+    If a single file exceeds max_file_chunk_tokens, it is split into multi-part
+    file blocks with explicit (Part X of N) headers so zero code is lost.
     """
     blocks: List[str] = []
-    total = 0
     for doc in documents:
         meta = getattr(doc, "meta_data", None) or {}
         path = meta.get("file_path", "unknown")
         text = getattr(doc, "text", "") or ""
-        if not text:
+        if not text or not text.strip():
             continue
-        if len(text) > PER_FILE_MAX_CHARS:
-            text = text[:PER_FILE_MAX_CHARS] + "\n... (file truncated)\n"
-        block = f"### File: {path}\n```\n{text}\n```\n"
-        if total + len(block) > CODEBASE_BLOB_MAX_CHARS:
-            remaining = CODEBASE_BLOB_MAX_CHARS - total
-            if remaining > 200:
-                blocks.append(block[:remaining] + "\n... (codebase blob truncated)\n")
-            break
-        blocks.append(block)
-        total += len(block)
+        file_tokens = _count_tokens(text)
+        if file_tokens > max_file_chunk_tokens:
+            blocks.extend(_split_large_file_into_parts(path, text, max_file_chunk_tokens))
+        else:
+            blocks.append(f"### File: {path}\n```\n{text}\n```\n")
     return blocks
 
 
@@ -783,9 +803,16 @@ async def _attempt_rlm(
     if rlm_failures >= RLM_MAX_FAILURES:
         return None
     try:
+        from api.model_utils import clamp_text_by_tokens
+        ctx_win = _resolve_rlm_context_window() or 8192
+        completion_res = max(1024, min(4096, ctx_win // 4))
+        max_prompt_limit = max(1024, ctx_win - completion_res)
+        safe_query_limit = max(2000, max_prompt_limit - 6000)
+        safe_query = clamp_text_by_tokens(query, safe_query_limit)
+
         from api.rlm_runner import run_rlm_task  # lazy: fast_rlm is optional
         res = await asyncio.wait_for(
-            run_rlm_task(query, rlm_model), timeout=RLM_SECTION_TIMEOUT
+            run_rlm_task(safe_query, rlm_model), timeout=RLM_SECTION_TIMEOUT
         )
         if res.get("success") and res.get("results"):
             txt = _clean_llm_text(str(res["results"]))
@@ -858,9 +885,18 @@ async def _generate_section_text(
 
     if llm is not None:
         try:
+            from api.model_utils import clamp_text_by_tokens
+            ctx_win = _resolve_rlm_context_window() or 8192
+            max_p_tokens = max(1024, ctx_win - 2048)
+
+            # ALWAYS attach codebase_blob when available (clamped to fit model context)
+            # so the standard LLM fallback has actual source code to generate the section from,
+            # even if RLM failed or was skipped.
             prompt = section_prompt
-            if not use_rlm and codebase_blob and len(codebase_blob) <= SMALL_CODEBASE_APPEND_LIMIT:
+            if codebase_blob:
                 prompt = prompt + _CODEBASE_BLOCK_HEADER + codebase_blob
+            
+            prompt = clamp_text_by_tokens(prompt, max_p_tokens)
             txt = _clean_llm_text(await llm.generate(prompt))
             if txt:
                 return txt
@@ -911,56 +947,85 @@ async def _generate_section_mapreduce(
         logger.warning("Section reduce produced no text; returning concatenated drafts.")
         return "\n\n".join(drafts)
 
-    # No drafts at all: degrade to the standard LLM with the section prompt
-    # only (no codebase blob), matching the existing large-codebase
-    # RLM-unavailable behaviour.
+    # No drafts at all: use Agentic Bottom-Up Synthesis Engine to analyze 100% of files
     logger.warning(
-        "Section map produced no drafts; falling back to standard LLM "
-        "(no codebase blob for this section)."
+        "Section map produced no RLM drafts; using Agentic Bottom-Up Synthesis Engine for standard LLM."
     )
     if llm is not None:
         try:
-            txt = _clean_llm_text(await llm.generate(section_prompt))
+            txt = await _agentic_bottom_up_docgen(section_prompt, chunks, llm)
             if txt:
                 return txt
         except Exception as e:  # pragma: no cover - depends on live Ollama
-            logger.warning("Standard LLM section generation failed: %s", e)
+            logger.warning("Agentic bottom-up section generation failed: %s", e)
     return ""
 
 
-async def _reduce_section_drafts(
+async def _agentic_file_map_summary(
+    block_chunk: str,
+    llm: Optional[_StandardLLM],
+    max_tokens: int,
+) -> str:
+    """Phase 1: Extract structured technical facts from a codebase block chunk."""
+    if llm is None or not block_chunk:
+        return ""
+    prompt = (
+        "Ты технический AI-агент. Проанализируй исходные файлы кодовой базы ниже "
+        "и извлеки краткую, но исчерпывающую техническую сводку:\n"
+        "1. Архитектурную роль и назначение каждого файла/модуля.\n"
+        "2. Экспортируемые классы, интерфейсы, функции и их сигнатуры.\n"
+        "3. API эндпоинты, методы, структуры запросов/ответов.\n"
+        "4. Модели данных, базы данных, сущности и их поля.\n"
+        "5. Зависимости, конфигурацию и CI/CD компоненты.\n"
+        "Будь предельно точен, не упускай технические детали, сохрани все имена файлов, "
+        "классов и методов.\n\n"
+        f"<codebase_chunk>\n{block_chunk}\n</codebase_chunk>\n\nAssistant:"
+    )
+    from api.model_utils import clamp_text_by_tokens
+    prompt = _with_verification_guard(clamp_text_by_tokens(prompt, max_tokens))
+    try:
+        return _clean_llm_text(await llm.generate(prompt))
+    except Exception as e:
+        logger.warning("Agentic file map summary call failed: %s", e)
+        return ""
+
+
+async def _agentic_bottom_up_docgen(
     section_prompt: str,
-    drafts: List[str],
+    chunks: List[str],
     llm: Optional[_StandardLLM],
 ) -> str:
-    """Merge per-chunk section drafts into one coherent section via the LLM.
+    """Agentic Bottom-Up Harness Engine for Standard LLM Fallback.
 
-    The drafts are small (each is a single section's worth of text), so the
-    reduce input always fits the standard LLM context regardless of how large
-    the original codebase was. Returns cleaned text or "" on failure.
+    Phase 1 (Map): Summarizes technical facts for 100% of files across chunks.
+    Phase 2 (Reduce/Synthesize): Merges file summaries into the final section.
+    Ensures 0% code loss on large codebases.
     """
-    if llm is None or not drafts:
+    if llm is None or not chunks:
         return ""
-    parts = [f"=== ЧЕРНОВИК {i} ===\n{d}" for i, d in enumerate(drafts, 1)]
-    reduce_prompt = (
-        "Ты объединяешь частичные черновики одного раздела документации, "
-        "полученные из разных частей большой кодовой базы. Синтезируй из них "
-        "один цельный, непротиворечивый раздел: убери дубликаты, сгруппируй "
-        "связанное, сохрани все значимые факты (файлы, функции, компоненты, "
-        "зависимости, потоки данных). Не добавляй фактов, которых нет в "
-        "черновиках. Верни только итоговый раздел в Markdown.\n\n"
-        f"Требования к разделу (исходная инструкция):\n{section_prompt}\n\n"
-        + "\n\n".join(parts)
-        + "\n\nAssistant:"
-    )
-    # Apply the same verification guard (grounding/citation/no-line-numbers) so
-    # the reduce step also strips line numbers and stays grounded in the drafts.
-    reduce_prompt = _with_verification_guard(reduce_prompt)
-    try:
-        return _clean_llm_text(await llm.generate(reduce_prompt))
-    except Exception as e:  # pragma: no cover - depends on live Ollama
-        logger.warning("Section reduce LLM call failed: %s", e)
-        return ""
+
+    ctx_win = _resolve_rlm_context_window() or 8192
+    max_p_tokens = max(1024, ctx_win - 2048)
+
+    # Phase 1: Map all file chunks to technical file summaries
+    file_summaries: List[str] = []
+    for i, chunk in enumerate(chunks, 1):
+        summary = await _agentic_file_map_summary(chunk, llm, max_p_tokens)
+        if summary:
+            file_summaries.append(f"### Сводка файлов (часть {i}/{len(chunks)}):\n{summary}")
+
+    if not file_summaries:
+        # Fallback to direct prompt if map produced nothing
+        combined_blob = "\n\n".join(chunks)
+        from api.model_utils import clamp_text_by_tokens
+        prompt = clamp_text_by_tokens(section_prompt + _CODEBASE_BLOCK_HEADER + combined_blob, max_p_tokens)
+        try:
+            return _clean_llm_text(await llm.generate(prompt))
+        except Exception:
+            return ""
+
+    # Phase 2: Synthesize the section from all file summaries
+    return await _reduce_section_drafts(section_prompt, file_summaries, llm)
 
 
 # ---------------------------------------------------------------------------
@@ -1078,6 +1143,19 @@ async def generate_codebase_docs(
         [(getattr(d, "meta_data", None) or {}).get("file_path", "") for d in documents]
     )
     readme = _read_readme(repo_dir)
+
+    # Enrich docgen context with product-level knowledge (Confluence pages / specs)
+    pid = getattr(product, "id", None) or getattr(product, "product_id", None)
+    if pid:
+        try:
+            from api.expert_agent import _retrieve_product_knowledge
+            p_knowledge = await _retrieve_product_knowledge(pid, "architecture functional API specifications")
+            if p_knowledge and p_knowledge.strip():
+                from api.model_utils import clamp_text_by_tokens
+                clamped_kn = clamp_text_by_tokens(p_knowledge, 4000)
+                readme = (readme or "") + f"\n\n### Дополнительный контекст продукта (Confluence / База знаний):\n{clamped_kn}\n"
+        except Exception as e:
+            logger.debug("Docgen product knowledge retrieval skipped for %s: %s", pid, e)
 
     # Decide whether the codebase fits a single RLM call. ``codebase_chunks`` is
     # used only on the RLM path; the standard-LLM path always uses the single
@@ -1342,6 +1420,11 @@ async def _generate_spec_doc(
     provider = provider or r_provider
     model = model or r_model
 
+    from api.model_utils import get_model_context_window, clamp_text_by_tokens
+    ctx_win = get_model_context_window(provider=provider, base_url=r_base_url, model_name=model, api_key=r_api_key, task="docgen")
+    content_token_limit = max(1024, ctx_win - 2048)
+    clamped_content = clamp_text_by_tokens(content, content_token_limit)
+
     spec = _parse_spec(content)
     skeleton = render_skeleton(spec) if spec else ""
     if not skeleton:
@@ -1354,7 +1437,7 @@ async def _generate_spec_doc(
             "repo_name": _product_name(product, artifact),
             "artifact_name": getattr(artifact, "name", None) or spec_kind,
             "previous_content": "",
-            "content": _cap(content, LLM_CONTENT_MAX_CHARS),
+            "content": clamped_content,
         },
     ))
     llm_text = await _llm_or_none(
@@ -1437,6 +1520,10 @@ async def generate_testcase_docs(
     provider = provider or r_provider
     model = model or r_model
 
+    from api.model_utils import get_model_context_window, clamp_text_by_tokens
+    ctx_win = get_model_context_window(provider=provider, base_url=r_base_url, model_name=model, api_key=r_api_key, task="docgen")
+    content_token_limit = max(1024, ctx_win - 2048)
+
     content_block = content or ""
     if allure_url:
         content_block += (
@@ -1444,6 +1531,7 @@ async def generate_testcase_docs(
             f"({allure_url})"
             " (ссылка предоставлена вручную; данные Allure не загружаются автоматически)."
         )
+    clamped_content_block = clamp_text_by_tokens(content_block, content_token_limit)
 
     template = load_prompt_file("testcase_doc.md", "")
     prompt = _with_verification_guard(_safe_replace(
@@ -1452,7 +1540,7 @@ async def generate_testcase_docs(
             "repo_name": _product_name(product, artifact),
             "artifact_name": getattr(artifact, "name", None) or "Тест-кейсы",
             "previous_content": "",
-            "content": _cap(content_block, LLM_CONTENT_MAX_CHARS),
+            "content": clamped_content_block,
         },
     ))
     llm_text = await _llm_or_none(
@@ -1568,6 +1656,11 @@ async def generate_documentation_docs(
     provider = provider or r_provider
     model = model or r_model
 
+    from api.model_utils import get_model_context_window, clamp_text_by_tokens
+    ctx_win = get_model_context_window(provider=provider, base_url=r_base_url, model_name=model, api_key=r_api_key, task="docgen")
+    content_token_limit = max(1024, ctx_win - 2048)
+    clamped_content = clamp_text_by_tokens(content, content_token_limit)
+
     enriched = ""
     template = load_prompt_file("documentation_doc.md", "")
     if template:
@@ -1575,7 +1668,7 @@ async def generate_documentation_docs(
             template,
             {
                 "artifact_name": getattr(artifact, "name", None) or "Documentation",
-                "content": _cap(content, LLM_CONTENT_MAX_CHARS),
+                "content": clamped_content,
             },
         ))
         enriched = await _llm_or_none(

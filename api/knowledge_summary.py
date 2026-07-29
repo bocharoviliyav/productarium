@@ -92,11 +92,19 @@ class _SummaryLLM:
             # that fills the ``{{input_str}}`` template placeholder), NOT a
             # bare ``input_str=`` kwarg -- passing that raises TypeError.
             result = self.generator(prompt_kwargs={"input_str": prompt})
-            for attr in ("response", "answer", "raw_response", "output"):
+            # On a model error adalflow returns a GeneratorOutput with ``error``
+            # set and stores the full prompt on ``input``. Returning
+            # ``str(result)`` would leak the prompt (incl. concatenated
+            # artifact/knowledge content) into the stored product summary.
+            # Treat any error as "no generation" instead.
+            if getattr(result, "error", None):
+                logger.warning("Summary LLM returned an error: %s", result.error)
+                return ""
+            for attr in ("data", "response", "answer", "raw_response", "output"):
                 val = getattr(result, attr, None)
                 if val:
                     return str(val)
-            return str(result)
+            return ""
 
         return await asyncio.to_thread(_call)
 
@@ -147,7 +155,7 @@ def _cap(text: str, limit: int) -> str:
 # --------------------------------------------------------------------------- #
 # Context collection + prompt building
 # --------------------------------------------------------------------------- #
-def _collect_summary_content(artifacts: Iterable[Any], nodes: Iterable[Any]) -> str:
+def _collect_summary_content(artifacts: Iterable[Any], nodes: Iterable[Any], max_tokens: int = 6000) -> str:
     """Concatenate artifact generated_docs + knowledge node content_md."""
     parts = []
     for a in artifacts or []:
@@ -162,7 +170,13 @@ def _collect_summary_content(artifacts: Iterable[Any], nodes: Iterable[Any]) -> 
             parts.append(f"## Страница базы знаний: {title}\n\n{md.strip()}")
     if not parts:
         return ""
-    return _cap("\n\n".join(parts), SUMMARY_CONTEXT_MAX_CHARS)
+    
+    full_text = "\n\n".join(parts)
+    try:
+        from api.model_utils import clamp_text_by_tokens
+        return clamp_text_by_tokens(full_text, max_tokens)
+    except Exception:
+        return _cap(full_text, SUMMARY_CONTEXT_MAX_CHARS)
 
 
 def _build_summary_prompt(product_name: str, content: str) -> str:
@@ -191,19 +205,9 @@ async def generate_product_summary(
     result directly.
     """
     product_name = getattr(product, "name", "") or "product"
-    content = _collect_summary_content(artifacts, nodes)
-    if not content.strip():
-        logger.info("Product %r has no content to summarize.", product_name)
-        return ""
 
     # Resolve provider/model/base_url/api_key from the settings store 'summary'
-    # task, falling back to env-driven defaults. Non-fatal if the store/DB is
-    # unavailable. base_url/api_key are read here (NOT in _SummaryLLM) so the
-    # summary LLM reaches the configured corporate gateway instead of the dead
-    # env-default LM Studio :1234 -- previously _SummaryLLM built its client
-    # with NO base_url/api_key, so the summary silently hit a non-existent
-    # endpoint and returned an empty/garbage result ("выдаёт запрос вместо
-    # результата").
+    # task, falling back to env-driven defaults.
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     if provider is None or model is None:
@@ -217,6 +221,18 @@ async def generate_product_summary(
         except Exception as e:  # pragma: no cover - depends on live DB
             logger.debug("settings_store summary task lookup failed: %s", e)
             provider = provider or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local")
+
+    try:
+        from api.model_utils import get_model_context_window
+        ctx_win = get_model_context_window(provider=provider, base_url=base_url, model_name=model, api_key=api_key, task="summary")
+    except Exception:
+        ctx_win = 8192
+
+    max_summary_tokens = max(1024, ctx_win - 2048)
+    content = _collect_summary_content(artifacts, nodes, max_tokens=max_summary_tokens)
+    if not content.strip():
+        logger.info("Product %r has no content to summarize.", product_name)
+        return ""
 
     llm = _safe_build_summary_llm(
         provider or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local"),

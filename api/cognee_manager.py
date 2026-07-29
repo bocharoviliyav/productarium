@@ -1,6 +1,9 @@
-import os
-import logging
+from __future__ import annotations
+
 import asyncio
+import logging
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -115,8 +118,7 @@ def _host_to_v1(host: str) -> str:
     ``.../v1`` OpenAI-compatible base URL.
     """
     h = (host or "").rstrip("/")
-    if h.endswith("/v1"):
-        h = h[:-3]
+    h = h.removesuffix("/v1")
     return f"{h}/v1" if h else h
 
 
@@ -148,7 +150,7 @@ _local_llm_host = (
 ).rstrip("/")
 # Normalize to a bare host (strip a trailing "/v1") so we can append the right
 # path per cognee's expectations below.
-_local_llm_host = _local_llm_host[:-3] if _local_llm_host.endswith("/v1") else _local_llm_host
+_local_llm_host = _local_llm_host.removesuffix("/v1")
 
 # The default cognee provider must MATCH the local server we point at, so that
 # the right adapter (OllamaAPIAdapter vs OpenAIAdapter) is selected and the
@@ -264,23 +266,39 @@ os.environ.setdefault("VECTOR_DB_NAME", DB_NAME)
 os.environ.setdefault("VECTOR_DB_USERNAME", DB_USERNAME)
 os.environ.setdefault("VECTOR_DB_PASSWORD", DB_PASSWORD)
 # --- Fix #2: asyncpg cross-loop termination --------------------------------
-# cognee's relational + graph Postgres engines use SQLAlchemy's
+# cognee's relational, graph, and vector Postgres engines use SQLAlchemy's
 # AsyncAdaptedQueuePool with asyncpg. A pooled asyncpg connection is bound to
 # the event loop that first checked it out; when the pool later tries to
 # terminate/recycle that connection from a DIFFERENT loop (which happens here
 # because cognee's own background tasks, the FastAPI request loop, and
 # asyncio.to_thread worker threads all touch the shared pool), asyncpg raises
 # ``RuntimeError: ... got Future ... attached to a different loop`` during
-# ``do_terminate`` -> ``_terminate_graceful_close``. The noise is benign (the
-# connection is being torn down anyway) but floods the logs.
+# ``do_terminate`` -> ``_terminate_graceful_close``.
 #
-# The robust fix is to disable connection pooling on cognee's async engines
-# (NullPool): each checkout opens a fresh asyncpg connection on the current
-# loop, so no connection ever crosses loops. The cost is one TCP round-trip
-# per DB operation, which is acceptable for a single-user local instance and
-# far cheaper than the cross-loop crashes. cognee reads these as JSON objects
-# (see RelationalConfig.pool_args / database_connect_args), and its adapter
-# maps poolclass="nullpool" -> sqlalchemy.pool.NullPool. Overridable via env.
+# The robust fix is to use NullPool so no asyncpg connections are retained in
+# a pool across tasks/loops. Each DB session opens a fresh connection and closes
+# it on the current loop.
+#
+# To support string `"nullpool"` across ALL cognee adapters (relational, graph,
+# and vector stores), we monkeypatch `sqlalchemy.ext.asyncio.create_async_engine`
+# so that any string `"nullpool"` in `kwargs["poolclass"]` is converted to the
+# `sqlalchemy.pool.NullPool` class before SQLAlchemy inspects it.
+try:
+    import sqlalchemy.ext.asyncio as _sa_asyncio
+    from sqlalchemy.pool import NullPool as _NullPool
+
+    _orig_create_async_engine = _sa_asyncio.create_async_engine
+
+    def _patched_create_async_engine(*args, **kwargs):
+        pc = kwargs.get("poolclass")
+        if isinstance(pc, str) and pc.strip().lower() == "nullpool":
+            kwargs["poolclass"] = _NullPool
+        return _orig_create_async_engine(*args, **kwargs)
+
+    _sa_asyncio.create_async_engine = _patched_create_async_engine
+except Exception as _patch_err:  # pragma: no cover - defensive
+    logger.warning("Could not patch create_async_engine for NullPool: %s", _patch_err)
+
 os.environ.setdefault(
     "POOL_ARGS",
     '{"poolclass": "nullpool", "pool_pre_ping": true}',
@@ -434,6 +452,76 @@ async def init_cognee():
 #
 # Everything here is best-effort and never raises: if the settings store / DB
 # is down, cognee simply keeps whatever config it already has (env defaults).
+_ORIG_ACREATE_STRUCTURED_OUTPUT = None
+
+
+def apply_cognee_retry_patch() -> None:
+    """Patch cognee's OpenAIAdapter.acreate_structured_output tenacity retry decorator.
+
+    cognee's default retry decorator on ``OpenAIAdapter.acreate_structured_output``
+    uses ``retry_if_not_exception_type((NotFoundError, AuthenticationError))``.
+    When an asyncio task is cancelled (e.g. timeout or request cancellation) or
+    an unrecoverable BadRequestError is raised, tenacity catches ``CancelledError``
+    or ``BadRequestError`` and RETRIES it with exponential backoff (8s -> 128s),
+    flooding logs with:
+      `Retrying ... as it raised CancelledError`
+    and stalling background workers.
+
+    We strip cognee's original @retry decorator by walking `__wrapped__` to the
+    raw method body, save it in `_ORIG_ACREATE_STRUCTURED_OUTPUT` (idempotent),
+    and wrap it with a 30-second `asyncio.wait_for` timeout and graceful
+    fallback to an empty `response_model()` on timeout/error.
+    """
+    global _ORIG_ACREATE_STRUCTURED_OUTPUT
+    if not _COGNEE_AVAILABLE or _ORIG_ACREATE_STRUCTURED_OUTPUT is not None:
+        return
+    try:
+        import asyncio
+        from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.openai.adapter import (
+            OpenAIAdapter,
+        )
+
+        curr = OpenAIAdapter.acreate_structured_output
+        while hasattr(curr, "__wrapped__"):
+            curr = getattr(curr, "__wrapped__")
+
+        _ORIG_ACREATE_STRUCTURED_OUTPUT = curr
+
+        async def _patched_acreate_structured_output(
+            self, text_input: str, system_prompt: str, response_model: type, **kwargs
+        ):
+            # Clamp text_input conservatively for graph extraction (max 400 tokens / ~1500 chars)
+            try:
+                from api.model_utils import clamp_text_by_tokens
+                text_input = clamp_text_by_tokens(text_input, max_tokens=400)
+            except Exception:
+                if len(text_input) > 1500:
+                    text_input = text_input[:1500] + "\n... (truncated)"
+
+            try:
+                # 30-second timeout so cognify graph extraction never hangs on a slow LLM
+                return await asyncio.wait_for(
+                    _ORIG_ACREATE_STRUCTURED_OUTPUT(self, text_input, system_prompt, response_model, **kwargs),
+                    timeout=30.0,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "cognee graph extraction skipped chunk due to %s (%s); returning empty model.",
+                    type(exc).__name__,
+                    exc,
+                )
+                try:
+                    return response_model()
+                except Exception:
+                    pass
+                raise exc
+
+        OpenAIAdapter.acreate_structured_output = _patched_acreate_structured_output
+        logger.info("Successfully applied idempotent cognee OpenAIAdapter retry patch.")
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Could not apply cognee OpenAIAdapter retry patch: %s", e)
+
+
 def apply_cognee_runtime_config() -> None:
     """Push admin-configured model + embedder settings into cognee's runtime.
 
@@ -444,14 +532,13 @@ def apply_cognee_runtime_config() -> None:
     """
     if not _COGNEE_AVAILABLE:
         return
-    # Re-apply SSL config so an admin save of ssl.ca_bundle / ssl.verify takes
-    # effect for the next cognee call: re-export the CA env vars and refresh the
-    # cognee aiohttp SSL monkeypatch (skip-verify toggle).
+    # Re-apply SSL config and retry patch so cognee calls do not retry CancelledError
     try:
         apply_ssl_env()
         apply_cognee_ssl_patch()
+        apply_cognee_retry_patch()
     except Exception as e:  # pragma: no cover - defensive
-        logger.debug("apply_cognee_runtime_config: SSL re-apply failed: %s", e)
+        logger.debug("apply_cognee_runtime_config: SSL/retry re-apply failed: %s", e)
     # Re-assert the persistent data/system roots on the cognee config singleton.
     # The env block above (DATA_ROOT_DIRECTORY / SYSTEM_ROOT_DIRECTORY) already
     # sets these at import time, but an admin could change DEEPWIKI_ADALFLOW_ROOT
@@ -986,139 +1073,92 @@ def _read_repo_text_for_cognee(repo_dir: str) -> str:
     return "\n".join(parts)
 
 
-async def add_and_index_document(content_or_path: str, dataset_name: str):
-    """
-    Adds document text or file path into Cognee memory and processes it to
-    knowledge graph. NEVER raises: errors are logged so callers (e.g.
-    background docgen) are not crashed by cognee import/timeout issues.
+async def add_document(content_or_path: str, dataset_name: str) -> bool:
+    """Add a document text or directory path to a cognee dataset (WITHOUT running cognify).
 
-    Robustness fixes over the naive ``cognee.add(content_or_path)``:
-    - **Directory input** (cat 2): when ``content_or_path`` is a directory
-      (the cloned repo), cognee's text loader would traverse ``.git/index``
-      and raise ``UnicodeDecodeError`` on the binary file. Instead we read the
-      text files ourselves (allow-listed extensions, skip ``.git``/binary) and
-      hand cognee a concatenated text blob.
-    - **Wrap text in DataItem** (cat 4): newer cognee (>=1.3) introspects each
-      data item as an object in the pipeline (provenance stamping, DLT
-      resolution) and raises ``'str' object has no attribute '__dict__'`` when a
-      raw ``str`` reaches the pipeline. ``cognee.tasks.ingestion.data_item.
-      DataItem`` is the documented object wrapper and is explicitly handled at
-      every pipeline stage, so we wrap our text payload in it before calling
-      ``cognee.add``. Falls back to the raw payload if DataItem is unavailable
-      (older cognee / import guard).
-    - **Re-index duplicate key** (cat 3): re-docgen re-adds the same content
-      to an existing dataset, which raises ``UniqueViolationError`` on cognee
-      1.2.x's ``data`` table (fixed content hash -> fixed PK). On that error
-      we delete the dataset's data and retry the add once.
+    Safe and non-fatal. Returns True if the payload was added successfully.
     """
-    if not _COGNEE_AVAILABLE:
-        logger.warning("cognee unavailable; skipping index of dataset %r.", dataset_name)
-        return
+    if not _COGNEE_AVAILABLE or not content_or_path:
+        return False
     apply_cognee_runtime_config()
 
-    # Cat 2: if the input is a directory (cloned repo), read text files
-    # ourselves and pass a blob to cognee. This avoids cognee's text loader
-    # choking on binary files like ``.git/index``.
     payload = content_or_path
     import os as _os
     if content_or_path and _os.path.isdir(content_or_path):
         blob = _read_repo_text_for_cognee(content_or_path)
         if not blob:
-            logger.warning(
-                "cognee index: no text files found in %r; skipping dataset %r.",
-                content_or_path, dataset_name,
-            )
-            return
+            logger.warning("cognee index: no text files found in %r; skipping dataset %r.", content_or_path, dataset_name)
+            return False
         payload = blob
-        logger.info(
-            "cognee index: read %d chars of text from repo %r for dataset %r.",
-            len(blob), content_or_path, dataset_name,
-        )
+        logger.info("cognee index: read %d chars of text from repo %r for dataset %r.", len(blob), content_or_path, dataset_name)
 
-    # Cat 4: newer cognee pipelines introspect data items as objects and crash
-    # on a raw ``str`` payload (``'str' object has no attribute '__dict__'``).
-    # Wrap text payloads in ``DataItem`` so every pipeline stage handles them
-    # explicitly. We wrap ONLY text (str) payloads; genuine file paths are
-    # left as strings so cognee's file loader can read them from disk.
     ingest_payload = payload
     if isinstance(payload, str) and not _looks_like_file_path(payload):
         try:
             from cognee.tasks.ingestion.data_item import DataItem
             ingest_payload = DataItem(data=payload)
-            logger.debug("cognee add: wrapped text payload (%d chars) in DataItem.", len(payload))
-        except Exception as _wrap_err:  # pragma: no cover - defensive
-            logger.debug("cognee add: DataItem unavailable, passing raw str: %s", _wrap_err)
+        except Exception:
+            pass
 
     try:
-        logger.info(f"Ingesting into Cognee (dataset: {dataset_name})...")
         await cognee.add(ingest_payload, dataset_name=dataset_name)
-        await cognee.cognify(datasets=[dataset_name])
-        logger.info(f"Cognee: Ingested and cognified dataset '{dataset_name}' successfully.")
+        return True
     except Exception as e:
-        # Cat 3 + ephemeral-root recovery: two recoverable failure classes share
-        # the same clear-and-retry path:
-        #  - **Duplicate key** (cat 3): re-indexing the same content raises a
-        #    duplicate-key violation on cognee 1.2.x's ``data`` table (PK is a
-        #    content hash). Clearing the dataset lets the retry re-ingest.
-        #  - **File not found** (stale backing file): if a ``Data`` row's
-        #    ``raw_data_location`` points at a ``text_<hash>.txt`` that no longer
-        #    exists (old ephemeral data root wiped on rebuild), ``cognify`` raises
-        #    ``File not found: .../text_<hash>.txt`` / ``FileNotFoundError``.
-        #    Clearing the stale dataset data lets the retry re-create the file.
-        # Any OTHER error is logged and swallowed (never fatal to docgen).
         msg = str(e)
-        is_dup_key = (
-            "duplicate key value" in msg
-            or "data_pkey" in msg
-            or "UniqueViolationError" in type(e).__name__
-            or "IntegrityError" in type(e).__name__
-        )
-        is_file_not_found = (
-            "File not found" in msg
-            or "FileNotFoundError" in type(e).__name__
-            or isinstance(e, FileNotFoundError)
-        )
-        if not (is_dup_key or is_file_not_found):
-            logger.error(
-                f"Error ingesting content into Cognee for dataset '{dataset_name}': {e}",
-                exc_info=True,
-            )
-            return
-        reason = (
-            "duplicate-key violation (re-index of existing content)"
-            if is_dup_key and not is_file_not_found
-            else "stale backing file (File not found)"
-            if is_file_not_found and not is_dup_key
-            else "duplicate-key + stale backing file"
-        )
-        logger.warning(
-            "cognee add for dataset %r hit a %s; clearing dataset data and "
-            "retrying once. Error: %s",
-            dataset_name, reason, msg,
-        )
-        # Clear the dataset's data + graph so the retry can re-ingest cleanly.
-        # Uses the CURRENT cognee API (``datasets.empty_dataset``); the legacy
-        # ``cognee.delete([name])`` is deprecated and its real signature is
-        # ``delete(data_id, dataset_id)`` so passing a list silently fails.
-        cleared = await _empty_cognee_dataset(dataset_name)
-        if not cleared:
-            logger.warning(
-                "could not clear dataset %r before retry; aborting re-index.",
-                dataset_name,
-            )
-            return
-        try:
-            await cognee.add(ingest_payload, dataset_name=dataset_name)
-            await cognee.cognify(datasets=[dataset_name])
-            logger.info(
-                "Cognee: re-ingested dataset '%s' successfully after %s.",
-                dataset_name, reason,
-            )
-        except Exception as e2:
-            logger.error(
-                f"cognee re-index retry failed for dataset '{dataset_name}': {e2}",
-                exc_info=True,
-            )
+        if "duplicate key value" in msg or "data_pkey" in msg or "UniqueViolationError" in type(e).__name__:
+            cleared = await _empty_cognee_dataset(dataset_name)
+            if cleared:
+                try:
+                    await cognee.add(ingest_payload, dataset_name=dataset_name)
+                    return True
+                except Exception:
+                    pass
+        logger.warning("cognee add_document failed for dataset %r: %s", dataset_name, e)
+        return False
+
+
+async def cognify_dataset(dataset_name: str) -> bool:
+    """Run cognee.cognify() ONCE over an entire dataset to build knowledge graph."""
+    if not _COGNEE_AVAILABLE:
+        return False
+    apply_cognee_runtime_config()
+
+    try:
+        from api.model_utils import get_model_context_window
+        ctx_win = get_model_context_window(task="cognee")
+    except Exception:
+        ctx_win = 8192
+    safe_chunk_size = max(300, min(1200, (ctx_win - 3000) // 2))
+
+    try:
+        logger.info("Cognifying Cognee dataset %r (chunk_size: %d)...", dataset_name, safe_chunk_size)
+        await cognee.cognify(datasets=[dataset_name], chunk_size=safe_chunk_size)
+        logger.info("Cognee: Ingested and cognified dataset %r successfully.", dataset_name)
+        return True
+    except Exception as e:
+        logger.error("Error cognifying dataset %r: %s", dataset_name, e, exc_info=True)
+        return False
+
+
+async def add_documents_and_cognify_once(items: List[str], dataset_name: str) -> None:
+    """Add multiple documents/paths to a dataset and run cognify ONCE at the end."""
+    if not _COGNEE_AVAILABLE or not items:
+        return
+    added_any = False
+    for item in items:
+        if item and item.strip():
+            ok = await add_document(item, dataset_name)
+            if ok:
+                added_any = True
+    if added_any:
+        await cognify_dataset(dataset_name)
+
+
+async def add_and_index_document(content_or_path: str, dataset_name: str) -> None:
+    """Convenience function: add single document and run cognify once."""
+    ok = await add_document(content_or_path, dataset_name)
+    if ok:
+        await cognify_dataset(dataset_name)
 
 async def query_cognee(query: str, dataset_name: str, top_k: int = 20) -> str:
     """

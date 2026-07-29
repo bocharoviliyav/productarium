@@ -40,7 +40,7 @@ _MAX_CHILDREN = 50
 class ConfluenceConnector(IntegrationConnector):
     name = "confluence"
     display_name = "Confluence"
-    description = "Pull Confluence spaces/pages (Cloud REST API v2) with markitdown attachments."
+    description = "Pull Confluence spaces/pages via Direct REST v2/v1 API or Corporate MCP Server."
     requires_credentials = True
 
     @classmethod
@@ -50,7 +50,58 @@ class ConfluenceConnector(IntegrationConnector):
         return get_confluence_creds()
 
     def is_configured(self) -> bool:
+        mode = (self.config.get("mode") or "direct").lower()
+        if mode == "mcp":
+            try:
+                from api.mcp_client import LocalMcpClient
+                client = LocalMcpClient()
+                return client.is_configured()
+            except Exception:
+                return False
         return bool(self.config.get("base_url") and self.config.get("token"))
+
+    # ---- MCP Mode Dispatcher ---------------------------------------------
+    def _is_mcp_mode(self) -> bool:
+        return (self.config.get("mode") or "direct").lower() == "mcp"
+
+    def _mcp_test(self) -> Dict[str, Any]:
+        try:
+            from api.mcp_client import get_local_mcp_client
+            client = get_local_mcp_client()
+            res = client.test_connections()
+            return {
+                "success": res.get("success", False),
+                "message": f"Confluence MCP Mode: {res.get('message', 'tested')}",
+            }
+        except Exception as e:
+            return {"success": False, "message": f"Confluence MCP connection test failed: {e}"}
+
+    def _mcp_list_spaces(self) -> List[Dict[str, Any]]:
+        try:
+            from api.mcp_client import list_all_mcp_tools
+            tools = list_all_mcp_tools()
+            out = []
+            mcp_server = self.config.get("mcp_server") or "confluence"
+            for t in tools:
+                if t.get("server") == mcp_server or mcp_server in (t.get("id") or ""):
+                    out.append(t)
+            return out if out else tools
+        except Exception as e:
+            logger.warning("Confluence MCP list_spaces failed: %s", e)
+            return []
+
+    def _mcp_pull(self, source_id: str, opts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        from api.mcp_client import invoke_mcp_tool
+        server = self.config.get("mcp_server") or "confluence"
+        full_source_id = source_id if ":" in source_id else f"{server}:{source_id}"
+        pulled = invoke_mcp_tool(full_source_id, opts=opts)
+        return {
+            "title": pulled.get("title") or source_id,
+            "markdown": pulled.get("markdown") or str(pulled),
+            "attachments": pulled.get("attachments") or [],
+            "page_id": source_id,
+            "source": "confluence_mcp",
+        }
 
     # ---- HTTP layer (single method so tests can monkeypatch it) ----------
     def _auth_headers(self) -> Dict[str, str]:
@@ -66,14 +117,18 @@ class ConfluenceConnector(IntegrationConnector):
         return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
     def _base(self) -> str:
-        return (self.config.get("base_url") or "").rstrip("/")
+        b = (self.config.get("base_url") or "").strip().rstrip("/")
+        # Strip trailing /wiki if user entered it in base_url to avoid /wiki/wiki URL duplication
+        if b.endswith("/wiki"):
+            b = b[:-5].rstrip("/")
+        return b
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """GET a Confluence v2 API path. Returns parsed JSON (dict).
+        """GET a Confluence API path. Returns parsed JSON (dict).
 
-        Raises on non-2xx so callers can convert to a {success: False} result.
-        Mock this method in tests to avoid real HTTP.
+        Raises a clear ValueError on HTTP errors or non-JSON responses.
         """
+        import json
         import requests
         from api.ssl_config import requests_verify
 
@@ -84,7 +139,20 @@ class ConfluenceConnector(IntegrationConnector):
         )
         if resp.status_code >= 400:
             raise ValueError(f"Confluence API {url} -> HTTP {resp.status_code}: {resp.text[:200]}")
-        return resp.json()
+
+        text = resp.text or ""
+        if not text.strip():
+            raise ValueError(f"Confluence API {url} returned an empty response.")
+
+        try:
+            return resp.json()
+        except Exception as err:
+            ct = resp.headers.get("content-type", "unknown")
+            preview = text[:150].replace("\n", " ")
+            raise ValueError(
+                f"Confluence API {url} returned non-JSON content (type: {ct}): {preview!r}. "
+                f"Please check base_url path and credentials."
+            ) from err
 
     def _get_bytes(self, url: str) -> bytes:
         """Download raw bytes (attachment download link)."""
@@ -102,10 +170,21 @@ class ConfluenceConnector(IntegrationConnector):
     # ---- IntegrationConnector interface ----------------------------------
     def test(self) -> Dict[str, Any]:
         if not self.is_configured():
-            return {"success": False, "message": "Confluence base_url/token not configured."}
+            return {"success": False, "message": "Confluence base_url/token or MCP server not configured."}
+        if self._is_mcp_mode():
+            return self._mcp_test()
         try:
-            data = self._get("/wiki/api/v2/spaces", params={"limit": 1})
-            n = len((data or {}).get("results", []) or [])
+            # Try Cloud v2 endpoint first, then Server/DC v1 endpoint fallback
+            data = None
+            try:
+                data = self._get("/wiki/api/v2/spaces", params={"limit": 1})
+            except Exception as e_v2:
+                try:
+                    data = self._get("/rest/api/space", params={"limit": 1})
+                except Exception:
+                    raise e_v2
+            results = (data or {}).get("results") or (data or {}).get("spaces") or []
+            n = len(results) if isinstance(results, list) else 1
             return {"success": True, "message": f"Connected to Confluence ({n} space(s) reachable)."}
         except Exception as e:
             return {"success": False, "message": f"Confluence connection failed: {e}"}
@@ -113,11 +192,12 @@ class ConfluenceConnector(IntegrationConnector):
     def list_spaces(self) -> List[Dict[str, Any]]:
         if not self.is_configured():
             return []
+        if self._is_mcp_mode():
+            return self._mcp_list_spaces()
         configured_space = self.config.get("space")
         out: List[Dict[str, Any]] = []
         try:
             url: Optional[str] = "/wiki/api/v2/spaces?limit=100"
-            # Follow cursor pagination (bounded).
             for _ in range(5):
                 if not url:
                     break
@@ -133,13 +213,11 @@ class ConfluenceConnector(IntegrationConnector):
                             "key": sp.get("key") or "",
                         }
                     )
-                # v2 cursor pagination: _links.next
                 nxt = ((data or {}).get("_links") or {}).get("next")
                 url = nxt if isinstance(nxt, str) else None
         except Exception as e:
             logger.warning("Confluence list_spaces failed: %s", e)
             return out
-        # If a specific space is configured, filter to it (still return all if none match).
         if configured_space:
             filtered = [s for s in out if s.get("key") == configured_space or s.get("id") == configured_space]
             if filtered:
@@ -239,26 +317,25 @@ class ConfluenceConnector(IntegrationConnector):
     def pull(self, source_id: str, opts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Pull a Confluence page (and optionally its descendants + attachments).
 
-        Args:
-            source_id: A Confluence page id.
-            opts: ``{"recursive": bool}`` — also pull descendant pages (bounded
-                to depth 3 / 50 pages). Default False.
+        Supports both direct REST API and corporate MCP modes. Returns structured
+        pages list with `id`, `title`, `html`, `parent_id` for KnowledgeNode tree creation.
         """
         if not self.is_configured():
-            raise ValueError("Confluence base_url/token not configured.")
+            raise ValueError("Confluence base_url/token or MCP server not configured.")
+        if self._is_mcp_mode():
+            return self._mcp_pull(source_id, opts)
         opts = opts or {}
         recursive = bool(opts.get("recursive"))
         pages = self._pull_page_tree(source_id, depth=0, recursive=recursive)
         if not pages:
             raise ValueError(f"Confluence page {source_id} not found.")
         markdown = self._pages_to_markdown(pages)
-        # Convert attachments for the root page (child-page attachments are
-        # included only when recursive; kept bounded to avoid huge pulls).
         attachments = self._convert_attachments(pages[0]["id"]) if not recursive else []
         root = pages[0]
         return {
             "title": root["title"],
             "markdown": markdown,
+            "pages": pages,
             "attachments": attachments,
             "page_id": root["id"],
             "space_id": root.get("space_id"),

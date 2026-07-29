@@ -369,6 +369,8 @@ Substitution uses `str.replace` (NOT `.format`) so Mermaid/JSON braces stay unes
 
 ## 12. Documentation Generation Pipeline
 
+For detailed technical specification of the codebase documentation generation, cognee indexing, MCP integration, and UI polling pipeline, see [`docs/CODEBASE_DOCGEN_PIPELINE.md`](docs/CODEBASE_DOCGEN_PIPELINE.md).
+
 ```mermaid
 flowchart TD
   G([POST /generate]) --> Disp{Artifact type?}

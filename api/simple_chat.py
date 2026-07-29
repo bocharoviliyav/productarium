@@ -308,28 +308,46 @@ async def chat_completions_stream(request: ChatCompletionRequest):
                 logger.error(f"Error retrieving file content: {str(e)}")
                 # Continue without file content if there's an error
 
-        # Format conversation history
+        # Resolve the model's actual context window dynamically
+        try:
+            from api.model_utils import get_model_context_window, clamp_text_by_tokens, _count_tokens
+            ctx_win = get_model_context_window(provider=request.provider, model_name=request.model)
+        except Exception:
+            ctx_win = 8192
+            from api.model_utils import clamp_text_by_tokens, _count_tokens
+
+        avail_tokens = max(1024, ctx_win - 2048)
+
+        # Format and clamp conversation history
         conversation_history = ""
         for turn_id, turn in request_rag.memory().items():
             if not isinstance(turn_id, int) and hasattr(turn, 'user_query') and hasattr(turn, 'assistant_response'):
                 conversation_history += f"<turn>\n<user>{turn.user_query.query_str}</user>\n<assistant>{turn.assistant_response.response_str}</assistant>\n</turn>\n"
 
+        history_budget = max(512, avail_tokens // 4)
+        clamped_history = clamp_text_by_tokens(conversation_history, history_budget, preserve_tail=True)
+
+        rem_tokens = max(512, avail_tokens - _count_tokens(clamped_history))
+        file_budget = max(256, rem_tokens // 3) if file_content else 0
+        clamped_file_content = clamp_text_by_tokens(file_content, file_budget) if file_content else ""
+
+        context_budget = max(512, rem_tokens - _count_tokens(clamped_file_content))
+        clamped_context_text = clamp_text_by_tokens(context_text, context_budget) if context_text else ""
+
         # Create the prompt with context
         prompt = f"/no_think {system_prompt}\n\n"
 
-        if conversation_history:
-            prompt += f"<conversation_history>\n{conversation_history}</conversation_history>\n\n"
+        if clamped_history:
+            prompt += f"<conversation_history>\n{clamped_history}</conversation_history>\n\n"
 
-        # Check if filePath is provided and fetch file content if it exists
-        if file_content:
-            # Add file content to the prompt after conversation history
-            prompt += f"<currentFileContent path=\"{request.filePath}\">\n{file_content}\n</currentFileContent>\n\n"
+        if clamped_file_content:
+            prompt += f"<currentFileContent path=\"{request.filePath}\">\n{clamped_file_content}\n</currentFileContent>\n\n"
 
         # Only include context if it's not empty
         CONTEXT_START = "<START_OF_CONTEXT>"
         CONTEXT_END = "<END_OF_CONTEXT>"
-        if context_text.strip():
-            prompt += f"{CONTEXT_START}\n{context_text}\n{CONTEXT_END}\n\n"
+        if clamped_context_text.strip():
+            prompt += f"{CONTEXT_START}\n{clamped_context_text}\n{CONTEXT_END}\n\n"
         else:
             # Add a note that we're skipping RAG due to size constraints or because it's the isolated API
             logger.info("No context available from RAG")
@@ -343,13 +361,10 @@ async def chat_completions_stream(request: ChatCompletionRequest):
             prompt += " /no_think"
 
             model = OllamaClient()
-            # Low temperature + seed for deterministic generation (matches
-            # generator.json). Defaults are 0.1/0.9 so a missing config still
-            # produces grounded, reproducible answers.
             _ollama_options = {
                 "temperature": model_config.get("temperature", 0.1),
                 "top_p": model_config.get("top_p", 0.9),
-                "num_ctx": model_config.get("num_ctx", 8000)
+                "num_ctx": ctx_win,
             }
             if "seed" in model_config:
                 _ollama_options["seed"] = model_config["seed"]

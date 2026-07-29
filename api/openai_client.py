@@ -183,6 +183,11 @@ class OpenAIClient(ModelClient):
         self._env_api_key_name = env_api_key_name
         self._env_base_url_name = env_base_url_name
         self.base_url = base_url or os.getenv(self._env_base_url_name, "http://localhost:8080/v1")
+        # Whether a REAL (non-placeholder) api_key was resolved. Set by
+        # init_sync_client/init_async_client via _resolve_api_key; default False
+        # so _strip_auth_if_placeholder suppresses the Bearer header until a
+        # real key is confirmed.
+        self._real_api_key = False
         self.sync_client = self.init_sync_client()
         self.async_client = None  # only initialize if the async call is called
         self.chat_completion_parser = (
@@ -193,8 +198,66 @@ class OpenAIClient(ModelClient):
 
     def _is_local_endpoint(self) -> bool:
         """Check if the base URL points to a local endpoint."""
-        local_hosts = ['localhost', '*********', '*******', '[::]', '[::1]']
+        local_hosts = ['localhost', '*********', '*******', '[::]', '[::1]', 'host.docker.internal']
         return any(host in self.base_url.lower() for host in local_hosts)
+
+    @staticmethod
+    def _is_no_auth_placeholder(api_key: Optional[str]) -> bool:
+        """True when the key is the explicit 'no auth' placeholder.
+
+        ``'not-needed'`` / ``'not_needed'`` is the documented sentinel for
+        OpenAI-compatible servers that do NOT require a key (LM Studio,
+        llama.cpp, vLLM, Ollama's /v1 shim, many corporate gateways). When the
+        admin/user sets it they are explicitly signalling "this endpoint has
+        no auth", so we honor it for ANY base URL (not just localhost) and
+        strip the ``Authorization`` header at send time.
+        """
+        return bool(api_key) and api_key.strip().lower() in ("not-needed", "not_needed")
+
+    @staticmethod
+    def _resolve_api_key(api_key: Optional[str]) -> Optional[str]:
+        """Resolve the effective API key, honoring the 'no-auth' placeholder.
+
+        Local OpenAI-compatible servers (LM Studio, llama.cpp, vLLM, Ollama's
+        /v1 shim) and some corporate gateways do NOT require authentication
+        and actively REJECT a ``Bearer`` header whose value is not a real key
+        -- returning ``401 {'detail': 'Invalid API key format. ...'}`` even
+        though ``GET /v1/models`` succeeds without auth. adalflow / the OpenAI
+        SDK always inject ``Authorization: Bearer <key>`` whenever a key is
+        set, so the default ``'not-needed'`` placeholder produced a hard 401 on
+        ``POST /v1/chat/completions`` for these no-auth gateways.
+
+        We treat the well-known placeholders (``'not-needed'``,
+        ``'not_needed'``, empty) as "no real key" (return ``None``); the caller
+        then suppresses the ``Authorization`` header via an httpx event hook so
+        the request carries no credentials at all. A real key is passed
+        through unchanged.
+        """
+        if not api_key:
+            return None
+        if api_key.strip().lower() in ("not-needed", "not_needed"):
+            return None
+        return api_key.strip()
+
+    def _strip_auth_if_placeholder(self, http_client):
+        """Register an httpx event hook that drops the Authorization header.
+
+        The OpenAI SDK sets ``Authorization: Bearer <api_key>`` on every
+        request at send time, so merely passing ``api_key=None`` to the client
+        is not enough to suppress it for no-auth gateways. This request hook
+        runs for every outgoing request and removes ``Authorization`` when no
+        real key was resolved, so a no-auth OpenAI-compatible endpoint is
+        reached with no credentials at all.
+        """
+        if self._real_api_key:
+            return http_client  # real key: keep the SDK's Bearer header
+        http_client.event_hooks["request"].append(self._drop_auth_header)
+        return http_client
+
+    @staticmethod
+    def _drop_auth_header(request):
+        request.headers.pop("authorization", None)
+        request.headers.pop("Authorization", None)
 
     def _ssl_verify(self):
         """Resolve the TLS verify value (corporate CA bundle / skip-verify).
@@ -210,11 +273,19 @@ class OpenAIClient(ModelClient):
 
     def init_sync_client(self):
         import httpx
-        api_key = self._api_key or os.getenv(self._env_api_key_name)
-        # For local endpoints, use a placeholder key if none provided
+        api_key_raw = self._api_key or os.getenv(self._env_api_key_name)
+        api_key = self._resolve_api_key(api_key_raw)
+        self._real_api_key = bool(api_key)
+        # No real key resolved. Use the 'not-needed' placeholder (the SDK needs
+        # a non-empty value) and strip the Authorization header at send time so
+        # the no-auth endpoint never sees a Bearer header. This is allowed when
+        # the user EXPLICITLY set the placeholder (a clear "no auth" signal for
+        # any endpoint, e.g. a corporate gateway) OR when the endpoint is
+        # local. A truly-missing key on a remote endpoint is almost certainly a
+        # misconfiguration -> raise so it is noticed.
         if not api_key:
-            if self._is_local_endpoint():
-                api_key = "not-needed"  # Many local servers don't require a key
+            if self._is_no_auth_placeholder(api_key_raw) or self._is_local_endpoint():
+                api_key = "not-needed"  # SDK needs a value; header stripped at send
                 log.info(f"Using placeholder API key for local endpoint: {self.base_url}")
             else:
                 raise ValueError(
@@ -223,21 +294,31 @@ class OpenAIClient(ModelClient):
         # Inject an httpx client with the resolved TLS verify config so a
         # corporate AI gateway (internal CA / skip-verify) is reachable.
         http_client = httpx.Client(verify=self._ssl_verify(), timeout=600.0)
+        http_client = self._strip_auth_if_placeholder(http_client)
         return OpenAI(api_key=api_key, base_url=self.base_url, http_client=http_client)
 
     def init_async_client(self):
         import httpx
-        api_key = self._api_key or os.getenv(self._env_api_key_name)
-        # For local endpoints, use a placeholder key if none provided
+        api_key_raw = self._api_key or os.getenv(self._env_api_key_name)
+        api_key = self._resolve_api_key(api_key_raw)
+        self._real_api_key = bool(api_key)
+        # No real key resolved. Use the 'not-needed' placeholder (the SDK needs
+        # a non-empty value) and strip the Authorization header at send time so
+        # the no-auth endpoint never sees a Bearer header. This is allowed when
+        # the user EXPLICITLY set the placeholder (a clear "no auth" signal for
+        # any endpoint, e.g. a corporate gateway) OR when the endpoint is
+        # local. A truly-missing key on a remote endpoint is almost certainly a
+        # misconfiguration -> raise so it is noticed.
         if not api_key:
-            if self._is_local_endpoint():
-                api_key = "not-needed"  # Many local servers don't require a key
+            if self._is_no_auth_placeholder(api_key_raw) or self._is_local_endpoint():
+                api_key = "not-needed"  # SDK needs a value; header stripped at send
                 log.info(f"Using placeholder API key for local endpoint: {self.base_url}")
             else:
                 raise ValueError(
                     f"Environment variable {self._env_api_key_name} must be set for remote endpoints"
                 )
         http_client = httpx.AsyncClient(verify=self._ssl_verify(), timeout=600.0)
+        http_client = self._strip_auth_if_placeholder(http_client)
         return AsyncOpenAI(api_key=api_key, base_url=self.base_url, http_client=http_client)
 
     # def _parse_chat_completion(self, completion: ChatCompletion) -> "GeneratorOutput":

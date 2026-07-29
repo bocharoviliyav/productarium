@@ -130,9 +130,10 @@ services:
       - COGNEE_LLM_CONNECTION_TIMEOUT=${COGNEE_LLM_CONNECTION_TIMEOUT:-5}
       # Connection-pool args for cognee's async Postgres engines (Fix #2:
       # asyncpg cross-loop crash). NullPool opens a fresh connection per
-      # checkout so no asyncpg connection ever crosses event loops. cognee maps
-      # the "poolclass" string to sqlalchemy.pool.NullPool. JSON literal is
-      # single-quoted so YAML/compose treat it as a plain string.
+      # checkout so no asyncpg connection ever crosses event loops.
+      # The create_async_engine monkeypatch in api/cognee_manager.py converts
+      # "nullpool" string to NullPool class across relational, graph, and vector stores.
+      # JSON literal is single-quoted so YAML/compose treat it as a plain string.
       - 'POOL_ARGS={"poolclass": "nullpool", "pool_pre_ping": true}'
       - 'DATABASE_POOL_ARGS={"poolclass": "nullpool", "pool_pre_ping": true}'
       # Single-user posture: disable cognee's multi-tenant access control so
