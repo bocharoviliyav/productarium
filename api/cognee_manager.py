@@ -615,26 +615,26 @@ def apply_cognee_runtime_config() -> None:
             _safe_set(cfg, "set_llm_endpoint", endpoint)
         _safe_set(cfg, "set_llm_api_key", api_key)
 
-        # --- Structured-output instructor mode ---
-        # cognee's cognify extracts a graph via ``instructor`` with a Pydantic
-        # ``response_model``. The mode comes from ``LLMConfig.llm_instructor_mode``
-        # (env ``LLM_INSTRUCTOR_MODE``) -> ``OpenAIAdapter(instructor_mode=...)``.
-        # The env default (set above) is ``markdown_json_mode`` because that's
-        # the only mode local OpenAI-compatible gateways (LM Studio) accept;
-        # JSON_SCHEMA/TOOLS raise ``BadRequestError: Invalid tool_choice``.
-        # cognee has no ``set_llm_instructor_mode`` setter, so we mutate the
-        # ``LLMConfig`` singleton directly. ``get_llm_client`` reads the config
-        # fresh on every call (it is NOT lru_cache), so the new mode takes
-        # effect on the next cognify without any cache invalidation.
+        # Export to process environment variables for cognee adapters reading os.environ directly
+        if endpoint:
+            os.environ["LLM_ENDPOINT"] = endpoint
+        if api_key:
+            os.environ["LLM_API_KEY"] = api_key
+
+        # Direct mutation of LLMConfig singleton so get_llm_config() sees new values instantly
         try:
             from cognee.infrastructure.llm.config import get_llm_config
-            _instructor_mode = os.environ.get("LLM_INSTRUCTOR_MODE") or "markdown_json_mode"
             _lc = get_llm_config()
-            if getattr(_lc, "llm_instructor_mode", "") != _instructor_mode:
-                _lc.llm_instructor_mode = _instructor_mode
-                logger.info("cognee LLM instructor_mode set to %r.", _instructor_mode)
-        except Exception as e:  # pragma: no cover - depends on cognee version
-            logger.debug("apply_cognee_runtime_config: instructor_mode push failed: %s", e)
+            if endpoint:
+                _lc.llm_endpoint = endpoint
+            if api_key:
+                _lc.llm_api_key = api_key
+            _lc.llm_provider = cognee_provider
+            _lc.llm_model = model
+            _instructor_mode = os.environ.get("LLM_INSTRUCTOR_MODE") or "markdown_json_mode"
+            _lc.llm_instructor_mode = _instructor_mode
+        except Exception as e:
+            logger.debug("apply_cognee_runtime_config: get_llm_config push failed: %s", e)
 
         # --- Embeddings ---
         # The embedder task uses the same provider vocabulary as the LLM task.
@@ -687,13 +687,35 @@ def apply_cognee_runtime_config() -> None:
         _safe_set(cfg, "set_embedding_endpoint", emb_endpoint)
         _safe_set(cfg, "set_embedding_api_key", emb_key)
         _safe_set(cfg, "set_embedding_dimensions", emb_dims)
-        # huggingface_tokenizer is required by cognee's Ollama tokenizer; set it
-        # via the generic embedding config dict setter.
         _safe_set_embedding_dict(cfg, {"huggingface_tokenizer": emb_tok})
+
+        # Export to process environment variables for cognee engines reading os.environ directly
+        if emb_endpoint:
+            os.environ["EMBEDDING_ENDPOINT"] = emb_endpoint
+        if emb_key:
+            os.environ["EMBEDDING_API_KEY"] = emb_key
+        if emb_model:
+            os.environ["EMBEDDING_MODEL"] = emb_model
+
+        # Direct mutation of EmbeddingConfig singleton so get_embedding_config() sees new values instantly
+        try:
+            from cognee.infrastructure.databases.vector.embeddings.config import get_embedding_config
+            _ec = get_embedding_config()
+            if emb_endpoint:
+                _ec.embedding_endpoint = emb_endpoint
+            if emb_key:
+                _ec.embedding_api_key = emb_key
+            if emb_model:
+                _ec.embedding_model = emb_model
+            _ec.embedding_provider = emb_provider
+            _ec.embedding_dimensions = emb_dims
+            _ec.huggingface_tokenizer = emb_tok
+        except Exception as e:
+            logger.debug("apply_cognee_runtime_config: get_embedding_config push failed: %s", e)
+
         # Invalidate cognee's ``create_embedding_engine`` lru_cache so a changed
         # embedder provider/model/endpoint takes effect on the next call instead
         # of reusing a stale (e.g. LiteLLM) engine built from the old config.
-        # Best-effort: the function is @lru_cache; cache_clear() resets it.
         try:
             from cognee.infrastructure.databases.vector.embeddings.get_embedding_engine import create_embedding_engine as _cee
             _cc = getattr(_cee, "cache_clear", None)

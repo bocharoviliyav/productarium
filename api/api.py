@@ -478,70 +478,52 @@ PROVIDER_SETTINGS: Dict[str, Dict[str, Any]] = {}
 @app.post("/models/settings")
 async def save_provider_settings(request: ProviderSettingsRequest):
     """
-    Save provider connection settings.
-
-    Request body:
-    {
-        "settings": {
-            "ollama": {
-                "provider": "ollama",
-                "base_url": "http://localhost:11434",
-                "api_key": "optional-key",
-                "custom_headers": {"Header": "value"}
-            },
-            "openai_local": {
-                "provider": "openai_local",
-                "base_url": "http://localhost:8080/v1",
-                "api_key": "optional-key",
-                "custom_headers": {}
-            }
-        }
-    }
-
-    Returns:
-    {
-        "success": true/false,
-        "message": "Settings saved successfully" or error message
-    }
+    Save provider connection settings to persistent DB settings store with HIGHEST PRECEDENCE.
     """
     global PROVIDER_SETTINGS
 
     try:
-        # Store settings (but don't store API keys in plain text in production!)
+        from api.config_abstraction import save_task_config, sync_runtime_settings
+
         for provider_id, provider_settings in request.settings.items():
             PROVIDER_SETTINGS[provider_id] = {
                 "provider": provider_settings.provider,
                 "base_url": provider_settings.base_url,
-                "api_key": provider_settings.api_key,  # In production, encrypt this!
+                "api_key": provider_settings.api_key,
                 "embedding_model": provider_settings.embedding_model,
                 "custom_headers": provider_settings.custom_headers
             }
 
-            # Update environment variables for the provider
-            if provider_settings.provider == "ollama":
-                os.environ["OLLAMA_HOST"] = provider_settings.base_url
-                if provider_settings.api_key:
-                    os.environ["OLLAMA_API_KEY"] = provider_settings.api_key
-                if provider_settings.embedding_model:
-                    os.environ["DEEPWIKI_EMBEDDER_TYPE"] = "ollama"
-                    from api.config import configs
-                    if "embedder_ollama" in configs:
-                        configs["embedder_ollama"]["model_kwargs"]["model"] = provider_settings.embedding_model
-            elif provider_settings.provider == "openai_local":
-                os.environ["LOCAL_OPENAI_BASE_URL"] = provider_settings.base_url
-                if provider_settings.api_key:
-                    os.environ["LOCAL_OPENAI_API_KEY"] = provider_settings.api_key
-                if provider_settings.embedding_model:
-                    os.environ["DEEPWIKI_EMBEDDER_TYPE"] = "openai_local"
-                    from api.config import configs
-                    if "embedder_openai_local" in configs:
-                        configs["embedder_openai_local"]["model_kwargs"]["model"] = provider_settings.embedding_model
+            key_val = provider_settings.api_key
+            if key_val == "__USE_STORED_KEY__":
+                key_val = None  # keep stored key
 
-        logger.info(f"Saved provider settings for: {list(request.settings.keys())}")
+            # Persist unconditionally to DB settings store (SettingORM)
+            for task in ("docgen", "expert", "summary", "cognee"):
+                save_task_config(
+                    task=task,
+                    provider=provider_settings.provider,
+                    model=provider_settings.model or "",
+                    base_url=provider_settings.base_url,
+                    api_key=key_val,
+                )
+
+            if provider_settings.embedding_model:
+                save_task_config(
+                    task="embedder",
+                    provider=provider_settings.provider,
+                    model=provider_settings.embedding_model,
+                    base_url=provider_settings.base_url,
+                    api_key=key_val,
+                )
+
+        # Instantly apply and synchronize across process & cognee
+        sync_runtime_settings()
+        logger.info(f"Saved and synchronized provider settings for: {list(request.settings.keys())}")
 
         return {
             "success": True,
-            "message": "Settings saved successfully"
+            "message": "Settings saved and synchronized successfully"
         }
 
     except Exception as e:
@@ -1494,6 +1476,14 @@ async def startup_event():
     # init_db() is non-fatal: it logs a warning and returns False if the DB
     # is unreachable, so app startup is never blocked.
     init_db()
+
+    # Bootstrap configuration abstraction layer (highest precedence to DB settings)
+    try:
+        from api.config_abstraction import bootstrap_config
+        bootstrap_config()
+    except Exception as e:
+        logger.warning("bootstrap_config failed (non-fatal): %s", e)
+
     from api.cognee_manager import init_cognee
     await init_cognee()
     # One-shot bootstrap admin (non-fatal): creates an admin from

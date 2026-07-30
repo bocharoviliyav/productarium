@@ -378,19 +378,17 @@ def _safe_build_llm(
 def _resolve_expert_model(model: Optional[str]) -> Tuple[str, str, Optional[str], Optional[str]]:
     """Resolve (provider, model, base_url, api_key) for the expert task.
 
-    Reads admin-configured ``models.expert.*`` from the settings store (with env
-    fallbacks) when ``model`` is not explicitly provided. Always returns sane
-    defaults so callers never crash when the DB/settings are unavailable.
+    Reads admin-configured ``models.expert.*`` from the Config Abstraction Layer.
     """
     try:
-        from api.settings_store import get_model_for_task
+        from api.config_abstraction import get_task_config
 
-        cfg = get_model_for_task("expert") or {}
+        cfg = get_task_config("expert") or {}
         provider = cfg.get("provider") or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local")
         resolved_model = model or cfg.get("model") or os.environ.get("DEEPWIKI_DEFAULT_MODEL", "qwen/qwen3.6-27b")
         return provider, resolved_model, cfg.get("base_url"), cfg.get("api_key")
     except Exception as e:  # pragma: no cover - settings store is import-safe
-        logger.debug("get_model_for_task(expert) failed; using defaults: %s", e)
+        logger.debug("get_task_config(expert) failed; using defaults: %s", e)
         return os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local"), model or os.environ.get("DEEPWIKI_DEFAULT_MODEL", "qwen/qwen3.6-27b"), None, None
 
 

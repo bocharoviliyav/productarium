@@ -374,6 +374,14 @@ def put_group(
                     str_value = str(parsed)
             set_setting(key, str_value, encrypt=encrypt)
             saved.append(key)
+
+        # Trigger instant synchronization across all process subsystems and cognee
+        try:
+            from api.config_abstraction import sync_runtime_settings
+            sync_runtime_settings()
+        except Exception as e:
+            logger.warning("sync_runtime_settings after admin put_group failed: %s", e)
+
         return {"group": group, "success": True, "saved": saved}
 
     if group == "users":

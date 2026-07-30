@@ -465,21 +465,18 @@ def _resolve_docgen_model(
 ) -> Tuple[str, str, Optional[str], Optional[str]]:
     """Resolve (provider, model, base_url, api_key) for the docgen task.
 
-    Reads admin-configured ``models.docgen.*`` from the settings store (with
-    env fallbacks) so docgen hits the corporate AI gateway when the admin has
-    configured it, instead of a dead env-default LM Studio :1234. Always
-    returns sane defaults so callers never crash when the DB/settings are
-    unavailable or an api_key can't decrypt.
+    Reads admin-configured ``models.docgen.*`` from the Config Abstraction Layer
+    (with env fallbacks) so docgen hits the corporate AI gateway when configured.
     """
     try:
-        from api.settings_store import get_model_for_task
+        from api.config_abstraction import get_task_config
 
-        cfg = get_model_for_task("docgen") or {}
+        cfg = get_task_config("docgen") or {}
         provider = cfg.get("provider") or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local")
         resolved_model = model or cfg.get("model") or os.environ.get("DEEPWIKI_DEFAULT_MODEL", "qwen/qwen3.6-27b")
         return provider, resolved_model, cfg.get("base_url"), cfg.get("api_key")
     except Exception as e:  # pragma: no cover - settings store is import-safe
-        logger.debug("get_model_for_task(docgen) failed; using defaults: %s", e)
+        logger.debug("get_task_config(docgen) failed; using defaults: %s", e)
         return (
             os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local"),
             model or os.environ.get("DEEPWIKI_DEFAULT_MODEL", "qwen/qwen3.6-27b"),
