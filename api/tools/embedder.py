@@ -54,7 +54,7 @@ def get_embedder(is_local_ollama: bool = False, embedder_type: str = None, base_
     
     if actual_type == 'ollama' and base_url:
         client_kwargs["host"] = base_url
-    elif actual_type == 'openai_local':
+    elif actual_type in ('openai_local', 'openai', 'openai_compatible') or 'openai' in str(actual_type):
         if base_url:
             client_kwargs["base_url"] = base_url
         if api_key:

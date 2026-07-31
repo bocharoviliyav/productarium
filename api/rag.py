@@ -260,7 +260,7 @@ IMPORTANT FORMATTING RULES:
         
         if self.provider == "ollama" and self.base_url:
             client_kwargs["host"] = self.base_url
-        elif self.provider == "openai_local":
+        elif self.provider in ("openai_local", "openai", "openai_compatible") or "openai" in str(self.provider):
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
             if self.api_key:

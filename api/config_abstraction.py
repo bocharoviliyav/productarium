@@ -26,8 +26,8 @@ _ALL_MODEL_TASKS = ("docgen", "expert", "summary", "cognee", "embedder")
 def sync_runtime_settings() -> None:
     """Force all process subsystems to synchronize with DB settings immediately.
 
-    1. Re-applies cognee runtime config (mutates LLMConfig & EmbeddingConfig singletons).
-    2. Exports resolved endpoints and API keys to `os.environ` for legacy readers.
+    1. Syncs active task API keys and base URLs to process environment variables.
+    2. Re-applies cognee runtime config (mutates LLMConfig & EmbeddingConfig singletons).
     3. Clears model context window cache in `api.model_utils`.
     """
     try:
@@ -35,6 +35,20 @@ def sync_runtime_settings() -> None:
         _MODEL_CTX_CACHE.clear()
     except Exception:
         pass
+
+    try:
+        from api.settings_store import get_model_for_task
+        for task in ("docgen", "expert", "summary"):
+            cfg = get_model_for_task(task) or {}
+            b_url = cfg.get("base_url")
+            a_key = cfg.get("api_key")
+            if b_url:
+                os.environ["LOCAL_OPENAI_BASE_URL"] = b_url
+            if a_key and a_key not in ("not-needed", "not_needed"):
+                os.environ["LOCAL_OPENAI_API_KEY"] = a_key
+                os.environ["OPENAI_API_KEY"] = a_key
+    except Exception as e:
+        logger.debug("sync_runtime_settings: env sync skipped: %s", e)
 
     try:
         from api.cognee_manager import apply_cognee_runtime_config

@@ -379,11 +379,15 @@ async def chat_completions_stream(request: ChatCompletionRequest):
                 model_kwargs=model_kwargs,
                 model_type=ModelType.LLM
             )
-        elif request.provider == "openai_local":
-            logger.info(f"Using local OpenAI API with model: {request.model}")
+        elif request.provider in ("openai_local", "openai", "openai_compatible") or "openai" in str(request.provider):
+            logger.info(f"Using OpenAI-compatible API with model: {request.model}")
 
-            # Initialize local OpenAI client (no API key required for local endpoints)
-            model = OpenAIClient()
+            from api.config_abstraction import get_task_config
+            cfg = get_task_config("expert") or {}
+            base_url = request.base_url or cfg.get("base_url") or os.getenv("LOCAL_OPENAI_BASE_URL")
+            api_key = request.api_key or cfg.get("api_key") or os.getenv("LOCAL_OPENAI_API_KEY")
+
+            model = OpenAIClient(base_url=base_url, api_key=api_key)
             model_kwargs = {
                 "model": request.model or model_config["model"],
                 "stream": True,
@@ -429,7 +433,7 @@ async def chat_completions_stream(request: ChatCompletionRequest):
         # Create a streaming response
         async def response_stream():
             try:
-                if request.provider == "ollama" or (request.provider not in ["ollama", "openai_local"]):
+                if request.provider == "ollama":
                     # Get the response and handle it properly using the previously created api_kwargs
                     response = await model.acall(api_kwargs=api_kwargs, model_type=ModelType.LLM)
                     # Handle streaming response from Ollama
@@ -438,7 +442,7 @@ async def chat_completions_stream(request: ChatCompletionRequest):
                         if text and not text.startswith('model=') and not text.startswith('created_at='):
                             text = text.replace('<think>', '').replace('</think>', '')
                             yield text
-                elif request.provider == "openai_local":
+                elif request.provider in ("openai_local", "openai", "openai_compatible") or "openai" in str(request.provider):
                     try:
                         # Get the response and handle it properly using the previously created api_kwargs
                         logger.info("Making local OpenAI API call")

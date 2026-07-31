@@ -50,10 +50,15 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
         logger.debug("get_model_for_task(docgen) failed in rlm_runner: %s", e)
 
     # Enforce standard RLM environment keys. Admin api_key wins over env.
-    if admin_api_key:
+    if admin_api_key and admin_api_key not in ("not-needed", "not_needed"):
         os.environ["RLM_MODEL_API_KEY"] = admin_api_key
+        os.environ["OPENAI_API_KEY"] = admin_api_key
+        os.environ["LOCAL_OPENAI_API_KEY"] = admin_api_key
     elif not os.environ.get("RLM_MODEL_API_KEY"):
-        os.environ["RLM_MODEL_API_KEY"] = os.environ.get("LOCAL_OPENAI_API_KEY") or os.environ.get("OLLAMA_API_KEY") or "not-needed"
+        key_val = os.environ.get("LOCAL_OPENAI_API_KEY") or os.environ.get("OLLAMA_API_KEY") or "not-needed"
+        os.environ["RLM_MODEL_API_KEY"] = key_val
+        if key_val not in ("not-needed", "not_needed"):
+            os.environ["OPENAI_API_KEY"] = key_val
 
     # Resolve the OpenAI-compatible base URL for fast-rlm. Precedence:
     #   1. admin models.docgen.base_url (corporate gateway etc.)

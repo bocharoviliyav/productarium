@@ -271,19 +271,19 @@ def _parse_int_setting(value: Optional[str]) -> Optional[int]:
 def _sanitize_api_key(value: Optional[str]) -> Optional[str]:
     """Normalize an API key read from the settings store.
 
-    Admins paste keys into the admin panel (or a ``.env``), and two common
-    mistakes break auth with an OpenAI-compatible gateway that rejects them
-    with a 401 / "invalid api key format":
-    - a leading ``Bearer `` prefix: the OpenAI SDK already adds ``Bearer ``
-      itself, so an unstripped prefix sends ``Bearer Bearer <key>``.
-    - trailing whitespace / a stray newline (common when a key is copied from
-      a secret manager or a wrapped ``.env`` line).
+    Admins paste keys into the admin panel (or a ``.env``), and common mistakes
+    (quotes, leading Bearer prefix, trailing whitespace) break auth with
+    OpenAI-compatible gateways.
 
-    Idempotent and never raises; ``None``/empty pass through unchanged.
+    Preserves any key format (UUID, hex, sk-*, JWT, custom) as long as it is a
+    non-empty string after normalization.
     """
     if not value:
         return value
     k = value.strip()
+    # Strip surrounding quotes if accidentally quoted in .env or UI
+    if len(k) >= 2 and ((k.startswith('"') and k.endswith('"')) or (k.startswith("'") and k.endswith("'"))):
+        k = k[1:-1].strip()
     # Strip a leading "Bearer " (case-insensitive) the SDK would double up.
     if len(k) >= 7 and k[:7].lower() == "bearer ":
         k = k[7:].strip()

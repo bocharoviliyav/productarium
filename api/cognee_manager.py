@@ -618,8 +618,9 @@ def apply_cognee_runtime_config() -> None:
         # Export to process environment variables for cognee adapters reading os.environ directly
         if endpoint:
             os.environ["LLM_ENDPOINT"] = endpoint
-        if api_key:
+        if api_key and api_key not in ("not-needed", "not_needed"):
             os.environ["LLM_API_KEY"] = api_key
+            os.environ["OPENAI_API_KEY"] = api_key
 
         # Direct mutation of LLMConfig singleton so get_llm_config() sees new values instantly
         try:

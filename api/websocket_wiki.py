@@ -493,17 +493,23 @@ This file contains...
                 model_kwargs=model_kwargs,
                 model_type=ModelType.LLM
             )
-        elif request.provider == "openai_local":
+        elif request.provider in ("openai_local", "openai", "openai_compatible") or "openai" in str(request.provider):
             logger.info(f"Using OpenAI-compatible API with model: {request.model}")
 
             # Initialize OpenAI-compatible client
             api_key = request.api_key
             if not api_key:
-                from api.api import PROVIDER_SETTINGS
-                stored = PROVIDER_SETTINGS.get("openai_local", {})
-                api_key = stored.get("api_key") or os.environ.get("LOCAL_OPENAI_API_KEY")
+                from api.config_abstraction import get_task_config
+                cfg = get_task_config("docgen") or {}
+                api_key = cfg.get("api_key") or os.environ.get("LOCAL_OPENAI_API_KEY")
 
-            model = OpenAIClient(base_url=request.base_url, api_key=api_key)
+            base_url = request.base_url
+            if not base_url:
+                from api.config_abstraction import get_task_config
+                cfg = get_task_config("docgen") or {}
+                base_url = cfg.get("base_url") or os.environ.get("LOCAL_OPENAI_BASE_URL")
+
+            model = OpenAIClient(base_url=base_url, api_key=api_key)
             model_kwargs = {
                 "model": request.model,
                 "stream": True,

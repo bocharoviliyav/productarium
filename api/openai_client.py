@@ -203,41 +203,28 @@ class OpenAIClient(ModelClient):
 
     @staticmethod
     def _is_no_auth_placeholder(api_key: Optional[str]) -> bool:
-        """True when the key is the explicit 'no auth' placeholder.
-
-        ``'not-needed'`` / ``'not_needed'`` is the documented sentinel for
-        OpenAI-compatible servers that do NOT require a key (LM Studio,
-        llama.cpp, vLLM, Ollama's /v1 shim, many corporate gateways). When the
-        admin/user sets it they are explicitly signalling "this endpoint has
-        no auth", so we honor it for ANY base URL (not just localhost) and
-        strip the ``Authorization`` header at send time.
-        """
-        return bool(api_key) and api_key.strip().lower() in ("not-needed", "not_needed")
+        """True when the key is missing or the explicit 'no auth' placeholder."""
+        if not api_key:
+            return True
+        from api.settings_store import _sanitize_api_key
+        clean = _sanitize_api_key(api_key)
+        return not clean or clean.lower() in ("not-needed", "not_needed")
 
     @staticmethod
     def _resolve_api_key(api_key: Optional[str]) -> Optional[str]:
         """Resolve the effective API key, honoring the 'no-auth' placeholder.
 
-        Local OpenAI-compatible servers (LM Studio, llama.cpp, vLLM, Ollama's
-        /v1 shim) and some corporate gateways do NOT require authentication
-        and actively REJECT a ``Bearer`` header whose value is not a real key
-        -- returning ``401 {'detail': 'Invalid API key format. ...'}`` even
-        though ``GET /v1/models`` succeeds without auth. adalflow / the OpenAI
-        SDK always inject ``Authorization: Bearer <key>`` whenever a key is
-        set, so the default ``'not-needed'`` placeholder produced a hard 401 on
-        ``POST /v1/chat/completions`` for these no-auth gateways.
-
-        We treat the well-known placeholders (``'not-needed'``,
-        ``'not_needed'``, empty) as "no real key" (return ``None``); the caller
-        then suppresses the ``Authorization`` header via an httpx event hook so
-        the request carries no credentials at all. A real key is passed
-        through unchanged.
+        Custom keys (UUIDs, hex tokens, sk-*, etc.) are sanitized and returned as-is.
+        Placeholders ('not-needed', 'not_needed') or empty strings return None,
+        signalling the client to strip Bearer headers for unauthenticated endpoints.
         """
         if not api_key:
             return None
-        if api_key.strip().lower() in ("not-needed", "not_needed"):
+        from api.settings_store import _sanitize_api_key
+        clean = _sanitize_api_key(api_key)
+        if not clean or clean.lower() in ("not-needed", "not_needed"):
             return None
-        return api_key.strip()
+        return clean
 
     def _strip_auth_if_placeholder(self, http_client):
         """Register an httpx event hook that drops the Authorization header.

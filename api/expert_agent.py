@@ -195,7 +195,7 @@ class _ExpertLLM:
         if provider == "ollama":
             if base_url:
                 client_kwargs["host"] = base_url
-        elif provider == "openai_local":
+        elif provider in ("openai_local", "openai", "openai_compatible") or "openai" in str(provider):
             if base_url:
                 client_kwargs["base_url"] = base_url
             if api_key:
