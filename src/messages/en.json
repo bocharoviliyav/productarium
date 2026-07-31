@@ -302,6 +302,7 @@
       "confluence": "Confluence",
       "integrations": "Integrations",
       "prompts": "System prompts",
+      "cognee": "Knowledge Graph (Cognee)",
       "users": "Users",
       "tokens": "API tokens"
     },
@@ -418,6 +419,22 @@
       "noFiles": "No prompt files found.",
       "save": "Save",
       "savedToast": "Saved {file}."
+    },
+    "cognee": {
+      "intro": "Configure rate limits and concurrency for Cognee knowledge graph indexing to prevent LLM API rate limit overflow.",
+      "maxConcurrency": "Max Concurrency",
+      "delaySeconds": "Delay Between Requests (sec)",
+      "rateLimitRps": "Rate Limit (RPS)",
+      "hint": "Throttles LLM and embedding requests generated during graph extraction (cognify). Setting max concurrency to 1-3 and delay to 0.5s prevents 429 Too Many Requests errors.",
+      "save": "Save Rate Limits",
+      "loading": "Loading Cognee settings…",
+      "savedToast": "Saved Cognee rate limits.",
+      "reindexHeader": "Force Refresh Knowledge Graph",
+      "reindexSub": "Manually trigger re-indexing of all products and artifacts into the Cognee knowledge graph.",
+      "reindexBtn": "Force Refresh Knowledge Graph",
+      "reindexing": "Reindexing…",
+      "reindexOkTitle": "Knowledge Graph Refreshed",
+      "reindexOkMsg": "Knowledge graph successfully updated across all products."
     },
     "users": {
       "createTitle": "Create user",

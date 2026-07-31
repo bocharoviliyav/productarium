@@ -4,6 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ArrowRight,
+  ArrowsCounterClockwise,
+  Brain,
   Copy,
   FileText,
   Gear,
@@ -45,7 +47,7 @@ import { useLanguage } from "@/contexts/LanguageContext";
 /* Small helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-type Section = "models" | "rlm" | "ssl" | "git" | "confluence" | "integrations" | "prompts" | "users" | "tokens";
+type Section = "models" | "rlm" | "ssl" | "git" | "confluence" | "integrations" | "prompts" | "cognee" | "users" | "tokens";
 
 const SECTIONS: { key: Section; icon: typeof Gear }[] = [
   { key: "models", icon: Rocket },
@@ -55,6 +57,7 @@ const SECTIONS: { key: Section; icon: typeof Gear }[] = [
   { key: "confluence", icon: Globe },
   { key: "integrations", icon: Plug },
   { key: "prompts", icon: FileText },
+  { key: "cognee", icon: Brain },
   { key: "users", icon: UserCircleGear },
   { key: "tokens", icon: Key },
 ];
@@ -1301,7 +1304,167 @@ function IntegrationsSection() {
 /* ------------------------------------------------------------------ */
 /* System prompts section (live-edit refs/prompts/*.md)                */
 /* ------------------------------------------------------------------ */
+/* Cognee Knowledge Graph section                                      */
+/* ------------------------------------------------------------------ */
 
+interface CogneeGroupResponse {
+  group: string;
+  settings: Record<string, { value: string | null }>;
+  resolved?: {
+    max_concurrency?: string;
+    delay_seconds?: string;
+    rate_limit_rps?: string;
+  };
+}
+
+function CogneeSection() {
+  const { getJson, putJson, postJson, notify } = useAdminApi();
+  const { messages } = useLanguage();
+  const t = messages?.admin ?? {};
+  const tcg = (t as Record<string, Record<string, string>>)?.cognee ?? {};
+
+  const [maxConcurrency, setMaxConcurrency] = useState("2");
+  const [delaySeconds, setDelaySeconds] = useState("0.5");
+  const [rateLimitRps, setRateLimitRps] = useState("2.0");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [reindexing, setReindexing] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await getJson<CogneeGroupResponse>("/api/admin/cognee");
+      const r = data?.resolved ?? {};
+      const s = data?.settings ?? {};
+      setMaxConcurrency(s["cognee.max_concurrency"]?.value ?? r.max_concurrency ?? "2");
+      setDelaySeconds(s["cognee.delay_seconds"]?.value ?? r.delay_seconds ?? "0.5");
+      setRateLimitRps(s["cognee.rate_limit_rps"]?.value ?? r.rate_limit_rps ?? "2.0");
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.loadFailedTitle ?? "Load failed",
+        message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
+      });
+    } finally {
+      setLoading(false);
+    }
+  }, [getJson, notify, t]);
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const body: Record<string, string> = {
+        "cognee.max_concurrency": maxConcurrency.trim(),
+        "cognee.delay_seconds": delaySeconds.trim(),
+        "cognee.rate_limit_rps": rateLimitRps.trim(),
+      };
+      await putJson("/api/admin/cognee", body);
+      await load();
+      notify({ tone: "success", title: tcg.savedToast ?? "Saved Cognee config." });
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.saveFailedTitle ?? "Save failed",
+        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const forceReindex = async () => {
+    setReindexing(true);
+    try {
+      const res = (await postJson("/api/admin/cognee/reindex", {})) as {
+        success?: boolean;
+        message?: string;
+      };
+      const ok = Boolean(res.success);
+      notify({
+        tone: ok ? "success" : "error",
+        title: ok ? (tcg.reindexOkTitle ?? "Reindex Complete") : (t.failed ?? "Failed"),
+        message: res.message || (ok ? (tcg.reindexOkMsg ?? "Reindexed Cognee knowledge graph.") : "Reindex failed"),
+      });
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.failed ?? "Failed",
+        message: e instanceof Error ? e.message : "Reindex failed",
+      });
+    } finally {
+      setReindexing(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-muted">
+        <Spinner /> {tcg.loading ?? "Loading Cognee settings…"}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <p className="text-[15px] text-muted">
+        {tcg.intro ?? "Configure rate limits and concurrency for Cognee knowledge graph indexing to prevent LLM API rate limit overflow."}
+      </p>
+
+      <Card className="p-5">
+        <div className="grid gap-4 md:grid-cols-3">
+          <Field
+            label={tcg.maxConcurrency ?? "Max Concurrency"}
+            value={maxConcurrency}
+            onChange={setMaxConcurrency}
+            placeholder="2"
+          />
+          <Field
+            label={tcg.delaySeconds ?? "Delay Between Requests (sec)"}
+            value={delaySeconds}
+            onChange={setDelaySeconds}
+            placeholder="0.5"
+          />
+          <Field
+            label={tcg.rateLimitRps ?? "Rate Limit (RPS)"}
+            value={rateLimitRps}
+            onChange={setRateLimitRps}
+            placeholder="2.0"
+          />
+        </div>
+        <p className="mt-2 text-xs text-muted">
+          {tcg.hint ?? "Throttles LLM and embedding requests generated during graph extraction (cognify). Setting max concurrency to 1-3 and delay to 0.5s prevents 429 Too Many Requests errors."}
+        </p>
+        <div className="mt-4 flex items-center gap-2">
+          <Button size="sm" onClick={save} disabled={saving}>
+            {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />}
+            {tcg.save ?? "Save Rate Limits"}
+          </Button>
+        </div>
+      </Card>
+
+      <Card className="p-5">
+        <SectionHeader
+          title={tcg.reindexHeader ?? "Force Refresh Knowledge Graph"}
+          subtitle={tcg.reindexSub ?? "Manually trigger re-indexing of all products and artifacts into the Cognee knowledge graph."}
+        />
+        <div className="mt-4 flex items-center gap-3">
+          <Button size="sm" variant="subtle" onClick={forceReindex} disabled={reindexing}>
+            {reindexing ? <SpinnerIcon /> : <ArrowsCounterClockwise size={14} weight="bold" />}
+            {reindexing ? (tcg.reindexing ?? "Reindexing...") : (tcg.reindexBtn ?? "Force Refresh Knowledge Graph")}
+          </Button>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Prompts section                                                     */
 interface PromptFile {
   filename: string;
   size?: number;
@@ -2027,6 +2190,7 @@ function AdminShell() {
             {section === "confluence" && <ConfluenceSection />}
             {section === "integrations" && <IntegrationsSection />}
             {section === "prompts" && <PromptsSection />}
+            {section === "cognee" && <CogneeSection />}
             {section === "users" && <UsersSection />}
             {section === "tokens" && <TokensSection />}
           </div>

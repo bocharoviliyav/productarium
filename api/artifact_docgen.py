@@ -431,33 +431,38 @@ class _StandardLLM:
         )
 
     async def generate(self, prompt: str) -> str:
-        def _call() -> str:
-            # adalflow 1.x Generator.call() takes ``prompt_kwargs`` (the dict
-            # that fills the ``{{input_str}}`` placeholder in the template),
-            # NOT a bare ``input_str=`` kwarg. Passing ``input_str=`` raises
-            # ``TypeError: Generator.call() got an unexpected keyword argument
-            # 'input_str'`` -- which silently killed the standard-LLM fallback
-            # whenever RLM failed (see api/wiki_generator.py:283 for the
-            # correct pattern).
-            result = self.generator(prompt_kwargs={"input_str": prompt})
-            # On a model error (e.g. 401 / connection refused) adalflow returns
-            # a GeneratorOutput with ``error`` set and ``data=None`` but, crucially,
-            # ``input=prompt_str`` (the full prompt is stored on the output for
-            # tracing). Returning ``str(result)`` here would embed the entire
-            # prompt -- including the section template + codebase blob -- onto
-            # the wiki page. Treat any error as "no generation" so the caller
-            # substitutes the "(section not generated)" placeholder instead.
-            if getattr(result, "error", None):
-                logger.warning("Standard LLM returned an error: %s", result.error)
-                return ""
-            # Prefer the parsed answer (``data``) over raw response fields.
-            for attr in ("data", "response", "answer", "raw_response", "output"):
-                val = getattr(result, attr, None)
-                if val:
-                    return str(val)
+        async def _call_with_retry() -> str:
+            def _single_call():
+                try:
+                    result = self.generator(prompt_kwargs={"input_str": prompt})
+                    if getattr(result, "error", None):
+                        return "", Exception(str(result.error))
+                    for attr in ("data", "response", "answer", "raw_response", "output"):
+                        val = getattr(result, attr, None)
+                        if val:
+                            return str(val), None
+                    return "", None
+                except Exception as ex:
+                    return "", ex
+
+            max_retries = 3
+            for attempt in range(max_retries):
+                res_str, exc = await asyncio.to_thread(_single_call)
+                if res_str:
+                    return res_str
+                if exc:
+                    emsg = str(exc).lower()
+                    if ("429" in emsg or "rate limit" in emsg or "too many requests" in emsg) and attempt < max_retries - 1:
+                        backoff = (attempt + 1) * 2.5
+                        logger.warning("Standard LLM hit rate limit (attempt %d/%d). Sleeping %.1fs: %s", attempt + 1, max_retries, backoff, exc)
+                        await asyncio.sleep(backoff)
+                    else:
+                        if exc:
+                            logger.warning("Standard LLM returned an error: %s", exc)
+                        break
             return ""
 
-        return await asyncio.to_thread(_call)
+        return await _call_with_retry()
 
 
 def _resolve_docgen_model(
@@ -1212,7 +1217,7 @@ async def generate_codebase_docs(
             prompt, codebase_chunks, use_rlm, llm, rlm_model, rlm_state
         )
         if not content:
-            content = "_(Раздел не сгенерирован: источник недоступен.)_"
+            content = "_(Содержимое раздела временно недоступно. Вы можете перезапустить генерацию.)_"
         # Validate + repair any mermaid diagrams in this section before storing
         # it, so broken diagrams never reach the UI or ``previous_content``.
         # The repair loop is non-fatal: if the Node verifier is unavailable it

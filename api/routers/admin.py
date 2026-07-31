@@ -75,7 +75,8 @@ _SECRET_SUFFIXES = (".api_key", ".token", ".password", ".secret")
 # secret group — its values are plain strings (auto/rlm/llm).
 # ``ssl`` stores TLS config (ssl.ca_bundle path + ssl.verify toggle) for reaching
 # a corporate AI gateway whose cert is signed by an internal CA; NOT secret.
-_SETTING_GROUPS = ("models", "git", "confluence", "integrations", "rlm", "ssl")
+# ``cognee`` stores knowledge graph rate limiting & concurrency settings; NOT secret.
+_SETTING_GROUPS = ("models", "git", "confluence", "integrations", "rlm", "ssl", "cognee")
 
 # Model "tasks" exposed in the admin Models section (contract J / plan D).
 _MODEL_TASKS = ("docgen", "expert", "summary", "cognee", "embedder")
@@ -163,6 +164,26 @@ def _redact_confluence_creds(creds: Dict[str, Optional[str]]) -> Dict[str, Any]:
 # Declared before the /{group} catch-all so they take priority.
 class PromptUpdateRequest(BaseModel):
     content: str
+
+
+class CogneeReindexRequest(BaseModel):
+    product_id: Optional[str] = None
+
+
+@router.post("/cognee/reindex")
+async def trigger_cognee_reindex(
+    body: Optional[CogneeReindexRequest] = None,
+    _admin: UserORM = Depends(require_admin),
+):
+    """Manually trigger/force a re-index of the Cognee knowledge graph."""
+    pid = body.product_id if body else None
+    try:
+        from api.cognee_manager import reindex_product_knowledge_graph
+        res = await reindex_product_knowledge_graph(pid)
+        return res
+    except Exception as e:
+        logger.error("Admin cognee reindex failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Reindex failed: {e}")
 
 
 def _safe_prompt_filename(filename: str) -> Optional[str]:
@@ -298,6 +319,14 @@ def get_group(
             # fast-rlm availability check (so the UI shows the real routing,
             # e.g. "llm" when fast-rlm is not installed even if stored="auto").
             resp["resolved"] = get_all_rlm_modes()
+        elif group == "cognee":
+            from api.cognee_manager import _cognee_rate_limiter
+            max_conc, delay_sec = _cognee_rate_limiter.get_rate_settings()
+            resp["resolved"] = {
+                "max_concurrency": str(max_conc),
+                "delay_seconds": str(delay_sec),
+                "rate_limit_rps": str(round(1.0 / delay_sec, 2)) if delay_sec > 0 else "0",
+            }
         return resp
 
     if group == "users":

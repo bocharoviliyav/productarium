@@ -369,7 +369,143 @@ logger.info(
     os.environ.get("DATA_ROOT_DIRECTORY"), os.environ.get("SYSTEM_ROOT_DIRECTORY"),
 )
 
-# Import cognee defensively: if the package is unavailable (or fails to import)
+class CogneeRateLimiter:
+    """Async Semaphore, Rate Limiter, and 429 Retry Handler for Cognee calls."""
+
+    def __init__(self):
+        self._lock: Optional[asyncio.Lock] = None
+        self._semaphore: Optional[asyncio.Semaphore] = None
+        self._current_max_concurrency: int = 2
+        self.last_call_time: float = 0.0
+
+    def get_rate_settings(self) -> Tuple[int, float]:
+        """Read rate limit settings from DB settings store or environment.
+
+        - cognee.max_concurrency: int (default 2)
+        - cognee.delay_seconds: float (default 0.5s -> max 2 requests/sec)
+        - cognee.rate_limit_rps: float (e.g. 2.0 -> 0.5s delay)
+        """
+        max_conc = 2
+        delay_sec = 0.5
+        try:
+            from api.settings_store import get_setting
+            mc = get_setting("cognee.max_concurrency") or os.environ.get("COGNEE_MAX_CONCURRENCY")
+            if mc:
+                try:
+                    max_conc = max(1, int(str(mc).strip()))
+                except ValueError:
+                    pass
+            ds = get_setting("cognee.delay_seconds") or get_setting("cognee.rate_limit_delay") or os.environ.get("COGNEE_DELAY_SECONDS")
+            if ds:
+                try:
+                    delay_sec = max(0.0, float(str(ds).strip()))
+                except ValueError:
+                    pass
+            rps = get_setting("cognee.rate_limit_rps") or os.environ.get("COGNEE_RATE_LIMIT_RPS")
+            if rps:
+                try:
+                    val = float(str(rps).strip())
+                    if val > 0:
+                        delay_sec = max(delay_sec, 1.0 / val)
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+        return max_conc, delay_sec
+
+    def _ensure_async_primitives(self, max_concurrency: int):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._semaphore is None or self._current_max_concurrency != max_concurrency:
+            self._semaphore = asyncio.Semaphore(max_concurrency)
+            self._lock = asyncio.Lock()
+            self._current_max_concurrency = max_concurrency
+
+    async def execute(self, func, *args, **kwargs):
+        max_conc, delay_sec = self.get_rate_settings()
+        self._ensure_async_primitives(max_conc)
+
+        async def _run():
+            if self._lock and delay_sec > 0:
+                async with self._lock:
+                    now = asyncio.get_running_loop().time()
+                    elapsed = now - self.last_call_time
+                    if elapsed < delay_sec:
+                        await asyncio.sleep(delay_sec - elapsed)
+                    self.last_call_time = asyncio.get_running_loop().time()
+
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if ("429" in err_msg or "rate limit" in err_msg or "too many requests" in err_msg) and attempt < max_retries - 1:
+                        backoff = (attempt + 1) * 2.5
+                        logger.warning(
+                            "Cognee LLM/Embedding call hit rate limit (attempt %d/%d). Sleeping %.1fs: %s",
+                            attempt + 1, max_retries, backoff, e,
+                        )
+                        await asyncio.sleep(backoff)
+                    else:
+                        raise
+
+        if self._semaphore:
+            async with self._semaphore:
+                return await _run()
+        else:
+            return await _run()
+
+
+_cognee_rate_limiter = CogneeRateLimiter()
+
+
+def _apply_cognee_rate_limit_patches():
+    """Apply rate limiter monkeypatches to litellm and openai clients for cognee."""
+    try:
+        import litellm
+        if not getattr(litellm, "_productarium_rate_limited", False):
+            orig_acompletion = getattr(litellm, "acompletion", None)
+            orig_aembedding = getattr(litellm, "aembedding", None)
+
+            if callable(orig_acompletion):
+                async def _patched_acompletion(*args, **kwargs):
+                    return await _cognee_rate_limiter.execute(orig_acompletion, *args, **kwargs)
+                setattr(litellm, "acompletion", _patched_acompletion)
+
+            if callable(orig_aembedding):
+                async def _patched_aembedding(*args, **kwargs):
+                    return await _cognee_rate_limiter.execute(orig_aembedding, *args, **kwargs)
+                setattr(litellm, "aembedding", _patched_aembedding)
+
+            setattr(litellm, "_productarium_rate_limited", True)
+            logger.info("Cognee litellm rate-limiter & 429 retry patch applied.")
+    except Exception as e:
+        logger.debug("Could not patch litellm for cognee rate limiting: %s", e)
+
+    try:
+        import openai
+        if hasattr(openai, "resources") and hasattr(openai.resources.chat, "AsyncCompletions"):
+            ac_cls = openai.resources.chat.AsyncCompletions
+            if not getattr(ac_cls, "_productarium_rate_limited", False):
+                orig_ac_create = ac_cls.create
+                async def _patched_ac_create(self_obj, *args, **kwargs):
+                    return await _cognee_rate_limiter.execute(orig_ac_create, self_obj, *args, **kwargs)
+                ac_cls.create = _patched_ac_create
+                ac_cls._productarium_rate_limited = True
+
+        if hasattr(openai, "resources") and hasattr(openai.resources.embeddings, "AsyncEmbeddings"):
+            ae_cls = openai.resources.embeddings.AsyncEmbeddings
+            if not getattr(ae_cls, "_productarium_rate_limited", False):
+                orig_ae_create = ae_cls.create
+                async def _patched_ae_create(self_obj, *args, **kwargs):
+                    return await _cognee_rate_limiter.execute(orig_ae_create, self_obj, *args, **kwargs)
+                ae_cls.create = _patched_ae_create
+                ae_cls._productarium_rate_limited = True
+    except Exception as e:
+        logger.debug("Could not patch openai AsyncCompletions for cognee rate limiting: %s", e)
 # the module still loads and every cognee entrypoint degrades gracefully.
 try:
     import cognee  # type: ignore
@@ -730,6 +866,7 @@ def apply_cognee_runtime_config() -> None:
             "embedder provider=%s model=%s endpoint=%s",
             cognee_provider, model, endpoint, emb_provider, emb_model, emb_endpoint,
         )
+        _apply_cognee_rate_limit_patches()
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("apply_cognee_runtime_config failed (non-fatal): %s", e)
 
@@ -1206,3 +1343,59 @@ async def query_cognee(query: str, dataset_name: str, top_k: int = 20) -> str:
     except Exception as e:
         logger.error(f"Error querying Cognee: {e}", exc_info=True)
         return ""
+
+
+async def reindex_product_knowledge_graph(product_id: Optional[str] = None) -> Dict[str, Any]:
+    """Force re-indexing of product artifacts and knowledge nodes into Cognee."""
+    if not _COGNEE_AVAILABLE:
+        return {"success": False, "message": "Cognee package is not available.", "reindexed_count": 0}
+
+    apply_cognee_runtime_config()
+
+    try:
+        from api.db import SessionLocal
+        from api.models import ProductORM
+        from sqlalchemy.orm import selectinload
+
+        with SessionLocal() as db:
+            if product_id:
+                products = db.query(ProductORM).options(
+                    selectinload(ProductORM.artifacts),
+                    selectinload(ProductORM.knowledge_nodes),
+                ).filter(ProductORM.id == product_id).all()
+            else:
+                products = db.query(ProductORM).options(
+                    selectinload(ProductORM.artifacts),
+                    selectinload(ProductORM.knowledge_nodes),
+                ).all()
+
+        if not products:
+            return {"success": True, "message": "No products found to reindex.", "reindexed_count": 0}
+
+        reindexed_count = 0
+        for p in products:
+            dataset_name = f"prod_{p.id}"
+            items = []
+            for a in p.artifacts:
+                docs = getattr(a, "generated_docs", None) or getattr(a, "content", None) or ""
+                if docs and docs.strip():
+                    items.append(docs.strip())
+            for n in p.knowledge_nodes:
+                md = getattr(n, "content", None) or getattr(n, "content_md", None) or ""
+                if md and md.strip():
+                    items.append(md.strip())
+
+            if items:
+                logger.info("Force re-indexing %d items for product %s (%s)...", len(items), p.name, dataset_name)
+                await _empty_cognee_dataset(dataset_name)
+                await add_documents_and_cognify_once(items, dataset_name)
+                reindexed_count += 1
+
+        return {
+            "success": True,
+            "message": f"Successfully reindexed {reindexed_count} product(s) into Cognee knowledge graph.",
+            "reindexed_count": reindexed_count,
+        }
+    except Exception as e:
+        logger.error("Error during force cognee reindex: %s", e, exc_info=True)
+        return {"success": False, "message": f"Reindex error: {e}", "reindexed_count": 0}
