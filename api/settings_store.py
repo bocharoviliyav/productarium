@@ -318,6 +318,7 @@ def get_model_for_task(task: str) -> Dict[str, Optional[str]]:
         "base_url": get_setting(p + "base_url") or default_base,
         "api_key": _sanitize_api_key(get_secret(p + "api_key")) or default_key,
         "max_prompt_tokens": _parse_int_setting(get_setting(p + "max_prompt_tokens")),
+        "dimensions": _parse_int_setting(get_setting(p + "dimensions")),
     }
 
 

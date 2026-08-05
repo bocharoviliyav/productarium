@@ -111,17 +111,49 @@ def _normalize_model_for_litellm(provider: str, model: str) -> str:
 
 
 def _host_to_v1(host: str) -> str:
-    """Normalize a local LLM host URL to an OpenAI ``/v1`` base URL.
+    """Normalize a local or remote LLM/embedder host URL to an OpenAI ``/v1`` base URL.
 
-    Strips a trailing ``/v1`` (if present) then re-appends it, so both
-    ``http://localhost:11434`` and ``http://localhost:1234/v1`` resolve to a
-    ``.../v1`` OpenAI-compatible base URL.
+    Strips trailing slashes, `/embeddings`, and `/v1` so that `f"{h}/v1"` resolves cleanly
+    without duplicating paths (e.g. `https://ai.gw/v1/embeddings` -> `https://ai.gw/v1`).
     """
-    h = (host or "").rstrip("/")
-    h = h.removesuffix("/v1")
+    if not host:
+        return ""
+    h = host.strip().rstrip("/")
+    if h.lower().endswith("/embeddings"):
+        h = h[:-11].rstrip("/")
+    if h.lower().endswith("/v1"):
+        h = h[:-3].rstrip("/")
     return f"{h}/v1" if h else h
 
 
+def _resolve_embedding_dimensions(model_name: str) -> int:
+    """Infer embedding dimensions from model name or admin settings/env."""
+    try:
+        from api.settings_store import get_setting
+        stored = get_setting("models.embedder.dimensions")
+        if stored:
+            return int(stored.strip())
+    except Exception:
+        pass
+    env_dim = os.environ.get("EMBEDDING_DIMENSIONS") or os.environ.get("DEEPWIKI_EMBEDDING_DIMENSIONS")
+    if env_dim:
+        try:
+            return int(env_dim.strip())
+        except ValueError:
+            pass
+
+    if not model_name:
+        return 768
+    m = model_name.lower()
+    if "3-large" in m or "3072" in m:
+        return 3072
+    if "3-small" in m or "ada-002" in m or "1536" in m:
+        return 1536
+    if "qwen" in m or "bge-m3" in m or "1024" in m:
+        return 1024
+    if "bge-small" in m or "minilm" in m or "384" in m:
+        return 384
+    return 768
 def _resolve_default_provider() -> str:
     """Best-effort default cognee LLM provider with NO .env.
 
@@ -811,8 +843,8 @@ def apply_cognee_runtime_config() -> None:
             # Ollama embeds via /api/embed; if the admin pasted a /v1 URL, swap it.
             if emb_endpoint.endswith("/v1"):
                 emb_endpoint = emb_endpoint[:-3] + "/api/embed"
-            emb_dims = 768
-            emb_tok = "nomic-ai/nomic-embed-text-v1.5"
+            emb_dims = _resolve_embedding_dimensions(emb_model)
+            emb_tok = os.environ.get("HUGGINGFACE_TOKENIZER", "")
             if not emb_model:
                 emb_model = "nomic-embed-text"
         else:
@@ -820,10 +852,12 @@ def apply_cognee_runtime_config() -> None:
             # uses the openai SDK directly (avoids litellm embedding quirks).
             emb_provider = "openai_compatible"
             emb_endpoint = _host_to_v1(emb_base) if emb_base else f"{_local_llm_host}/v1"
-            emb_dims = 768
-            emb_tok = "nomic-ai/nomic-embed-text-v1.5"
             if not emb_model:
-                emb_model = "text-embedding-nomic-embed-text-v1.5"
+                emb_model = os.environ.get("EMBEDDING_MODEL") or "text-embedding-3-small"
+            emb_dims = _resolve_embedding_dimensions(emb_model)
+            # Default tokenizer to empty string so local tiktoken is used
+            # without making external network requests to huggingface.co
+            emb_tok = os.environ.get("HUGGINGFACE_TOKENIZER", "")
 
         _safe_set(cfg, "set_embedding_provider", emb_provider)
         _safe_set(cfg, "set_embedding_model", emb_model)

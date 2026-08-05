@@ -198,6 +198,7 @@ interface ModelCfg {
   // Empty string = use the default (no override). Only consumed by the docgen
   // RLM path, but surfaced for every task for generality.
   max_prompt_tokens: string;
+  dimensions?: string;
 }
 type ModelsConfig = Record<ModelTask, ModelCfg>;
 
@@ -215,6 +216,7 @@ interface ModelResolvedEntry {
   api_key: string | null;
   hasApiKey: boolean;
   max_prompt_tokens: number | null;
+  dimensions: number | null;
 }
 
 const DEFAULT_MODEL_CFG: ModelCfg = {
@@ -224,6 +226,7 @@ const DEFAULT_MODEL_CFG: ModelCfg = {
   api_key: "",
   hasApiKey: false,
   max_prompt_tokens: "",
+  dimensions: "",
 };
 
 const MODEL_TASKS: ModelTask[] = [
@@ -306,6 +309,7 @@ function ModelsSection() {
           hasApiKey: Boolean(r?.hasApiKey),
           max_prompt_tokens:
             r?.max_prompt_tokens != null ? String(r.max_prompt_tokens) : "",
+          dimensions: r?.dimensions != null ? String(r.dimensions) : "",
         };
       }
       setCfg(next);
@@ -344,6 +348,7 @@ function ModelsSection() {
         [`models.${task}.model`]: cur.model,
         [`models.${task}.base_url`]: cur.base_url,
         [`models.${task}.max_prompt_tokens`]: cur.max_prompt_tokens,
+        [`models.${task}.dimensions`]: cur.dimensions ?? "",
       };
       if (cur.api_key) body[`models.${task}.api_key`] = cur.api_key;
       await putJson("/api/admin/models", body);
@@ -464,6 +469,25 @@ function ModelsSection() {
                 }
                 secret
               />
+              {task === "embedder" && (
+                <div className="md:col-span-2">
+                  <Field
+                    label="Vector dimensions (e.g. 1536, 1024, 768, 384)"
+                    value={c.dimensions ?? ""}
+                    onChange={(v) =>
+                      update(
+                        task,
+                        "dimensions",
+                        v.replace(/[^0-9]/g, "").slice(0, 5),
+                      )
+                    }
+                    placeholder="Auto-detected if left empty (default: 768)"
+                  />
+                  <p className="mt-1 text-xs text-muted">
+                    Optional. Specify custom embedding vector dimensions if using a non-768 model (e.g. 1536 for text-embedding-3-small or 1024 for qwen-embedding).
+                  </p>
+                </div>
+              )}
               <div className="md:col-span-2">
                 <Field
                   label={tm.maxPromptTokens ?? "Max prompt tokens"}

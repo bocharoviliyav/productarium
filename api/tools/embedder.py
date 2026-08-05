@@ -16,6 +16,21 @@ def get_embedder(is_local_ollama: bool = False, embedder_type: str = None, base_
         adal.Embedder: Configured embedder instance
     """
     # Determine which embedder config to use (local providers only)
+    try:
+        from api.settings_store import get_model_for_task
+        emb_cfg = get_model_for_task("embedder") or {}
+        if emb_cfg.get("model"):
+            if "embedder_openai_local" in configs:
+                configs["embedder_openai_local"]["model_kwargs"]["model"] = emb_cfg["model"]
+            if "embedder_ollama" in configs:
+                configs["embedder_ollama"]["model_kwargs"]["model"] = emb_cfg["model"]
+        if not base_url and emb_cfg.get("base_url"):
+            base_url = emb_cfg["base_url"]
+        if not api_key and emb_cfg.get("api_key"):
+            api_key = emb_cfg["api_key"]
+    except Exception:
+        pass
+
     if embedder_type:
         if embedder_type == 'openai_local':
             embedder_config = configs.get("embedder_openai_local", configs.get("embedder_ollama"))

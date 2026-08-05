@@ -133,7 +133,7 @@ def _token_out(
     )
 
 
-def _redact_model_task(cfg: Dict[str, Optional[str]]) -> Dict[str, Any]:
+def _redact_model_task(cfg: Dict[str, Optional[Any]]) -> Dict[str, Any]:
     has_key = bool(cfg.get("api_key"))
     return {
         "provider": cfg.get("provider"),
@@ -142,6 +142,7 @@ def _redact_model_task(cfg: Dict[str, Optional[str]]) -> Dict[str, Any]:
         "api_key": None,
         "hasApiKey": has_key,
         "max_prompt_tokens": cfg.get("max_prompt_tokens"),
+        "dimensions": cfg.get("dimensions"),
     }
 
 
@@ -554,27 +555,13 @@ def _test_models(body: Dict[str, Any]) -> Dict[str, Any]:
         model = model or cfg.get("model")
     if not base_url:
         return {"success": False, "message": "No base_url configured for models test."}
-    return _ping_model_endpoint(provider or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local"), base_url, api_key, model)
+    return _ping_model_endpoint(provider or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local"), base_url, api_key, model, task=task)
 
 
 def _ping_model_endpoint(
-    provider: str, base_url: str, api_key: Optional[str], model: Optional[str] = None
+    provider: str, base_url: str, api_key: Optional[str], model: Optional[str] = None, task: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Ping a configured LLM endpoint.
-
-    Reuses the logic of ``api.config.fetch_ollama_models`` /
-    ``fetch_openai_local_models`` (same URLs + response shapes) but reads the
-    target from admin settings rather than module-level env, so the test
-    reflects what the admin actually configured.
-
-    For OpenAI-compatible gateways the test is HONEST about auth: many gateways
-    do NOT enforce auth on ``GET /v1/models`` (it returns 200 + a model list
-    even with a bad/missing key) but DO enforce it on
-    ``POST /v1/chat/completions``. A GET-only test therefore reports a false
-    positive ("N models available") while real chat calls 401. After a
-    successful GET we probe the chat endpoint with a 1-token request and fail
-    on 401/403 so the admin sees the real auth state.
-    """
+    """Ping a configured LLM or Embedder endpoint."""
     try:
         import requests
     except Exception as e:  # pragma: no cover - dep missing
@@ -612,39 +599,59 @@ def _ping_model_endpoint(
                 "message": f"OpenAI-compatible API returned status {resp.status_code}",
             }
         names = [m.get("id", "") for m in resp.json().get("data", [])]
-        # Honest auth probe: GET /v1/models often succeeds without a valid key,
-        # so probe the chat endpoint with a 1-token request and fail on 401/403.
-        # Use the configured model when available, else the first listed id.
         probe_model = model or (names[0] if names else "")
         chat_note = ""
         if probe_model:
             try:
-                chat_resp = requests.post(
-                    f"{url}/chat/completions",
-                    headers=headers,
-                    json={
-                        "model": probe_model,
-                        "messages": [{"role": "user", "content": "ping"}],
-                        "max_tokens": 1,
-                    },
-                    timeout=15,
-                    verify=requests_verify(),
-                )
-                if chat_resp.status_code in (401, 403):
-                    return {
-                        "success": False,
-                        "message": (
-                            f"Auth rejected by /v1/chat/completions "
-                            f"(status {chat_resp.status_code}). The key is "
-                            f"invalid or lacks chat permissions, though "
-                            f"GET /v1/models succeeded (this gateway does not "
-                            f"enforce auth on /v1/models)."
-                        ),
-                    }
-                if chat_resp.status_code >= 400:
-                    chat_note = f" (chat probe returned status {chat_resp.status_code})"
+                if task == "embedder":
+                    probe_resp = requests.post(
+                        f"{url}/embeddings",
+                        headers=headers,
+                        json={
+                            "model": probe_model,
+                            "input": "ping",
+                        },
+                        timeout=15,
+                        verify=requests_verify(),
+                    )
+                    if probe_resp.status_code in (401, 403):
+                        return {
+                            "success": False,
+                            "message": (
+                                f"Auth rejected by /v1/embeddings "
+                                f"(status {probe_resp.status_code}). The key is "
+                                f"invalid or lacks embedding permissions."
+                            ),
+                        }
+                    if probe_resp.status_code >= 400:
+                        chat_note = f" (embeddings probe returned status {probe_resp.status_code})"
+                else:
+                    chat_resp = requests.post(
+                        f"{url}/chat/completions",
+                        headers=headers,
+                        json={
+                            "model": probe_model,
+                            "messages": [{"role": "user", "content": "ping"}],
+                            "max_tokens": 1,
+                        },
+                        timeout=15,
+                        verify=requests_verify(),
+                    )
+                    if chat_resp.status_code in (401, 403):
+                        return {
+                            "success": False,
+                            "message": (
+                                f"Auth rejected by /v1/chat/completions "
+                                f"(status {chat_resp.status_code}). The key is "
+                                f"invalid or lacks chat permissions, though "
+                                f"GET /v1/models succeeded (this gateway does not "
+                                f"enforce auth on /v1/models)."
+                            ),
+                        }
+                    if chat_resp.status_code >= 400:
+                        chat_note = f" (chat probe returned status {chat_resp.status_code})"
             except Exception as ce:
-                chat_note = f" (chat probe failed: {ce})"
+                chat_note = f" (probe failed: {ce})"
         return {
             "success": True,
             "message": f"OpenAI-compatible API reachable; {len(names)} model(s).{chat_note}",
