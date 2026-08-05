@@ -373,9 +373,8 @@ class CogneeRateLimiter:
     """Async Semaphore, Rate Limiter, and 429 Retry Handler for Cognee calls."""
 
     def __init__(self):
-        self._lock: Optional[asyncio.Lock] = None
-        self._semaphore: Optional[asyncio.Semaphore] = None
-        self._current_max_concurrency: int = 2
+        # Map: loop_id -> (Semaphore, Lock, max_concurrency)
+        self._loop_primitives: Dict[int, Tuple[asyncio.Semaphore, asyncio.Lock, int]] = {}
         self.last_call_time: float = 0.0
 
     def get_rate_settings(self) -> Tuple[int, float]:
@@ -413,23 +412,30 @@ class CogneeRateLimiter:
             pass
         return max_conc, delay_sec
 
-    def _ensure_async_primitives(self, max_concurrency: int):
+    def _get_loop_primitives(self, max_concurrency: int) -> Tuple[Optional[asyncio.Semaphore], Optional[asyncio.Lock]]:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            return
-        if self._semaphore is None or self._current_max_concurrency != max_concurrency:
-            self._semaphore = asyncio.Semaphore(max_concurrency)
-            self._lock = asyncio.Lock()
-            self._current_max_concurrency = max_concurrency
+            return None, None
+
+        loop_id = id(loop)
+        if loop_id in self._loop_primitives:
+            sem, lock, cached_max = self._loop_primitives[loop_id]
+            if cached_max == max_concurrency:
+                return sem, lock
+
+        sem = asyncio.Semaphore(max_concurrency)
+        lock = asyncio.Lock()
+        self._loop_primitives[loop_id] = (sem, lock, max_concurrency)
+        return sem, lock
 
     async def execute(self, func, *args, **kwargs):
         max_conc, delay_sec = self.get_rate_settings()
-        self._ensure_async_primitives(max_conc)
+        sem, lock = self._get_loop_primitives(max_conc)
 
         async def _run():
-            if self._lock and delay_sec > 0:
-                async with self._lock:
+            if lock and delay_sec > 0:
+                async with lock:
                     now = asyncio.get_running_loop().time()
                     elapsed = now - self.last_call_time
                     if elapsed < delay_sec:
@@ -452,8 +458,8 @@ class CogneeRateLimiter:
                     else:
                         raise
 
-        if self._semaphore:
-            async with self._semaphore:
+        if sem:
+            async with sem:
                 return await _run()
         else:
             return await _run()

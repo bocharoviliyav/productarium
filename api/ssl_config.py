@@ -186,6 +186,40 @@ def apply_litellm_ssl() -> None:
         logger.debug("apply_litellm_ssl failed (non-fatal): %s", e)
 
 
+def apply_openai_ssl_patch() -> None:
+    """Patch openai.AsyncOpenAI and openai.OpenAI default http_client to honor ssl_config.
+
+    Ensures that any OpenAI or AsyncOpenAI client constructed without an explicit
+    http_client (e.g. inside cognee, litellm, instructor) automatically uses
+    an httpx.AsyncClient / httpx.Client configured with httpx_verify() and a generous timeout,
+    preventing ConnectionError / SSL verification failures against external corporate gateways.
+    """
+    try:
+        import openai
+        import httpx
+
+        if not getattr(openai, "_productarium_ssl_patched", False):
+            orig_async_init = openai.AsyncOpenAI.__init__
+            orig_sync_init = openai.OpenAI.__init__
+
+            def _patched_async_init(self_obj, *args, **kwargs):
+                if "http_client" not in kwargs or kwargs["http_client"] is None:
+                    kwargs["http_client"] = httpx.AsyncClient(verify=httpx_verify(), timeout=300.0)
+                orig_async_init(self_obj, *args, **kwargs)
+
+            def _patched_sync_init(self_obj, *args, **kwargs):
+                if "http_client" not in kwargs or kwargs["http_client"] is None:
+                    kwargs["http_client"] = httpx.Client(verify=httpx_verify(), timeout=300.0)
+                orig_sync_init(self_obj, *args, **kwargs)
+
+            openai.AsyncOpenAI.__init__ = _patched_async_init
+            openai.OpenAI.__init__ = _patched_sync_init
+            openai._productarium_ssl_patched = True
+            logger.info("Successfully applied OpenAI SDK http_client SSL patch.")
+    except Exception as e:
+        logger.debug("Could not apply OpenAI SDK SSL patch: %s", e)
+
+
 def apply_ssl_env() -> None:
     """Push the CA bundle path into env vars honored by httpx/cognee/requests.
 
@@ -200,6 +234,7 @@ def apply_ssl_env() -> None:
     unset pre-existing env values from the process environment.
     """
     try:
+        apply_openai_ssl_patch()
         if not get_verify():
             # Skip-verify mode: do not force a CA bundle on the environment.
             # Per-call clients (requests/httpx) get verify=False directly.

@@ -77,6 +77,18 @@ class TestCustomAPIKeyHandling(unittest.TestCase):
         self.assertEqual(os.environ.get("LOCAL_OPENAI_API_KEY"), custom_key)
         self.assertEqual(os.environ.get("OPENAI_API_KEY"), custom_key)
 
+    def test_cognee_rate_limiter_per_loop_primitives(self):
+        import asyncio
+        from api.cognee_manager import _cognee_rate_limiter
+
+        async def _test():
+            sem, lock = _cognee_rate_limiter._get_loop_primitives(2)
+            self.assertIsNotNone(sem)
+            self.assertIsNotNone(lock)
+            self.assertEqual(sem._value, 2)
+
+        asyncio.run(_test())
+
 
 if __name__ == "__main__":
     unittest.main()
