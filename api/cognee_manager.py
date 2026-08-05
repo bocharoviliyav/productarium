@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -355,6 +356,54 @@ logger.info(
     os.environ.get("COGNEE_SKIP_CONNECTION_TEST"),
 )
 
+# --- Per-call timeout for cognee graph extraction (structured-output LLM) -------
+# cognee's ``cognify`` extracts a knowledge graph by calling the LLM with a
+# Pydantic ``response_model`` via ``instructor`` (one call per text chunk).
+# A slow local/corporate LLM can take several minutes for a single structured
+# extraction. The patched wrapper below clamps each call to this timeout
+# (default 180s) and returns an empty model on timeout so cognify keeps making
+# progress instead of stalling. Tunable via env. Must be >= the per-request HTTP
+# timeout (LLM_REQUEST_TIMEOUT_SECONDS) so a genuinely slow-but-progressing call
+# is not killed before it can return.
+def _resolve_graph_extraction_timeout() -> float:
+    try:
+        return max(30.0, float(os.environ.get("COGNEE_GRAPH_EXTRACTION_TIMEOUT", "180")))
+    except (TypeError, ValueError):
+        return 180.0
+
+
+# --- Overall timeout for a full ``cognify()`` run -----------------------------
+# A cognify pass over a large product dataset can run 20-30 minutes on a local
+# model (many chunks, each a structured-output LLM call). cognee itself has no
+# top-level timeout, so a hung chunk / dead LLM connection could stall the
+# background indexer forever. Wrap the whole run in ``asyncio.wait_for`` with
+# this ceiling (default 1800s = 30 min). Tunable via env.
+def _resolve_cognify_timeout() -> float:
+    try:
+        return max(300.0, float(os.environ.get("COGNEE_COGNIFY_TIMEOUT", "1800")))
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+# --- Suppress the benign "coroutine was never awaited" RuntimeWarning ----------
+# cognee's structured-output path (OpenAIAdapter.acreate_structured_output ->
+# litellm.acompletion / instructor) can, on a timeout or a structured-output
+# validation failure, create a litellm ``acompletion`` coroutine that is never
+# awaited before being replaced by the retry. Python's runtime then emits:
+#   RuntimeWarning: coroutine 'OpenAIChatCompletion.acompletion' was never awaited
+# This is internal to cognee/litellm and harmless here: the patched wrapper
+# below already returns an empty ``response_model()`` on failure, so the dropped
+# coroutine has no observable effect. Filter just this warning so the logs are
+# not flooded during a long cognify run. Applied once at import.
+try:
+    warnings.filterwarnings(
+        "ignore",
+        message=r"coroutine '.*acompletion' was never awaited",
+        category=RuntimeWarning,
+    )
+except Exception:  # pragma: no cover - defensive
+    pass
+
 # --- Single-user posture (disable cognee's multi-tenant access control) -------
 # cognee 1.2.x defaults to ENABLE_BACKEND_ACCESS_CONTROL=true, which turns on
 # per-user/per-tenant dataset isolation + mandatory auth. Productarium runs as a
@@ -672,13 +721,30 @@ def apply_cognee_retry_patch() -> None:
                 if len(text_input) > 1500:
                     text_input = text_input[:1500] + "\n... (truncated)"
 
+            # Drive the underlying coroutine manually instead of a bare
+            # ``asyncio.wait_for``. ``wait_for`` cancels the task on timeout and
+            # relies on the coroutine propagating ``CancelledError``; cognee's
+            # structured-output path (litellm.acompletion -> instructor) does
+            # NOT always honor cancellation promptly, so a cancelled call can
+            # leave a never-awaited ``acompletion`` coroutine that Python then
+            # warns about at GC time ("coroutine '...acompletion' was never
+            # awaited"). By creating the coroutine explicitly and closing it on
+            # any failure we guarantee the coroutine object is released cleanly.
+            coro = _ORIG_ACREATE_STRUCTURED_OUTPUT(
+                self, text_input, system_prompt, response_model, **kwargs
+            )
+            task = asyncio.ensure_future(coro)
             try:
-                # 30-second timeout so cognify graph extraction never hangs on a slow LLM
-                return await asyncio.wait_for(
-                    _ORIG_ACREATE_STRUCTURED_OUTPUT(self, text_input, system_prompt, response_model, **kwargs),
-                    timeout=30.0,
-                )
+                return await asyncio.wait_for(asyncio.shield(task), timeout=_resolve_graph_extraction_timeout())
             except Exception as exc:
+                # Cancel + await the task so any inner coroutine is properly
+                # released rather than leaked as never-awaited.
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                 logger.warning(
                     "cognee graph extraction skipped chunk due to %s (%s); returning empty model.",
                     type(exc).__name__,
@@ -1330,10 +1396,28 @@ async def cognify_dataset(dataset_name: str) -> bool:
         ctx_win = 8192
     safe_chunk_size = max(300, min(1200, (ctx_win - 3000) // 2))
 
+    cognify_timeout = _resolve_cognify_timeout()
     try:
-        logger.info("Cognifying Cognee dataset %r (chunk_size: %d)...", dataset_name, safe_chunk_size)
-        await cognee.cognify(datasets=[dataset_name], chunk_size=safe_chunk_size)
+        logger.info(
+            "Cognifying Cognee dataset %r (chunk_size: %d, timeout: %.0fs)...",
+            dataset_name, safe_chunk_size, cognify_timeout,
+        )
+        await asyncio.wait_for(
+            cognee.cognify(datasets=[dataset_name], chunk_size=safe_chunk_size),
+            timeout=cognify_timeout,
+        )
         logger.info("Cognee: Ingested and cognified dataset %r successfully.", dataset_name)
+        return True
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Cognify timed out after %.0fs for dataset %r; partial graph may be indexed.",
+            cognify_timeout, dataset_name,
+        )
+        # A timeout does NOT mean total failure: cognee commits graph nodes +
+        # vectors incrementally per chunk, so the chunks processed before the
+        # timeout are already persisted. Treat as a soft success so the caller
+        # does not retry the whole dataset from scratch (which would duplicate
+        # the already-indexed chunks and re-hit the rate limit).
         return True
     except Exception as e:
         logger.error("Error cognifying dataset %r: %s", dataset_name, e, exc_info=True)

@@ -53,6 +53,28 @@ from adalflow.components.model_client.utils import parse_embedding_response
 log = logging.getLogger(__name__)
 T = TypeVar("T")
 
+# Per-request HTTP timeout for OpenAI-compatible clients. Generation and
+# cognee cognify can run 20-30 minutes on a local model, so the SDK's default
+# (~600s on the explicit http_client, much less on patched defaults) is far too
+# short. Read once at import; overridable via env. Default 1800s (30 min).
+def _resolve_request_timeout() -> float:
+    try:
+        return max(60.0, float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "1800")))
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+# Total time budget for the backoff retry decorator on transient errors
+# (APITimeoutError / RateLimitError / 5xx). The stock 5s ceiling aborts before a
+# single rate-limited cognee/embedding retry can complete its backoff. Read once
+# at import; overridable via env. Default 600s (10 min) -- long enough to ride
+# out a transient 429 storm without hanging a generation indefinitely.
+def _resolve_retry_max_time() -> float:
+    try:
+        return max(30.0, float(os.getenv("LLM_RETRY_MAX_TIME_SECONDS", "600")))
+    except (TypeError, ValueError):
+        return 600.0
+
 
 # completion parsing functions and you can combine them into one singple chat completion parser
 def get_first_message_content(completion: ChatCompletion) -> str:
@@ -280,7 +302,7 @@ class OpenAIClient(ModelClient):
                 )
         # Inject an httpx client with the resolved TLS verify config so a
         # corporate AI gateway (internal CA / skip-verify) is reachable.
-        http_client = httpx.Client(verify=self._ssl_verify(), timeout=600.0)
+        http_client = httpx.Client(verify=self._ssl_verify(), timeout=_resolve_request_timeout())
         http_client = self._strip_auth_if_placeholder(http_client)
         return OpenAI(api_key=api_key, base_url=self.base_url, http_client=http_client)
 
@@ -304,7 +326,7 @@ class OpenAIClient(ModelClient):
                 raise ValueError(
                     f"Environment variable {self._env_api_key_name} must be set for remote endpoints"
                 )
-        http_client = httpx.AsyncClient(verify=self._ssl_verify(), timeout=600.0)
+        http_client = httpx.AsyncClient(verify=self._ssl_verify(), timeout=_resolve_request_timeout())
         http_client = self._strip_auth_if_placeholder(http_client)
         return AsyncOpenAI(api_key=api_key, base_url=self.base_url, http_client=http_client)
 
@@ -511,7 +533,7 @@ class OpenAIClient(ModelClient):
             UnprocessableEntityError,
             BadRequestError,
         ),
-        max_time=5,
+        max_time=_resolve_retry_max_time,
     )
     def call(self, api_kwargs: Dict = {}, model_type: ModelType = ModelType.UNDEFINED):
         """
@@ -588,7 +610,7 @@ class OpenAIClient(ModelClient):
             UnprocessableEntityError,
             BadRequestError,
         ),
-        max_time=5,
+        max_time=_resolve_retry_max_time,
     )
     async def acall(
         self, api_kwargs: Dict = {}, model_type: ModelType = ModelType.UNDEFINED

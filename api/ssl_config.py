@@ -199,17 +199,27 @@ def apply_openai_ssl_patch() -> None:
         import httpx
 
         if not getattr(openai, "_productarium_ssl_patched", False):
+            # Resolve the per-request timeout once at patch time so every
+            # patched OpenAI/AsyncOpenAI client (cognee, litellm, instructor)
+            # honors the same long-running timeout as the explicit adalflow
+            # clients. Generation + cognify can run 20-30 min on a local model;
+            # the 300s ceiling here aborted those calls mid-flight.
+            try:
+                _ssl_timeout = max(60.0, float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "1800")))
+            except (TypeError, ValueError):
+                _ssl_timeout = 1800.0
+
             orig_async_init = openai.AsyncOpenAI.__init__
             orig_sync_init = openai.OpenAI.__init__
 
             def _patched_async_init(self_obj, *args, **kwargs):
                 if "http_client" not in kwargs or kwargs["http_client"] is None:
-                    kwargs["http_client"] = httpx.AsyncClient(verify=httpx_verify(), timeout=300.0)
+                    kwargs["http_client"] = httpx.AsyncClient(verify=httpx_verify(), timeout=_ssl_timeout)
                 orig_async_init(self_obj, *args, **kwargs)
 
             def _patched_sync_init(self_obj, *args, **kwargs):
                 if "http_client" not in kwargs or kwargs["http_client"] is None:
-                    kwargs["http_client"] = httpx.Client(verify=httpx_verify(), timeout=300.0)
+                    kwargs["http_client"] = httpx.Client(verify=httpx_verify(), timeout=_ssl_timeout)
                 orig_sync_init(self_obj, *args, **kwargs)
 
             openai.AsyncOpenAI.__init__ = _patched_async_init
