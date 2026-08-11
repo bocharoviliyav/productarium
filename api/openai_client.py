@@ -54,26 +54,24 @@ log = logging.getLogger(__name__)
 T = TypeVar("T")
 
 # Per-request HTTP timeout for OpenAI-compatible clients. Generation and
-# cognee cognify can run 20-30 minutes on a local model, so the SDK's default
-# (~600s on the explicit http_client, much less on patched defaults) is far too
-# short. Read once at import; overridable via env. Default 1800s (30 min).
+# cognee cognify can run for hours on a local model, so the SDK's default
+# (~600s on the explicit http_client, much less on patched defaults) is far
+# too short. Now resolved through the central :mod:`api.timeout_config` so the
+# admin "Timeouts" panel overrides env/default. Default 3600s (1h), floor 60s.
 def _resolve_request_timeout() -> float:
-    try:
-        return max(60.0, float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "1800")))
-    except (TypeError, ValueError):
-        return 1800.0
+    from api.timeout_config import resolve_llm_request_timeout
+    return resolve_llm_request_timeout()
 
 
 # Total time budget for the backoff retry decorator on transient errors
 # (APITimeoutError / RateLimitError / 5xx). The stock 5s ceiling aborts before a
-# single rate-limited cognee/embedding retry can complete its backoff. Read once
-# at import; overridable via env. Default 600s (10 min) -- long enough to ride
-# out a transient 429 storm without hanging a generation indefinitely.
+# single rate-limited cognee/embedding retry can complete its backoff. Resolved
+# through the central :mod:`api.timeout_config` (admin > env > default).
+# Default 900s (15 min), floor 30s -- long enough to ride out a transient 429
+# storm without hanging a generation indefinitely.
 def _resolve_retry_max_time() -> float:
-    try:
-        return max(30.0, float(os.getenv("LLM_RETRY_MAX_TIME_SECONDS", "600")))
-    except (TypeError, ValueError):
-        return 600.0
+    from api.timeout_config import resolve_llm_retry_max_time
+    return resolve_llm_retry_max_time()
 
 
 # completion parsing functions and you can combine them into one singple chat completion parser

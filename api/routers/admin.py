@@ -76,7 +76,9 @@ _SECRET_SUFFIXES = (".api_key", ".token", ".password", ".secret")
 # ``ssl`` stores TLS config (ssl.ca_bundle path + ssl.verify toggle) for reaching
 # a corporate AI gateway whose cert is signed by an internal CA; NOT secret.
 # ``cognee`` stores knowledge graph rate limiting & concurrency settings; NOT secret.
-_SETTING_GROUPS = ("models", "git", "confluence", "integrations", "rlm", "ssl", "cognee")
+# ``timeouts`` stores per-key timeout overrides (timeouts.<key>) resolved through
+# api.timeout_config (admin store > env var > default); NOT secret.
+_SETTING_GROUPS = ("models", "git", "confluence", "integrations", "rlm", "ssl", "cognee", "timeouts")
 
 # Model "tasks" exposed in the admin Models section (contract J / plan D).
 _MODEL_TASKS = ("docgen", "expert", "summary", "cognee", "embedder")
@@ -328,6 +330,14 @@ def get_group(
                 "delay_seconds": str(delay_sec),
                 "rate_limit_rps": str(round(1.0 / delay_sec, 2)) if delay_sec > 0 else "0",
             }
+        elif group == "timeouts":
+            # ``resolved`` is the effective per-key timeout AFTER admin store >
+            # env var > default + floor, so the UI shows the real value each
+            # resolver will return on the next call (and the floor/default for
+            # helper text). Stored overrides are plain strings (not secret),
+            # so they are already in ``settings`` above.
+            from api.timeout_config import get_timeout_resolved_view
+            resp["resolved"] = get_timeout_resolved_view()
         return resp
 
     if group == "users":
@@ -402,6 +412,31 @@ def put_group(
                         )
                         continue
                     str_value = str(parsed)
+            # Validate timeout overrides: an empty value clears the override;
+            # otherwise it must be a positive number (>= the key floor, which
+            # the resolver also enforces, so we only reject non-numeric /
+            # negative / zero here). Reuse the max_prompt_tokens pattern.
+            if group == "timeouts":
+                normed = str_value.strip() if isinstance(str_value, str) else str(str_value)
+                if normed == "":
+                    # Clear: store an explicit empty string so the UI reflects it
+                    # and the resolver falls through to env var / default.
+                    str_value = ""
+                else:
+                    try:
+                        parsed = float(normed)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "Ignoring invalid timeout value for %r: %r", key, value
+                        )
+                        continue
+                    if parsed <= 0:
+                        logger.warning(
+                            "Ignoring non-positive timeout value for %r: %r", key, value
+                        )
+                        continue
+                    # Keep a clean representation: int when whole, else float.
+                    str_value = str(int(parsed)) if float(parsed).is_integer() else str(parsed)
             set_setting(key, str_value, encrypt=encrypt)
             saved.append(key)
 

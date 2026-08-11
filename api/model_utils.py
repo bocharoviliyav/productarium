@@ -106,6 +106,7 @@ def get_model_context_window(
     try:
         from api.ssl_config import requests_verify
         from api.settings_store import _sanitize_api_key
+        from api.timeout_config import resolve_model_list_timeout
 
         headers = {}
         clean_key = _sanitize_api_key(api_key or os.environ.get("LOCAL_OPENAI_API_KEY"))
@@ -115,7 +116,7 @@ def get_model_context_window(
         if prov == "ollama" or ":11434" in url or "ollama" in url.lower():
             ollama_base = url.replace("/v1", "").rstrip("/")
             try:
-                resp = requests.post(f"{ollama_base}/api/show", json={"name": model}, headers=headers, timeout=3, verify=requests_verify())
+                resp = requests.post(f"{ollama_base}/api/show", json={"name": model}, headers=headers, timeout=resolve_model_list_timeout(), verify=requests_verify())
                 if resp.status_code == 200:
                     data = resp.json()
                     model_info = data.get("model_info", {})
@@ -135,7 +136,7 @@ def get_model_context_window(
             # OpenAI-compatible /v1/models
             oai_url = url if url.endswith("/v1") else url.rstrip("/") + "/v1"
             try:
-                resp = requests.get(f"{oai_url}/models", headers=headers, timeout=3, verify=requests_verify())
+                resp = requests.get(f"{oai_url}/models", headers=headers, timeout=resolve_model_list_timeout(), verify=requests_verify())
                 if resp.status_code == 200:
                     data = resp.json()
                     models_list = data.get("data", []) if isinstance(data, dict) else []

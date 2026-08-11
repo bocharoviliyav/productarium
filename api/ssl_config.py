@@ -199,15 +199,18 @@ def apply_openai_ssl_patch() -> None:
         import httpx
 
         if not getattr(openai, "_productarium_ssl_patched", False):
-            # Resolve the per-request timeout once at patch time so every
-            # patched OpenAI/AsyncOpenAI client (cognee, litellm, instructor)
-            # honors the same long-running timeout as the explicit adalflow
-            # clients. Generation + cognify can run 20-30 min on a local model;
-            # the 300s ceiling here aborted those calls mid-flight.
+            # Resolve the per-request timeout through the central timeout config
+            # (admin > env > default) so every patched OpenAI/AsyncOpenAI client
+            # (cognee, litellm, instructor) honors the same long-running timeout
+            # as the explicit adalflow clients. Generation + cognify can run for
+            # hours on a local model; the previous 300s ceiling aborted those
+            # calls mid-flight. Read at patch time; admin overrides take effect
+            # on the next patch (a process restart, since the patch is once-only).
             try:
-                _ssl_timeout = max(60.0, float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "1800")))
-            except (TypeError, ValueError):
-                _ssl_timeout = 1800.0
+                from api.timeout_config import resolve_llm_request_timeout
+                _ssl_timeout = resolve_llm_request_timeout()
+            except Exception:
+                _ssl_timeout = 3600.0
 
             orig_async_init = openai.AsyncOpenAI.__init__
             orig_sync_init = openai.OpenAI.__init__

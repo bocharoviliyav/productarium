@@ -69,8 +69,9 @@ class GitHubConnector(IntegrationConnector, GitConnector):
             api_base = api_base.rstrip("/") + "/api/v3"
         url = f"{api_base.rstrip('/')}/user"
         try:
+            from api.timeout_config import resolve_integration_http_timeout
             resp = requests.get(
-                url, headers=self.auth_headers(), timeout=10,
+                url, headers=self.auth_headers(), timeout=resolve_integration_http_timeout(),
                 verify=requests_verify(),
             )
             if resp.status_code == 200:

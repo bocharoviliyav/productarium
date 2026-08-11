@@ -47,7 +47,7 @@ import { useLanguage } from "@/contexts/LanguageContext";
 /* Small helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-type Section = "models" | "rlm" | "ssl" | "git" | "confluence" | "integrations" | "prompts" | "cognee" | "users" | "tokens";
+type Section = "models" | "rlm" | "ssl" | "git" | "confluence" | "integrations" | "prompts" | "cognee" | "timeouts" | "users" | "tokens";
 
 const SECTIONS: { key: Section; icon: typeof Gear }[] = [
   { key: "models", icon: Rocket },
@@ -58,6 +58,7 @@ const SECTIONS: { key: Section; icon: typeof Gear }[] = [
   { key: "integrations", icon: Plug },
   { key: "prompts", icon: FileText },
   { key: "cognee", icon: Brain },
+  { key: "timeouts", icon: Wrench },
   { key: "users", icon: UserCircleGear },
   { key: "tokens", icon: Key },
 ];
@@ -1488,6 +1489,190 @@ function CogneeSection() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Timeouts section (central timeout_config resolvers)                */
+/* ------------------------------------------------------------------ */
+
+// Static catalog of every timeout key rendered in the UI. Kept in sync with
+// api/timeout_config.TIMEOUT_KEYS; the resolved view from the backend carries
+// the effective value / default / floor / unit / group / label, but the list
+// of keys + their order + grouping is defined here so the UI renders even
+// before the first load (and so the i18n keys are stable).
+const TIMEOUT_FIELDS: { key: string; group: string }[] = [
+  { key: "llm_request", group: "LLM" },
+  { key: "llm_retry_max_time", group: "LLM" },
+  { key: "model_list", group: "LLM" },
+  { key: "provider_test", group: "LLM" },
+  { key: "cognee_graph_extraction", group: "Cognee" },
+  { key: "cognee_cognify", group: "Cognee" },
+  { key: "cognee_llm_connection", group: "Cognee" },
+  { key: "docgen_indexing_drain", group: "Cognee" },
+  { key: "rlm_api_ms", group: "RLM" },
+  { key: "rlm_section", group: "RLM" },
+  { key: "rlm_expert", group: "RLM" },
+  { key: "integration_http", group: "Integrations" },
+  { key: "git_file_content", group: "Integrations" },
+  { key: "mcp_stdio_wait", group: "Integrations" },
+  { key: "mermaid_verify", group: "Mermaid" },
+  { key: "mermaid_repair", group: "Mermaid" },
+  { key: "mermaid_max_repair_attempts", group: "Mermaid" },
+];
+
+const TIMEOUT_GROUPS = ["LLM", "Cognee", "RLM", "Integrations", "Mermaid"] as const;
+
+interface TimeoutResolvedEntry {
+  value: string;
+  default: string;
+  floor: string;
+  env_var: string;
+  label: string;
+  unit: string;
+  group: string;
+}
+
+type TimeoutResolvedView = Record<string, TimeoutResolvedEntry>;
+
+interface TimeoutsGroupResponse {
+  group: string;
+  settings: Record<string, { value: string | null }>;
+  resolved?: TimeoutResolvedView;
+}
+
+function TimeoutsSection() {
+  const { getJson, putJson, notify } = useAdminApi();
+  const { messages } = useLanguage();
+  const t = messages?.admin ?? {};
+  const tt = (t as Record<string, Record<string, string>>)?.timeouts ?? {};
+
+  // One form value per timeout key, keyed by the resolver key (without the
+  // "timeouts." prefix). Empty string = no override (fall through to env /
+  // default).
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [resolved, setResolved] = useState<TimeoutResolvedView | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await getJson<TimeoutsGroupResponse>("/api/admin/timeouts");
+      const r = data?.resolved ?? {};
+      setResolved(r);
+      const next: Record<string, string> = {};
+      for (const f of TIMEOUT_FIELDS) {
+        const stored = data?.settings?.[`timeouts.${f.key}`]?.value;
+        // Show the stored override if present; otherwise empty (no override).
+        next[f.key] = stored ?? "";
+      }
+      setValues(next);
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.loadFailedTitle ?? "Load failed",
+        message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
+      });
+    } finally {
+      setLoading(false);
+    }
+  }, [getJson, notify, t]);
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const body: Record<string, string> = {};
+      for (const f of TIMEOUT_FIELDS) {
+        const v = (values[f.key] ?? "").trim();
+        // Only send keys the user touched (non-empty). Empty clears: send an
+        // explicit empty string so the backend clears the override.
+        body[`timeouts.${f.key}`] = v;
+      }
+      await putJson("/api/admin/timeouts", body);
+      await load();
+      notify({ tone: "success", title: tt.savedToast ?? "Saved timeout settings." });
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.saveFailedTitle ?? "Save failed",
+        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const groupLabel = (g: string) =>
+    tt.groups?.[g] ?? g;
+
+  const fieldLabel = (key: string, fallback: string) =>
+    tt.labels?.[key] ?? fallback;
+
+  const fieldHint = (key: string, entry: TimeoutResolvedEntry | undefined) => {
+    const floor = entry?.floor ?? "";
+    const unit = entry?.unit === "milliseconds" ? "ms" : "s";
+    const def = entry?.default ?? "";
+    const i18nHint = tt.hints?.[key];
+    const parts: string[] = [];
+    if (i18nHint) parts.push(i18nHint);
+    parts.push(`${tt.floor ?? "floor"} ${floor}${unit}`);
+    parts.push(`${tt.default ?? "default"} ${def}${unit}`);
+    return parts.join(" · ");
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-muted">
+        <Spinner /> {tt.loading ?? "Loading timeout settings…"}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <p className="text-[15px] text-muted">
+        {tt.intro ??
+          "Centralized timeout management. Each value is resolved with precedence: admin store > env var > default. Leave a field empty to fall back to the env var or the built-in default."}
+      </p>
+
+      {TIMEOUT_GROUPS.map((g) => (
+        <Card key={g} className="p-5">
+          <SectionHeader title={groupLabel(g)} />
+          <div className="mt-4 grid gap-4 md:grid-cols-2">
+            {TIMEOUT_FIELDS.filter((f) => f.group === g).map((f) => {
+              const entry = resolved?.[f.key];
+              return (
+                <div key={f.key}>
+                  <Field
+                    label={fieldLabel(f.key, entry?.label ?? f.key)}
+                    value={values[f.key] ?? ""}
+                    onChange={(v) => setValues((prev) => ({ ...prev, [f.key]: v }))}
+                    placeholder={entry?.value ?? entry?.default ?? ""}
+                    type="number"
+                  />
+                  <p className="mt-1 text-xs text-muted">
+                    {fieldHint(f.key, entry)}
+                  </p>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      ))}
+
+      <div className="flex items-center gap-2">
+        <Button size="sm" onClick={save} disabled={saving}>
+          {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />}
+          {tt.save ?? "Save"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Prompts section                                                     */
 interface PromptFile {
   filename: string;
@@ -2215,6 +2400,7 @@ function AdminShell() {
             {section === "integrations" && <IntegrationsSection />}
             {section === "prompts" && <PromptsSection />}
             {section === "cognee" && <CogneeSection />}
+            {section === "timeouts" && <TimeoutsSection />}
             {section === "users" && <UsersSection />}
             {section === "tokens" && <TokensSection />}
           </div>

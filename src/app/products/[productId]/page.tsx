@@ -260,10 +260,11 @@ export default function ProductDetailPage() {
       }
       // Async 202 + poll: the backend offloads heavy work (git clone, file
       // read, RLM) to a worker thread, so we poll the status endpoint until
-      // the job succeeds or fails (max ~15 min).
+      // the job succeeds or fails. Display is decoupled from the cognee
+      // knowledge graph — once the job is "succeeded" the docs are committed
+      // and shown immediately, even while cognify continues in the background.
       notify({ tone: "info", title: t.genTitle ?? "Generation", message: t.genStarted ?? "Generation started…" });
-      let notifiedIndexingStart = false;
-      const maxWaitMs = 15 * 60 * 1000;
+      const maxWaitMs = 30 * 60 * 1000;
       const startedAt = Date.now();
       while (Date.now() - startedAt < maxWaitMs) {
         if (generateAbortRef.current) return;
@@ -281,20 +282,11 @@ export default function ProductDetailPage() {
         }
         const st = await stRes.json().catch(() => ({}));
         if (st.status === "succeeded") {
-          if (st.indexing_status === "indexing") {
-            if (!notifiedIndexingStart) {
-              notify({
-                tone: "info",
-                title: t.genTitle ?? "Generation",
-                message: st.indexing_message || "Документы сгенерированы. Обновляется граф знаний (cognee)...",
-              });
-              notifiedIndexingStart = true;
-              await fetchProduct();
-            }
-            continue;
-          }
+          // Docs are already committed and shown now; cognee indexing (if any)
+          // continues in the background and never gates display. Indexing
+          // status is surfaced only as an informational note, never an error.
           notify({
-            tone: st.indexing_status === "failed" ? "warning" : "success",
+            tone: "success",
             title: t.genTitle ?? "Generation",
             message: st.indexing_message || (t.genDone ?? "Documentation generated."),
           });
@@ -302,7 +294,7 @@ export default function ProductDetailPage() {
           return;
         }
         if (st.status === "failed") {
-          throw new Error(st.error || (t.genFailed ?? "Generation failed."));
+          throw new Error(st.error || st.indexing_message || (t.genFailed ?? "Generation failed."));
         }
         // queued / running -> keep polling.
       }

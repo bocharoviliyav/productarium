@@ -364,7 +364,8 @@ def fetch_ollama_models():
     from api.ssl_config import requests_verify
     
     try:
-        response = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5, verify=requests_verify())
+        from api.timeout_config import resolve_model_list_timeout
+        response = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=resolve_model_list_timeout(), verify=requests_verify())
         if response.status_code == 200:
             data = response.json()
             models = []
@@ -405,7 +406,8 @@ def fetch_openai_local_models(base_url: str = None):
         url = url.rstrip("/") + "/v1"
     
     try:
-        response = requests.get(f"{url}/models", timeout=5, verify=requests_verify())
+        from api.timeout_config import resolve_model_list_timeout
+        response = requests.get(f"{url}/models", timeout=resolve_model_list_timeout(), verify=requests_verify())
         if response.status_code == 200:
             data = response.json()
             models = []

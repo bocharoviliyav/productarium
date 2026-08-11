@@ -110,13 +110,14 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
     # long-context generation (e.g. LM Studio running qwen3.6-27b can take
     # several minutes for a single long completion). Without raising this,
     # long tasks fail mid-run with "Request timed out." even though the model
-    # is still happily generating. Make it env-tunable; default 30 min.
+    # is still happily generating. Resolved through the central timeout config
+    # (admin > env > default) so the admin "Timeouts" panel overrides without a
+    # restart. Default 3600000ms (1h), floor 30000ms.
     try:
-        config.api_timeout_ms = int(
-            os.environ.get("RLM_API_TIMEOUT_MS") or "1800000"
-        )
-    except ValueError:
-        config.api_timeout_ms = 1800000
+        from api.timeout_config import resolve_rlm_api_timeout_ms
+        config.api_timeout_ms = resolve_rlm_api_timeout_ms()
+    except Exception:
+        config.api_timeout_ms = 3600000
     # Likewise let the prompt/completion token budgets grow for long tasks
     # (fast-rlm defaults: max_prompt_tokens=200000, max_completion_tokens=50000).
     # Precedence for the prompt budget: admin models.docgen.max_prompt_tokens >

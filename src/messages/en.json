@@ -303,6 +303,7 @@
       "integrations": "Integrations",
       "prompts": "System prompts",
       "cognee": "Knowledge Graph (Cognee)",
+      "timeouts": "Timeouts",
       "users": "Users",
       "tokens": "API tokens"
     },
@@ -435,6 +436,59 @@
       "reindexing": "Reindexing…",
       "reindexOkTitle": "Knowledge Graph Refreshed",
       "reindexOkMsg": "Knowledge graph successfully updated across all products."
+    },
+    "timeouts": {
+      "intro": "Centralized timeout management. Each value is resolved with precedence: admin store > env var > default. Leave a field empty to fall back to the env var or the built-in default.",
+      "loading": "Loading timeout settings…",
+      "save": "Save",
+      "savedToast": "Saved timeout settings.",
+      "floor": "floor",
+      "default": "default",
+      "groups": {
+        "LLM": "LLM",
+        "Cognee": "Cognee",
+        "RLM": "RLM",
+        "Integrations": "Integrations",
+        "Mermaid": "Mermaid"
+      },
+      "labels": {
+        "llm_request": "LLM request timeout",
+        "llm_retry_max_time": "LLM retry max time",
+        "model_list": "Model list / existence check",
+        "provider_test": "Provider connection test",
+        "cognee_graph_extraction": "Graph extraction (per chunk)",
+        "cognee_cognify": "Full cognify run",
+        "cognee_llm_connection": "Cognee LLM connection test",
+        "docgen_indexing_drain": "Docgen indexing drain",
+        "rlm_api_ms": "RLM API timeout",
+        "rlm_section": "RLM docgen section timeout",
+        "rlm_expert": "RLM expert timeout",
+        "integration_http": "Integration HTTP request",
+        "git_file_content": "Git file-content fetch",
+        "mcp_stdio_wait": "MCP stdio wait",
+        "mermaid_verify": "Mermaid diagram verification",
+        "mermaid_repair": "Mermaid diagram repair",
+        "mermaid_max_repair_attempts": "Mermaid max repair attempts"
+      },
+      "hints": {
+        "llm_request": "HTTP timeout for OpenAI-compatible clients.",
+        "llm_retry_max_time": "Backoff retry budget for transient LLM errors.",
+        "model_list": "HTTP timeout for model listing and existence checks.",
+        "provider_test": "Timeout for the admin panel connection test.",
+        "cognee_graph_extraction": "Per-chunk graph-extraction LLM call timeout.",
+        "cognee_cognify": "Overall cognify timeout. Allow for multi-hour indexing on large repos.",
+        "cognee_llm_connection": "Cognee LLM connection test timeout.",
+        "docgen_indexing_drain": "Ceiling for the docgen worker-loop indexing drain. Defaults to cognify so a cognify task isn't dropped.",
+        "rlm_api_ms": "Per-API-call timeout for fast-rlm (Pyodide reads from env).",
+        "rlm_section": "Per-section RLM timeout for the docgen path.",
+        "rlm_expert": "RLM timeout for the expert agent.",
+        "integration_http": "HTTP timeout for integration connectors.",
+        "git_file_content": "HTTP timeout for GitHub/GitLab file-content API fetches.",
+        "mcp_stdio_wait": "Timeout for .wait() on the MCP stdio subprocess.",
+        "mermaid_verify": "Per-diagram verification timeout via the Node validator.",
+        "mermaid_repair": "Per-LLM-call timeout for repairing one diagram.",
+        "mermaid_max_repair_attempts": "Repair attempt budget per unique diagram body."
+      }
     },
     "users": {
       "createTitle": "Create user",

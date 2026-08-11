@@ -132,9 +132,10 @@ class ConfluenceConnector(IntegrationConnector):
         import requests
         from api.ssl_config import requests_verify
 
+        from api.timeout_config import resolve_integration_http_timeout
         url = f"{self._base()}{path}"
         resp = requests.get(
-            url, headers=self._auth_headers(), params=params, timeout=20,
+            url, headers=self._auth_headers(), params=params, timeout=resolve_integration_http_timeout(),
             verify=requests_verify(),
         )
         if resp.status_code >= 400:
@@ -159,8 +160,9 @@ class ConfluenceConnector(IntegrationConnector):
         import requests
         from api.ssl_config import requests_verify
 
+        from api.timeout_config import resolve_integration_http_timeout
         resp = requests.get(
-            url, headers=self._auth_headers(), timeout=30,
+            url, headers=self._auth_headers(), timeout=resolve_integration_http_timeout(),
             verify=requests_verify(),
         )
         if resp.status_code >= 400:

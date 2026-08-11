@@ -302,6 +302,7 @@
       "integrations": "Интеграции",
       "prompts": "Системные промпты",
       "cognee": "База знаний (Cognee)",
+      "timeouts": "Таймауты",
       "users": "Пользователи",
       "tokens": "API-токены"
     },
@@ -434,6 +435,59 @@
       "reindexing": "Индексирование…",
       "reindexOkTitle": "База знаний обновлена",
       "reindexOkMsg": "Граф знаний успешно обновлён по всем продуктам."
+    },
+    "timeouts": {
+      "intro": "Единое управление таймаутами. Каждое значение разрешается с приоритетом: админ-хранилище > переменная окружения > значение по умолчанию. Оставьте поле пустым, чтобы откатиться к переменной окружения или встроенному значению по умолчанию.",
+      "loading": "Загрузка настроек таймаутов…",
+      "save": "Сохранить",
+      "savedToast": "Настройки таймаутов сохранены.",
+      "floor": "минимум",
+      "default": "по умолчанию",
+      "groups": {
+        "LLM": "LLM",
+        "Cognee": "Cognee",
+        "RLM": "RLM",
+        "Integrations": "Интеграции",
+        "Mermaid": "Mermaid"
+      },
+      "labels": {
+        "llm_request": "Таймаут LLM-запроса",
+        "llm_retry_max_time": "Бюджет ретраев LLM",
+        "model_list": "Листинг/проверка моделей",
+        "provider_test": "Тест подключения провайдера",
+        "cognee_graph_extraction": "Извлечение графа (на чанк)",
+        "cognee_cognify": "Полный прогон cognify",
+        "cognee_llm_connection": "Проверка LLM-подключения Cognee",
+        "docgen_indexing_drain": "Дрейн индексации docgen",
+        "rlm_api_ms": "Таймаут RLM API",
+        "rlm_section": "Таймаут RLM-секции docgen",
+        "rlm_expert": "Таймаут RLM эксперта",
+        "integration_http": "HTTP-запрос интеграций",
+        "git_file_content": "Получение файла через Git API",
+        "mcp_stdio_wait": "Ожидание stdio MCP",
+        "mermaid_verify": "Проверка диаграммы Mermaid",
+        "mermaid_repair": "Ремонт диаграммы Mermaid",
+        "mermaid_max_repair_attempts": "Макс. попыток ремонта Mermaid"
+      },
+      "hints": {
+        "llm_request": "HTTP-таймаут запроса к OpenAI-совместимым клиентам.",
+        "llm_retry_max_time": "Бюджет backoff-ретраев при транзиентных ошибках LLM.",
+        "model_list": "HTTP-таймаут для листинга и проверки существования моделей.",
+        "provider_test": "Таймаут теста подключения на панели администратора.",
+        "cognee_graph_extraction": "Таймаут LLM-вызова извлечения связей графа на один чанк.",
+        "cognee_cognify": "Общий таймаут cognify. Учитывайте многочасовую индексацию больших репозиториев.",
+        "cognee_llm_connection": "Таймаут проверки LLM-подключения Cognee.",
+        "docgen_indexing_drain": "Потолок дрейна индексации воркером docgen. По умолчанию равен cognify, чтобы задача cognify не обрывалась.",
+        "rlm_api_ms": "Таймаут одного API-вызова fast-rlm (Pyodide читает из env).",
+        "rlm_section": "Таймаут генерации одной секции RLM в docgen.",
+        "rlm_expert": "Таймаут RLM для эксперт-агента.",
+        "integration_http": "HTTP-таймаут для коннекторов интеграций.",
+        "git_file_content": "HTTP-таймаут получения содержимого файла через GitHub/GitLab API.",
+        "mcp_stdio_wait": "Таймаут ожидания .wait() stdio-сабпроцесса MCP.",
+        "mermaid_verify": "Таймаут проверки одной диаграммы через Node-валидатор.",
+        "mermaid_repair": "Таймаут LLM-вызова ремонта одной диаграммы.",
+        "mermaid_max_repair_attempts": "Бюджет попыток ремонта на уникальную диаграмму."
+      }
     },
     "users": {
       "createTitle": "Создать пользователя",

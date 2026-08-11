@@ -206,3 +206,143 @@ class TestAsyncDocgen:
             params={"job_id": job_id},
         )
         assert bad.status_code == 404
+
+    def test_job_succeeds_without_waiting_on_indexing(self, monkeypatch):
+        """Display is decoupled from the cognee knowledge graph: a job whose
+        pipeline succeeds must reach status="succeeded" with committed docs,
+        even while cognee indexing is still running (a long cognify). The
+        indexing coroutine is handed off to the main event loop and never
+        gates the docgen job."""
+        import asyncio
+        import api.api as api_mod
+        import api.artifact_docgen as adg
+        import api.cognee_manager as cm
+        from api.models import ArtifactORM
+
+        _indexed = {"v": False}
+
+        async def _long_index(content_or_path, dataset_name=None):
+            # Simulates a 20-30 min cognify; runs on the MAIN loop, NOT the
+            # worker loop, so it never gates the docgen job and is cleaned up
+            # when the TestClient context exits.
+            _indexed["v"] = True
+            await asyncio.sleep(300)
+
+        monkeypatch.setattr(cm, "add_and_index_document", _long_index)
+
+        async def _fake(artifact, product, **kwargs):
+            artifact.generated_docs = "# Generated\n\ncontent"
+            artifact.pages = {
+                "page_links": {
+                    "id": "page_links", "title": "Links",
+                    "content": "# Generated", "filePaths": [],
+                    "importance": "medium", "relatedPages": [],
+                }
+            }
+            # Call _index_in_background like the real pipeline does. With the
+            # main loop captured (via `with TestClient`), it hands off to the
+            # main loop; the worker drain finds no pending tasks and returns
+            # immediately — the job does NOT wait for the 300s cognify.
+            adg._index_in_background("repo_dir", "prod_prod_1")
+            return artifact.generated_docs
+
+        monkeypatch.setattr(adg, "generate_artifact_documentation", _fake)
+
+        db_mod = _setup_db()
+        _seed(db_mod)
+        # `with TestClient` triggers the lifespan startup event, which calls
+        # set_main_event_loop — so _index_in_background hands off to the main
+        # loop instead of scheduling on the worker loop (production behavior).
+        client = TestClient(api_mod.app)
+        # Override get_db so the request-scoped session uses the test DB.
+        def _get_test_db():
+            s = db_mod.SessionLocal()
+            try:
+                yield s
+            finally:
+                s.close()
+        api_mod.app.dependency_overrides[api_mod.get_db] = _get_test_db
+        monkeypatch.setattr(api_mod, "SessionLocal", db_mod.SessionLocal, raising=True)
+
+        with client:
+            resp = client.post(
+                "/api/products/prod_1/artifacts/art_1/generate",
+                json={"language": "en"},
+            )
+            assert resp.status_code == 202
+            job_id = resp.json()["job_id"]
+
+            # Poll until terminal: should be "succeeded" quickly (the worker
+            # drain finds no pending tasks — indexing was handed off).
+            deadline = time.time() + 15
+            last = None
+            while time.time() < deadline:
+                s = client.get(
+                    "/api/products/prod_1/artifacts/art_1/generate/status",
+                    params={"job_id": job_id},
+                )
+                assert s.status_code == 200
+                last = s.json()
+                if last["status"] in ("succeeded", "failed"):
+                    break
+                time.sleep(0.1)
+            assert last is not None, "status never reached a terminal state"
+            assert last["status"] == "succeeded", last
+            assert last["indexing_status"] == "succeeded", last
+            assert _indexed["v"], "background indexing was not scheduled"
+
+        # Docs were committed despite indexing still running in the background.
+        with db_mod.SessionLocal() as db:
+            art = db.get(ArtifactORM, "art_1")
+            assert art is not None
+            assert (art.generated_docs or "").startswith("# Generated")
+
+    def test_all_placeholder_sections_marks_job_failed(self, monkeypatch):
+        """When generation produces no usable content for ANY section, the job
+        must be marked failed (with no committed docs) instead of committing
+        the "Содержимое раздела временно недоступно" placeholder as success."""
+        db_mod = _setup_db()
+        _seed(db_mod)
+        _app, client = _build_app(db_mod, monkeypatch)
+
+        import api.artifact_docgen as adg
+
+        async def _fake(artifact, product, **kwargs):
+            # Simulate a total generation failure: every section is the
+            # placeholder string. generate_codebase_docs raises before persist.
+            raise ValueError(
+                "Не удалось сгенерировать ни один раздел документации (LLM/RLM "
+                "недоступны или превысили таймаут). Проверьте подключение к модели "
+                "и перезапустите генерацию."
+            )
+
+        monkeypatch.setattr(adg, "generate_artifact_documentation", _fake)
+        resp = client.post(
+            "/api/products/prod_1/artifacts/art_1/generate",
+            json={"language": "en"},
+        )
+        assert resp.status_code == 202
+        job_id = resp.json()["job_id"]
+
+        deadline = time.time() + 10
+        last = None
+        while time.time() < deadline:
+            s = client.get(
+                "/api/products/prod_1/artifacts/art_1/generate/status",
+                params={"job_id": job_id},
+            )
+            assert s.status_code == 200
+            last = s.json()
+            if last["status"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.1)
+        assert last is not None, "status never reached a terminal state"
+        assert last["status"] == "failed", last
+        assert "Не удалось сгенерировать" in (last.get("error") or "")
+
+        # No placeholder-only docs were committed as a success.
+        from api.models import ArtifactORM
+        with db_mod.SessionLocal() as db:
+            art = db.get(ArtifactORM, "art_1")
+            assert art is not None
+            assert not (art.generated_docs or "").strip()

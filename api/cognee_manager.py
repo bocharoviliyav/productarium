@@ -348,7 +348,13 @@ os.environ.setdefault(
 # cognify() starts immediately. Overridable via env. Also best-effort: shrink
 # the cognee LLM connection timeout if cognee honors it.
 os.environ.setdefault("COGNEE_SKIP_CONNECTION_TEST", "true")
-os.environ.setdefault("COGNEE_LLM_CONNECTION_TIMEOUT", "5")
+# Best-effort: shrink the cognee LLM connection timeout if cognee honors it.
+# Resolved through the central timeout config (admin > env > default).
+try:
+    from api.timeout_config import resolve_cognee_llm_connection_timeout
+    os.environ.setdefault("COGNEE_LLM_CONNECTION_TIMEOUT", str(int(resolve_cognee_llm_connection_timeout())))
+except Exception:  # pragma: no cover - defensive
+    os.environ.setdefault("COGNEE_LLM_CONNECTION_TIMEOUT", "10")
 logger.info(
     "cognee connection test %s (COGNEE_SKIP_CONNECTION_TEST=%s).",
     "skipped" if os.environ.get("COGNEE_SKIP_CONNECTION_TEST", "true").lower()
@@ -361,28 +367,26 @@ logger.info(
 # Pydantic ``response_model`` via ``instructor`` (one call per text chunk).
 # A slow local/corporate LLM can take several minutes for a single structured
 # extraction. The patched wrapper below clamps each call to this timeout
-# (default 180s) and returns an empty model on timeout so cognify keeps making
-# progress instead of stalling. Tunable via env. Must be >= the per-request HTTP
-# timeout (LLM_REQUEST_TIMEOUT_SECONDS) so a genuinely slow-but-progressing call
-# is not killed before it can return.
+# and returns an empty model on timeout so cognify keeps making progress
+# instead of stalling. Resolved through the central timeout config
+# (admin > env > default). Default 600s (10 min), floor 30s. Must be >= the
+# per-request HTTP timeout (llm_request) so a genuinely slow-but-progressing
+# call is not killed before it can return.
 def _resolve_graph_extraction_timeout() -> float:
-    try:
-        return max(30.0, float(os.environ.get("COGNEE_GRAPH_EXTRACTION_TIMEOUT", "180")))
-    except (TypeError, ValueError):
-        return 180.0
+    from api.timeout_config import resolve_cognee_graph_extraction_timeout
+    return resolve_cognee_graph_extraction_timeout()
 
 
 # --- Overall timeout for a full ``cognify()`` run -----------------------------
-# A cognify pass over a large product dataset can run 20-30 minutes on a local
+# A cognify pass over a large product dataset can run for hours on a local
 # model (many chunks, each a structured-output LLM call). cognee itself has no
 # top-level timeout, so a hung chunk / dead LLM connection could stall the
 # background indexer forever. Wrap the whole run in ``asyncio.wait_for`` with
-# this ceiling (default 1800s = 30 min). Tunable via env.
+# this ceiling. Resolved through the central timeout config (admin > env >
+# default). Default 7200s (2h) to accommodate very large repos, floor 300s.
 def _resolve_cognify_timeout() -> float:
-    try:
-        return max(300.0, float(os.environ.get("COGNEE_COGNIFY_TIMEOUT", "1800")))
-    except (TypeError, ValueError):
-        return 1800.0
+    from api.timeout_config import resolve_cognee_cognify_timeout
+    return resolve_cognee_cognify_timeout()
 
 
 # --- Suppress the benign "coroutine was never awaited" RuntimeWarning ----------

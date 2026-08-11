@@ -74,10 +74,11 @@ EXPERT_DOC_PROMPT: str = load_prompt_file("expert_agent_doc.md", "")
 
 # Per-section RLM timeout for the EXPERT path. fast-rlm can hang on a LOCAL
 # model doing long-context synthesis (or on the first-run Deno/Pyodide
-# bootstrap); without a cap the expert SSE stream stays open forever. Tunable
-# via env (default 20 min). When the timeout fires we fall back to the
-# standard LLM, which is the guaranteed-operation baseline.
-RLM_EXPERT_TIMEOUT = float(os.environ.get("RLM_EXPERT_TIMEOUT", "1200"))
+# bootstrap); without a cap the expert SSE stream stays open forever. Resolved
+# at call time via the central timeout config (admin > env > default) so an
+# admin save takes effect without a restart. Default 1800s (30 min), floor 60s.
+# When the timeout fires we fall back to the standard LLM, which is the
+# guaranteed-operation baseline.
 
 # Default language instruction substituted into {language_name}. The expert
 # agent follows the user's language rather than a fixed one.
@@ -590,11 +591,17 @@ def _build_prompt(
 async def _rlm_generate(prompt: str, model: Optional[str]) -> str:
     """Run fast-rlm and return cleaned text, or "" on any failure/empty result.
 
-    Capped by ``RLM_EXPERT_TIMEOUT`` so a hung fast-rlm (first-run bootstrap,
-    dead Pyodide worker, a local model that never returns) cannot hold the
-    expert SSE stream open indefinitely. On timeout we return "" and the caller
-    falls back to the standard LLM.
+    Capped by the per-section RLM expert timeout (resolved at call time via the
+    central timeout config: admin > env > default) so a hung fast-rlm
+    (first-run bootstrap, dead Pyodide worker, a local model that never
+    returns) cannot hold the expert SSE stream open indefinitely. On timeout we
+    return "" and the caller falls back to the standard LLM.
     """
+    try:
+        from api.timeout_config import resolve_rlm_expert_timeout
+        rlm_expert_timeout = resolve_rlm_expert_timeout()
+    except Exception:
+        rlm_expert_timeout = 1800.0
     try:
         from api.model_utils import get_model_context_window, clamp_text_by_tokens
         ctx_win = get_model_context_window(model_name=model, task="expert")
@@ -606,7 +613,7 @@ async def _rlm_generate(prompt: str, model: Optional[str]) -> str:
         from api.rlm_runner import run_rlm_task  # lazy: fast_rlm is optional
 
         res = await asyncio.wait_for(
-            run_rlm_task(safe_prompt, model), timeout=RLM_EXPERT_TIMEOUT
+            run_rlm_task(safe_prompt, model), timeout=rlm_expert_timeout
         )
         if isinstance(res, dict) and res.get("success") and res.get("results"):
             return _clean_llm_text(str(res["results"]))
@@ -614,7 +621,7 @@ async def _rlm_generate(prompt: str, model: Optional[str]) -> str:
     except asyncio.TimeoutError:
         logger.warning(
             "RLM expert generation timed out after %ss; falling back to standard LLM.",
-            RLM_EXPERT_TIMEOUT,
+            rlm_expert_timeout,
         )
     except Exception as e:  # pragma: no cover - depends on live fast-rlm
         logger.warning("RLM expert generation failed: %s", e)

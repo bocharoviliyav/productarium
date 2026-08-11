@@ -84,15 +84,49 @@ LLM_CONTENT_MAX_CHARS = 50_000
 # (e.g. LM Studio running qwen3.6-27b over a 200k-char codebase blob) can take
 # several minutes, so the default must be generous. This is a safety net for a
 # genuinely hung fast-rlm (first-run npm/pyodide bootstrap) -- the per-API-call
-# timeout lives in rlm_runner.py (RLM_API_TIMEOUT_MS, default 30 min). When this
-# section timeout fires, only the awaited result is discarded; the underlying
-# RLM worker thread keeps running. Tunable via env.
-RLM_SECTION_TIMEOUT = float(os.environ.get("RLM_SECTION_TIMEOUT", "1200"))
+# timeout lives in rlm_runner.py (RLM_API_TIMEOUT_MS). When this section timeout
+# fires, only the awaited result is discarded; the underlying RLM worker thread
+# keeps running. Resolved at call time via the central timeout config
+# (admin > env > default) so an admin save takes effect without a restart.
+# Default 1800s (30 min), floor 60s.
 # Max RLM failures within a single generate run before skipping RLM for the
 # remaining sections. fast-rlm runs the model inside a Pyodide Python REPL;
 # after this many failures we stop trying RLM and go straight to the standard
 # LLM for the rest of the run. Default 2 failures.
 RLM_MAX_FAILURES = int(os.environ.get("RLM_MAX_FAILURES", "2"))
+
+# Placeholder used when a single section's generation produces no usable text.
+# Kept as a named constant so callers can detect an all-placeholder result and
+# surface a clear failure instead of committing placeholder-only docs as success.
+_SECTION_UNAVAILABLE_PLACEHOLDER = (
+    "_(Содержимое раздела временно недоступно. Вы можете перезапустить генерацию.)_"
+)
+
+# Long-lived main FastAPI event loop, captured at startup so the docgen worker
+# threads (which run their own short-lived loops) can hand off fire-and-forget
+# cognee indexing via ``asyncio.run_coroutine_threadsafe``. This lets the
+# long-running cognify survive the worker loop teardown instead of being
+# cancelled when ``_run_docgen_job`` finishes. Set by ``set_main_event_loop``
+# from ``api.api.startup_event``.
+_main_event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def set_main_event_loop(loop: Optional[asyncio.AbstractEventLoop]) -> None:
+    """Record the long-lived main event loop for cross-thread task handoff.
+
+    Called once from ``api.api.startup_event``. Docgen worker threads then use
+    ``get_main_event_loop`` to schedule cognee indexing so the cognify coroutine
+    is NOT cancelled when the worker's own loop closes.
+    """
+    global _main_event_loop
+    _main_event_loop = loop
+
+
+def get_main_event_loop() -> Optional[asyncio.AbstractEventLoop]:
+    """Return the captured main loop, or None if startup has not run yet."""
+    return _main_event_loop
+
+
 # fast-rlm's default ``max_prompt_tokens`` (200000) is the hard ceiling a single
 # RLM call must stay under (the whole codebase blob + fast-rlm's recursive
 # subagent outputs count toward it). On large repos the full blob alone can
@@ -804,6 +838,13 @@ async def _attempt_rlm(
     rlm_failures = (rlm_state or {}).get("failures", 0)
     if rlm_failures >= RLM_MAX_FAILURES:
         return None
+    # Resolve the per-section RLM timeout at call time (admin > env > default)
+    # so an admin save takes effect without a restart.
+    try:
+        from api.timeout_config import resolve_rlm_section_timeout
+        rlm_section_timeout = resolve_rlm_section_timeout()
+    except Exception:
+        rlm_section_timeout = 1800.0
     try:
         from api.model_utils import clamp_text_by_tokens
         ctx_win = _resolve_rlm_context_window() or 8192
@@ -814,14 +855,14 @@ async def _attempt_rlm(
 
         from api.rlm_runner import run_rlm_task  # lazy: fast_rlm is optional
         res = await asyncio.wait_for(
-            run_rlm_task(safe_query, rlm_model), timeout=RLM_SECTION_TIMEOUT
+            run_rlm_task(safe_query, rlm_model), timeout=rlm_section_timeout
         )
         if res.get("success") and res.get("results"):
             txt = _clean_llm_text(str(res["results"]))
             if txt:
                 return txt
     except asyncio.TimeoutError:
-        logger.warning("RLM timed out after %ss.", RLM_SECTION_TIMEOUT)
+        logger.warning("RLM timed out after %ss.", rlm_section_timeout)
     except Exception as e:  # pragma: no cover - depends on live fast-rlm
         logger.warning("RLM generation failed: %s", e)
     # Non-success path (no usable result / timeout / exception): record it.
@@ -1054,7 +1095,18 @@ def _cognee_dataset(product: Any) -> str:
 
 
 def _index_in_background(content_or_path: str, dataset_name: str) -> None:
-    """Fire-and-forget cognee indexing. Failures are logged, never fatal."""
+    """Fire-and-forget cognee indexing. Failures are logged, never fatal.
+
+    The indexing coroutine is handed off to the long-lived MAIN FastAPI event
+    loop (captured at startup) via ``asyncio.run_coroutine_threadsafe`` so it
+    survives the docgen worker thread's own short-lived loop teardown. This is
+    essential because cognee's ``cognify`` can legitimately run 20-30 min — if
+    it were scheduled on the worker loop, closing that loop when the docgen job
+    finishes would CANCEL the still-running cognify and the graph would never
+    finish building. By moving it to the main loop, the job can return
+    immediately (display is decoupled from the knowledge graph) while indexing
+    continues in the background.
+    """
 
     async def _run() -> None:
         try:
@@ -1063,6 +1115,26 @@ def _index_in_background(content_or_path: str, dataset_name: str) -> None:
         except Exception as e:  # pragma: no cover - depends on live cognee/DB
             logger.warning("Cognee indexing failed for %r: %s", dataset_name, e)
 
+    main_loop = get_main_event_loop()
+    if main_loop is not None and main_loop.is_running():
+        try:
+            asyncio.run_coroutine_threadsafe(_run(), main_loop)
+            logger.info(
+                "Scheduled cognee indexing for %r onto the main event loop.",
+                dataset_name,
+            )
+            return
+        except RuntimeError as e:  # loop closed between the check and the call
+            logger.warning(
+                "Could not schedule cognee indexing on the main loop for %r (%s); "
+                "falling back to a local task.",
+                dataset_name, e,
+            )
+
+    # Fallback: no main loop captured (startup not run / tests) — schedule on the
+    # current loop so the old non-worker callers (websocket wiki, inline edits)
+    # still work. The worker-thread drain in ``_run_docgen_job`` is best-effort
+    # and non-fatal, so a cancellation here no longer marks the job as failed.
     try:
         asyncio.create_task(_run())
     except RuntimeError:
@@ -1087,6 +1159,27 @@ def _section_pages(sections: Dict[str, str], language: str) -> Dict[str, Any]:
             "relatedPages": [],
         }
     return pages
+
+
+def _raise_if_all_sections_unavailable(sections: Dict[str, str]) -> None:
+    """Raise ValueError when EVERY section is the unavailable placeholder.
+
+    Real generation produced no usable content in this case (the LLM/RLM were
+    unreachable or rate-limited for the whole run). Committing placeholder-only
+    docs as a "succeeded" job would make the UI show
+    "Содержимое раздела временно недоступно" on every page while claiming
+    success. Surfacing a genuine failure lets the user retry instead. Display
+    being decoupled from cognee does NOT mean a total generation failure should
+    be masked as a successful (empty) doc set.
+    """
+    if sections and all(
+        (v or "").strip() == _SECTION_UNAVAILABLE_PLACEHOLDER for v in sections.values()
+    ):
+        raise ValueError(
+            "Не удалось сгенерировать ни один раздел документации (LLM/RLM "
+            "недоступны или превысили таймаут). Проверьте подключение к модели "
+            "и перезапустите генерацию."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1217,7 +1310,7 @@ async def generate_codebase_docs(
             prompt, codebase_chunks, use_rlm, llm, rlm_model, rlm_state
         )
         if not content:
-            content = "_(Содержимое раздела временно недоступно. Вы можете перезапустить генерацию.)_"
+            content = _SECTION_UNAVAILABLE_PLACEHOLDER
         # Validate + repair any mermaid diagrams in this section before storing
         # it, so broken diagrams never reach the UI or ``previous_content``.
         # The repair loop is non-fatal: if the Node verifier is unavailable it
@@ -1229,6 +1322,15 @@ async def generate_codebase_docs(
         # Feed this section back as previous_content for the next section.
         gen.generated_sections[section_type.value] = content
         sections[section_type.value] = content
+
+    # If EVERY section came back as the unavailable placeholder, real generation
+    # produced no usable content (LLM/RLM were unreachable or rate-limited for
+    # the whole run). Committing placeholder-only docs as "succeeded" would make
+    # the UI show "Содержимое раздела временно недоступно" on every page while
+    # claiming success. Surface it as a genuine failure instead so the user can
+    # retry — display is decoupled from cognee, but a total generation failure
+    # must NOT be masked as a successful (empty) doc set.
+    _raise_if_all_sections_unavailable(sections)
 
     repo_name = context.repo_name or _repo_name_from_url(repo_url)
     markdown = f"# Документация по кодовой базе: {repo_name}\n\n"

@@ -97,14 +97,24 @@ class TestLongRunningTimeouts(unittest.TestCase):
 
     def setUp(self):
         # Snapshot + clear the relevant env vars so each test is deterministic.
+        # NOTE: these env vars are the FALLBACK layer. The admin settings store
+        # (timeouts.<key>) has higher precedence; these tests assume the store
+        # is empty / unset, which is the case in a clean test DB.
         self._saved = {}
         for k in (
             "LLM_REQUEST_TIMEOUT_SECONDS",
             "LLM_RETRY_MAX_TIME_SECONDS",
             "COGNEE_GRAPH_EXTRACTION_TIMEOUT",
             "COGNEE_COGNIFY_TIMEOUT",
+            "DOCGEN_INDEXING_DRAIN_SECONDS",
         ):
             self._saved[k] = os.environ.pop(k, None)
+        # Ensure the admin store does not leak a stored override into these
+        # default-value assertions.
+        from api.settings_store import list_settings, set_setting
+        self._stored_timeouts = [r["key"] for r in list_settings(prefix="timeouts.")]
+        for key in self._stored_timeouts:
+            set_setting(key, "", encrypt=False)
 
     def tearDown(self):
         for k, v in self._saved.items():
@@ -112,14 +122,19 @@ class TestLongRunningTimeouts(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        # Restore the admin-store overrides we cleared (best-effort).
+        from api.settings_store import set_setting
+        for key in self._stored_timeouts:
+            set_setting(key, "", encrypt=False)
 
     def test_request_timeout_default_and_override(self):
         from api.openai_client import _resolve_request_timeout
 
-        # Default is 1800s (30 min) to accommodate long generation/cognify.
-        self.assertEqual(_resolve_request_timeout(), 1800.0)
-        os.environ["LLM_REQUEST_TIMEOUT_SECONDS"] = "2400"
-        self.assertEqual(_resolve_request_timeout(), 2400.0)
+        # Default is 3600s (1 h) to accommodate long generation/cognify on
+        # large repos.
+        self.assertEqual(_resolve_request_timeout(), 3600.0)
+        os.environ["LLM_REQUEST_TIMEOUT_SECONDS"] = "4800"
+        self.assertEqual(_resolve_request_timeout(), 4800.0)
         # Below the 60s floor is clamped, so a typo can't make calls fail
         # instantly on a legitimately slow model.
         os.environ["LLM_REQUEST_TIMEOUT_SECONDS"] = "5"
@@ -128,11 +143,11 @@ class TestLongRunningTimeouts(unittest.TestCase):
     def test_retry_max_time_default_and_override(self):
         from api.openai_client import _resolve_retry_max_time
 
-        # Default 600s (10 min) lets a rate-limited cognee/embedding call
-        # actually complete its backoff instead of aborting after 5s.
-        self.assertEqual(_resolve_retry_max_time(), 600.0)
-        os.environ["LLM_RETRY_MAX_TIME_SECONDS"] = "900"
+        # Default 900s lets a rate-limited cognee/embedding call actually
+        # complete its backoff instead of aborting after 5s.
         self.assertEqual(_resolve_retry_max_time(), 900.0)
+        os.environ["LLM_RETRY_MAX_TIME_SECONDS"] = "1200"
+        self.assertEqual(_resolve_retry_max_time(), 1200.0)
         os.environ["LLM_RETRY_MAX_TIME_SECONDS"] = "1"
         self.assertEqual(_resolve_retry_max_time(), 30.0)
 
@@ -142,20 +157,35 @@ class TestLongRunningTimeouts(unittest.TestCase):
             _resolve_cognify_timeout,
         )
 
-        # Graph extraction default 180s per chunk; cognify default 1800s overall.
-        self.assertEqual(_resolve_graph_extraction_timeout(), 180.0)
-        self.assertEqual(_resolve_cognify_timeout(), 1800.0)
-
-        os.environ["COGNEE_GRAPH_EXTRACTION_TIMEOUT"] = "600"
+        # Graph extraction default 600s per chunk; cognify default 7200s overall.
         self.assertEqual(_resolve_graph_extraction_timeout(), 600.0)
-        os.environ["COGNEE_COGNIFY_TIMEOUT"] = "3600"
-        self.assertEqual(_resolve_cognify_timeout(), 3600.0)
+        self.assertEqual(_resolve_cognify_timeout(), 7200.0)
+
+        os.environ["COGNEE_GRAPH_EXTRACTION_TIMEOUT"] = "900"
+        self.assertEqual(_resolve_graph_extraction_timeout(), 900.0)
+        os.environ["COGNEE_COGNIFY_TIMEOUT"] = "14400"
+        self.assertEqual(_resolve_cognify_timeout(), 14400.0)
 
         # Invalid values fall back to the defaults, not crash.
         os.environ["COGNEE_GRAPH_EXTRACTION_TIMEOUT"] = "not-a-number"
-        self.assertEqual(_resolve_graph_extraction_timeout(), 180.0)
+        self.assertEqual(_resolve_graph_extraction_timeout(), 600.0)
         os.environ["COGNEE_COGNIFY_TIMEOUT"] = ""
-        self.assertEqual(_resolve_cognify_timeout(), 1800.0)
+        self.assertEqual(_resolve_cognify_timeout(), 7200.0)
+
+    def test_docgen_drain_derives_from_cognify(self):
+        # The docgen indexing-drain timeout defaults to the resolved cognify
+        # timeout so a leftover cognify task gets the full cognify budget
+        # instead of being cancelled at a fixed 30s (which previously dropped
+        # the connection mid-graph-build).
+        from api.cognee_manager import _resolve_cognify_timeout
+        from api.timeout_config import resolve_docgen_indexing_drain_seconds
+
+        self.assertEqual(resolve_docgen_indexing_drain_seconds(), _resolve_cognify_timeout())
+        os.environ["COGNEE_COGNIFY_TIMEOUT"] = "10800"
+        self.assertEqual(resolve_docgen_indexing_drain_seconds(), 10800.0)
+        # An explicit DOCGEN_INDEXING_DRAIN_SECONDS override still wins.
+        os.environ["DOCGEN_INDEXING_DRAIN_SECONDS"] = "60"
+        self.assertEqual(resolve_docgen_indexing_drain_seconds(), 60.0)
 
     @patch("api.openai_client.OpenAI")
     def test_client_uses_configured_timeout(self, mock_openai):
@@ -169,6 +199,34 @@ class TestLongRunningTimeouts(unittest.TestCase):
         self.assertIsInstance(http_client, httpx.Client)
         # httpx stores the configured timeout as a Timeout object.
         self.assertEqual(http_client.timeout.read, 1234.0)
+
+
+class TestAllPlaceholderDetection(unittest.TestCase):
+    """A total generation failure (every section is the unavailable
+    placeholder) must raise so the job is marked failed, not committed as a
+    placeholder-filled "success"."""
+
+    def test_all_placeholder_raises(self):
+        import api.artifact_docgen as adg
+
+        placeholder = adg._SECTION_UNAVAILABLE_PLACEHOLDER
+        with self.assertRaises(ValueError):
+            adg._raise_if_all_sections_unavailable({"a": placeholder, "b": placeholder})
+
+    def test_mixed_content_does_not_raise(self):
+        import api.artifact_docgen as adg
+
+        placeholder = adg._SECTION_UNAVAILABLE_PLACEHOLDER
+        # At least one real section -> NOT a total failure; must not raise.
+        adg._raise_if_all_sections_unavailable(
+            {"a": placeholder, "b": "# Real content\n\n..."}
+        )
+
+    def test_empty_does_not_raise(self):
+        import api.artifact_docgen as adg
+
+        # No sections (e.g. a non-codebase artifact path) -> nothing to flag.
+        adg._raise_if_all_sections_unavailable({})
 
 
 if __name__ == "__main__":

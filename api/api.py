@@ -386,10 +386,11 @@ async def test_provider_connection(settings: ProviderSettings):
         # Test connection based on provider type
         if settings.provider == "ollama":
             # Test Ollama API
+            from api.timeout_config import resolve_provider_test_timeout
             response = requests.get(
                 f"{settings.base_url}/api/tags",
                 headers=headers,
-                timeout=10,
+                timeout=resolve_provider_test_timeout(),
                 verify=requests_verify(),
             )
 
@@ -413,10 +414,11 @@ async def test_provider_connection(settings: ProviderSettings):
 
         elif settings.provider == "openai_local":
             # Test OpenAI-compatible API
+            from api.timeout_config import resolve_provider_test_timeout
             response = requests.get(
                 f"{settings.base_url}/models",
                 headers=headers,
-                timeout=10,
+                timeout=resolve_provider_test_timeout(),
                 verify=requests_verify(),
             )
 
@@ -1472,6 +1474,16 @@ def _upsert_product(db: Session, product: Product) -> ProductORM:
 
 @app.on_event("startup")
 async def startup_event():
+    # Capture the long-lived main event loop so the docgen worker threads (which
+    # run their own short-lived loops) can hand off fire-and-forget cognee
+    # indexing via run_coroutine_threadsafe. This keeps a 20-30 min cognify
+    # running after the worker loop closes (display decoupled from the graph).
+    try:
+        from api.artifact_docgen import set_main_event_loop
+        set_main_event_loop(asyncio.get_running_loop())
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Could not capture main event loop for docgen indexing: %s", e)
+
     # Initialize SQLAlchemy tables for Product/Artifact persistence.
     # init_db() is non-fatal: it logs a warning and returns False if the DB
     # is unreachable, so app startup is never blocked.
@@ -1715,11 +1727,17 @@ async def _run_docgen_job_async(
         )
         db.commit()
         job["status"] = "succeeded"
-        job["indexing_status"] = "indexing"
-        job["indexing_message"] = "Документы сгенерированы. Обновляется граф знаний (cognee)..."
+        # Display is decoupled from the knowledge graph: docs are already
+        # committed, so the job is a success regardless of how long cognee
+        # cognify takes (it can run 20-30 min and is handed off to the main
+        # event loop, NOT gated on the worker thread). Indexing continues in
+        # the background; its own outcome surfaces via cognee logs / admin
+        # reindex, never as a docgen job failure.
+        job["indexing_status"] = "succeeded"
+        job["indexing_message"] = "Документы сгенерированы. Граф знаний обновляется в фоне."
         job["finished_at"] = time.time()
         job["docs_chars"] = len(docs or "")
-        logger.info("Docgen job %s succeeded for artifact %s; cognee indexing in progress.", job_id, artifact_id)
+        logger.info("Docgen job %s succeeded for artifact %s; cognee indexing handed off to background.", job_id, artifact_id)
     except Exception as e:
         try:
             db.rollback()
@@ -1738,6 +1756,26 @@ async def _run_docgen_job_async(
             pass
 
 
+def _resolve_indexing_drain_seconds() -> float:
+    """Best-effort ceiling for the worker-loop indexing drain.
+
+    Cognee indexing is normally handed off to the MAIN event loop (see
+    ``_index_in_background``) so it survives the worker loop teardown. This drain
+    only catches tasks that were NOT handed off (no main loop at startup, or the
+    handoff failed). It is NON-FATAL: a timeout here never marks the job as
+    failed — docs are already committed.
+
+    Resolved through the central timeout config (admin > env > default). The
+    default DERIVES from the cognee cognify timeout so a leftover cognify task
+    (one that wasn't handed off to the main loop) gets the FULL cognify budget
+    instead of being cancelled at a fixed 30s -- which previously dropped the
+    connection mid-graph-build (the user-flagged api.py-vs-cognify conflict).
+    Floor 5s so a typo can't make the drain instantaneous.
+    """
+    from api.timeout_config import resolve_docgen_indexing_drain_seconds
+    return resolve_docgen_indexing_drain_seconds()
+
+
 def _run_docgen_job(
     job_id: str,
     product_id: str,
@@ -1748,9 +1786,11 @@ def _run_docgen_job(
 ) -> None:
     """Worker-thread entry point: runs the async job in a brand-new event loop
     so the heavy sync work (git clone, file read, RLM) never touches the main
-    loop. Fire-and-forget background tasks scheduled during the job (cognee
-    indexing via ``asyncio.create_task``) are drained best-effort (120s) before
-    the loop is closed, so indexing is not cancelled by loop teardown."""
+    loop. Cognee indexing is normally handed off to the MAIN event loop via
+    ``_index_in_background`` (so a 20-30 min cognify survives this loop closing);
+    any leftover tasks on the worker loop are drained best-effort and NON-FATAL
+    — a drain timeout never marks the job as failed because the docs are already
+    committed and display is decoupled from the knowledge graph."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     job = _docgen_jobs.get(job_id)
@@ -1766,24 +1806,22 @@ def _run_docgen_job(
             ]
             if pending:
                 await asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True), timeout=120
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=_resolve_indexing_drain_seconds(),
                 )
 
         try:
             loop.run_until_complete(_drain())
-            if job and job.get("status") == "succeeded":
-                job["indexing_status"] = "succeeded"
-                job["indexing_message"] = "Документы сгенерированы и граф знаний успешно обновлён."
-                logger.info("Cognee indexing completed for job %s.", job_id)
         except asyncio.TimeoutError:
-            if job and job.get("status") == "succeeded":
-                job["indexing_status"] = "failed"
-                job["indexing_message"] = "Документы сгенерированы. Превышено время ожидания индексации графа знаний."
-            logger.warning("Docgen background drain timed out for job %s; non-fatal.", job_id)
+            # Non-fatal: docs are already committed. Indexing either was handed
+            # off to the main loop (the common path) or this drain caught a
+            # leftover task that couldn't finish in time — either way the job's
+            # success / indexing_status (set in _run_docgen_job_async) stands.
+            logger.warning(
+                "Docgen background drain timed out for job %s; non-fatal (docs already committed).",
+                job_id,
+            )
         except Exception as e:  # pragma: no cover - defensive
-            if job and job.get("status") == "succeeded":
-                job["indexing_status"] = "failed"
-                job["indexing_message"] = f"Документы сгенерированы. Ошибка индексации графа знаний: {e}"
             logger.warning("Docgen background drain error for job %s: %s", job_id, e)
     finally:
         try:

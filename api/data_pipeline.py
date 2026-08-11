@@ -561,9 +561,10 @@ def get_github_file_content(repo_url: str, file_path: str, access_token: str = N
         headers = {}
         if access_token:
             headers["Authorization"] = f"token {access_token}"
+        from api.timeout_config import resolve_git_file_content_timeout
         logger.info(f"Fetching file content from GitHub API: {api_url}")
         try:
-            response = requests.get(api_url, headers=headers)
+            response = requests.get(api_url, headers=headers, timeout=resolve_git_file_content_timeout())
             response.raise_for_status()
         except RequestException as e:
             raise ValueError(f"Error fetching file content: {e}")
@@ -626,6 +627,7 @@ def get_gitlab_file_content(repo_url: str, file_path: str, access_token: str = N
         # Encode file path
         encoded_file_path = quote(file_path, safe='')
 
+        from api.timeout_config import resolve_git_file_content_timeout
         # Try to get the default branch from the project info
         default_branch = None
         try:
@@ -634,7 +636,7 @@ def get_gitlab_file_content(repo_url: str, file_path: str, access_token: str = N
             if access_token:
                 project_headers["PRIVATE-TOKEN"] = access_token
             
-            project_response = requests.get(project_info_url, headers=project_headers)
+            project_response = requests.get(project_info_url, headers=project_headers, timeout=resolve_git_file_content_timeout())
             if project_response.status_code == 200:
                 project_data = project_response.json()
                 default_branch = project_data.get('default_branch', 'main')
@@ -653,7 +655,7 @@ def get_gitlab_file_content(repo_url: str, file_path: str, access_token: str = N
             headers["PRIVATE-TOKEN"] = access_token
         logger.info(f"Fetching file content from GitLab API: {api_url}")
         try:
-            response = requests.get(api_url, headers=headers)
+            response = requests.get(api_url, headers=headers, timeout=resolve_git_file_content_timeout())
             response.raise_for_status()
             content = response.text
         except RequestException as e:

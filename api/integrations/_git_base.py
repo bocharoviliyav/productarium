@@ -200,8 +200,9 @@ class GitConnector:
             for _ in range(self.list_max_pages):
                 if not url:
                     break
+                from api.timeout_config import resolve_integration_http_timeout
                 resp = requests.get(
-                    url, headers=headers, timeout=15,
+                    url, headers=headers, timeout=resolve_integration_http_timeout(),
                     verify=requests_verify(),
                 )
                 if resp.status_code >= 400:

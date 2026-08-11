@@ -61,8 +61,16 @@ _VALID_TRANSPORTS = ("http", "stdio")
 # MCP protocol version we advertise during initialize.
 _MCP_PROTOCOL_VERSION = "2024-11-05"
 _MCP_CLIENT_INFO = {"name": "productarium", "version": "1.0"}
-# Default timeout (seconds) for JSON-RPC calls.
-_DEFAULT_TIMEOUT = 30
+# Default timeout (seconds) for JSON-RPC calls. Resolved lazily through the
+# central timeout config (admin > env > default) so an admin save takes effect
+# without a restart. Kept as a helper (not a module constant) because the
+# central resolver is read-through.
+def _default_timeout() -> float:
+    try:
+        from api.timeout_config import resolve_integration_http_timeout
+        return resolve_integration_http_timeout()
+    except Exception:
+        return 30.0
 
 
 class _StdioProcess:
@@ -191,7 +199,8 @@ class _StdioProcess:
             if self._proc.poll() is None:
                 self._proc.terminate()
                 try:
-                    self._proc.wait(timeout=5)
+                    from api.timeout_config import resolve_mcp_stdio_wait_timeout
+                    self._proc.wait(timeout=resolve_mcp_stdio_wait_timeout())
                 except Exception:
                     self._proc.kill()
         except Exception:
@@ -293,12 +302,14 @@ class McpConnector(IntegrationConnector):
         url: str,
         payload: Dict[str, Any],
         headers: Optional[Dict[str, str]] = None,
-        timeout: int = _DEFAULT_TIMEOUT,
+        timeout: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Send a JSON-RPC POST and return the parsed response dict."""
         import requests
         from api.ssl_config import requests_verify
 
+        if timeout is None:
+            timeout = _default_timeout()
         hdrs = {"Accept": "application/json, text/event-stream"}
         if headers:
             hdrs.update(headers)
@@ -355,7 +366,7 @@ class McpConnector(IntegrationConnector):
                     },
                 },
                 headers=server.get("headers"),
-                timeout=10,
+                timeout=_default_timeout(),
             )
             return result is not None
         except Exception as e:

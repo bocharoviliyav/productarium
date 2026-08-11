@@ -29,6 +29,10 @@ def sync_runtime_settings() -> None:
     1. Syncs active task API keys and base URLs to process environment variables.
     2. Re-applies cognee runtime config (mutates LLMConfig & EmbeddingConfig singletons).
     3. Clears model context window cache in `api.model_utils`.
+    4. Exports admin-store timeout overrides to their canonical env vars so
+       subprocess / module-level readers (e.g. fast-rlm's Pyodide REPL, which
+       reads RLM_API_TIMEOUT_MS from the process environment and cannot reach
+       host Python) see admin-set values without a restart.
     """
     try:
         from api.model_utils import _MODEL_CTX_CACHE
@@ -55,6 +59,12 @@ def sync_runtime_settings() -> None:
         apply_cognee_runtime_config()
     except Exception as e:
         logger.debug("sync_runtime_settings: apply_cognee_runtime_config skipped: %s", e)
+
+    try:
+        from api.timeout_config import sync_timeout_env
+        sync_timeout_env()
+    except Exception as e:
+        logger.debug("sync_runtime_settings: sync_timeout_env skipped: %s", e)
 
     logger.info("Configuration Abstraction Layer: Synchronized runtime settings across process.")
 

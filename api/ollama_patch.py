@@ -43,7 +43,8 @@ def check_ollama_model_exists(model_name: str, ollama_host: str = None) -> tuple
         logger.debug(f"Calling Ollama API: {api_url}")
         
         from api.ssl_config import requests_verify
-        response = requests.get(api_url, timeout=10, verify=requests_verify())
+        from api.timeout_config import resolve_model_list_timeout
+        response = requests.get(api_url, timeout=resolve_model_list_timeout(), verify=requests_verify())
         logger.debug(f"Ollama API response status: {response.status_code}")
         
         if response.status_code == 200:

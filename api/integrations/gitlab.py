@@ -63,8 +63,9 @@ class GitLabConnector(IntegrationConnector, GitConnector):
         base = self._api_base().rstrip("/")
         url = f"{base}/api/v4/user"
         try:
+            from api.timeout_config import resolve_integration_http_timeout
             resp = requests.get(
-                url, headers=self.auth_headers(), timeout=10,
+                url, headers=self.auth_headers(), timeout=resolve_integration_http_timeout(),
                 verify=requests_verify(),
             )
             if resp.status_code == 200:

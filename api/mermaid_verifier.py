@@ -10,8 +10,9 @@ the original.
 
 Public API
 ----------
-- :data:`MERMAID_VERIFY_ENABLED`, :data:`MAX_REPAIR_ATTEMPTS`,
-  :data:`VERIFY_TIMEOUT`, :data:`REPAIR_TIMEOUT` — tunables (env-overridable).
+- :data:`MERMAID_VERIFY_ENABLED` — env-only master switch. Per-diagram verify /
+  repair timeouts and the repair-attempt budget are resolved per-call through
+  :mod:`api.timeout_config` (admin store > env var > default).
 - :func:`extract_mermaid_blocks` — split markdown into fenced mermaid blocks.
 - :func:`verify_diagram` — validate one diagram body via the Node subprocess.
 - :func:`run_repair_loop` — extract → verify → enqueue → repair → splice; the
@@ -45,22 +46,28 @@ import shutil
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
+from api.timeout_config import (
+    resolve_mermaid_max_repair_attempts,
+    resolve_mermaid_repair_timeout,
+    resolve_mermaid_verify_timeout,
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Tunables (env-overridable)
+# Tunables
 # ---------------------------------------------------------------------------
-# Master switch. ``false`` disables verification entirely and run_repair_loop
-# returns the markdown unchanged — generation behaves exactly as before.
+# Master switch (env-only). ``false`` disables verification entirely and
+# run_repair_loop returns the markdown unchanged — generation behaves exactly
+# as before. The per-diagram verify timeout, per-LLM-repair-call timeout, and
+# the per-unique-body repair budget are resolved per-call through
+# api.timeout_config (admin store > env var > default); see the
+# mermaid_verify / mermaid_repair / mermaid_max_repair_attempts entries in
+# TIMEOUT_KEYS. Editing them in the admin panel takes effect on the next
+# verify_diagram / repair_diagram / run_repair_loop call without a restart.
 MERMAID_VERIFY_ENABLED: bool = os.environ.get("MERMAID_VERIFY", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
-# Max LLM repair attempts per UNIQUE diagram body (keyed by normalized hash).
-MAX_REPAIR_ATTEMPTS: int = int(os.environ.get("MERMAID_MAX_REPAIR_ATTEMPTS", "3"))
-# Per-diagram Node validation timeout (seconds).
-VERIFY_TIMEOUT: float = float(os.environ.get("MERMAID_VERIFY_TIMEOUT", "10"))
-# Per-LLM-repair-call timeout (seconds).
-REPAIR_TIMEOUT: float = float(os.environ.get("MERMAID_REPAIR_TIMEOUT", "120"))
 
 # Path to the headless Node validator, resolved relative to this file so it
 # works regardless of the process CWD.
@@ -165,7 +172,7 @@ async def verify_diagram(body: str, timeout: Optional[float] = None) -> VerifyRe
         )
         return VerifyResult(ok=True, unverifiable=True)
 
-    timeout = timeout if timeout is not None else VERIFY_TIMEOUT
+    timeout = timeout if timeout is not None else resolve_mermaid_verify_timeout()
 
     async def _run() -> VerifyResult:
         proc = await asyncio.create_subprocess_exec(
@@ -328,18 +335,20 @@ LLMCallable = Callable[[str], Awaitable[str]]
 async def repair_diagram(job: RepairJob, llm: LLMCallable) -> Optional[str]:
     """Ask the LLM to fix ``job``'s diagram; return the repaired body or None.
 
-    The repair call is bounded by ``REPAIR_TIMEOUT``. Any failure returns None
-    so the caller can decide whether to re-enqueue (within the budget) or give
-    up and mark the diagram.
+    The repair call is bounded by the mermaid-repair timeout, resolved per call
+    through api.timeout_config. Any failure returns None so the caller can
+    decide whether to re-enqueue (within the budget) or give up and mark the
+    diagram.
     """
     template = _load_repair_prompt()
     prompt = template.replace("{broken_diagram}", job.body).replace(
         "{error}", job.error or "Неизвестная ошибка синтаксиса"
     )
+    repair_timeout = resolve_mermaid_repair_timeout()
     try:
-        raw = await asyncio.wait_for(llm(prompt), timeout=REPAIR_TIMEOUT)
+        raw = await asyncio.wait_for(llm(prompt), timeout=repair_timeout)
     except asyncio.TimeoutError:
-        logger.warning("Mermaid repair LLM call timed out after %ss.", REPAIR_TIMEOUT)
+        logger.warning("Mermaid repair LLM call timed out after %ss.", repair_timeout)
         return None
     except Exception as e:  # pragma: no cover - depends on live LLM
         logger.warning("Mermaid repair LLM call failed: %s", e)
@@ -413,6 +422,11 @@ async def run_repair_loop(
     if not MERMAID_VERIFY_ENABLED:
         return page_markdown, stats
 
+    # Resolve the per-unique-body repair budget once for this loop run so the
+    # budget stays consistent across the drain (admin edits take effect on the
+    # next run_repair_loop call, not mid-drain).
+    max_attempts = resolve_mermaid_max_repair_attempts()
+
     blocks = extract_mermaid_blocks(page_markdown)
     if not blocks:
         return page_markdown, stats
@@ -434,7 +448,7 @@ async def run_repair_loop(
         stats["broken"] += 1
         h = _body_hash(block.body)
         attempt_counts[h] = attempt_counts.get(h, 0)
-        if attempt_counts[h] < MAX_REPAIR_ATTEMPTS:
+        if attempt_counts[h] < max_attempts:
             queue.append(
                 RepairJob(
                     block_index=block.index,
@@ -464,7 +478,7 @@ async def run_repair_loop(
             fixed_bodies[job.block_index] = fixed_by_hash[h]
             stats["fixed"] += 1
             continue
-        if attempt_counts[h] >= MAX_REPAIR_ATTEMPTS:
+        if attempt_counts[h] >= max_attempts:
             marked.add(job.block_index)
             stats["failed"] += 1
             continue
@@ -479,7 +493,7 @@ async def run_repair_loop(
         repaired = await repair_diagram(job, llm)
         if not repaired:
             # LLM gave nothing usable; re-enqueue if budget remains.
-            if attempt_counts[h] < MAX_REPAIR_ATTEMPTS:
+            if attempt_counts[h] < max_attempts:
                 queue.append(job)
             else:
                 marked.add(job.block_index)
@@ -504,7 +518,7 @@ async def run_repair_loop(
         # a different broken variant also gets its own budget.
         new_h = _body_hash(repaired)
         attempt_counts[new_h] = attempt_counts.get(new_h, 0)
-        if attempt_counts[new_h] < MAX_REPAIR_ATTEMPTS:
+        if attempt_counts[new_h] < max_attempts:
             queue.append(
                 RepairJob(
                     block_index=job.block_index,
@@ -527,7 +541,7 @@ async def run_repair_loop(
         if block.index in fixed_bodies:
             to_apply.append((block.index, f"```mermaid\n{fixed_bodies[block.index]}```"))
         elif block.index in marked:
-            attempts_used = attempt_counts.get(_body_hash(block.body), MAX_REPAIR_ATTEMPTS)
+            attempts_used = attempt_counts.get(_body_hash(block.body), max_attempts)
             to_apply.append((block.index, block.raw + _error_marker(attempts_used)))
     # Apply in reverse document order.
     for block in reversed(blocks):
@@ -552,9 +566,6 @@ async def run_repair_loop(
 
 __all__ = [
     "MERMAID_VERIFY_ENABLED",
-    "MAX_REPAIR_ATTEMPTS",
-    "VERIFY_TIMEOUT",
-    "REPAIR_TIMEOUT",
     "MermaidBlock",
     "VerifyResult",
     "RepairJob",
