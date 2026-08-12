@@ -127,10 +127,13 @@ async def _run_docgen_job_async(
         from api.docgen import generate_artifact_documentation
         # generate_artifact_documentation writes generated_docs/pages onto the
         # artifact ORM in-place; persist them in the same transaction.
+        # Pass provider/model straight through (None when unset) so
+        # _resolve_docgen_model resolves the admin-configured alias from the
+        # DB settings store instead of an env-default shadowing it.
         docs = await generate_artifact_documentation(
             artifact,
             p_orm,
-            provider=provider or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local"),
+            provider=provider,
             model=model,
             language=language or "ru",
         )

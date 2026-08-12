@@ -29,12 +29,12 @@ router = APIRouter(prefix="/api/products", tags=["docgen"])
 
 
 class GenerateDocRequest(BaseModel):
-    # Provider/model default to the OpenAI-compatible local server (LM Studio /
-    # llama.cpp / vLLM). Override via env or per-request. Ollama is still
-    # supported when explicitly requested, but is no longer the default because
-    # the default local server in this deployment is LM Studio (:1234).
-    provider: Optional[str] = os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local")
-    model: Optional[str] = os.environ.get("DEEPWIKI_DEFAULT_MODEL", "qwen/qwen3.6-27b")
+    # provider/model default to None so the DB settings store (admin-configured
+    # alias, e.g. "flash") is resolved downstream via _resolve_docgen_model,
+    # instead of being shadowed by an env-default. A per-request override still
+    # wins (it is non-None and _resolve_docgen_model prefers it over DB).
+    provider: Optional[str] = None
+    model: Optional[str] = None
     language: Optional[str] = "ru"
 
 
@@ -65,7 +65,9 @@ async def generate_artifact_docs(
         job_id,
         product_id,
         artifact_id,
-        request_data.provider or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local"),
+        # Pass None through (no env-default) so _resolve_docgen_model in the
+        # worker resolves the admin-configured alias from the DB settings store.
+        request_data.provider,
         request_data.model,
         request_data.language or "ru",
     )

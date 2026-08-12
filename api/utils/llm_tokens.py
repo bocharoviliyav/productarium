@@ -90,6 +90,19 @@ def get_model_context_window(
             mpt = cfg.get("max_prompt_tokens")
             if isinstance(mpt, int) and mpt > 0:
                 return mpt
+            # Resolve model/base_url/api_key/provider from the admin config so
+            # the live API query uses the admin-configured model name (e.g. a
+            # gateway alias like "flash") instead of the hardcoded default
+            # "qwen/qwen3.6-27b" that the gateway may reject (direct access
+            # forbidden, only alias access allowed).
+            if not model_name:
+                model_name = cfg.get("model")
+            if not base_url:
+                base_url = cfg.get("base_url")
+            if not api_key:
+                api_key = cfg.get("api_key")
+            if not provider:
+                provider = cfg.get("provider")
         except Exception:
             pass
 
