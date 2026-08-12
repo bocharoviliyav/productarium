@@ -382,7 +382,7 @@ class TestPublicKnowledgeExport:
 
 
 # --- Public ask / push degrade to 501 when deps missing ---------------------
-# After merge, api.expert_agent and api.integrations both exist, so the 501
+# After merge, api.expert.chat and api.integrations both exist, so the 501
 # fallback can only be exercised by simulating the module being unimportable
 # (the real graceful path when a parallel module has not landed yet).
 import importlib as _importlib
@@ -413,7 +413,7 @@ class TestPublicAskPush501:
         from api.auth import deps as auth_deps
         app.dependency_overrides[auth_deps.require_api_token] = _api_token
 
-        saved = self._with_module_blocked("api.expert_agent")
+        saved = self._with_module_blocked("api.expert.chat")
         try:
             resp = client.post(
                 "/api/public/products/prod_1/ask", json={"query": "hi"}
@@ -421,8 +421,8 @@ class TestPublicAskPush501:
             assert resp.status_code == 501
             assert "Expert agent not available" in resp.json()["detail"]
         finally:
-            self._restore("api.expert_agent", saved)
-            _importlib.import_module("api.expert_agent")
+            self._restore("api.expert.chat", saved)
+            _importlib.import_module("api.expert.chat")
 
     def test_push_501_when_integrations_missing(self):
         db_mod = _setup_db()

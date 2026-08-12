@@ -1,8 +1,8 @@
 """GitLab connector (plan section G).
 
-Wraps :func:`api.data_pipeline.download_repo` for cloning and the GitLab REST
+Wraps :func:`api.clients.git.download_repo` for cloning and the GitLab REST
 API v4 (``gitlab.com`` or a self-hosted instance) for listing projects.
-Credentials come from ``settings_store.get_git_creds("gitlab")``.
+Credentials come from ``settings_store.get_git_creds("gitlab")`.
 """
 
 from __future__ import annotations

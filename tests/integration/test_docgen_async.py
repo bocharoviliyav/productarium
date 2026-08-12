@@ -10,10 +10,11 @@ Covers:
 
 The heavy ``generate_artifact_documentation`` pipeline is monkeypatched with an
 instant async fake so the worker thread completes in milliseconds. The worker
-thread reads the module-global ``api.api.SessionLocal`` at runtime, so the test
-rebinds it to the isolated StaticPool SQLite engine (one shared connection,
-``check_same_thread=False``) — the same trick the other test modules use so the
-worker's own session sees the seeded data and persists into the test DB.
+thread reads ``api.docgen.jobs.SessionLocal`` at runtime (its import site), so
+the test rebinds it to the isolated StaticPool SQLite engine (one shared
+connection, ``check_same_thread=False``) — the same trick the other test
+modules use so the worker's own session sees the seeded data and persists into
+the test DB.
 """
 
 from __future__ import annotations
@@ -72,8 +73,10 @@ def _build_app(db_mod, monkeypatch):
     """Return the real api.api app + client with get_db overridden and the
     worker-thread SessionLocal rebound to the test engine."""
     import api.api as api_mod
-    # The worker thread reads this module global at runtime (db = SessionLocal()).
-    monkeypatch.setattr(api_mod, "SessionLocal", db_mod.SessionLocal, raising=True)
+    import api.docgen.jobs as dj
+    # The worker thread reads SessionLocal from api.docgen.jobs (its import
+    # site) at runtime (db = SessionLocal()).
+    monkeypatch.setattr(dj, "SessionLocal", db_mod.SessionLocal, raising=True)
 
     def _get_test_db():
         s = db_mod.SessionLocal()
@@ -106,7 +109,7 @@ class TestAsyncDocgen:
 
         # Instant async fake for the heavy pipeline; it persists docs onto the
         # artifact ORM (loaded in the worker's own session) and returns.
-        import api.artifact_docgen as adg
+        import api.docgen as adg
 
         async def _fake(artifact, product, **kwargs):
             artifact.generated_docs = "# Generated\n\nfake"
@@ -186,7 +189,7 @@ class TestAsyncDocgen:
         _seed(db_mod)
         _app, client = _build_app(db_mod, monkeypatch)
 
-        import api.artifact_docgen as adg
+        import api.docgen as adg
 
         async def _fake(artifact, product, **kwargs):
             artifact.generated_docs = "ok"
@@ -215,8 +218,9 @@ class TestAsyncDocgen:
         gates the docgen job."""
         import asyncio
         import api.api as api_mod
-        import api.artifact_docgen as adg
+        import api.docgen as adg
         import api.cognee_manager as cm
+        import api.docgen.jobs as dj
         from api.models import ArtifactORM
 
         _indexed = {"v": False}
@@ -262,7 +266,9 @@ class TestAsyncDocgen:
             finally:
                 s.close()
         api_mod.app.dependency_overrides[api_mod.get_db] = _get_test_db
-        monkeypatch.setattr(api_mod, "SessionLocal", db_mod.SessionLocal, raising=True)
+        # The worker thread reads SessionLocal from api.docgen.jobs (its
+        # import site), not api.api.
+        monkeypatch.setattr(dj, "SessionLocal", db_mod.SessionLocal, raising=True)
 
         with client:
             resp = client.post(
@@ -305,7 +311,7 @@ class TestAsyncDocgen:
         _seed(db_mod)
         _app, client = _build_app(db_mod, monkeypatch)
 
-        import api.artifact_docgen as adg
+        import api.docgen as adg
 
         async def _fake(artifact, product, **kwargs):
             # Simulate a total generation failure: every section is the

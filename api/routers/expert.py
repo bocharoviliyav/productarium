@@ -10,9 +10,10 @@ Endpoints (prefix ``/api/products``, tags ``expert``):
     file (``Content-Disposition: attachment``).
 
 Both endpoints require an authenticated session (``get_current_user``). The
-heavy lifting (cognee recall, RLM routing, LLM streaming) lives in
-``api.expert_agent``; this router only does request parsing, SSE framing, and
-file-response packaging so it stays thin and file-disjoint from the foundation.
+heavy lifting (cognee recall, RLM routing, LLM streaming) lives in the
+``api.expert`` package (``api.expert.chat``); this router only does request
+parsing, SSE framing, and file-response packaging so it stays thin and
+file-disjoint from the foundation.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from api.auth.deps import get_current_user
-from api.expert_agent import run_expert_chat, run_expert_doc
+from api.expert.chat import run_expert_chat, run_expert_doc
 from api.models import UserORM
 
 logger = logging.getLogger(__name__)

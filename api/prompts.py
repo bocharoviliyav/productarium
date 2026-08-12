@@ -98,7 +98,6 @@ SECTION_PROMPTS: Dict[str, str] = {}
 # the load calls (which reference them as fallbacks).
 # ============================================================================
 
-RAG_SYSTEM_PROMPT = ""
 WIKI_OVERVIEW_PROMPT = ""
 WIKI_ARCHITECTURE_PROMPT = ""
 WIKI_FUNCTIONAL_PROMPT = ""
@@ -111,43 +110,11 @@ WIKI_COMPACT_GENERATION_PROMPT = ""
 DEEP_RESEARCH_FIRST_ITERATION_PROMPT = ""
 DEEP_RESEARCH_FINAL_ITERATION_PROMPT = ""
 DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT = ""
-SIMPLE_CHAT_SYSTEM_PROMPT = ""
-RAG_SYSTEM_PROMPT = ""
 MERMAID_REPAIR_PROMPT = ""
 # Unified verification guard (anti-hallucination + citation + no-line-numbers
 # rules). Appended to every generation prompt via VERIFICATION_GUARD. Loaded
 # from refs/prompts/_verification_guard.md; hot-reloadable via the admin panel.
 VERIFICATION_GUARD = ""
-# RAG render template (Jinja-style, consumed by api/rag.py). This is a
-# structural render template — not an LLM prompt body — so it stays inline and
-# is NOT loaded from refs/prompts.
-RAG_TEMPLATE = r"""<START_OF_SYS_PROMPT>
-{system_prompt}
-{output_format_str}
-<END_OF_SYS_PROMPT>
-{# OrderedDict of DialogTurn #}
-{% if conversation_history %}
-<START_OF_CONVERSATION_HISTORY>
-{% for key, dialog_turn in conversation_history.items() %}
-{{key}}.
-User: {{dialog_turn.user_query.query_str}}
-You: {{dialog_turn.assistant_response.response_str}}
-{% endfor %}
-<END_OF_CONVERSATION_HISTORY>
-{% endif %}
-{% if contexts %}
-<START_OF_CONTEXT>
-{% for context in contexts %}
-{{loop.index}}.
-File Path: {{context.meta_data.get('file_path', 'unknown')}}
-Content: {{context.text}}
-{% endfor %}
-<END_OF_CONTEXT>
-{% endif %}
-<START_OF_USER_PROMPT>
-{{input_str}}
-<END_OF_USER_PROMPT>
-"""
 
 # ============================================================================
 # DYNAMIC PROMPT LOADING FROM REFS
@@ -186,10 +153,10 @@ def load_prompt_file(filename: str, fallback: str) -> str:
 # attribute name that holds the loaded prompt text.
 #
 # Note: expert_agent_system.md and expert_agent_doc.md are consumed by
-# ``api.expert_agent`` (which loads them via ``load_prompt_file`` into its
+# ``api.expert.prompt`` (which loads them via ``load_prompt_file`` into its
 # own ``EXPERT_SYSTEM_PROMPT`` / ``EXPERT_DOC_PROMPT`` constants). They are
 # included here so ``reload_prompt_file`` can also refresh them via
-# ``importlib.reload(api.expert_agent)`` (best-effort, optional).
+# ``importlib.reload(api.expert.prompt)`` (best-effort, optional).
 PROMPT_FILES: Dict[str, str] = {
     "overview.md": "WIKI_OVERVIEW_PROMPT",
     "architecture.md": "WIKI_ARCHITECTURE_PROMPT",
@@ -203,8 +170,6 @@ PROMPT_FILES: Dict[str, str] = {
     "deep_research_first_iteration.md": "DEEP_RESEARCH_FIRST_ITERATION_PROMPT",
     "deep_research_final_iteration.md": "DEEP_RESEARCH_FINAL_ITERATION_PROMPT",
     "deep_research_intermediate_iteration.md": "DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT",
-    "simple_chat_system_prompt.md": "SIMPLE_CHAT_SYSTEM_PROMPT",
-    "rag_system_prompt.md": "RAG_SYSTEM_PROMPT",
     "expert_agent_system.md": "EXPERT_SYSTEM_PROMPT",
     "expert_agent_doc.md": "EXPERT_DOC_PROMPT",
     "product_summary.md": "PRODUCT_SUMMARY_PROMPT",
@@ -256,20 +221,23 @@ def reload_prompt_file(filename: str) -> bool:
     section_id = _section_id_by_attr.get(attr_name)
     if section_id is not None:
         SECTION_PROMPTS[section_id] = content
-    # Expert agent prompts live in api.expert_agent as module-level constants.
-    # Best-effort refresh: reload the module so its constants are re-read.
+    # Expert agent prompts live in api.expert.prompt as module-level constants.
+    # ``api.expert.chat`` reads them via ``api.expert.prompt.<CONST>`` at call
+    # time (not captured at import), so reloading the prompt module updates the
+    # module object the chat path references and the next call picks up the new
+    # text. Best-effort refresh.
     if filename in ("expert_agent_system.md", "expert_agent_doc.md"):
         try:
             import importlib
-            import api.expert_agent as _ea  # type: ignore
-            importlib.reload(_ea)
+            import api.expert.prompt as _ep  # type: ignore
+            importlib.reload(_ep)
         except Exception as e:  # pragma: no cover - optional best-effort
-            logger.warning("reload_prompt_file: could not reload api.expert_agent: %s", e)
+            logger.warning("reload_prompt_file: could not reload api.expert.prompt: %s", e)
     # The verification guard is consumed by name from this module by every
-    # generation path (wiki_generator, expert_agent, artifact_docgen,
-    # simple_chat, websocket_wiki). It has no SECTION_PROMPTS entry; the
-    # globals() update above is sufficient for newly-built prompts to pick it
-    # up. (Already-built long-lived generators re-read it lazily.)
+    # generation path (docgen, expert_agent, wiki_generator). It has
+    # no SECTION_PROMPTS entry; the globals() update above is sufficient for
+    # newly-built prompts to pick it up. (Already-built long-lived generators
+    # re-read it lazily.)
     logger.info("reload_prompt_file: refreshed %r -> %s", filename, attr_name)
     return True
 
@@ -298,10 +266,6 @@ DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT = load_prompt_file(
     "deep_research_intermediate_iteration.md", DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT
 )
 
-SIMPLE_CHAT_SYSTEM_PROMPT = load_prompt_file(
-    "simple_chat_system_prompt.md", SIMPLE_CHAT_SYSTEM_PROMPT
-)
-RAG_SYSTEM_PROMPT = load_prompt_file("rag_system_prompt.md", RAG_SYSTEM_PROMPT)
 MERMAID_REPAIR_PROMPT = load_prompt_file("mermaid_repair.md", MERMAID_REPAIR_PROMPT)
 VERIFICATION_GUARD = load_prompt_file("_verification_guard.md", VERIFICATION_GUARD)
 

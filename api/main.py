@@ -21,7 +21,7 @@ bootstrap_secret_key()
 from api.ssl_config import apply_ssl_env
 apply_ssl_env()
 
-from api.logging_config import setup_logging
+from api.utils import setup_logging
 
 # Configure logging
 setup_logging()

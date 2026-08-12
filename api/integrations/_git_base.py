@@ -160,7 +160,7 @@ class GitConnector:
         ``source_id`` is a git URL. ``opts`` may carry ``"token"`` to override
         the configured token (e.g. a per-request token from the caller).
         """
-        from api.data_pipeline import download_repo
+        from api.clients.git import download_repo
 
         opts = opts or {}
         token = opts.get("token") or self._token()

@@ -64,12 +64,10 @@ FORMAT_CONTRACT: dict[str, set[str]] = {
                                                 "research_iteration"},
     "deep_research_final_iteration.md": {"language_name", "repo_name",
                                         "repo_type", "repo_url"},
-    "simple_chat_system_prompt.md": {"language_name", "repo_name",
-                                    "repo_type", "repo_url"},
 }
 
 # No runtime placeholders at all.
-NO_PLACEHOLDER: set[str] = {"_verification_guard.md", "rag_system_prompt.md"}
+NO_PLACEHOLDER: set[str] = {"_verification_guard.md"}
 
 # recommended-next; str.replace with literal JSON braces allowed.
 REPLACE_LOOSE: dict[str, set[str]] = {

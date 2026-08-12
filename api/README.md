@@ -108,7 +108,7 @@ Add new `api/integrations/<name>.py` subclassing `IntegrationConnector` — no c
 
 - **`rag.py`** — RAG implementation. Custom `Memory`/`CustomConversation`/`DialogTurn` (adalflow workaround). `RAG` class manages retriever, FAISS indices, queries. Parameters: text splitter (350 words, 100 overlap), retriever top_k=20.
 - **`data_pipeline.py`** — Repository cloning (GitHub/GitLab, shallow `--depth=1`), file reading with include/exclude filters, `DatabaseManager` (FAISS indices).
-- **`artifact_docgen.py`** — Artifact documentation pipeline. Dispatches by type: codebase→RLM (fast-rlm, if ≥20k chars) or standard LLM; spec→parse + enrich; documentation/guides→LLM. All paths index into cognee and persist `generated_docs` + `pages`.
+- **`docgen/`** — Artifact documentation package. `dispatcher.py` dispatches by type: codebase→RLM (fast-rlm, if ≥20k chars) or standard LLM; spec→parse + enrich; documentation/guides→LLM. Split across `codebase.py` / `spec.py` / `simple.py` / `_common.py` (shared helpers). All paths index into cognee and persist `generated_docs` + `pages`.
 - **`expert_agent.py`** — Expert agent (cognee-recall + RLM routing + LLM streaming). Prompt bodies in `refs/prompts/expert_agent_*.md`.
 - **`wiki_generator.py`** — Sequential 7-section wiki generation (Overview → Architecture → Functional → Technical → CI/CD → LLD → Data Model). Section bodies from `refs/prompts/<section>.md`. Substitution via `str.replace` (not `.format`).
 - **`cognee_manager.py`** — cognee integration (local Ollama for LLM + embeddings; no cloud key). `init_cognee()`, `add_and_index_document()`, `query_cognee()` — all async, all non-fatal.

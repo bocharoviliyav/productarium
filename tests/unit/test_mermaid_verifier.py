@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the Mermaid verifier + repair loop (api.mermaid_verifier).
+"""Unit tests for the Mermaid verifier + repair loop (api.formats.mermaid).
 
 Runs under pytest (pytest.ini: testpaths=test). No live LLM/Node required for
 the core logic tests: ``verify_diagram`` is monkeypatched to return canned
@@ -28,14 +28,14 @@ def _isolated_env(tmp_path, monkeypatch):
     # Force-reload the module so env changes take effect for module-level
     # tunables (they are read at import time).
     import importlib
-    import api.mermaid_verifier as mv
+    import api.formats.mermaid as mv
     importlib.reload(mv)
     yield
 
 
 def _reload():
     import importlib
-    import api.mermaid_verifier as mv
+    import api.formats.mermaid as mv
     importlib.reload(mv)
     return mv
 
@@ -396,20 +396,20 @@ def _node_and_mermaid_available():
 )
 class TestRealNodeValidator:
     def test_valid_diagram_ok(self):
-        import api.mermaid_verifier as mv
+        import api.formats.mermaid as mv
         res = asyncio.run(mv.verify_diagram("flowchart TD\n  A --> B\n"))
         assert res.ok is True
         assert not res.unverifiable
 
     def test_broken_diagram_reports_error(self):
-        import api.mermaid_verifier as mv
+        import api.formats.mermaid as mv
         res = asyncio.run(mv.verify_diagram("flowchart TD\n  A --> > B\n"))
         assert res.ok is False
         assert res.error
         assert not res.unverifiable
 
     def test_c4_marked_unverifiable(self):
-        import api.mermaid_verifier as mv
+        import api.formats.mermaid as mv
         res = asyncio.run(
             mv.verify_diagram('C4Context\n  title Test\n  Person(user, "User")\n')
         )
@@ -417,7 +417,7 @@ class TestRealNodeValidator:
         assert res.unverifiable is True
 
     def test_run_repair_loop_with_real_verifier(self):
-        import api.mermaid_verifier as mv
+        import api.formats.mermaid as mv
 
         async def llm(prompt):
             return "```mermaid\nflowchart TD\n    A --> B\n```"

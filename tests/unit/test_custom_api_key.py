@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 from api.settings_store import _sanitize_api_key
-from api.openai_client import OpenAIClient
+from api.clients.openai_client import OpenAIClient
 from api.config_abstraction import sync_runtime_settings
 
 
@@ -42,7 +42,7 @@ class TestCustomAPIKeyHandling(unittest.TestCase):
         self.assertTrue(OpenAIClient._is_no_auth_placeholder("not-needed"))
         self.assertTrue(OpenAIClient._is_no_auth_placeholder(None))
 
-    @patch("api.openai_client.OpenAI")
+    @patch("api.clients.openai_client.OpenAI")
     def test_openai_client_initialization_with_custom_key(self, mock_openai):
         uuid_key = "12345678-abcd-1234-abcd-123456789abc"
         base_url = "http://my-gateway.example.com/v1"
@@ -128,7 +128,7 @@ class TestLongRunningTimeouts(unittest.TestCase):
             set_setting(key, "", encrypt=False)
 
     def test_request_timeout_default_and_override(self):
-        from api.openai_client import _resolve_request_timeout
+        from api.clients.openai_client import _resolve_request_timeout
 
         # Default is 3600s (1 h) to accommodate long generation/cognify on
         # large repos.
@@ -141,7 +141,7 @@ class TestLongRunningTimeouts(unittest.TestCase):
         self.assertEqual(_resolve_request_timeout(), 60.0)
 
     def test_retry_max_time_default_and_override(self):
-        from api.openai_client import _resolve_retry_max_time
+        from api.clients.openai_client import _resolve_retry_max_time
 
         # Default 900s lets a rate-limited cognee/embedding call actually
         # complete its backoff instead of aborting after 5s.
@@ -187,7 +187,7 @@ class TestLongRunningTimeouts(unittest.TestCase):
         os.environ["DOCGEN_INDEXING_DRAIN_SECONDS"] = "60"
         self.assertEqual(resolve_docgen_indexing_drain_seconds(), 60.0)
 
-    @patch("api.openai_client.OpenAI")
+    @patch("api.clients.openai_client.OpenAI")
     def test_client_uses_configured_timeout(self, mock_openai):
         import httpx
 
@@ -207,14 +207,14 @@ class TestAllPlaceholderDetection(unittest.TestCase):
     placeholder-filled "success"."""
 
     def test_all_placeholder_raises(self):
-        import api.artifact_docgen as adg
+        import api.docgen.codebase as adg
 
         placeholder = adg._SECTION_UNAVAILABLE_PLACEHOLDER
         with self.assertRaises(ValueError):
             adg._raise_if_all_sections_unavailable({"a": placeholder, "b": placeholder})
 
     def test_mixed_content_does_not_raise(self):
-        import api.artifact_docgen as adg
+        import api.docgen.codebase as adg
 
         placeholder = adg._SECTION_UNAVAILABLE_PLACEHOLDER
         # At least one real section -> NOT a total failure; must not raise.
@@ -223,7 +223,7 @@ class TestAllPlaceholderDetection(unittest.TestCase):
         )
 
     def test_empty_does_not_raise(self):
-        import api.artifact_docgen as adg
+        import api.docgen.codebase as adg
 
         # No sections (e.g. a non-codebase artifact path) -> nothing to flag.
         adg._raise_if_all_sections_unavailable({})

@@ -14,7 +14,7 @@ can be added by implementing three methods:
 - ``pull(source_id, opts=None)`` -> ``{"title", "markdown", "attachments", ...}``
   — fetch a single space/repo/page and return its markdown representation.
   ``attachments`` is a list of ``{"filename", "markdown"}`` for converted
-  binary attachments (handled via :mod:`api.markitdown_client`).
+  binary attachments (handled via :mod:`api.formats.markitdown`).
 
 Configuration is injected via the constructor (``config`` dict). Connectors
 load their own config from :mod:`api.settings_store` through the classmethod

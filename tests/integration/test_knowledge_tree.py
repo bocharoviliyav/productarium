@@ -4,10 +4,10 @@
 Covers:
 - ``api.routers.knowledge.build_tree`` (parent_id nesting + orphan handling)
 - ``api.routers.knowledge._slugify``
-- ``api.knowledge_summary.generate_product_summary`` (mocked LLM + empty content)
-- ``api.artifact_docgen`` new-type dispatch (spec/links/documentation/guides +
+- ``api.docgen.summary.generate_product_summary`` (mocked LLM + empty content)
+- ``api.docgen.dispatcher`` new-type dispatch (spec/links/documentation/guides +
   legacy type mapping) via monkeypatched sub-generators
-- ``api.artifact_docgen._render_links_index`` / ``generate_links_docs`` /
+- ``api.docgen.simple._render_links_index`` / ``generate_links_docs`` /
   ``generate_guides_docs`` / ``generate_documentation_docs`` (passthrough)
 - Router endpoint integration (create/get/tree/put/delete/verify) over an
   isolated SQLite DB via FastAPI TestClient with dependency overrides.
@@ -127,7 +127,7 @@ class TestSlugify:
 # --- Summary (mocked LLM) ----------------------------------------------------
 class TestProductSummary:
     def test_summary_with_mocked_llm(self, monkeypatch):
-        import api.knowledge_summary as ks
+        import api.docgen.summary as ks
 
         class _FakeLLM:
             async def generate(self, prompt: str) -> str:
@@ -147,13 +147,13 @@ class TestProductSummary:
         assert out == "Acme is a service."
 
     def test_summary_empty_when_no_content(self):
-        import api.knowledge_summary as ks
+        import api.docgen.summary as ks
         product = SimpleNamespace(id="prod_1", name="Acme")
         out = asyncio.run(ks.generate_product_summary(product, [], []))
         assert out == ""
 
     def test_summary_empty_when_llm_unavailable(self, monkeypatch):
-        import api.knowledge_summary as ks
+        import api.docgen.summary as ks
         monkeypatch.setattr(ks, "_safe_build_summary_llm", lambda p, m, **kw: None)
         product = SimpleNamespace(id="prod_1", name="Acme")
         artifacts = [SimpleNamespace(id="a", name="a", generated_docs="some docs")]
@@ -161,7 +161,7 @@ class TestProductSummary:
         assert out == ""
 
     def test_collect_summary_content_caps_large_input(self):
-        import api.knowledge_summary as ks
+        import api.docgen.summary as ks
         big = "x" * (ks.SUMMARY_CONTEXT_MAX_CHARS + 5000)
         artifacts = [SimpleNamespace(id="a", name="a", generated_docs=big)]
         out = ks._collect_summary_content(artifacts, [])
@@ -174,7 +174,7 @@ class TestArtifactDocgenDispatch:
     @pytest.fixture
     def patched_generators(self, monkeypatch):
         """Monkeypatch every sub-generator to return a sentinel; no LLM/cognee."""
-        import api.artifact_docgen as adg
+        import api.docgen.dispatcher as adg
         sentinels = {}
 
         def _mk(name):
@@ -260,12 +260,12 @@ class TestArtifactDocgenDispatch:
 class TestRealGenerators:
     @pytest.fixture
     def no_index(self, monkeypatch):
-        import api.artifact_docgen as adg
+        import api.docgen.simple as adg
         monkeypatch.setattr(adg, "_index_in_background", lambda *a, **k: None)
         return adg
 
     def test_render_links_index_json_list(self):
-        from api.artifact_docgen import _render_links_index
+        from api.docgen.simple import _render_links_index
         art = SimpleNamespace(name="Useful links")
         content = '[{"url":"https://a.example","title":"A","description":"aa"},{"url":"https://b.example","title":"B"}]'
         md = _render_links_index(content, art)
@@ -275,19 +275,19 @@ class TestRealGenerators:
         assert "[B](https://b.example)" in md
 
     def test_render_links_index_links_wrapper(self):
-        from api.artifact_docgen import _render_links_index
+        from api.docgen.simple import _render_links_index
         art = SimpleNamespace(name="L")
         md = _render_links_index('{"links":[{"url":"https://x","title":"X"}]}', art)
         assert "[X](https://x)" in md
 
     def test_render_links_index_non_json_passthrough(self):
-        from api.artifact_docgen import _render_links_index
+        from api.docgen.simple import _render_links_index
         art = SimpleNamespace(name="L")
         md = _render_links_index("## My links\n- [x](https://x)", art)
         assert "## My links" in md
 
     def test_render_links_index_empty(self):
-        from api.artifact_docgen import _render_links_index
+        from api.docgen.simple import _render_links_index
         art = SimpleNamespace(name="L")
         md = _render_links_index("", art)
         assert "Ссылки не предоставлены" in md
@@ -507,7 +507,7 @@ class TestKnowledgeRouterEndpoints:
 
         # Mock the summary LLM so we don't need live Ollama. The real builder
         # now accepts base_url/api_key kwargs; accept them here too.
-        import api.knowledge_summary as ks
+        import api.docgen.summary as ks
         class _FakeLLM:
             async def generate(self, prompt):
                 return "Acme is a service that does X and Y."

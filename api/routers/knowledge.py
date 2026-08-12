@@ -21,11 +21,10 @@ Design notes:
   ``KnowledgeNode`` Pydantic model has no ``children`` field by design).
 - Subtree deletion is handled by the DB-level ``ON DELETE CASCADE`` on
   ``knowledge_nodes.parent_id``; we simply delete the node and commit.
-- The markitdown upload imports ``api.markitdown_client`` LAZILY inside the
-  handler (the integrations agent owns that module; it may be absent before
-  merge). On absence we degrade gracefully (text passthrough or 501).
-- The summary uses ``api.knowledge_summary.generate_product_summary`` (self-
-  contained, decoupled from ``api.expert_agent``) and stores the result onto
+- The markitdown upload imports ``api.formats.markitdown`` LAZILY inside the
+  handler. On absence we degrade gracefully (text passthrough or 501).
+- The summary uses ``api.docgen.summary.generate_product_summary`` (self-
+  contained, decoupled from ``api.expert``) and stores the result onto
   ``ProductORM.summary``.
 """
 
@@ -44,7 +43,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from api.auth.deps import get_current_user
 from api.db import get_db
-from api.knowledge_summary import generate_product_summary
+from api.docgen.summary import generate_product_summary
 from api.models import ArtifactORM, KnowledgeNodeORM, ProductORM
 from api.schemas import (
     KnowledgeNode,
@@ -316,7 +315,7 @@ def update_node(
     # expert agent / Ask recall user edits. Fire-and-forget; never fatal.
     if content_changed and node.content_md and node.content_md.strip():
         try:
-            from api.artifact_docgen import _index_in_background
+            from api.docgen import _index_in_background
             _index_in_background(node.content_md, f"prod_{product_id}")
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("Cognee re-index failed for node %s: %s", node_id, e)
@@ -342,19 +341,18 @@ def delete_node(
 # markitdown upload
 # --------------------------------------------------------------------------- #
 def _convert_via_markitdown(data: bytes, filename: str) -> tuple:
-    """Try api.markitdown_client.convert_to_markdown with common conventions.
+    """Try api.formats.markitdown.convert_to_markdown with common conventions.
 
-    Returns ``(ok, markdown_or_error)``. The integrations agent owns
-    ``api.markitdown_client``; we import it lazily and tolerate either a
-    path-based or bytes-based ``convert_to_markdown`` signature.
+    Returns ``(ok, markdown_or_error)``. We import it lazily and tolerate
+    either a path-based or bytes-based ``convert_to_markdown`` signature.
     """
     try:
-        md = importlib.import_module("api.markitdown_client")
-    except Exception as e:  # module absent (pre-merge) -> degrade
-        return (False, f"markitdown_client unavailable: {e}")
+        md = importlib.import_module("api.formats.markitdown")
+    except Exception as e:  # module absent -> degrade
+        return (False, f"markitdown unavailable: {e}")
     convert = getattr(md, "convert_to_markdown", None)
     if convert is None:
-        return (False, "markitdown_client.convert_to_markdown not found")
+        return (False, "formats.markitdown.convert_to_markdown not found")
 
     suffix = os.path.splitext(filename or "")[1]
     tmp_path: Optional[str] = None

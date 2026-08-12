@@ -13,7 +13,7 @@ All endpoints require a valid Bearer API token (``require_api_token``), which
 also updates ``last_used_at``. Only verified content (``KnowledgeNode`` /
 ``Artifact`` with ``verified=True``) is exported or pushed.
 
-The expert agent (``api.expert_agent``) and integrations (``api.integrations``)
+The expert agent (``api.expert.chat``) and integrations (``api.integrations``)
 are imported lazily: they are built in parallel and may not be present yet, so
 a missing dependency degrades to a clear ``501`` instead of crashing the
 router import.
@@ -229,7 +229,7 @@ async def ask(
 ):
     """Reuse the expert agent to answer a query over a product (SSE stream).
 
-    The expert agent (``api.expert_agent.run_expert_chat``) is imported lazily.
+    The expert agent (``api.expert.chat.run_expert_chat``) is imported lazily.
     If it is not available (e.g. not yet merged) the endpoint returns 501 with
     a clear message instead of failing at import time.
     """
@@ -237,7 +237,7 @@ async def ask(
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
     try:
-        from api.expert_agent import run_expert_chat  # lazy: built in parallel
+        from api.expert.chat import run_expert_chat  # lazy: built in parallel
     except Exception as e:
         raise HTTPException(
             status_code=501, detail=f"Expert agent not available: {e}"

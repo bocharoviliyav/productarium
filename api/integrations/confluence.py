@@ -3,7 +3,7 @@
 Talks to the Confluence Cloud REST API v2 (``<base_url>/wiki/api/v2``) to list
 spaces, fetch page bodies (export/storage format), walk child pages, and
 download attachments. Binary attachments (docx/pdf/pptx/xlsx/...) are
-converted to markdown via :mod:`api.markitdown_client`.
+converted to markdown via :mod:`api.formats.markitdown`.
 
 Auth: Confluence Cloud uses HTTP Basic with ``email:api_token``; Confluence
 Server/Data Center uses a Bearer personal-access token. The settings store
@@ -27,7 +27,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from api.integrations.base import IntegrationConnector
-from api.markitdown_client import convert_to_markdown
+from api.formats.markitdown import convert_to_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ class ConfluenceConnector(IntegrationConnector):
         mode = (self.config.get("mode") or "direct").lower()
         if mode == "mcp":
             try:
-                from api.mcp_client import LocalMcpClient
+                from api.utils import LocalMcpClient
                 client = LocalMcpClient()
                 return client.is_configured()
             except Exception:
@@ -66,7 +66,7 @@ class ConfluenceConnector(IntegrationConnector):
 
     def _mcp_test(self) -> Dict[str, Any]:
         try:
-            from api.mcp_client import get_local_mcp_client
+            from api.utils import get_local_mcp_client
             client = get_local_mcp_client()
             res = client.test_connections()
             return {
@@ -78,7 +78,7 @@ class ConfluenceConnector(IntegrationConnector):
 
     def _mcp_list_spaces(self) -> List[Dict[str, Any]]:
         try:
-            from api.mcp_client import list_all_mcp_tools
+            from api.utils import list_all_mcp_tools
             tools = list_all_mcp_tools()
             out = []
             mcp_server = self.config.get("mcp_server") or "confluence"
@@ -91,7 +91,7 @@ class ConfluenceConnector(IntegrationConnector):
             return []
 
     def _mcp_pull(self, source_id: str, opts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        from api.mcp_client import invoke_mcp_tool
+        from api.utils import invoke_mcp_tool
         server = self.config.get("mcp_server") or "confluence"
         full_source_id = source_id if ":" in source_id else f"{server}:{source_id}"
         pulled = invoke_mcp_tool(full_source_id, opts=opts)

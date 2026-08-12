@@ -4,7 +4,7 @@
 Covers:
 - ``api.integrations.registry`` auto-discovery + get_connector + list_connectors
 - ``api.integrations.confluence`` connector with a mocked HTTP layer
-- ``api.markitdown_client.convert_to_markdown`` with a mocked markitdown + the
+- ``api.formats.markitdown.convert_to_markdown`` with a mocked markitdown + the
   graceful-placeholder path when markitdown is unavailable
 - ``api.integrations._git_base.GitConnector.extract_repo_name``
 
@@ -304,7 +304,7 @@ class TestConfluenceConnector:
 # --- markitdown client (mocked) ---------------------------------------------
 class TestMarkitdownClient:
     def test_convert_bytes_with_mocked_markitdown(self, monkeypatch):
-        import api.markitdown_client as mc
+        import api.formats.markitdown as mc
 
         class FakeResult:
             text_content = "# Converted markdown"
@@ -325,7 +325,7 @@ class TestMarkitdownClient:
         assert out == "# Converted markdown"
 
     def test_convert_path_with_mocked_markitdown(self, monkeypatch, tmp_path):
-        import api.markitdown_client as mc
+        import api.formats.markitdown as mc
 
         f = tmp_path / "doc.docx"
         f.write_bytes(b"DOCXBYTES")
@@ -345,7 +345,7 @@ class TestMarkitdownClient:
         assert mc.convert_to_markdown(str(f)) == "docx content"
 
     def test_placeholder_when_markitdown_missing(self, monkeypatch):
-        import api.markitdown_client as mc
+        import api.formats.markitdown as mc
 
         monkeypatch.setattr(mc, "_MARKITDOWN_AVAILABLE", None)
         monkeypatch.setattr(mc, "_MARKITDOWN", None)
@@ -357,7 +357,7 @@ class TestMarkitdownClient:
         assert out.startswith("<!--")
 
     def test_placeholder_on_conversion_error(self, monkeypatch):
-        import api.markitdown_client as mc
+        import api.formats.markitdown as mc
 
         class FakeMarkItDown:
             def convert(self, stream):

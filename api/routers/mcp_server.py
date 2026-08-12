@@ -145,7 +145,7 @@ async def _mcp_search_product_graph(product_id: str, query: str, top_k: int = 20
 
 async def _mcp_ask_expert(product_id: str, query: str, model: Optional[str] = None) -> str:
     try:
-        from api.expert_agent import run_expert_chat
+        from api.expert.chat import run_expert_chat
 
         ans = run_expert_chat(product_id=product_id, query=query, model=model, stream=False)
         if hasattr(ans, "__await__"):

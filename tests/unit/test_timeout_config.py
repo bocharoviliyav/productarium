@@ -40,6 +40,8 @@ WRAPPER_TO_KEY = {
     "resolve_cognee_graph_extraction_timeout": "cognee_graph_extraction",
     "resolve_cognee_cognify_timeout": "cognee_cognify",
     "resolve_cognee_llm_connection_timeout": "cognee_llm_connection",
+    "resolve_cognee_init_timeout": "cognee_init",
+    "resolve_cognee_recall_timeout": "cognee_recall",
     "resolve_docgen_indexing_drain_seconds": "docgen_indexing_drain",
     "resolve_rlm_api_timeout_ms": "rlm_api_ms",
     "resolve_rlm_section_timeout": "rlm_section",

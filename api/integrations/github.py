@@ -1,6 +1,6 @@
 """GitHub connector (plan section G).
 
-Wraps :func:`api.data_pipeline.download_repo` for cloning and the GitHub REST
+Wraps :func:`api.clients.git.download_repo` for cloning and the GitHub REST
 API (public ``api.github.com`` or GitHub Enterprise ``/api/v3``) for listing
 repositories. Credentials come from ``settings_store.get_git_creds("github")``.
 

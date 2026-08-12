@@ -188,7 +188,6 @@ function Field({
 type ModelTask = "docgen" | "expert" | "summary" | "cognee" | "embedder";
 
 interface ModelCfg {
-  provider: string;
   model: string;
   base_url: string;
   api_key: string;
@@ -211,7 +210,6 @@ interface ModelGroupResponse {
   resolved: Partial<Record<ModelTask, ModelResolvedEntry>>;
 }
 interface ModelResolvedEntry {
-  provider: string | null;
   model: string | null;
   base_url: string | null;
   api_key: string | null;
@@ -221,7 +219,6 @@ interface ModelResolvedEntry {
 }
 
 const DEFAULT_MODEL_CFG: ModelCfg = {
-  provider: "ollama",
   model: "",
   base_url: "",
   api_key: "",
@@ -237,49 +234,6 @@ const MODEL_TASKS: ModelTask[] = [
   "cognee",
   "embedder",
 ];
-
-// Provider presets surfaced as a dropdown in the admin Models section. Each
-// option maps to the backend provider id (ollama|openai_local) + a default
-// base_url; the base_url stays editable afterwards.
-type ModelProviderKey = "ollama" | "lmstudio" | "openai_compatible";
-
-const PROVIDER_PRESETS: Record<
-  ModelProviderKey,
-  { provider: string; base_url: string; labelKey: "providerOllama" | "providerLmstudio" | "providerOpenaiCompatible" }
-> = {
-  ollama: {
-    provider: "ollama",
-    base_url: "http://localhost:11434/v1",
-    labelKey: "providerOllama",
-  },
-  lmstudio: {
-    provider: "openai_local",
-    base_url: "http://localhost:1234/v1",
-    labelKey: "providerLmstudio",
-  },
-  openai_compatible: {
-    provider: "openai_local",
-    base_url: "",
-    labelKey: "providerOpenaiCompatible",
-  },
-};
-
-const PROVIDER_ORDER: ModelProviderKey[] = [
-  "ollama",
-  "lmstudio",
-  "openai_compatible",
-];
-
-/**
- * Derive the dropdown selection from a stored (provider, base_url) pair so the
- * Select reflects the saved config on load.
- */
-function providerKeyFromConfig(provider: string, base_url: string): ModelProviderKey {
-  if (provider === "ollama") return "ollama";
-  const host = (base_url || "").toLowerCase();
-  if (host.includes(":1234")) return "lmstudio";
-  return "openai_compatible";
-}
 
 function ModelsSection() {
   const { getJson, putJson, postJson, notify } = useAdminApi();
@@ -303,7 +257,6 @@ function ModelsSection() {
       for (const task of MODEL_TASKS) {
         const r = resolved[task];
         next[task] = {
-          provider: r?.provider ?? DEFAULT_MODEL_CFG.provider,
           model: r?.model ?? "",
           base_url: r?.base_url ?? "",
           api_key: "",
@@ -343,9 +296,10 @@ function ModelsSection() {
       const cur = cfg[task] ?? DEFAULT_MODEL_CFG;
       // The PUT contract expects flat setting keys `models.<task>.<field>`.
       // Only send api_key when the admin typed a new value, to avoid
-      // overwriting a stored secret with an empty string.
+      // overwriting a stored secret with an empty string. The `provider` field
+      // is no longer surfaced or sent; the backend always treats every model
+      // as OpenAI-compatible.
       const body: Record<string, string> = {
-        [`models.${task}.provider`]: cur.provider,
         [`models.${task}.model`]: cur.model,
         [`models.${task}.base_url`]: cur.base_url,
         [`models.${task}.max_prompt_tokens`]: cur.max_prompt_tokens,
@@ -407,46 +361,14 @@ function ModelsSection() {
       </p>
       {MODEL_TASKS.map((task) => {
         const c = cfg?.[task] ?? DEFAULT_MODEL_CFG;
-        const providerKey = providerKeyFromConfig(c.provider, c.base_url);
         return (
           <Card key={task} className="p-5">
             <div className="mb-4 flex items-center justify-between">
               <h3 className="font-editorial text-base tracking-tight text-ink">
                 {task}
               </h3>
-              <Tag tone="neutral">{c.provider || "ollama"}</Tag>
             </div>
             <div className="grid gap-4 md:grid-cols-2">
-              <div>
-                <Label>{tm.provider ?? "Provider"}</Label>
-                <Select
-                  value={providerKey}
-                  onChange={(e) => {
-                    const key = e.target.value as ModelProviderKey;
-                    const preset = PROVIDER_PRESETS[key];
-                    setCfg((prev) => {
-                      if (!prev) return prev;
-                      const cur = prev[task] ?? DEFAULT_MODEL_CFG;
-                      return {
-                        ...prev,
-                        [task]: {
-                          ...cur,
-                          provider: preset.provider,
-                          // Keep the existing base_url when the preset has none
-                          // (e.g. "OpenAI Compatible"); otherwise adopt it.
-                          base_url: preset.base_url || cur.base_url,
-                        },
-                      };
-                    });
-                  }}
-                >
-                  {PROVIDER_ORDER.map((key) => (
-                    <option key={key} value={key}>
-                      {tm?.[PROVIDER_PRESETS[key].labelKey] ?? key}
-                    </option>
-                  ))}
-                </Select>
-              </div>
               <Field
                 label={tm.model ?? "Model"}
                 value={c.model}
@@ -1505,6 +1427,8 @@ const TIMEOUT_FIELDS: { key: string; group: string }[] = [
   { key: "cognee_graph_extraction", group: "Cognee" },
   { key: "cognee_cognify", group: "Cognee" },
   { key: "cognee_llm_connection", group: "Cognee" },
+  { key: "cognee_init", group: "Cognee" },
+  { key: "cognee_recall", group: "Cognee" },
   { key: "docgen_indexing_drain", group: "Cognee" },
   { key: "rlm_api_ms", group: "RLM" },
   { key: "rlm_section", group: "RLM" },
@@ -1541,7 +1465,7 @@ function TimeoutsSection() {
   const { getJson, putJson, notify } = useAdminApi();
   const { messages } = useLanguage();
   const t = messages?.admin ?? {};
-  const tt = (t as Record<string, Record<string, string>>)?.timeouts ?? {};
+  const tt = t?.timeouts ?? {};
 
   // One form value per timeout key, keyed by the resolver key (without the
   // "timeouts." prefix). Empty string = no override (fall through to env /

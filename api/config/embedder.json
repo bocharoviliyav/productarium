@@ -1,10 +1,4 @@
 {
-  "embedder_ollama": {
-    "client_class": "OllamaClient",
-    "model_kwargs": {
-      "model": "nomic-embed-text"
-    }
-  },
   "embedder_openai_local": {
     "batch_size": 100,
     "client_class": "OpenAIClient",

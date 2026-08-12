@@ -609,21 +609,9 @@ def _ping_model_endpoint(
     if api_key and api_key != "not-needed":
         headers["Authorization"] = f"Bearer {api_key}"
     try:
-        if provider == "ollama":
-            # Ollama list endpoint (mirrors fetch_ollama_models).
-            resp = requests.get(
-                f"{base_url.rstrip('/')}/api/tags", headers=headers, timeout=10,
-                verify=requests_verify(),
-            )
-            if resp.status_code == 200:
-                names = [m.get("name", "") for m in resp.json().get("models", [])]
-                return {
-                    "success": True,
-                    "message": f"Ollama reachable; {len(names)} model(s).",
-                    "models": names,
-                }
-            return {"success": False, "message": f"Ollama returned status {resp.status_code}"}
-        # OpenAI-compatible (mirrors fetch_openai_local_models).
+        # Every supported server (Ollama, LM Studio, llama.cpp, vLLM, ...)
+        # exposes the OpenAI-compatible /v1/models endpoint, so the provider
+        # type no longer matters. Ollama's :11434 also serves /v1/models.
         url = base_url
         if not url.endswith("/v1"):
             url = url.rstrip("/") + "/v1"

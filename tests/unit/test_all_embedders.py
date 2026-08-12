@@ -27,7 +27,9 @@ class TestEmbedderConfiguration:
         """Test that embedder configurations load properly."""
         from api.config import configs, CLIENT_CLASSES
 
-        assert 'embedder_ollama' in configs, "Ollama embedder config missing"
+        # With the unified OpenAI-compatible provider, only the
+        # ``embedder_openai_local`` config exists; ``embedder_ollama`` was
+        # removed. Both client classes remain importable.
         assert 'embedder_openai_local' in configs, "OpenAI local embedder config missing"
 
         assert 'OpenAIClient' in CLIENT_CLASSES, "OpenAIClient missing from CLIENT_CLASSES"
@@ -98,7 +100,7 @@ class TestDataPipelineFunctions:
 
     def test_count_tokens(self):
         """Test token counting."""
-        from api.data_pipeline import count_tokens
+        from api.repositories.documents import count_tokens
 
         test_text = "This is a test string for token counting."
         for embedder_type in [None, 'ollama', 'openai_local']:
@@ -108,7 +110,7 @@ class TestDataPipelineFunctions:
 
     def test_prepare_data_pipeline(self):
         """Test data pipeline preparation."""
-        from api.data_pipeline import prepare_data_pipeline
+        from api.repositories.documents import prepare_data_pipeline
 
         for embedder_type in [None, 'ollama', 'openai_local']:
             try:
@@ -119,26 +121,17 @@ class TestDataPipelineFunctions:
                 logger.warning(f"Pipeline creation failed for embedder_type={embedder_type}: {e}")
 
 
-class TestRAGIntegration:
-    """Test RAG class integration with embedders."""
-
-    def test_rag_initialization(self):
-        """Test RAG initialization with default configuration."""
-        from api.rag import RAG
-
-        try:
-            rag = RAG(provider="ollama", model="qwen3.5:9b")
-            assert rag is not None, "RAG should be initialized"
-            assert hasattr(rag, 'embedder'), "RAG should have embedder"
-        except Exception as e:
-            logger.warning(f"RAG initialization failed: {e}")
-
-
 class TestEnvironmentVariableHandling:
     """Test embedder selection via environment variables."""
 
     def test_embedder_type_env_var(self):
-        """Test embedder selection via DEEPWIKI_EMBEDDER_TYPE environment variable."""
+        """Test embedder selection via DEEPWIKI_EMBEDDER_TYPE environment variable.
+
+        With the unified OpenAI-compatible provider, ``get_embedder_type()``
+        always returns ``'openai_local'`` regardless of the env var (the env
+        var is now inert). The module-level ``EMBEDDER_TYPE`` still reflects
+        the raw env value for backwards compatibility.
+        """
         import importlib
         import api.config
 
@@ -151,7 +144,9 @@ class TestEnvironmentVariableHandling:
 
                 from api.config import EMBEDDER_TYPE, get_embedder_type
                 assert EMBEDDER_TYPE == et, f"EMBEDDER_TYPE should be {et}"
-                assert get_embedder_type() == et, f"get_embedder_type() should return {et}"
+                # get_embedder_type() is hardcoded to 'openai_local'
+                assert get_embedder_type() == 'openai_local', \
+                    f"get_embedder_type() should always return 'openai_local' (got {get_embedder_type()!r})"
         finally:
             if original_value is not None:
                 os.environ['DEEPWIKI_EMBEDDER_TYPE'] = original_value

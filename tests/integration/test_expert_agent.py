@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the product-scoped expert agent (api.expert_agent) and its
+"""Unit tests for the product-scoped expert agent (api.expert) and its
 router (api.routers.expert) — Wave 2 scope F.
 
 Runs under pytest (pytest.ini: testpaths=test). No live Ollama / cognee / RLM /
@@ -60,13 +60,18 @@ class _FakeLLM:
 
 
 def _patch_llm(monkeypatch, text: str = "FAKE ANSWER", chunks: List[str] | None = None):
-    """Patch api.expert_agent._safe_build_llm to return a _FakeLLM."""
+    """Patch api.expert.generate._safe_build_llm to return a _FakeLLM.
+
+    ``_generate_answer`` (in ``api.expert.generate``) looks up
+    ``_safe_build_llm`` in ``generate``'s globals, so the patch must target
+    that submodule (not the ``api.expert`` package).
+    """
     fake = _FakeLLM(text=text, chunks=chunks)
 
     def _builder(*args, **kwargs):
         return fake
 
-    monkeypatch.setattr("api.expert_agent._safe_build_llm", _builder)
+    monkeypatch.setattr("api.expert.generate._safe_build_llm", _builder)
     return fake
 
 
@@ -80,12 +85,12 @@ def _patch_cognee(monkeypatch, payload: str):
 
 
 def _patch_rlm(monkeypatch, result: str, success: bool = True):
-    """Patch api.rlm_runner.run_rlm_task to return a fixed result dict."""
+    """Patch api.rlm.runner.run_rlm_task to return a fixed result dict."""
 
     async def _fake_rlm(query: str, model_name: str | None = None) -> Dict[str, Any]:
         return {"results": result, "usage": {}, "success": success}
 
-    monkeypatch.setattr("api.rlm_runner.run_rlm_task", _fake_rlm)
+    monkeypatch.setattr("api.rlm.runner.run_rlm_task", _fake_rlm)
 
 
 # ============================================================================
@@ -93,7 +98,7 @@ def _patch_rlm(monkeypatch, result: str, success: bool = True):
 # ============================================================================
 class TestImportsAndPrompts:
     def test_modules_import_cleanly(self):
-        import api.expert_agent  # noqa: F401
+        import api.expert  # noqa: F401
         import api.routers.expert  # noqa: F401
 
     def test_router_is_apirouter_with_products_prefix(self):
@@ -108,7 +113,7 @@ class TestImportsAndPrompts:
         assert "/api/products/{product_id}/ask/doc" in paths
 
     def test_prompts_loaded_from_refs(self):
-        import api.expert_agent as ea
+        import api.expert as ea
         # The .md files exist and are loaded (non-empty).
         assert ea.EXPERT_SYSTEM_PROMPT, "expert_agent_system.md not loaded"
         assert ea.EXPERT_DOC_PROMPT, "expert_agent_doc.md not loaded"
@@ -119,7 +124,7 @@ class TestImportsAndPrompts:
         assert "{language_name}" in ea.EXPERT_DOC_PROMPT
 
     def test_public_api_surface(self):
-        import api.expert_agent as ea
+        import api.expert as ea
         for name in ("run_expert_chat", "run_expert_doc"):
             assert hasattr(ea, name)
 
@@ -129,23 +134,23 @@ class TestImportsAndPrompts:
 # ============================================================================
 class TestHelpers:
     def test_safe_replace_substitutes_and_leaves_unmatched(self):
-        import api.expert_agent as ea
+        import api.expert as ea
         out = ea._safe_replace("a={x} b={y} c={z}", {"x": "1", "y": None})
         assert out == "a=1 b= c={z}"
 
     def test_safe_replace_empty_template(self):
-        import api.expert_agent as ea
+        import api.expert as ea
         assert ea._safe_replace("", {"x": "1"}) == ""
 
     def test_clean_llm_text_strips_fences(self):
-        import api.expert_agent as ea
+        import api.expert as ea
         assert ea._clean_llm_text("```markdown\n# T\nbody\n```") == "# T\nbody"
         assert ea._clean_llm_text("  plain  ") == "plain"
         assert ea._clean_llm_text(None) == ""
         assert ea._clean_llm_text("") == ""
 
     def test_chunk_text_keeps_short_lines_and_splits_long(self):
-        import api.expert_agent as ea
+        import api.expert as ea
         pieces = ea._chunk_text("hi\n" + ("a " * 200), size=20)
         assert pieces[0] == "hi\n"
         # Long line is split into multiple pieces each <= ~20 chars.
@@ -154,7 +159,7 @@ class TestHelpers:
             assert len(p) <= 21  # word + space tolerance
 
     def test_format_history_renders_pairs(self):
-        import api.expert_agent as ea
+        import api.expert as ea
         out = ea._format_history([
             {"role": "user", "content": "q1"},
             {"role": "assistant", "content": "a1"},
@@ -165,12 +170,12 @@ class TestHelpers:
         assert "<system>s</system>" in out
 
     def test_format_history_skips_empty(self):
-        import api.expert_agent as ea
+        import api.expert as ea
         assert ea._format_history([]) == ""
         assert ea._format_history([{"role": "user", "content": ""}]) == ""
 
     def test_build_prompt_includes_knowledge_and_query(self):
-        import api.expert_agent as ea
+        import api.expert as ea
         prompt = ea._build_prompt(
             ea.EXPERT_SYSTEM_PROMPT, "Acme", "KNOWLEDGE HERE", "<user>hi</user>", "QUESTION?"
         )
@@ -182,7 +187,7 @@ class TestHelpers:
         assert "<query>\nQUESTION?\n</query>" in prompt
 
     def test_build_prompt_uses_note_when_no_knowledge(self):
-        import api.expert_agent as ea
+        import api.expert as ea
         prompt = ea._build_prompt(ea.EXPERT_DOC_PROMPT, "Acme", "", "", "Q")
         assert "<note>" in prompt
         # No knowledge BLOCK was added. The template body mentions
@@ -198,13 +203,13 @@ class TestHelpers:
 # ============================================================================
 class TestKnowledgeRetrieval:
     def test_retrieve_uses_cognee_when_available(self, monkeypatch):
-        import api.expert_agent as ea
+        import api.expert as ea
         _patch_cognee(monkeypatch, "COGNEE CONTEXT")
         out = asyncio.run(ea._retrieve_product_knowledge("prod_1", "q"))
         assert out == "COGNEE CONTEXT"
 
     def test_retrieve_falls_back_to_artifact_docs(self, monkeypatch):
-        import api.expert_agent as ea
+        import api.expert as ea
         db = _sqlite_db()
         from api.models import ArtifactORM, ProductORM
 
@@ -232,14 +237,14 @@ class TestKnowledgeRetrieval:
         assert "Acme" not in out  # name comes from artifact, not product
 
     def test_fallback_returns_empty_for_missing_product(self, monkeypatch):
-        import api.expert_agent as ea
+        import api.expert as ea
         db = _sqlite_db()
         _patch_cognee(monkeypatch, "")
         out = asyncio.run(ea._retrieve_product_knowledge("does_not_exist", "q"))
         assert out == ""
 
     def test_fallback_artifact_docs_non_fatal_on_db_error(self, monkeypatch):
-        import api.expert_agent as ea
+        import api.expert as ea
         # Force SessionLocal to raise by pointing it at a broken callable.
         import api.db as dbmod
 
@@ -261,7 +266,7 @@ class TestKnowledgeRetrieval:
 # ============================================================================
 class TestRunExpertDoc:
     def test_returns_markdown_from_llm(self, monkeypatch):
-        import api.expert_agent as ea
+        import api.expert as ea
         _patch_cognee(monkeypatch, "CTX")
         _patch_llm(monkeypatch, text="# Generated Doc\n\nbody text")
         out = asyncio.run(ea.run_expert_doc("prod_1", "summarize the service"))
@@ -269,7 +274,7 @@ class TestRunExpertDoc:
         assert "body text" in out
 
     def test_returns_placeholder_when_llm_empty(self, monkeypatch):
-        import api.expert_agent as ea
+        import api.expert as ea
         _patch_cognee(monkeypatch, "CTX")
         _patch_llm(monkeypatch, text="")
         out = asyncio.run(ea.run_expert_doc("prod_1", "q"))
@@ -277,7 +282,7 @@ class TestRunExpertDoc:
         assert "prod_1" in out
 
     def test_rlm_used_for_long_context(self, monkeypatch):
-        import api.expert_agent as ea
+        import api.expert as ea
         import api.settings_store as ss
         monkeypatch.setattr(ss, "get_rlm_mode", lambda task: "auto")
         # Big knowledge -> prompt >= RLM_MIN_CHARS -> RLM path.
@@ -294,7 +299,7 @@ class TestRunExpertDoc:
 # ============================================================================
 class TestRunExpertChat:
     def test_collect_returns_full_answer(self, monkeypatch):
-        import api.expert_agent as ea
+        import api.expert as ea
         _patch_cognee(monkeypatch, "CTX")
         _patch_llm(monkeypatch, text="# Answer\nthe body")
         out = asyncio.run(
@@ -303,7 +308,7 @@ class TestRunExpertChat:
         assert out == "# Answer\nthe body"
 
     def test_stream_yields_chunks(self, monkeypatch):
-        import api.expert_agent as ea
+        import api.expert as ea
         _patch_cognee(monkeypatch, "CTX")
         _patch_llm(monkeypatch, text="FULL", chunks=["Hel", "lo", " world"])
 
@@ -316,7 +321,7 @@ class TestRunExpertChat:
         assert asyncio.run(_collect()) == ["Hel", "lo", " world"]
 
     def test_stream_uses_rlm_for_long_context(self, monkeypatch):
-        import api.expert_agent as ea
+        import api.expert as ea
         import api.settings_store as ss
         monkeypatch.setattr(ss, "get_rlm_mode", lambda task: "auto")
         _patch_cognee(monkeypatch, "K" * (ea.RLM_MIN_CHARS + 5000))
@@ -332,7 +337,7 @@ class TestRunExpertChat:
         assert asyncio.run(_collect()) == "RLM CHUNKED ANSWER"
 
     def test_stream_rlm_empty_falls_back_to_llm(self, monkeypatch):
-        import api.expert_agent as ea
+        import api.expert as ea
         _patch_cognee(monkeypatch, "K" * (ea.RLM_MIN_CHARS + 5000))
         # RLM fails -> standard LLM stream is used.
         _patch_rlm(monkeypatch, "", success=False)
@@ -347,26 +352,30 @@ class TestRunExpertChat:
         assert asyncio.run(_collect()) == ["FALL", "BACK"]
 
     def test_collect_no_llm_returns_empty(self, monkeypatch):
-        import api.expert_agent as ea
+        import api.expert as ea
         _patch_cognee(monkeypatch, "CTX")
         # _safe_build_llm returns None -> empty answer.
-        monkeypatch.setattr("api.expert_agent._safe_build_llm", lambda *a, **k: None)
+        monkeypatch.setattr("api.expert.generate._safe_build_llm", lambda *a, **k: None)
         out = asyncio.run(ea.run_expert_chat("prod_1", "q", stream=False))
         assert out == ""
 
     def test_messages_history_included_in_prompt(self, monkeypatch):
-        import api.expert_agent as ea
+        # ``_run_expert_chat_collect`` lives in ``api.expert.chat`` and looks up
+        # ``_generate_answer`` / ``_retrieve_product_knowledge`` /
+        # ``_product_name_by_id`` in ``chat``'s globals (not the package's), so
+        # the patches must target that use-site submodule.
+        import api.expert.chat as chat
         captured: dict = {}
 
         async def _fake_generate_answer(prompt, provider, model, base_url, api_key, use_rlm):
             captured["prompt"] = prompt
             return "ok"
 
-        monkeypatch.setattr(ea, "_generate_answer", _fake_generate_answer)
-        monkeypatch.setattr(ea, "_retrieve_product_knowledge", _async_value("CTX"))
-        monkeypatch.setattr(ea, "_product_name_by_id", lambda pid: "Acme")
+        monkeypatch.setattr(chat, "_generate_answer", _fake_generate_answer)
+        monkeypatch.setattr(chat, "_retrieve_product_knowledge", _async_value("CTX"))
+        monkeypatch.setattr(chat, "_product_name_by_id", lambda pid: "Acme")
         asyncio.run(
-            ea._run_expert_chat_collect(
+            chat._run_expert_chat_collect(
                 "prod_1", "current q", [{"role": "user", "content": "prior"}], None, None
             )
         )
