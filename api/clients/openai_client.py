@@ -366,13 +366,21 @@ class OpenAIClient(ModelClient):
         completion: Union[ChatCompletion, Generator[ChatCompletionChunk, None, None]],
     ) -> CompletionUsage:
 
-        try:
-            usage: CompletionUsage = CompletionUsage(
-                completion_tokens=completion.usage.completion_tokens,
-                prompt_tokens=completion.usage.prompt_tokens,
-                total_tokens=completion.usage.total_tokens,
+        # Some OpenAI-compatible gateways (and the streaming-accumulated
+        # ChatCompletion built in ``call``) return ``usage=None``. Guarding
+        # avoids "'NoneType' object has no attribute 'completion_tokens'" on
+        # every generation over large repos.
+        usage_obj = getattr(completion, "usage", None)
+        if usage_obj is None:
+            return CompletionUsage(
+                completion_tokens=None, prompt_tokens=None, total_tokens=None
             )
-            return usage
+        try:
+            return CompletionUsage(
+                completion_tokens=usage_obj.completion_tokens,
+                prompt_tokens=usage_obj.prompt_tokens,
+                total_tokens=usage_obj.total_tokens,
+            )
         except Exception as e:
             log.error(f"Error tracking the completion usage: {e}")
             return CompletionUsage(

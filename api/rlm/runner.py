@@ -92,12 +92,29 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
     # A :11434 URL is Ollama; a URL containing "ollama" is Ollama. Everything
     # else (LM Studio :1234, openrouter, corporate gateway, ...) is treated as
     # a generic OpenAI-compatible endpoint -> no tag coercion.
-    if ":11434" in base_url or "ollama" in base_url.lower():
+    is_ollama = ":11434" in base_url or "ollama" in base_url.lower()
+    if is_ollama:
         if "35b" in resolved_model:
             resolved_model = "qwen3.5:35b-a3b"
         elif ":" not in resolved_model.split("/")[-1]:
             # Looks like a cloud/Ollama-mismatched name -> safe local default.
             resolved_model = "qwen3:8b"
+    else:
+        # Non-Ollama OpenAI-compatible endpoints (corporate gateway, LM Studio,
+        # vLLM, ...) go through fast-rlm's litellm routing. litellm derives the
+        # provider from the model-name PREFIX; a bare local name like ``flash``
+        # or ``qwen/qwen3.6-27b`` is misread as provider ``flash``/``qwen`` and
+        # raises ``litellm.BadRequestError`` / "Connection error" before the
+        # request ever reaches the gateway. Prefix with ``openai/`` so litellm
+        # routes via its openai-compatible path with the configured api_base
+        # (mirrors cognee's _normalize_model_for_litellm). Idempotent: an
+        # already-prefixed name is not double-prefixed.
+        try:
+            from api.cognee._runtime import _normalize_model_for_litellm
+            resolved_model = _normalize_model_for_litellm("openai", resolved_model)
+        except Exception:  # pragma: no cover - import-safe
+            if not resolved_model.startswith(("openai/", "ollama/")):
+                resolved_model = f"openai/{resolved_model}"
 
     config = RLMConfig.default()
     config.primary_agent = resolved_model

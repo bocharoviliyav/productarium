@@ -411,6 +411,21 @@ async def _remember_with_timeout(payload, dataset_name: str, chunk_size: int) ->
             cognify_timeout, dataset_name,
         )
         # Soft success: do not re-raise. See docstring.
+    except asyncio.CancelledError as e:
+        # The outer timeout (cognee_cognify) cancelling this task shows up as a
+        # CancelledError bubbling out of ``extract_chunks_from_documents`` after
+        # the per-chunk graph-extraction path already logged
+        # "graph extraction skipped chunk due to TimeoutError". Cognee persists
+        # graph nodes + vectors incrementally per chunk, so the chunks processed
+        # before the cancellation are already committed. Treat as soft success
+        # (same as TimeoutError) instead of leaking the CancelledError, which
+        # previously surfaced as a confusing bare exception in the logs.
+        logger.warning(
+            "Cognee remember cancelled for dataset %r (%s); partial graph may be "
+            "indexed (cognee persists incrementally per chunk).",
+            dataset_name, e,
+        )
+        # Do not re-raise: see TimeoutError branch above.
 
 
 async def add_document(content_or_path: str, dataset_name: str) -> bool:
@@ -497,6 +512,17 @@ async def cognify_dataset(dataset_name: str) -> bool:
         # timeout are already persisted. Treat as a soft success so the caller
         # does not retry the whole dataset from scratch (which would duplicate
         # the already-indexed chunks and re-hit the rate limit).
+        return True
+    except asyncio.CancelledError as e:
+        # Same rationale as the TimeoutError branch: the outer timeout cancelling
+        # ``extract_chunks_from_documents`` surfaces as CancelledError after the
+        # per-chunk graph-extraction path logs "skipped chunk due to TimeoutError".
+        # Cognee persists per chunk, so the partial graph is already committed.
+        # Treat as soft success instead of propagating a bare CancelledError.
+        logger.warning(
+            "Cognify cancelled for dataset %r (%s); partial graph may be indexed.",
+            dataset_name, e,
+        )
         return True
     except Exception as e:
         logger.error("Error cognifying dataset %r: %s", dataset_name, e, exc_info=True)

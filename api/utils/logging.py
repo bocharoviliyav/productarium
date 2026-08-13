@@ -147,6 +147,36 @@ def setup_logging(format: str = None):
     # root logger; the file/console handlers are driven by the listener.
     logging.basicConfig(level=log_level, handlers=[queue_handler], force=True)
 
+    # --- Route third-party loggers through the root QueueHandler -----------
+    # adalflow (``adalflow.utils.logger.get_logger``) and litellm
+    # (``litellm._logging`` / ``litellm.litellm_logging_utils``) attach their
+    # OWN ``StreamHandler(sys.stdout)`` to named loggers with
+    # ``propagate=False``. Those direct handlers write synchronously on the
+    # calling thread -- from a worker thread (``asyncio.to_thread`` used by
+    # adalflow / RLM / cognee) to a pipe-backed stdout that raises
+    # ``BlockingIOError: [Errno 11] write could not complete without blocking``
+    # once the pipe buffer fills. They also emit noisy INFO records (adalflow's
+    # ``Prompt has variables: ['input_str']`` on every Generator construct;
+    # litellm's verbose request logging).
+    #
+    # Fix: clear their direct handlers, set propagate=True (so records flow to
+    # the root QueueHandler -> the listener thread's truncating formatter),
+    # and raise their level to WARNING so the INFO-level spam never even
+    # reaches the queue. ``setup_logging`` runs with ``force=True`` above, so
+    # re-running it (e.g. via tests) re-applies this cleanly.
+    for _vendor_name in (
+        "adalflow", "adalflow.core", "adalflow.utils", "adalflow.components",
+        "litellm", "litellm.litellm_logging_utils", "litellm.utils",
+        "httpx", "httpcore", "openai._base_client",
+    ):
+        try:
+            _vlog = logging.getLogger(_vendor_name)
+            _vlog.handlers = []  # drop their direct StreamHandler/FileHandler
+            _vlog.propagate = True  # -> root -> QueueHandler
+            _vlog.setLevel(logging.WARNING)
+        except Exception:
+            pass
+
     # Log configuration info
     logger = logging.getLogger(__name__)
     logger.debug(

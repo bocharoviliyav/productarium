@@ -597,6 +597,49 @@ async def _generate_section_mapreduce(
     return ""
 
 
+async def _reduce_section_drafts(
+    section_prompt: str,
+    drafts: List[str],
+    llm: Optional[_StandardLLM],
+) -> str:
+    """Merge per-chunk section drafts into one coherent section via the LLM.
+
+    Used by the map-reduce path (``_generate_section_mapreduce``) and the
+    agentic bottom-up engine (``_agentic_bottom_up_docgen``). The drafts are
+    each a section's worth of text (small), so the merged input fits the
+    standard LLM context. Returns cleaned text, or "" on LLM failure / empty
+    input (the caller falls back to concatenated drafts).
+    """
+    if not drafts:
+        return ""
+    if llm is None:
+        return "\n\n".join(drafts)
+    if len(drafts) == 1:
+        return drafts[0]
+    from api.utils import clamp_text_by_tokens
+    ctx_win = _resolve_rlm_context_window() or 8192
+    max_p_tokens = max(1024, ctx_win - 2048)
+    joined = "\n\n---\n\n".join(drafts)
+    joined = clamp_text_by_tokens(joined, max_p_tokens)
+    reduce_prompt = (
+        "Ниже представлены частичные черновики одного раздела документации,\n"
+        "полученные из разных частей кодовой базы. Объедини их в один\n"
+        "согласованный, непротиворечивый раздел на русском языке (технические\n"
+        "термины на английском). Убери дублирование, сохрани все технические\n"
+        "факты и имена. Не добавляй новых фактов, которых нет в черновиках.\n\n"
+        f"<section_instruction>\n{section_prompt}\n</section_instruction>\n\n"
+        f"<drafts>\n{joined}\n</drafts>\n\n"
+        "Готовый раздел:"
+    )
+    try:
+        txt = _clean_llm_text(await llm.generate(_with_verification_guard(reduce_prompt)))
+        if txt:
+            return txt
+    except Exception as e:  # pragma: no cover - depends on live Ollama
+        logger.warning("Section reduce LLM call failed: %s", e)
+    return ""
+
+
 async def _agentic_file_map_summary(
     block_chunk: str,
     llm: Optional[_StandardLLM],
