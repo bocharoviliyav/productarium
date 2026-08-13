@@ -3,8 +3,10 @@
 Split out of the former ``api/expert_agent.py`` (Step 6). Owns the
 ``_ExpertLLM`` adalflow Generator wrapper (non-streaming ``generate`` + async
 ``stream`` with chunked fallback), the ``_safe_build_llm`` graceful-degrade
-factory, ``_extract_chunk_text`` (Ollama + OpenAI streaming-chunk shape
-handling), and ``_resolve_expert_model`` (admin-configured provider/model/
+factory, ``_extract_chunk_fields`` / ``_extract_chunk_text`` (Ollama + OpenAI
+streaming-chunk shape handling including reasoning/thinking fields),
+``_ThinkingStreamParser`` (inline ``⬢`` tag splitter), and
+``_resolve_expert_model`` (admin-configured provider/model/
 base_url/api_key resolution for the ``expert`` task).
 
 ``_ExpertLLM`` mirrors ``api.docgen._common._StandardLLM`` for non-streaming
@@ -19,12 +21,26 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, AsyncIterator, Dict, Optional, Tuple
+import re
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from api.utils import setup_logging
+from api.expert.types import (
+    EVENT_CONTENT,
+    EVENT_REASONING,
+    ExpertStreamEvent,
+)
 
 setup_logging()
 logger = logging.getLogger(__name__)
+
+# Inline thinking tag delimiters used by some models (Ollama/Qwen3 with
+# think:false, or older checkpoints) that inline the reasoning trace directly
+# in the content field instead of emitting a separate field.
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+_THINK_UNCLOSED_RE = re.compile(r"<think>.*$", re.DOTALL)
 
 
 class _ExpertLLM:
@@ -97,12 +113,18 @@ class _ExpertLLM:
 
         return await asyncio.to_thread(_call)
 
-    async def stream(self, prompt: str) -> AsyncIterator[str]:
-        """Async-stream text chunks from the local LLM.
+    async def stream(self, prompt: str) -> AsyncIterator[ExpertStreamEvent]:
+        """Async-stream typed events from the local LLM.
+
+        Yields ``ExpertStreamEvent`` objects:
+        - ``("reasoning", text)`` for reasoning/thinking deltas (from
+          ``reasoning_content`` / ``reasoning`` / ``thinking`` fields or
+          inline ``<think>`` tags parsed from content).
+        - ``("content", text)`` for answer text deltas.
 
         Attempts true token streaming via the model client's ``acall``; on any
         failure falls back to non-streaming ``generate`` + chunked delivery so
-        the caller always receives incremental chunks.
+        the caller always receives incremental events.
         """
         # Late import: prompt.py defines _clean_llm_text + _chunk_text. Kept
         # local to avoid an import cycle (prompt -> llm would otherwise circle).
@@ -129,12 +151,27 @@ class _ExpertLLM:
             response = await self.model_client.acall(
                 api_kwargs=api_kwargs, model_type=ModelType.LLM
             )
+            parser = _ThinkingStreamParser()
             produced = False
             async for chunk in response:  # type: ignore[union-attr]
-                text = _extract_chunk_text(chunk, self.provider)
-                if text:
+                content_text, reasoning_text = _extract_chunk_fields(
+                    chunk, self.provider
+                )
+                # Separate reasoning field (DeepSeek/vLLM/Ollama thinking) —
+                # yield directly, no inline-tag parsing needed.
+                if reasoning_text:
                     produced = True
-                    yield text
+                    yield ExpertStreamEvent(EVENT_REASONING, reasoning_text)
+                # Content may contain inline <think> tags (Ollama/Qwen3 with
+                # think:false). Route through the stateful parser.
+                if content_text:
+                    produced = True
+                    for ev in parser.feed(content_text):
+                        yield ev
+            # Flush any text still buffered in the parser.
+            for ev in parser.flush():
+                produced = True
+                yield ev
             if produced:
                 return
             logger.warning(
@@ -152,39 +189,193 @@ class _ExpertLLM:
         except Exception as e:  # pragma: no cover - depends on live Ollama
             logger.warning("Expert LLM fallback generate failed: %s", e)
             return
+        # Strip inline thinking tags — the non-streaming fallback can't show
+        # reasoning separately, so remove it from the answer text.
+        text = _strip_thinking_tags(text)
         for piece in _chunk_text(text):
-            yield piece
+            yield ExpertStreamEvent(EVENT_CONTENT, piece)
 
 
-def _extract_chunk_text(chunk: Any, provider: str) -> Optional[str]:
-    """Extract a text delta from a streaming chunk (Ollama or OpenAI shape).
+class _ThinkingStreamParser:
+    """Stateful parser for inline ``<think>...</think>`` tags in the content stream.
 
-    Mirrors the extraction logic in ``api/websocket_wiki.py`` for both the
-    Ollama native format (``message.content``) and the OpenAI streaming format
-    (``choices[0].delta.content``).
+    Some models (Ollama/Qwen3 with ``think:false``, or older checkpoints)
+    inline the reasoning trace directly in the ``content`` field using
+    ``<think>...</think>`` tags instead of emitting a separate
+    ``reasoning_content`` / ``reasoning`` / ``thinking`` field. This parser
+    detects tag boundaries across chunk boundaries and yields
+    ``ExpertStreamEvent`` objects: reasoning events while inside ``<think>``,
+    content events outside.
+
+    When no ``<think>`` tags are present (non-reasoning models, or models that
+    emit reasoning as a separate field), text passes through as content
+    unchanged — near-zero overhead.
     """
-    # Ollama native format
+
+    def __init__(self) -> None:
+        self._in_thinking = False
+        self._buffer = ""
+
+    def feed(self, text: str) -> List[ExpertStreamEvent]:
+        """Process new text and return events. Buffers ambiguous tail."""
+        if not text:
+            return []
+        self._buffer += text
+        events: List[ExpertStreamEvent] = []
+
+        while self._buffer:
+            if self._in_thinking:
+                idx = self._buffer.find(_THINK_CLOSE)
+                if idx == -1:
+                    # No close tag yet — check for a partial tag at the end.
+                    partial = self._partial_tag_match(self._buffer, _THINK_CLOSE)
+                    if partial < len(self._buffer):
+                        events.append(
+                            ExpertStreamEvent(
+                                EVENT_REASONING, self._buffer[:partial]
+                            )
+                        )
+                        self._buffer = self._buffer[partial:]
+                        break
+                    # Entire buffer could be the start of the close tag.
+                    events.append(
+                        ExpertStreamEvent(EVENT_REASONING, self._buffer)
+                    )
+                    self._buffer = ""
+                    break
+                else:
+                    # Found the close tag.
+                    events.append(
+                        ExpertStreamEvent(EVENT_REASONING, self._buffer[:idx])
+                    )
+                    self._buffer = self._buffer[idx + len(_THINK_CLOSE) :]
+                    self._in_thinking = False
+                    # Strip leading whitespace after </think>.
+                    self._buffer = self._buffer.lstrip("\n")
+            else:
+                idx = self._buffer.find(_THINK_OPEN)
+                if idx == -1:
+                    # No open tag — check for a partial tag at the end.
+                    partial = self._partial_tag_match(self._buffer, _THINK_OPEN)
+                    if partial < len(self._buffer):
+                        events.append(
+                            ExpertStreamEvent(
+                                EVENT_CONTENT, self._buffer[:partial]
+                            )
+                        )
+                        self._buffer = self._buffer[partial:]
+                        break
+                    # Entire buffer could be the start of the open tag.
+                    events.append(
+                        ExpertStreamEvent(EVENT_CONTENT, self._buffer)
+                    )
+                    self._buffer = ""
+                    break
+                else:
+                    # Found the open tag.
+                    if idx > 0:
+                        events.append(
+                            ExpertStreamEvent(EVENT_CONTENT, self._buffer[:idx])
+                        )
+                    self._buffer = self._buffer[idx + len(_THINK_OPEN) :]
+                    self._in_thinking = True
+                    # Strip leading whitespace after <think>.
+                    self._buffer = self._buffer.lstrip("\n")
+
+        return events
+
+    def flush(self) -> List[ExpertStreamEvent]:
+        """Yield any remaining buffered text. Called when the stream ends."""
+        if not self._buffer:
+            return []
+        text = self._buffer
+        self._buffer = ""
+        if self._in_thinking:
+            # Stream ended inside thinking — yield as reasoning.
+            return [ExpertStreamEvent(EVENT_REASONING, text)]
+        return [ExpertStreamEvent(EVENT_CONTENT, text)]
+
+    @staticmethod
+    def _partial_tag_match(buffer: str, tag: str) -> int:
+        """Return the index where a partial tag prefix starts at the buffer end.
+
+        If the buffer ends with a prefix of ``tag`` (e.g. buffer ends with
+        ``"<thi"`` and tag is ``"<think>"``), return the start index of that
+        prefix so the caller can keep it buffered for the next chunk.
+        Otherwise return ``len(buffer)`` (nothing to keep).
+        """
+        max_overlap = min(len(buffer), len(tag) - 1)
+        for i in range(max_overlap, 0, -1):
+            if buffer[-i:] == tag[:i]:
+                return len(buffer) - i
+        return len(buffer)
+
+
+def _strip_thinking_tags(text: str) -> str:
+    """Remove inline ``<think>...</think>`` blocks (or unclosed ``<think>``)."""
+    text = _THINK_BLOCK_RE.sub("", text)
+    text = _THINK_UNCLOSED_RE.sub("", text)
+    return text.strip()
+
+
+def _get_field(obj: Any, *keys: str) -> Optional[str]:
+    """Get the first non-empty value for any of *keys* from a dict or object."""
+    for key in keys:
+        if isinstance(obj, dict):
+            val = obj.get(key)
+        else:
+            val = getattr(obj, key, None)
+        if val:
+            return val
+    return None
+
+
+def _extract_chunk_fields(
+    chunk: Any, provider: str
+) -> Tuple[Optional[str], Optional[str]]:
+    """Extract ``(content, reasoning)`` deltas from a streaming chunk.
+
+    Handles Ollama native (``message.content`` / ``message.thinking``), Ollama
+    /v1 (``choices[0].delta.reasoning``), DeepSeek/DashScope
+    (``choices[0].delta.reasoning_content``), and plain dict shapes. Either
+    element of the tuple may be ``None`` if the field is absent or empty.
+    """
+    # Ollama native format (object with .message attribute)
     message = getattr(chunk, "message", None)
     if message is not None:
         if isinstance(message, dict):
-            content = message.get("content")
+            content = message.get("content") or None
+            reasoning = _get_field(message, "thinking", "reasoning_content", "reasoning")
         else:
-            content = getattr(message, "content", None)
-        if isinstance(content, str) and content:
-            return content
-    # dict-shaped Ollama chunk
+            content = getattr(message, "content", None) or None
+            reasoning = _get_field(message, "thinking", "reasoning_content", "reasoning")
+        if (isinstance(content, str) and content) or reasoning:
+            return content, reasoning
+
+    # dict-shaped chunk
     if isinstance(chunk, dict):
         msg = chunk.get("message")
-        if isinstance(msg, dict) and msg.get("content"):
-            return msg["content"]
+        if isinstance(msg, dict):
+            content = msg.get("content") or None
+            reasoning = _get_field(msg, "thinking", "reasoning_content", "reasoning")
+            if content or reasoning:
+                return content, reasoning
+
         choices = chunk.get("choices") or []
         if choices:
             delta = choices[0].get("delta") or choices[0].get("message") or {}
-            if isinstance(delta, dict) and delta.get("content"):
-                return delta["content"]
+            if isinstance(delta, dict):
+                content = delta.get("content") or None
+                reasoning = _get_field(delta, "reasoning_content", "reasoning", "thinking")
+                if content or reasoning:
+                    return content, reasoning
+
         if chunk.get("content"):
-            return chunk["content"]
-    # OpenAI ChatCompletion chunk format
+            content = chunk["content"]
+            reasoning = _get_field(chunk, "thinking", "reasoning_content", "reasoning")
+            return content, reasoning
+
+    # OpenAI ChatCompletion chunk format (object with .choices)
     choices = getattr(chunk, "choices", None)
     if choices:
         try:
@@ -192,15 +383,28 @@ def _extract_chunk_text(chunk: Any, provider: str) -> Optional[str]:
         except Exception:
             delta = None
         if delta is not None:
-            content = getattr(delta, "content", None)
-            if isinstance(content, str) and content:
-                return content
+            content = getattr(delta, "content", None) or None
+            reasoning = _get_field(delta, "reasoning_content", "reasoning", "thinking")
+            if (isinstance(content, str) and content) or reasoning:
+                return content, reasoning
+
     # adalflow GeneratorOutput-style: .response / .data
     for attr in ("response", "data", "text"):
         val = getattr(chunk, attr, None)
         if isinstance(val, str) and val:
-            return val
-    return None
+            return val, None
+
+    return None, None
+
+
+def _extract_chunk_text(chunk: Any, provider: str) -> Optional[str]:
+    """Extract a text delta from a streaming chunk (backward-compat wrapper).
+
+    Delegates to ``_extract_chunk_fields`` and returns only the content part.
+    Kept so existing callers (and tests) that only need content still work.
+    """
+    content, _ = _extract_chunk_fields(chunk, provider)
+    return content
 
 
 def _safe_build_llm(

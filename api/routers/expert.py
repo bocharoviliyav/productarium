@@ -29,11 +29,24 @@ from pydantic import BaseModel, Field
 
 from api.auth.deps import get_current_user
 from api.expert.chat import run_expert_chat, run_expert_doc
+from api.expert.types import ExpertStreamEvent
 from api.models import UserORM
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/products", tags=["expert"])
+
+
+def _format_sse(chunk: object) -> str:
+    """Map a stream chunk to an SSE ``data:`` frame.
+
+    ``ExpertStreamEvent`` → typed frame (``{content}`` / ``{reasoning}`` /
+    ``{status}`` / ``{error}``). Plain ``str`` → ``{"content": ...}``
+    (backward compat with old test mocks that yield bare strings).
+    """
+    if isinstance(chunk, ExpertStreamEvent):
+        return f"data: {json.dumps({chunk.type: chunk.content}, ensure_ascii=False)}\n\n"
+    return f"data: {json.dumps({'content': str(chunk)}, ensure_ascii=False)}\n\n"
 
 
 class ChatMessage(BaseModel):
@@ -81,7 +94,7 @@ async def expert_ask(
             ):
                 if chunk is None:
                     continue
-                yield f"data: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
+                yield _format_sse(chunk)
         except Exception as e:  # pragma: no cover - defensive over streaming
             logger.error("expert /ask stream failed: %s", e, exc_info=True)
             yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"

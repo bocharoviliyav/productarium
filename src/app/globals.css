@@ -298,6 +298,81 @@ body {
   animation: toast-in 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
+/* ------------------------------------------------------------------
+   Expert chat — streaming, reasoning panel, phase-aware loader.
+   ------------------------------------------------------------------ */
+
+/* 3-dot pulse animation for the phase-aware loader. */
+@keyframes thinking-pulse {
+  0%, 60%, 100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+.thinking-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.thinking-dots span {
+  width: 4px;
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--foreground-muted);
+  animation: thinking-pulse 1.2s ease-in-out infinite;
+}
+.thinking-dots span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.thinking-dots span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+/* Streaming cursor — pulsing block appended to content while streaming. */
+@keyframes cursor-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.2;
+  }
+}
+.stream-cursor {
+  display: inline-block;
+  font-weight: 700;
+  color: var(--foreground-muted);
+  animation: cursor-pulse 0.9s ease-in-out infinite;
+  margin-left: 1px;
+}
+
+/* Reasoning panel — subtle pulsing dot while reasoning streams. */
+@keyframes reasoning-dot-pulse {
+  0%, 100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.reasoning-stream-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 9999px;
+  background: var(--foreground-muted);
+  animation: reasoning-dot-pulse 1s ease-in-out infinite;
+  vertical-align: middle;
+}
+
+/* Reasoning panel styling. */
+.reasoning-panel {
+  background: var(--surface-2);
+}
+
 /* Line clamp utilities (Tailwind v4 ships these, kept as a safety net). */
 .line-clamp-1 {
   overflow: hidden;

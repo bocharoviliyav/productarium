@@ -92,8 +92,15 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
     TimeoutKey(
         key="cognee_graph_extraction",
         env_var="COGNEE_GRAPH_EXTRACTION_TIMEOUT",
-        default=600.0,
-        floor=30.0,
+        # Per-chunk structured-output LLM call (instructor + markdown_json_mode)
+        # over a cognee chunk. A slow corporate gateway can take several minutes
+        # for a single JSON-schema extraction (the mode appends a "return JSON"
+        # instruction and parses a JSON block out of the plain-text completion,
+        # so the model emits a full section's worth of tokens before the parse).
+        # The previous 600s (10 min) default bit on corporate LLMs and logged
+        # "graph extraction skipped chunk due to TimeoutError" repeatedly.
+        default=1800.0,
+        floor=60.0,
         label="Cognee graph extraction (per chunk)",
         group="Cognee",
     ),

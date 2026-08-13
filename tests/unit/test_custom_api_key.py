@@ -157,18 +157,20 @@ class TestLongRunningTimeouts(unittest.TestCase):
             _resolve_cognify_timeout,
         )
 
-        # Graph extraction default 600s per chunk; cognify default 7200s overall.
-        self.assertEqual(_resolve_graph_extraction_timeout(), 600.0)
+        # Graph extraction default 1800s (30 min) per chunk so a slow corporate
+        # gateway doing markdown_json_mode extraction is not aborted per chunk;
+        # cognify default 7200s overall.
+        self.assertEqual(_resolve_graph_extraction_timeout(), 1800.0)
         self.assertEqual(_resolve_cognify_timeout(), 7200.0)
 
-        os.environ["COGNEE_GRAPH_EXTRACTION_TIMEOUT"] = "900"
-        self.assertEqual(_resolve_graph_extraction_timeout(), 900.0)
+        os.environ["COGNEE_GRAPH_EXTRACTION_TIMEOUT"] = "2400"
+        self.assertEqual(_resolve_graph_extraction_timeout(), 2400.0)
         os.environ["COGNEE_COGNIFY_TIMEOUT"] = "14400"
         self.assertEqual(_resolve_cognify_timeout(), 14400.0)
 
         # Invalid values fall back to the defaults, not crash.
         os.environ["COGNEE_GRAPH_EXTRACTION_TIMEOUT"] = "not-a-number"
-        self.assertEqual(_resolve_graph_extraction_timeout(), 600.0)
+        self.assertEqual(_resolve_graph_extraction_timeout(), 1800.0)
         os.environ["COGNEE_COGNIFY_TIMEOUT"] = ""
         self.assertEqual(_resolve_cognify_timeout(), 7200.0)
 

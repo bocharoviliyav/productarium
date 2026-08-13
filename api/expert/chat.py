@@ -22,7 +22,7 @@ import) so ``api.prompts.reload_prompt_file`` can hot-reload them by reloading
 from __future__ import annotations
 
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 from api.utils import setup_logging
 from api.expert.generate import (
@@ -38,6 +38,14 @@ from api.expert.knowledge import (
 from api.expert.llm import _resolve_expert_model
 from api.expert import prompt as _expert_prompt
 from api.expert.prompt import _build_prompt
+from api.expert.types import (
+    EVENT_ANSWERING,
+    EVENT_CONTENT,
+    EVENT_RETRIEVING,
+    EVENT_STATUS,
+    EVENT_THINKING,
+    ExpertStreamEvent,
+)
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -76,8 +84,18 @@ async def _run_expert_chat_stream(
     messages: List[Dict[str, Any]],
     model: Optional[str],
     use_rlm: Optional[bool],
-) -> AsyncIterator[str]:
-    """Streaming chat: yields answer text chunks."""
+) -> AsyncIterator[Union[ExpertStreamEvent, str]]:
+    """Streaming chat: yields status events then answer chunks.
+
+    Emits status events so the frontend can show a phase-aware loader:
+    - ``("status", "retrieving")`` before knowledge retrieval.
+    - ``("status", "thinking")`` before the first answer chunk.
+    - ``("status", "answering")`` when content starts flowing.
+
+    Yields ``ExpertStreamEvent`` objects (or plain ``str`` for backward
+    compatibility when ``_stream_answer`` yields a bare string).
+    """
+    yield ExpertStreamEvent(EVENT_STATUS, EVENT_RETRIEVING)
     provider, resolved_model, base_url, api_key = _resolve_expert_model(model)
     knowledge = await _retrieve_product_knowledge(product_id, query)
     history = _format_history(messages)
@@ -92,10 +110,17 @@ async def _run_expert_chat_stream(
         len(prompt),
         use_rlm_resolved,
     )
-    async for piece in _stream_answer(
+    yield ExpertStreamEvent(EVENT_STATUS, EVENT_THINKING)
+    content_started = False
+    async for event in _stream_answer(
         prompt, provider, resolved_model, base_url, api_key, use_rlm_resolved
     ):
-        yield piece
+        # Emit the "answering" status just before the first content chunk
+        # (after any reasoning events have been sent).
+        if not content_started and isinstance(event, ExpertStreamEvent) and event.type == EVENT_CONTENT:
+            content_started = True
+            yield ExpertStreamEvent(EVENT_STATUS, EVENT_ANSWERING)
+        yield event
 
 
 def run_expert_chat(

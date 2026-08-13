@@ -585,7 +585,13 @@
     "engineRlm": "RLM",
     "engineAutoHint": "Авто: следовать режиму RLM/LLM из админки (RLM для большого контекста, иначе LLM)",
     "engineLlmHint": "LLM: стандартная модель, быстрее",
-    "engineRlmHint": "RLM: рекурсивный анализ для большого контекста, при сбое откат к LLM"
+    "engineRlmHint": "RLM: рекурсивный анализ для большого контекста, при сбое откат к LLM",
+    "thinking": "Размышление…",
+    "reasoning": "Ход рассуждений",
+    "retrievingKnowledge": "Поиск по базе знаний…",
+    "generating": "Генерация…",
+    "showReasoning": "Показать рассуждения",
+    "hideReasoning": "Скрыть рассуждения"
   },
   "mermaid": {
     "clickToFullscreen": "Нажмите, чтобы открыть на весь экран",

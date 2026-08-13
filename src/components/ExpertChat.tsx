@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * Productarium expert agent chat (item 3 — replaces the Long-context RLM panel).
+ * Productarium expert agent chat — streaming + reasoning + phase-aware loader.
  *
  * Product-scoped chat over ALL artifacts via cognee recall (+ optional fast-rlm
  * deep synthesis) on the backend. Streams answers from POST
@@ -9,18 +9,35 @@
  * works via the existing <Markdown /> component). "Download as document" hits
  * POST /api/products/{id}/ask/doc and saves the returned .md file.
  *
- * SSE tolerance: the backend may emit either `data: {json}\n\n` frames or raw
- * text chunks. We parse `data:` lines, accept JSON with a {content|delta|text}
- * field, and fall back to appending raw text — so this works whichever stream
- * shape the expert-agent router lands on.
+ * SSE event types (typed frames from the backend router):
+ * - {"content": "..."}     — answer text delta
+ * - {"reasoning": "..."}   — reasoning/thinking trace delta (Qwen3/DeepSeek)
+ * - {"status": "retrieving"|"thinking"|"answering"} — phase indicator
+ * - {"error": "..."}        — error message
+ * - [DONE]                  — stream end
+ *
+ * Backward-compatible: if the backend emits plain text or untyped {content}
+ * frames, they are appended to the answer content.
+ *
+ * UX features (hand-built, no external chat libraries):
+ * - Phase-aware loader: "Retrieving knowledge…" / "Thinking…" / "Generating…"
+ *   with a 3-dot pulse animation.
+ * - Collapsible reasoning panel: auto-expanded while reasoning streams,
+ *   auto-collapses when content starts. User can toggle manually.
+ * - Streaming cursor: pulsing ▍ appended to content while streaming.
+ * - Smart auto-scroll: smooth scroll to bottom on new content, but pauses
+ *   when the user scrolls up.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
+  Brain,
+  CaretDown,
   ChatCircleText,
   DownloadSimple,
   Eraser,
+  MagnifyingGlass,
   Spinner,
   StopCircle,
 } from "@phosphor-icons/react";
@@ -40,10 +57,27 @@ interface ExpertChatProps {
   className?: string;
 }
 
+type Phase = "retrieving" | "thinking" | "answering" | "done";
+
 interface Turn {
   role: "user" | "assistant";
   content: string;
+  reasoning: string;
+  phase: Phase;
+  streaming: boolean;
+  reasoningOpen: boolean;
+  /** Whether the user manually toggled the reasoning panel. */
+  reasoningTouched: boolean;
 }
+
+const EMPTY_TURN: Omit<Turn, "role"> = {
+  content: "",
+  reasoning: "",
+  phase: "retrieving",
+  streaming: true,
+  reasoningOpen: true,
+  reasoningTouched: false,
+};
 
 export function ExpertChat({ productId, className }: ExpertChatProps) {
   const { messages } = useLanguage();
@@ -60,23 +94,107 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const lastQuestionRef = useRef<string>("");
+  // Track whether the user has scrolled up — pause auto-scroll if so.
+  const userScrolledUpRef = useRef(false);
 
   useEffect(() => {
     return () => abortRef.current?.abort();
   }, []);
 
+  // --- Auto-scroll: only scroll down if the user hasn't scrolled up.
+  const scrollToBottom = useCallback(() => {
+    if (userScrolledUpRef.current || !scrollRef.current) return;
+    scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, []);
+
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [turns]);
+    scrollToBottom();
+  }, [turns, scrollToBottom]);
+
+  const onScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    // If the user is near the bottom (< 60px from the bottom), resume auto-scroll.
+    const nearBottom =
+      el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    userScrolledUpRef.current = !nearBottom;
+  }, []);
+
+  // --- Update the last assistant turn.
+  const updateLastTurn = useCallback(
+    (updater: (prev: Turn) => Turn) => {
+      setTurns((prev) => {
+        const next = prev.slice();
+        const last = next[next.length - 1];
+        if (last && last.role === "assistant") {
+          next[next.length - 1] = updater(last);
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  const appendContent = useCallback(
+    (text: string) => {
+      updateLastTurn((last) => {
+        const wasStreaming = last.streaming;
+        return {
+          ...last,
+          content: last.content + text,
+          streaming: true,
+          // Auto-collapse reasoning when content starts flowing (unless user
+          // manually toggled it open).
+          reasoningOpen: wasStreaming
+            ? last.reasoningTouched
+              ? last.reasoningOpen
+              : false
+            : last.reasoningOpen,
+        };
+      });
+    },
+    [updateLastTurn],
+  );
+
+  const appendReasoning = useCallback(
+    (text: string) => {
+      updateLastTurn((last) => ({
+        ...last,
+        reasoning: last.reasoning + text,
+        // Auto-expand reasoning panel while streaming (unless user manually
+        // collapsed it).
+        reasoningOpen: last.reasoningTouched ? last.reasoningOpen : true,
+      }));
+    },
+    [updateLastTurn],
+  );
+
+  const setPhase = useCallback(
+    (phase: Phase) => {
+      updateLastTurn((last) => ({ ...last, phase }));
+    },
+    [updateLastTurn],
+  );
+
+  const finishTurn = useCallback(() => {
+    updateLastTurn((last) => ({
+      ...last,
+      streaming: false,
+      phase: "done",
+    }));
+  }, [updateLastTurn]);
 
   const send = useCallback(async () => {
     const q = input.trim();
     if (!q || streaming) return;
     lastQuestionRef.current = q;
-    setTurns((prev) => [...prev, { role: "user", content: q }]);
-    setTurns((prev) => [...prev, { role: "assistant", content: "" }]);
+    // Reset scroll state for a new question.
+    userScrolledUpRef.current = false;
+    setTurns([
+      ...turns,
+      { role: "user", ...EMPTY_TURN, content: q, streaming: false },
+      { role: "assistant", ...EMPTY_TURN },
+    ]);
     setStreaming(true);
     setInput("");
 
@@ -112,18 +230,41 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      let acc = "";
 
-      const append = (text: string) => {
-        acc += text;
-        setTurns((prev) => {
-          const next = prev.slice();
-          const last = next[next.length - 1];
-          if (last && last.role === "assistant") {
-            next[next.length - 1] = { ...last, content: acc };
+      const processPayload = (payload: string) => {
+        if (payload === "[DONE]") return;
+        try {
+          const obj = JSON.parse(payload);
+          // Typed SSE frames: {content} / {reasoning} / {status} / {error}
+          if (typeof obj.reasoning === "string" && obj.reasoning) {
+            appendReasoning(obj.reasoning);
+            return;
           }
-          return next;
-        });
+          if (typeof obj.status === "string" && obj.status) {
+            setPhase(obj.status as Phase);
+            return;
+          }
+          if (typeof obj.error === "string" && obj.error) {
+            updateLastTurn((last) => ({
+              ...last,
+              content: last.content || `> ⚠️ ${obj.error}`,
+              streaming: false,
+              phase: "done",
+            }));
+            return;
+          }
+          const chunk = obj?.content ?? obj?.delta ?? obj?.text ?? "";
+          if (typeof chunk === "string" && chunk) {
+            appendContent(chunk);
+            setPhase("answering");
+          }
+        } catch {
+          // Not JSON — treat the payload as raw text content.
+          if (payload) {
+            appendContent(payload);
+            setPhase("answering");
+          }
+        }
       };
 
       while (true) {
@@ -143,38 +284,27 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
               buffer = "";
               continue;
             }
-            try {
-              const obj = JSON.parse(payload);
-              const chunk =
-                obj?.content ?? obj?.delta ?? obj?.text ?? obj?.message ?? "";
-              if (typeof chunk === "string" && chunk) append(chunk);
-            } catch {
-              // Not JSON — treat the payload as raw text.
-              if (payload) append(payload);
-            }
+            processPayload(payload);
           } else if (line.startsWith(":")) {
             // SSE comment / heartbeat — ignore.
           } else {
             // Raw text stream (no SSE framing).
-            append(line);
+            appendContent(line);
+            setPhase("answering");
           }
         }
       }
+      // Process any remaining buffered text.
       if (buffer.trim()) {
         const line = buffer.trim();
         if (line.startsWith("data:")) {
           const payload = line.slice(5).trim();
           if (payload && payload !== "[DONE]") {
-            try {
-              const obj = JSON.parse(payload);
-              const chunk = obj?.content ?? obj?.delta ?? obj?.text ?? "";
-              if (typeof chunk === "string" && chunk) append(chunk);
-            } catch {
-              append(payload);
-            }
+            processPayload(payload);
           }
         } else {
-          append(line);
+          appendContent(line);
+          setPhase("answering");
         }
       }
     } catch (e) {
@@ -183,23 +313,30 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
       } else {
         const msg = e instanceof Error ? e.message : "Expert chat failed";
         notify({ tone: "error", title: "Expert chat failed", message: msg });
-        setTurns((prev) => {
-          const next = prev.slice();
-          const last = next[next.length - 1];
-          if (last && last.role === "assistant" && !last.content) {
-            next[next.length - 1] = {
-              ...last,
-              content: `> ⚠️ ${msg}`,
-            };
-          }
-          return next;
+        updateLastTurn((last) => {
+          if (last.content) return last; // keep partial output if any
+          return { ...last, content: `> ⚠️ ${msg}`, streaming: false, phase: "done" };
         });
       }
     } finally {
+      finishTurn();
       setStreaming(false);
       abortRef.current = null;
     }
-  }, [input, streaming, productId, turns, rlmMode, notify, router]);
+  }, [
+    input,
+    streaming,
+    productId,
+    turns,
+    rlmMode,
+    notify,
+    router,
+    appendContent,
+    appendReasoning,
+    setPhase,
+    finishTurn,
+    updateLastTurn,
+  ]);
 
   const stop = useCallback(() => {
     abortRef.current?.abort();
@@ -209,6 +346,24 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
     setTurns([]);
     setInput("");
   }, []);
+
+  const toggleReasoning = useCallback(
+    (idx: number) => {
+      setTurns((prev) => {
+        const next = prev.slice();
+        const turn = next[idx];
+        if (turn && turn.role === "assistant") {
+          next[idx] = {
+            ...turn,
+            reasoningOpen: !turn.reasoningOpen,
+            reasoningTouched: true,
+          };
+        }
+        return next;
+      });
+    },
+    [],
+  );
 
   const downloadDoc = useCallback(async () => {
     const q = lastQuestionRef.current.trim() || input.trim();
@@ -255,29 +410,41 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
       {/* Conversation */}
       <div
         ref={scrollRef}
+        onScroll={onScroll}
         className="max-h-[480px] min-h-[160px] flex-1 space-y-4 overflow-y-auto rounded-md border border-divider bg-surface-2 p-4"
       >
-        {turns.length === 0 ? null : (
-          turns.map((t, i) => (
+        {turns.length === 0 ? (
+          <div className="flex h-full min-h-[120px] items-center justify-center text-center">
+            <p className="max-w-sm text-sm text-muted">
+              {t.emptyHint ??
+                "Ask the expert anything about this product. Answers are grounded in its indexed artifacts via the knowledge graph."}
+            </p>
+          </div>
+        ) : (
+          turns.map((turn, i) => (
             <div
               key={i}
               className={cn(
                 "flex",
-                t.role === "user" ? "justify-end" : "justify-start",
+                turn.role === "user" ? "justify-end" : "justify-start",
               )}
             >
               <div
                 className={cn(
                   "max-w-[88%] rounded-md px-3 py-2 text-sm",
-                  t.role === "user"
+                  turn.role === "user"
                     ? "bg-ink text-[var(--button-fg)]"
                     : "bg-surface text-ink border border-divider",
                 )}
               >
-                {t.role === "assistant" ? (
-                  <Markdown content={t.content || "…"} />
+                {turn.role === "assistant" ? (
+                  <AssistantContent
+                    turn={turn}
+                    t={t}
+                    onToggleReasoning={() => toggleReasoning(i)}
+                  />
                 ) : (
-                  <p className="whitespace-pre-wrap">{t.content}</p>
+                  <p className="whitespace-pre-wrap">{turn.content}</p>
                 )}
               </div>
             </div>
@@ -383,6 +550,105 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+// --- Phase-aware loader + reasoning panel + content rendering ---------------
+
+interface AssistantContentProps {
+  turn: Turn;
+  t: Record<string, string>;
+  onToggleReasoning: () => void;
+}
+
+function AssistantContent({ turn, t, onToggleReasoning }: AssistantContentProps) {
+  const { phase, streaming, reasoning, content, reasoningOpen } = turn;
+  const showLoader = streaming && !content;
+  const showReasoning = reasoning.length > 0;
+
+  return (
+    <div className="space-y-2">
+      {/* Phase-aware loader (shown before content arrives) */}
+      {showLoader && (
+        <PhaseLoader phase={phase} t={t} />
+      )}
+
+      {/* Reasoning panel */}
+      {showReasoning && (
+        <div className="reasoning-panel rounded border border-divider bg-surface-2 p-2">
+          <button
+            type="button"
+            onClick={onToggleReasoning}
+            className="flex w-full items-center gap-1.5 text-xs font-medium text-muted transition-colors hover:text-ink"
+          >
+            <Brain size={13} weight="regular" />
+            <span>
+              {t.reasoning ?? "Reasoning"}
+              {streaming && phase === "thinking" && (
+                <span className="ml-1 reasoning-stream-dot" />
+              )}
+            </span>
+            <CaretDown
+              size={12}
+              weight="bold"
+              className={cn(
+                "ml-auto transition-transform",
+                reasoningOpen ? "rotate-0" : "-rotate-90",
+              )}
+            />
+          </button>
+          {reasoningOpen && (
+            <div className="mt-1.5 max-h-[200px] overflow-y-auto border-l-2 border-divider pl-2.5 font-mono text-[12px] leading-relaxed text-muted">
+              {reasoning}
+              {streaming && phase === "thinking" && (
+                <span className="stream-cursor">▍</span>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Answer content */}
+      {content ? (
+        <div className="streaming-content">
+          <Markdown content={content} />
+          {streaming && phase === "answering" && (
+            <span className="stream-cursor">▍</span>
+          )}
+        </div>
+      ) : !showLoader ? (
+        <span className="text-muted">…</span>
+      ) : null}
+    </div>
+  );
+}
+
+// --- 3-dot pulse loader ------------------------------------------------------
+
+function PhaseLoader({ phase, t }: { phase: Phase; t: Record<string, string> }) {
+  let label = t.generating ?? "Generating…";
+  let icon = <Spinner size={14} />;
+
+  if (phase === "retrieving") {
+    label = t.retrievingKnowledge ?? "Retrieving knowledge…";
+    icon = <MagnifyingGlass size={14} weight="regular" />;
+  } else if (phase === "thinking") {
+    label = t.thinking ?? "Thinking…";
+    icon = <Brain size={14} weight="regular" />;
+  }
+
+  return (
+    <div className="flex items-center gap-2 text-xs text-muted">
+      <span className="inline-flex items-center gap-1.5">
+        {icon}
+        <span>{label}</span>
+      </span>
+      <span className="thinking-dots" aria-hidden>
+        <span />
+        <span />
+        <span />
+      </span>
     </div>
   );
 }

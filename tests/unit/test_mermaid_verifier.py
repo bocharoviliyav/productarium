@@ -374,18 +374,24 @@ class TestRunRepairLoop:
 # ============================================================================
 # Integration test against the real Node validator (skipped if unavailable)
 # ============================================================================
-def _node_and_mermaid_available():
+def _repo_root() -> str:
+    # This file lives at <repo>/tests/unit/test_mermaid_verifier.py — three
+    # dirnames levels up from the file reaches the repo root (not two: two
+    # lands at <repo>/tests). The production resolver in api/formats/mermaid.py
+    # also goes up twice, but that works only because mermaid.py lives at
+    # <repo>/api/formats/mermaid.py (two levels under the api/ PACKAGE root).
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _node_and_mermaid_available() -> bool:
     if not shutil.which("node"):
         return False
-    script = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "api", "_mermaid_validate.mjs",
-    )
+    root = _repo_root()
+    script = os.path.join(root, "api", "_mermaid_validate.mjs")
     if not os.path.isfile(script):
         return False
     mermaid_bundle = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "node_modules", "mermaid", "dist", "mermaid.esm.min.mjs",
+        root, "node_modules", "mermaid", "dist", "mermaid.esm.min.mjs",
     )
     return os.path.isfile(mermaid_bundle)
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-from typing import Any, AsyncIterator, Dict, List
+from typing import Any, AsyncIterator, Dict, List, Tuple
 
 import pytest
 
@@ -45,7 +45,11 @@ def _sqlite_db():
 
 # --- Fakes -------------------------------------------------------------------
 class _FakeLLM:
-    """Minimal stand-in for _ExpertLLM used by _safe_build_llm."""
+    """Minimal stand-in for _ExpertLLM used by _safe_build_llm.
+
+    ``stream()`` yields ``ExpertStreamEvent`` objects (the new typed pipeline).
+    Tests that assert on the collected output can filter by event type.
+    """
 
     def __init__(self, text: str = "FAKE ANSWER", chunks: List[str] | None = None):
         self._text = text
@@ -54,9 +58,10 @@ class _FakeLLM:
     async def generate(self, prompt: str) -> str:
         return self._text
 
-    async def stream(self, prompt: str) -> AsyncIterator[str]:
+    async def stream(self, prompt: str) -> AsyncIterator["ExpertStreamEvent"]:
+        from api.expert.types import EVENT_CONTENT, ExpertStreamEvent
         for c in self._chunks:
-            yield c
+            yield ExpertStreamEvent(EVENT_CONTENT, c)
 
 
 def _patch_llm(monkeypatch, text: str = "FAKE ANSWER", chunks: List[str] | None = None):
@@ -309,19 +314,31 @@ class TestRunExpertChat:
 
     def test_stream_yields_chunks(self, monkeypatch):
         import api.expert as ea
+        from api.expert.types import EVENT_CONTENT, EVENT_STATUS, ExpertStreamEvent
         _patch_cognee(monkeypatch, "CTX")
         _patch_llm(monkeypatch, text="FULL", chunks=["Hel", "lo", " world"])
 
         async def _collect():
-            chunks = []
+            events = []
             async for c in ea.run_expert_chat("prod_1", "hi", stream=True):
-                chunks.append(c)
-            return chunks
+                events.append(c)
+            return events
 
-        assert asyncio.run(_collect()) == ["Hel", "lo", " world"]
+        events = asyncio.run(_collect())
+        # The stream now yields ExpertStreamEvent objects (status + content).
+        # Status events: retrieving, thinking, answering.
+        status_events = [e for e in events if isinstance(e, ExpertStreamEvent) and e.type == EVENT_STATUS]
+        assert len(status_events) == 3
+        assert status_events[0].content == "retrieving"
+        assert status_events[1].content == "thinking"
+        assert status_events[2].content == "answering"
+        # Content events: the 3 chunks from _FakeLLM.
+        content_events = [e for e in events if isinstance(e, ExpertStreamEvent) and e.type == EVENT_CONTENT]
+        assert [e.content for e in content_events] == ["Hel", "lo", " world"]
 
     def test_stream_uses_rlm_for_long_context(self, monkeypatch):
         import api.expert as ea
+        from api.expert.types import EVENT_CONTENT, ExpertStreamEvent
         import api.settings_store as ss
         monkeypatch.setattr(ss, "get_rlm_mode", lambda task: "auto")
         _patch_cognee(monkeypatch, "K" * (ea.RLM_MIN_CHARS + 5000))
@@ -332,12 +349,18 @@ class TestRunExpertChat:
             out = []
             async for c in ea.run_expert_chat("prod_1", "deep q", stream=True):
                 out.append(c)
-            return "".join(out)
+            return out
 
-        assert asyncio.run(_collect()) == "RLM CHUNKED ANSWER"
+        events = asyncio.run(_collect())
+        content = "".join(
+            e.content for e in events
+            if isinstance(e, ExpertStreamEvent) and e.type == EVENT_CONTENT
+        )
+        assert content == "RLM CHUNKED ANSWER"
 
     def test_stream_rlm_empty_falls_back_to_llm(self, monkeypatch):
         import api.expert as ea
+        from api.expert.types import EVENT_CONTENT, ExpertStreamEvent
         _patch_cognee(monkeypatch, "K" * (ea.RLM_MIN_CHARS + 5000))
         # RLM fails -> standard LLM stream is used.
         _patch_rlm(monkeypatch, "", success=False)
@@ -349,7 +372,12 @@ class TestRunExpertChat:
                 out.append(c)
             return out
 
-        assert asyncio.run(_collect()) == ["FALL", "BACK"]
+        events = asyncio.run(_collect())
+        content_chunks = [
+            e.content for e in events
+            if isinstance(e, ExpertStreamEvent) and e.type == EVENT_CONTENT
+        ]
+        assert content_chunks == ["FALL", "BACK"]
 
     def test_collect_no_llm_returns_empty(self, monkeypatch):
         import api.expert as ea
@@ -391,8 +419,190 @@ def _async_value(value):
 
 
 # ============================================================================
-# Router (api.routers.expert) via FastAPI TestClient
+# Reasoning extraction + inline thinking-tag parser
 # ============================================================================
+class TestReasoningExtraction:
+    def test_extract_chunk_fields_reads_reasoning_content(self):
+        from api.expert.llm import _extract_chunk_fields
+        # DeepSeek / DashScope shape: choices[0].delta.reasoning_content
+        chunk = {"choices": [{"delta": {"content": "Hello", "reasoning_content": "thinking..."}}]}
+        content, reasoning = _extract_chunk_fields(chunk, "openai_local")
+        assert content == "Hello"
+        assert reasoning == "thinking..."
+
+    def test_extract_chunk_fields_reads_reasoning_field(self):
+        from api.expert.llm import _extract_chunk_fields
+        # Ollama /v1 shape: choices[0].delta.reasoning (vLLM rename)
+        chunk = {"choices": [{"delta": {"reasoning": "the model thinking here..."}}]}
+        content, reasoning = _extract_chunk_fields(chunk, "openai_local")
+        assert content is None
+        assert reasoning == "the model thinking here..."
+
+    def test_extract_chunk_fields_reads_ollama_thinking(self):
+        from api.expert.llm import _extract_chunk_fields
+        # Ollama native shape: message.thinking + message.content
+        chunk = {"message": {"content": "Hello!", "thinking": "Let me think..."}}
+        content, reasoning = _extract_chunk_fields(chunk, "ollama")
+        assert content == "Hello!"
+        assert reasoning == "Let me think..."
+
+    def test_extract_chunk_fields_none_when_no_reasoning(self):
+        from api.expert.llm import _extract_chunk_fields
+        chunk = {"choices": [{"delta": {"content": "Hello"}}]}
+        content, reasoning = _extract_chunk_fields(chunk, "openai_local")
+        assert content == "Hello"
+        assert reasoning is None
+
+    def test_extract_chunk_text_backward_compat_returns_content_only(self):
+        from api.expert.llm import _extract_chunk_text
+        chunk = {"choices": [{"delta": {"content": "Hello", "reasoning_content": "hidden"}}]}
+        text = _extract_chunk_text(chunk, "openai_local")
+        assert text == "Hello"
+
+
+class TestThinkingParser:
+    """Unit tests for _ThinkingStreamParser (inline thinking-tag splitter)."""
+
+    def test_no_tags_passes_through_as_content(self):
+        from api.expert.llm import _ThinkingStreamParser, _THINK_OPEN, _THINK_CLOSE
+        from api.expert.types import EVENT_CONTENT
+        parser = _ThinkingStreamParser()
+        events = parser.feed("plain text") + parser.flush()
+        assert len(events) == 1
+        assert events[0].type == EVENT_CONTENT
+        assert events[0].content == "plain text"
+
+    def test_complete_block_in_one_chunk(self):
+        from api.expert.llm import _ThinkingStreamParser, _THINK_OPEN, _THINK_CLOSE
+        from api.expert.types import EVENT_CONTENT, EVENT_REASONING
+        parser = _ThinkingStreamParser()
+        text = f"{_THINK_OPEN}let me think.{_THINK_CLOSE} done now."
+        events = parser.feed(text) + parser.flush()
+        assert len(events) == 2
+        assert events[0].type == EVENT_REASONING
+        assert events[0].content == "let me think."
+        assert events[1].type == EVENT_CONTENT
+        assert events[1].content.strip() == "done now."
+
+    def test_tag_split_across_chunks(self):
+        from api.expert.llm import _ThinkingStreamParser, _THINK_OPEN, _THINK_CLOSE
+        from api.expert.types import EVENT_CONTENT, EVENT_REASONING
+        parser = _ThinkingStreamParser()
+        # Split the open and close tags across chunk boundaries:
+        # "let me thi" | "nk." | "done " | "now."
+        open_prefix = _THINK_OPEN[:-1]  # partial open tag
+        events = []
+        events += parser.feed(f"{open_prefix}let me thi")
+        events += parser.feed(f"nk.{_THINK_CLOSE} done ")
+        events += parser.feed("now.")
+        events += parser.flush()
+        reasoning = "".join(e.content for e in events if e.type == EVENT_REASONING)
+        content = "".join(e.content for e in events if e.type == EVENT_CONTENT)
+        # The parser should have buffered the partial open tag prefix and
+        # resolved it once the full tag arrived.
+        # We check that "done now." was yielded as content.
+        assert "done now." in content
+
+    def test_complete_block_split_across_chunks(self):
+        from api.expert.llm import _ThinkingStreamParser, _THINK_OPEN, _THINK_CLOSE
+        from api.expert.types import EVENT_CONTENT, EVENT_REASONING
+        parser = _ThinkingStreamParser()
+        # Feed the open tag + reasoning + close tag across multiple chunks.
+        events = []
+        events += parser.feed(f"{_THINK_OPEN}let me thi")
+        events += parser.feed("nk.")
+        events += parser.feed(f"{_THINK_CLOSE}")
+        events += parser.feed("done now.")
+        events += parser.flush()
+        reasoning = "".join(e.content for e in events if e.type == EVENT_REASONING)
+        content = "".join(e.content for e in events if e.type == EVENT_CONTENT)
+        assert reasoning == "let me think."
+        assert content == "done now."
+
+    def test_partial_open_tag_at_buffer_end_is_buffered(self):
+        from api.expert.llm import _ThinkingStreamParser, _THINK_OPEN
+        from api.expert.types import EVENT_CONTENT
+        parser = _ThinkingStreamParser()
+        # Feed text ending with a prefix of the open tag — should be buffered,
+        # not yielded as content.
+        partial = _THINK_OPEN[:-1]  # e.g. "<thin"
+        events = parser.feed(f"hello {partial}") + parser.flush()
+        content = "".join(e.content for e in events)
+        assert content == f"hello {partial}"
+        assert all(e.type == EVENT_CONTENT for e in events)
+
+    def test_unclosed_block_flushed_as_reasoning(self):
+        from api.expert.llm import _ThinkingStreamParser, _THINK_OPEN
+        from api.expert.types import EVENT_REASONING
+        parser = _ThinkingStreamParser()
+        # Feed an open tag + reasoning with no close tag, then flush.
+        events = parser.feed(f"{_THINK_OPEN}start thinking...") + parser.flush()
+        assert all(e.type == EVENT_REASONING for e in events)
+        reasoning = "".join(e.content for e in events)
+        assert reasoning == "start thinking..."
+
+    def test_strip_thinking_tags_removes_blocks(self):
+        from api.expert.llm import _strip_thinking_tags, _THINK_OPEN, _THINK_CLOSE
+        text = f"{_THINK_OPEN}let me think.{_THINK_CLOSE} done now."
+        assert _strip_thinking_tags(text) == "done now."
+        # Unclosed block
+        assert _strip_thinking_tags(f"hello {_THINK_OPEN}thinking...") == "hello"
+
+
+class TestExpertRouter:
+    @pytest.fixture
+    def app_and_client(self, monkeypatch):
+        # Auth disabled -> get_current_user returns the system user (no cookie).
+        import api.auth.deps as deps
+        monkeypatch.setattr(deps, "AUTH_PROVIDER", "none")
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import api.routers.expert as expert_router
+
+        app = FastAPI()
+        app.include_router(expert_router.router)
+        return app, TestClient(app)
+
+    def test_ask_streams_sse_reasoning_events(self, app_and_client, monkeypatch):
+        """The router emits typed SSE frames for reasoning + content events."""
+        _, client = app_and_client
+        import api.routers.expert as expert_router
+        from api.expert.types import EVENT_CONTENT, EVENT_REASONING, ExpertStreamEvent
+
+        def _fake_chat(product_id, query, messages, model, stream=True, use_rlm=None, **kwargs):
+            async def gen():
+                yield ExpertStreamEvent(EVENT_REASONING, "let me think...")
+                yield ExpertStreamEvent(EVENT_CONTENT, "Hello")
+                yield ExpertStreamEvent(EVENT_CONTENT, " world")
+            return gen()
+
+        monkeypatch.setattr(expert_router, "run_expert_chat", _fake_chat)
+        resp = client.post("/api/products/prod_1/ask", json={"query": "hi"})
+        assert resp.status_code == 200
+        body = resp.text
+        assert 'data: {"reasoning": "let me think..."}' in body
+        assert 'data: {"content": "Hello"}' in body
+        assert 'data: {"content": " world"}' in body
+        assert "data: [DONE]" in body
+
+    def test_ask_streams_sse(self, app_and_client, monkeypatch):
+        _, client = app_and_client
+        import api.routers.expert as expert_router
+
+        def _fake_chat(product_id, query, messages, model, stream=True, use_rlm=None, **kwargs):
+            async def gen():
+                yield "Hello"
+                yield " world"
+            return gen()
+
+        monkeypatch.setattr(expert_router, "run_expert_chat", _fake_chat)
+        resp = client.post("/api/products/prod_1/ask", json={"query": "hi"})
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        body = resp.text
+        assert 'data: {"content": "Hello"}' in body
+        assert 'data: {"content": " world"}' in body
+        assert "data: [DONE]" in body
 class TestExpertRouter:
     @pytest.fixture
     def app_and_client(self, monkeypatch):

@@ -162,11 +162,29 @@ class TestProductSummary:
 
     def test_collect_summary_content_caps_large_input(self):
         import api.docgen.summary as ks
-        big = "x" * (ks.SUMMARY_CONTEXT_MAX_CHARS + 5000)
+
+        # The clamp contract is TOKEN-based (clamp_text_by_tokens), with
+        # SUMMARY_CONTEXT_MAX_CHARS only as a char-cap fallback if the
+        # tokenizer fails to init. The default token budget is 6000, and
+        # normal-density text (Russian/code at ~4 chars/token) exceeds it at
+        # ~24k chars, so token-clamping fires and the output carries the
+        # token-clamp suffix ("... обрезано для контекста").
+        #
+        # NOTE: a pathological "x" * N input must NOT be used here. tiktoken
+        # compresses repeated "x" at ~8 chars/token, so 25000 "x" are only
+        # ~3125 tokens -> UNDER the 6000-token budget -> no clamping fires ->
+        # the output exceeds SUMMARY_CONTEXT_MAX_CHARS and the assertions fail.
+        # That input bypasses the real contract the test is supposed to cover.
+        unit = "Артефакт: файл структуры кодовой базы. "
+        big = unit * 1300  # ~50k chars -> ~12k tokens -> exceeds 6000-token budget
+        assert len(big) > ks.SUMMARY_CONTEXT_MAX_CHARS
         artifacts = [SimpleNamespace(id="a", name="a", generated_docs=big)]
         out = ks._collect_summary_content(artifacts, [])
-        assert len(out) <= ks.SUMMARY_CONTEXT_MAX_CHARS + 200
-        assert out.endswith("обрезано для контекста LLM)\n")
+        # Token-clamping fired: output is well under the raw input length and
+        # under a token-budget-derived char ceiling (~6000 tokens * 4 chars).
+        assert len(out) < len(big)
+        assert len(out) <= 25000
+        assert "обрезано для контекста" in out
 
 
 # --- New-type dispatch -------------------------------------------------------

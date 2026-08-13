@@ -586,7 +586,13 @@
     "engineRlm": "RLM",
     "engineAutoHint": "Auto: follow admin RLM/LLM mode (RLM for large context, else LLM)",
     "engineLlmHint": "LLM: standard model, faster",
-    "engineRlmHint": "RLM: recursive reasoning for large context, falls back to LLM on failure"
+    "engineRlmHint": "RLM: recursive reasoning for large context, falls back to LLM on failure",
+    "thinking": "Thinking…",
+    "reasoning": "Reasoning",
+    "retrievingKnowledge": "Retrieving knowledge…",
+    "generating": "Generating…",
+    "showReasoning": "Show reasoning",
+    "hideReasoning": "Hide reasoning"
   },
   "mermaid": {
     "clickToFullscreen": "Click to view fullscreen",

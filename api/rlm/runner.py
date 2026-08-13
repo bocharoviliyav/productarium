@@ -80,6 +80,24 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
     if not base_url:
         ollama_host = (os.environ.get("OLLAMA_HOST") or "").rstrip("/")
         base_url = (ollama_host + "/v1") if ollama_host else "http://localhost:11434/v1"
+    # Normalize to a clean ``/v1`` base: the fast-rlm Deno engine builds
+    # ``new OpenAI({ baseURL })`` and the SDK POSTs to
+    # ``${baseURL}/chat/completions``. If the admin pasted a bare host like
+    # ``https://ai.corp.gateway`` (no ``/v1``), the SDK posts to
+    # ``https://ai.corp.gateway/chat/completions`` — most gateways only expose
+    # the OpenAI surface under ``/v1``, so a bare host 404s or closes the
+    # connection, surfacing as "Connection error". Mirrors cognee's
+    # ``_host_to_v1`` normalization (strips trailing slashes + a stray
+    # ``/embeddings``/``/v1`` then appends ``/v1``).
+    try:
+        from api.cognee._runtime import _host_to_v1
+        normalized = _host_to_v1(base_url)
+        if normalized:
+            base_url = normalized
+    except Exception:  # pragma: no cover - import-safe
+        _b = base_url.rstrip("/")
+        if not _b.lower().endswith("/v1"):
+            base_url = f"{_b}/v1"
     os.environ["RLM_MODEL_BASE_URL"] = base_url
 
     # Resolve model. Admin models.docgen.model wins over the explicit arg / env.
@@ -89,32 +107,36 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
     # pass the model name through verbatim -- these servers use their own model
     # IDs and reject Ollama tags.
     resolved_model = model_name or admin_model or os.environ.get("RLM_MODEL_NAME") or "z-ai/glm-5"
-    # A :11434 URL is Ollama; a URL containing "ollama" is Ollama. Everything
-    # else (LM Studio :1234, openrouter, corporate gateway, ...) is treated as
-    # a generic OpenAI-compatible endpoint -> no tag coercion.
-    is_ollama = ":11434" in base_url or "ollama" in base_url.lower()
-    if is_ollama:
+    # fast-rlm's Deno engine builds ``new OpenAI({ apiKey, baseURL })`` and calls
+    # ``chat.completions.create({ model: resolvedModel, ... })``. The OpenAI SDK
+    # POSTs to ``${baseURL}/chat/completions`` verbatim — there is NO litellm
+    # routing layer, so the model name must be passed through UNTAMPERED (a
+    # gateway alias like ``flash`` is what the gateway expects; prefixing with
+    # ``openai/`` makes the SDK send ``model: "openai/flash"`` which the
+    # gateway rejects as model-not-found -> "Connection error").
+    #
+    # A :11434 URL is a native Ollama server: coerce cloud-style names to a
+    # known local tag (Ollama rejects ``qwen/qwen3.6-27b``). For any other
+    # OpenAI-compatible endpoint (LM Studio, llama.cpp, vLLM, corporate
+    # gateway) pass the model name through verbatim.
+    if ":11434" in base_url or "ollama" in base_url.lower():
         if "35b" in resolved_model:
             resolved_model = "qwen3.5:35b-a3b"
         elif ":" not in resolved_model.split("/")[-1]:
             # Looks like a cloud/Ollama-mismatched name -> safe local default.
             resolved_model = "qwen3:8b"
-    else:
-        # Non-Ollama OpenAI-compatible endpoints (corporate gateway, LM Studio,
-        # vLLM, ...) go through fast-rlm's litellm routing. litellm derives the
-        # provider from the model-name PREFIX; a bare local name like ``flash``
-        # or ``qwen/qwen3.6-27b`` is misread as provider ``flash``/``qwen`` and
-        # raises ``litellm.BadRequestError`` / "Connection error" before the
-        # request ever reaches the gateway. Prefix with ``openai/`` so litellm
-        # routes via its openai-compatible path with the configured api_base
-        # (mirrors cognee's _normalize_model_for_litellm). Idempotent: an
-        # already-prefixed name is not double-prefixed.
-        try:
-            from api.cognee._runtime import _normalize_model_for_litellm
-            resolved_model = _normalize_model_for_litellm("openai", resolved_model)
-        except Exception:  # pragma: no cover - import-safe
-            if not resolved_model.startswith(("openai/", "ollama/")):
-                resolved_model = f"openai/{resolved_model}"
+    # Strip a stray litellm provider prefix the admin might have pasted in the
+    # settings UI (cognee normalizes its model WITH a prefix, so the admin
+    # store sometimes carries ``openai/flash``). fast-rlm's native OpenAI SDK
+    # must receive the bare alias the gateway actually knows.
+    try:
+        from api.cognee._runtime import _strip_provider_prefix
+        resolved_model = _strip_provider_prefix(resolved_model)
+    except Exception:  # pragma: no cover - import-safe
+        for _pfx in ("openai/", "ollama/"):
+            if resolved_model.startswith(_pfx):
+                resolved_model = resolved_model[len(_pfx):]
+                break
 
     config = RLMConfig.default()
     config.primary_agent = resolved_model

@@ -348,12 +348,13 @@ logger.info(
 # cognee's ``cognify`` extracts a knowledge graph by calling the LLM with a
 # Pydantic ``response_model`` via ``instructor`` (one call per text chunk).
 # A slow local/corporate LLM can take several minutes for a single structured
-# extraction. The patched wrapper below clamps each call to this timeout
-# and returns an empty model on timeout so cognify keeps making progress
-# instead of stalling. Resolved through the central timeout config
-# (admin > env > default). Default 600s (10 min), floor 30s. Must be >= the
-# per-request HTTP timeout (llm_request) so a genuinely slow-but-progressing
-# call is not killed before it can return.
+# extraction (markdown_json_mode: the model emits a full section's worth of
+# tokens before the JSON block is parsed out). The patched wrapper below clamps
+# each call to this timeout and returns an empty model on timeout so cognify
+# keeps making progress instead of stalling. Resolved through the central
+# timeout config (admin > env > default). Default 1800s (30 min), floor 60s.
+# Must be >= the per-request HTTP timeout (llm_request) so a genuinely
+# slow-but-progressing call is not killed before it can return.
 def _resolve_graph_extraction_timeout() -> float:
     from api.timeout_config import resolve_cognee_graph_extraction_timeout
     return resolve_cognee_graph_extraction_timeout()

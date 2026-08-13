@@ -42,9 +42,12 @@ from api.expert.knowledge import (  # noqa: F401
 )
 from api.expert.llm import (  # noqa: F401
     _ExpertLLM,
+    _ThinkingStreamParser,
+    _extract_chunk_fields,
     _extract_chunk_text,
     _resolve_expert_model,
     _safe_build_llm,
+    _strip_thinking_tags,
 )
 from api.expert.prompt import (  # noqa: F401
     EXPERT_DOC_PROMPT,
@@ -57,10 +60,22 @@ from api.expert.prompt import (  # noqa: F401
     _clean_llm_text,
 )
 from api.expert.prompt import _safe_replace  # noqa: F401
+from api.expert.types import (  # noqa: F401
+    EVENT_ANSWERING,
+    EVENT_CONTENT,
+    EVENT_ERROR,
+    EVENT_REASONING,
+    EVENT_RETRIEVING,
+    EVENT_STATUS,
+    EVENT_THINKING,
+    ExpertStreamEvent,
+    StreamChunk,
+)
 
 __all__ = [
     "run_expert_chat",
     "run_expert_doc",
+    "ExpertStreamEvent",
     "EXPERT_SYSTEM_PROMPT",
     "EXPERT_DOC_PROMPT",
 ]

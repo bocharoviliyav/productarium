@@ -27,6 +27,10 @@ from api.expert.prompt import (
     _chunk_text,
     _clean_llm_text,
 )
+from api.expert.types import (
+    EVENT_CONTENT,
+    ExpertStreamEvent,
+)
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -136,17 +140,24 @@ async def _stream_answer(
     base_url: Optional[str],
     api_key: Optional[str],
     use_rlm: bool,
-) -> AsyncIterator[str]:
-    """Streaming answer: RLM (chunked) -> standard LLM stream (with fallback)."""
+) -> AsyncIterator[ExpertStreamEvent]:
+    """Streaming answer: RLM (chunked) -> standard LLM stream (with fallback).
+
+    Yields ``ExpertStreamEvent`` objects so the router can emit typed SSE
+    frames (status / reasoning / content). The RLM path wraps each text
+    piece as a ``content`` event; the standard LLM path passes through the
+    events from ``_ExpertLLM.stream()`` (which may include ``reasoning``
+    events for thinking-capable models).
+    """
     if use_rlm:
         text = await _rlm_generate(prompt, model)
         if text:
             for piece in _chunk_text(text):
-                yield piece
+                yield ExpertStreamEvent(EVENT_CONTENT, piece)
             return
         logger.warning("Expert RLM stream empty; falling back to standard LLM.")
     llm = _safe_build_llm(provider, model, base_url=base_url, api_key=api_key)
     if llm is None:
         return
-    async for piece in llm.stream(prompt):
-        yield piece
+    async for event in llm.stream(prompt):
+        yield event
