@@ -4,7 +4,7 @@ Admin-guarded CRUD + connectivity-test endpoints for configurable groups:
 ``models``, ``git``, ``confluence``, ``integrations``, ``users``,
 ``apitokens``. Every endpoint requires an admin session (``require_admin``).
 Secrets are encrypted on save via
-``api.settings_store.set_setting(..., encrypt=True)`` and redacted on read
+``api.config.settings.set_setting(..., encrypt=True)`` and redacted on read
 (callers see ``hasKey`` booleans, never raw secret values).
 
 API tokens are created here (``POST /api/admin/apitokens``) and verified by
@@ -48,7 +48,7 @@ from api.schemas import (
     UserCreateResult,
     UserOut,
 )
-from api.settings_store import (
+from api.config.settings import (
     _sanitize_api_key,
     get_all_rlm_modes,
     get_confluence_creds,
@@ -66,7 +66,7 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 # Setting-key suffixes that mark a value as a secret (encrypted on save,
 # redacted on read). Keep in sync with the secret fields used by the grouped
-# getters in api.settings_store (e.g. models.<task>.api_key, git.<host>.token,
+# getters in api.config.settings (e.g. models.<task>.api_key, git.<host>.token,
 # confluence.token).
 _SECRET_SUFFIXES = (".api_key", ".token", ".password", ".secret")
 
@@ -77,7 +77,7 @@ _SECRET_SUFFIXES = (".api_key", ".token", ".password", ".secret")
 # a corporate AI gateway whose cert is signed by an internal CA; NOT secret.
 # ``cognee`` stores knowledge graph rate limiting & concurrency settings; NOT secret.
 # ``timeouts`` stores per-key timeout overrides (timeouts.<key>) resolved through
-# api.timeout_config (admin store > env var > default); NOT secret.
+# api.config.timeout (admin store > env var > default); NOT secret.
 _SETTING_GROUPS = ("models", "git", "confluence", "integrations", "rlm", "ssl", "cognee", "timeouts")
 
 # Model "tasks" exposed in the admin Models section (contract J / plan D).
@@ -138,7 +138,6 @@ def _token_out(
 def _redact_model_task(cfg: Dict[str, Optional[Any]]) -> Dict[str, Any]:
     has_key = bool(cfg.get("api_key"))
     return {
-        "provider": cfg.get("provider"),
         "model": cfg.get("model"),
         "base_url": cfg.get("base_url"),
         "api_key": None,
@@ -181,7 +180,7 @@ async def trigger_cognee_reindex(
     """Manually trigger/force a re-index of the Cognee knowledge graph."""
     pid = body.product_id if body else None
     try:
-        from api.cognee_manager import reindex_product_knowledge_graph
+        from api.cognee import reindex_product_knowledge_graph
         res = await reindex_product_knowledge_graph(pid)
         return res
     except Exception as e:
@@ -323,7 +322,7 @@ def get_group(
             # e.g. "llm" when fast-rlm is not installed even if stored="auto").
             resp["resolved"] = get_all_rlm_modes()
         elif group == "cognee":
-            from api.cognee_manager import _cognee_rate_limiter
+            from api.cognee import _cognee_rate_limiter
             max_conc, delay_sec = _cognee_rate_limiter.get_rate_settings()
             resp["resolved"] = {
                 "max_concurrency": str(max_conc),
@@ -336,7 +335,7 @@ def get_group(
             # resolver will return on the next call (and the floor/default for
             # helper text). Stored overrides are plain strings (not secret),
             # so they are already in ``settings`` above.
-            from api.timeout_config import get_timeout_resolved_view
+            from api.config.timeout import get_timeout_resolved_view
             resp["resolved"] = get_timeout_resolved_view()
         return resp
 
@@ -442,7 +441,7 @@ def put_group(
 
         # Trigger instant synchronization across all process subsystems and cognee
         try:
-            from api.config_abstraction import sync_runtime_settings
+            from api.config.abstraction import sync_runtime_settings
             sync_runtime_settings()
         except Exception as e:
             logger.warning("sync_runtime_settings after admin put_group failed: %s", e)
@@ -577,31 +576,29 @@ def test_group(
 
 def _test_models(body: Dict[str, Any]) -> Dict[str, Any]:
     """Ping a configured LLM endpoint (default: the ``expert`` task config)."""
-    provider = body.get("provider")
     base_url = body.get("base_url")
     api_key = body.get("api_key")
     model = body.get("model")
     task = body.get("task") or "expert"
-    if not base_url or not provider or not model:
+    if not base_url or not model:
         cfg = get_model_for_task(task)
-        provider = provider or cfg.get("provider") or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local")
         base_url = base_url or cfg.get("base_url")
         api_key = api_key if api_key else cfg.get("api_key")
         model = model or cfg.get("model")
     if not base_url:
         return {"success": False, "message": "No base_url configured for models test."}
-    return _ping_model_endpoint(provider or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local"), base_url, api_key, model, task=task)
+    return _ping_model_endpoint(base_url, api_key, model, task=task)
 
 
 def _ping_model_endpoint(
-    provider: str, base_url: str, api_key: Optional[str], model: Optional[str] = None, task: Optional[str] = None
+    base_url: str, api_key: Optional[str], model: Optional[str] = None, task: Optional[str] = None
 ) -> Dict[str, Any]:
     """Ping a configured LLM or Embedder endpoint."""
     try:
         import requests
     except Exception as e:  # pragma: no cover - dep missing
         return {"success": False, "message": f"requests not available: {e}"}
-    from api.ssl_config import requests_verify
+    from api.config.ssl import requests_verify
     # Normalize a pasted key (strip whitespace / a stray "Bearer " prefix the
     # SDK would double up) so the test reflects real client behaviour.
     api_key = _sanitize_api_key(api_key)
@@ -610,8 +607,8 @@ def _ping_model_endpoint(
         headers["Authorization"] = f"Bearer {api_key}"
     try:
         # Every supported server (Ollama, LM Studio, llama.cpp, vLLM, ...)
-        # exposes the OpenAI-compatible /v1/models endpoint, so the provider
-        # type no longer matters. Ollama's :11434 also serves /v1/models.
+        # exposes the OpenAI-compatible /v1/models endpoint. Ollama's :11434
+        # also serves /v1/models.
         url = base_url
         if not url.endswith("/v1"):
             url = url.rstrip("/") + "/v1"

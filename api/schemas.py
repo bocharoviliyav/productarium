@@ -5,10 +5,11 @@ Wave 2 routers import these instead of ``api.api`` to avoid circular imports.
 product/artifact endpoints keep their ``response_model`` working.
 
 Shapes:
-- ``Product``  — no ``type``; +summary, +owner_id
-- ``Artifact`` — type enum codebase|spec|links|documentation|guides; +kind,
-                 +verified, +verified_by, +verified_at, +source
-- ``User``     — id/username/email/role/provider
+- ``Product``   — no ``type``; +summary, +owner_id; owns codebases/specs/links
+- ``Codebase``  — git repo artifact (repo_url, pages, generated_docs)
+- ``Spec``      — OpenAPI/AsyncAPI spec (kind + content)
+- ``Links``     — curated external links (content = JSON array)
+- ``User``      — id/username/email/role/provider
 - ``KnowledgeNode`` — Confluence-like tree node
 - ``ApiToken`` / ``Setting`` — admin/public API helpers
 """
@@ -21,21 +22,36 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 
 
-# --- Artifact / Product -----------------------------------------------------
-class Artifact(BaseModel):
+# --- Codebase / Spec / Links / Product --------------------------------------
+class Codebase(BaseModel):
     id: str
     name: str
-    # codebase|spec|links|documentation|guides (legacy openapi/asyncapi/testcase
-    # are normalized to spec/documentation + kind on write).
-    type: str
-    kind: Optional[str] = None  # subtype, e.g. openapi/asyncapi for spec
     repo_url: Optional[str] = None
     repo_type: Optional[str] = None
     token: Optional[str] = None
-    content: Optional[str] = None
-    allure_url: Optional[str] = None
     generated_docs: Optional[str] = None
     pages: Optional[Dict[str, Any]] = None
+    verified: bool = False
+    verified_by: Optional[str] = None
+    verified_at: Optional[datetime] = None
+    source: str = "manual"
+
+
+class Spec(BaseModel):
+    id: str
+    name: str
+    kind: str = "openapi"  # openapi|asyncapi
+    content: Optional[str] = None
+    verified: bool = False
+    verified_by: Optional[str] = None
+    verified_at: Optional[datetime] = None
+    source: str = "manual"
+
+
+class Links(BaseModel):
+    id: str
+    name: str
+    content: Optional[str] = None  # JSON array of {url, description}
     verified: bool = False
     verified_by: Optional[str] = None
     verified_at: Optional[datetime] = None
@@ -48,7 +64,9 @@ class Product(BaseModel):
     description: str = ""
     summary: Optional[str] = None
     owner_id: Optional[str] = None
-    artifacts: List[Artifact] = []
+    codebases: List[Codebase] = []
+    specs: List[Spec] = []
+    links: List[Links] = []
 
 
 # --- User -------------------------------------------------------------------

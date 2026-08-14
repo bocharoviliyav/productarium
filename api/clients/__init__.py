@@ -11,7 +11,6 @@ Members:
 
 from api.clients.git import (
     download_repo,
-    download_github_repo,
     get_file_content,
     get_github_file_content,
     get_gitlab_file_content,
@@ -19,7 +18,6 @@ from api.clients.git import (
 
 __all__ = [
     "download_repo",
-    "download_github_repo",
     "get_file_content",
     "get_github_file_content",
     "get_gitlab_file_content",

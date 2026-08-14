@@ -68,7 +68,7 @@ def _to_bool(value: Optional[Union[str, bool]], default: bool = True) -> bool:
 def _setting(key: str) -> Optional[str]:
     """Read a setting from the store (best-effort; None if DB/cognee down)."""
     try:
-        from api.settings_store import get_setting  # lazy: avoids circular import
+        from api.config.settings import get_setting  # lazy: avoids circular import
         return get_setting(key)
     except Exception as e:  # pragma: no cover - DB / import unavailable
         logger.debug("ssl_config: get_setting(%r) failed: %s", key, e)
@@ -207,7 +207,7 @@ def apply_openai_ssl_patch() -> None:
             # calls mid-flight. Read at patch time; admin overrides take effect
             # on the next patch (a process restart, since the patch is once-only).
             try:
-                from api.timeout_config import resolve_llm_request_timeout
+                from api.config.timeout import resolve_llm_request_timeout
                 _ssl_timeout = resolve_llm_request_timeout()
             except Exception:
                 _ssl_timeout = 3600.0

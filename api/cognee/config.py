@@ -18,7 +18,7 @@ from api.cognee._runtime import (
     cognee,
 )
 from api.cognee.rate_limiter import _apply_cognee_rate_limit_patches
-from api.ssl_config import apply_cognee_ssl_patch, apply_ssl_env
+from api.config.ssl import apply_cognee_ssl_patch, apply_ssl_env
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ async def init_cognee():
         return
     apply_cognee_runtime_config()
     try:
-        from api.timeout_config import resolve_cognee_init_timeout
+        from api.config.timeout import resolve_cognee_init_timeout
         init_timeout = resolve_cognee_init_timeout()
     except Exception:  # pragma: no cover - defensive
         init_timeout = 120.0
@@ -158,13 +158,12 @@ def apply_cognee_retry_patch() -> None:
         async def _patched_acreate_structured_output(
             self, text_input: str, system_prompt: str, response_model: type, **kwargs
         ):
-            # Clamp text_input conservatively for graph extraction (max 400 tokens / ~1500 chars)
-            try:
-                from api.utils import clamp_text_by_tokens
-                text_input = clamp_text_by_tokens(text_input, max_tokens=400)
-            except Exception:
-                if len(text_input) > 1500:
-                    text_input = text_input[:1500] + "\n... (truncated)"
+            # Cap text_input conservatively for graph extraction (~1500 chars,
+            # roughly 400 tokens) so a single chunk stays well inside the model's
+            # context window. cognee's cognify already chunks documents upstream
+            # of this call; this is a per-call safety cap only.
+            if len(text_input) > 1500:
+                text_input = text_input[:1500] + "\n... (truncated)"
 
             # Drive the underlying coroutine manually instead of a bare
             # ``asyncio.wait_for``. ``wait_for`` cancels the task on timeout and
@@ -248,7 +247,7 @@ def apply_cognee_runtime_config() -> None:
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("apply_cognee_runtime_config: root re-assert failed: %s", e)
     try:
-        from api.settings_store import get_model_for_task, get_setting
+        from api.config.settings import get_model_for_task, get_setting
         llm_cfg = get_model_for_task("cognee")
         emb_cfg = get_model_for_task("embedder")
     except Exception as e:  # pragma: no cover - settings store / DB unavailable

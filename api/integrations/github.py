@@ -28,7 +28,7 @@ class GitHubConnector(IntegrationConnector, GitConnector):
 
     @classmethod
     def get_config(cls) -> Dict[str, Any]:
-        from api.settings_store import get_git_creds
+        from api.config.settings import get_git_creds
 
         return get_git_creds("github")
 
@@ -59,7 +59,7 @@ class GitHubConnector(IntegrationConnector, GitConnector):
             import requests
         except Exception as e:  # pragma: no cover
             return {"success": False, "message": f"requests unavailable: {e}"}
-        from api.ssl_config import requests_verify
+        from api.config.ssl import requests_verify
 
         token = self._token()
         if not token:
@@ -69,7 +69,7 @@ class GitHubConnector(IntegrationConnector, GitConnector):
             api_base = api_base.rstrip("/") + "/api/v3"
         url = f"{api_base.rstrip('/')}/user"
         try:
-            from api.timeout_config import resolve_integration_http_timeout
+            from api.config.timeout import resolve_integration_http_timeout
             resp = requests.get(
                 url, headers=self.auth_headers(), timeout=resolve_integration_http_timeout(),
                 verify=requests_verify(),

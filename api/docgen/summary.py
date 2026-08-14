@@ -10,7 +10,7 @@ Decoupling notes (per the Wave 2 plan):
 - This module replicates the minimal ``_StandardLLM`` wrapper pattern (now in
   ``api.docgen._common``) so it stays self-contained.
 - Provider/model are resolved from the settings store task ``summary``
-  (``api.settings_store.get_model_for_task``) with env fallback, so the admin
+  (``api.config.settings.get_model_for_task``) with env fallback, so the admin
   panel can configure the summary model without touching this file.
 
 All LLM/cognee/DB dependencies are imported lazily so this module imports
@@ -58,7 +58,6 @@ class _SummaryLLM:
 
     def __init__(
         self,
-        provider: str,
         model: Optional[str],
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
@@ -66,7 +65,7 @@ class _SummaryLLM:
         import adalflow as adal
         from api.config import get_model_config
 
-        generator_config = get_model_config(provider, model)
+        generator_config = get_model_config(model)
         model_client_class = generator_config["model_client"]
         # Thread admin base_url/api_key through to the OpenAI-compatible client
         # so the summary LLM hits the configured endpoint (corporate AI gateway,
@@ -111,18 +110,17 @@ class _SummaryLLM:
 
 
 def _safe_build_summary_llm(
-    provider: str,
     model: Optional[str],
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Optional[_SummaryLLM]:
     try:
-        return _SummaryLLM(provider, model, base_url=base_url, api_key=api_key)
+        return _SummaryLLM(model, base_url=base_url, api_key=api_key)
     except Exception as e:  # pragma: no cover - depends on live config/Ollama
         logger.warning(
-            "Could not initialise summary LLM (%s/%s): %s. "
+            "Could not initialise summary LLM (%s): %s. "
             "Falling back to a deterministic stub summary.",
-            provider, model, e,
+            model, e,
         )
         return None
 
@@ -144,14 +142,25 @@ def _clean_text(text: Optional[str]) -> str:
 # --------------------------------------------------------------------------- #
 # Context collection + prompt building
 # --------------------------------------------------------------------------- #
-def _collect_summary_content(artifacts: Iterable[Any], nodes: Iterable[Any], max_tokens: int = 6000) -> str:
-    """Concatenate artifact generated_docs + knowledge node content_md."""
+def _collect_summary_content(
+    codebases: Iterable[Any],
+    specs: Iterable[Any],
+    nodes: Iterable[Any],
+    max_tokens: int = 6000,
+) -> str:
+    """Concatenate codebase generated_docs + spec content + knowledge node content_md."""
     parts = []
-    for a in artifacts or []:
-        docs = getattr(a, "generated_docs", None) or ""
+    for c in codebases or []:
+        docs = getattr(c, "generated_docs", None) or ""
         if docs and docs.strip():
-            name = getattr(a, "name", None) or getattr(a, "id", "artifact")
-            parts.append(f"## Артефакт: {name}\n\n{docs.strip()}")
+            name = getattr(c, "name", None) or getattr(c, "id", "codebase")
+            parts.append(f"## Codebase: {name}\n\n{docs.strip()}")
+    for s in specs or []:
+        content = getattr(s, "content", None) or ""
+        if content and content.strip():
+            name = getattr(s, "name", None) or getattr(s, "id", "spec")
+            kind = getattr(s, "kind", None) or "spec"
+            parts.append(f"## Спецификация ({kind}): {name}\n\n{content.strip()}")
     for n in nodes or []:
         md = getattr(n, "content_md", None) or ""
         if md and md.strip():
@@ -159,13 +168,9 @@ def _collect_summary_content(artifacts: Iterable[Any], nodes: Iterable[Any], max
             parts.append(f"## Страница базы знаний: {title}\n\n{md.strip()}")
     if not parts:
         return ""
-    
+
     full_text = "\n\n".join(parts)
-    try:
-        from api.utils import clamp_text_by_tokens
-        return clamp_text_by_tokens(full_text, max_tokens)
-    except Exception:
-        return _cap(full_text, SUMMARY_CONTEXT_MAX_CHARS)
+    return _cap(full_text, SUMMARY_CONTEXT_MAX_CHARS)
 
 
 def _build_summary_prompt(product_name: str, content: str) -> str:
@@ -181,13 +186,13 @@ def _build_summary_prompt(product_name: str, content: str) -> str:
 # --------------------------------------------------------------------------- #
 async def generate_product_summary(
     product: Any,
-    artifacts: Iterable[Any],
+    codebases: Iterable[Any],
+    specs: Iterable[Any],
     nodes: Iterable[Any],
     *,
-    provider: Optional[str] = None,
     model: Optional[str] = None,
 ) -> str:
-    """Generate an AI summary over the product's artifacts + knowledge nodes.
+    """Generate an AI summary over the product's codebases + specs + knowledge nodes.
 
     Returns the cleaned summary text (possibly empty on LLM failure or when the
     product has no content to summarize). NEVER raises: callers store/return the
@@ -195,36 +200,33 @@ async def generate_product_summary(
     """
     product_name = getattr(product, "name", "") or "product"
 
-    # Resolve provider/model/base_url/api_key from the settings store 'summary'
-    # task, falling back to env-driven defaults.
+    # Resolve model/base_url/api_key from the settings store 'summary' task,
+    # falling back to env-driven defaults.
     base_url: Optional[str] = None
     api_key: Optional[str] = None
-    if provider is None or model is None:
+    if model is None:
         try:
-            from api.settings_store import get_model_for_task
+            from api.config.settings import get_model_for_task
             cfg = get_model_for_task("summary")
-            provider = provider or cfg.get("provider") or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local")
-            model = model or cfg.get("model")
+            model = cfg.get("model")
             base_url = cfg.get("base_url")
             api_key = cfg.get("api_key")
         except Exception as e:  # pragma: no cover - depends on live DB
             logger.debug("settings_store summary task lookup failed: %s", e)
-            provider = provider or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local")
 
     try:
         from api.utils import get_model_context_window
-        ctx_win = get_model_context_window(provider=provider, base_url=base_url, model_name=model, api_key=api_key, task="summary")
+        ctx_win = get_model_context_window(base_url=base_url, model_name=model, api_key=api_key, task="summary")
     except Exception:
         ctx_win = 8192
 
     max_summary_tokens = max(1024, ctx_win - 2048)
-    content = _collect_summary_content(artifacts, nodes, max_tokens=max_summary_tokens)
+    content = _collect_summary_content(codebases, specs, nodes, max_tokens=max_summary_tokens)
     if not content.strip():
         logger.info("Product %r has no content to summarize.", product_name)
         return ""
 
     llm = _safe_build_summary_llm(
-        provider or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local"),
         model,
         base_url=base_url,
         api_key=api_key,

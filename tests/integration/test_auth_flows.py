@@ -39,7 +39,7 @@ def _setup_db():
     import api.db as db
 
     importlib.reload(db)
-    import api.settings_store as ss
+    import api.config.settings as ss
 
     importlib.reload(ss)
     engine = create_engine(

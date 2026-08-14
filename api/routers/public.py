@@ -11,12 +11,7 @@ API-token-authenticated endpoints for external integrations:
 
 All endpoints require a valid Bearer API token (``require_api_token``), which
 also updates ``last_used_at``. Only verified content (``KnowledgeNode`` /
-``Artifact`` with ``verified=True``) is exported or pushed.
-
-The expert agent (``api.expert.chat``) and integrations (``api.integrations``)
-are imported lazily: they are built in parallel and may not be present yet, so
-a missing dependency degrades to a clear ``501`` instead of crashing the
-router import.
+``Codebase``/``Spec``/``Links`` with ``verified=True``) is exported or pushed.
 """
 
 from __future__ import annotations
@@ -33,8 +28,10 @@ from sqlalchemy.orm import Session
 
 from api.auth.deps import require_api_token
 from api.db import get_db
-from api.models import ApiTokenORM, ArtifactORM, KnowledgeNodeORM, ProductORM
-from api.settings_store import get_confluence_creds, get_git_creds
+from api.models import (
+    ApiTokenORM, CodebaseORM, KnowledgeNodeORM, LinksORM, ProductORM, SpecORM,
+)
+from api.config.settings import get_confluence_creds, get_git_creds
 
 logger = logging.getLogger(__name__)
 
@@ -51,21 +48,33 @@ class AskRequest(BaseModel):
 
 
 class PushRequest(BaseModel):
-    # confluence | github | gitlab; default resolved from settings.
     target: Optional[str] = None
-    space: Optional[str] = None  # Confluence space override
-    host: Optional[str] = None  # git host override (kept for symmetry)
+    space: Optional[str] = None
+    host: Optional[str] = None
     options: Optional[Dict[str, Any]] = None
 
 
 # --- Verified-content queries ----------------------------------------------
-def _verified_artifacts(product_id: str, db: Session) -> List[ArtifactORM]:
+def _verified_codebases(product_id: str, db: Session) -> List[CodebaseORM]:
     return (
-        db.query(ArtifactORM)
-        .filter(
-            ArtifactORM.product_id == product_id,
-            ArtifactORM.verified.is_(True),
-        )
+        db.query(CodebaseORM)
+        .filter(CodebaseORM.product_id == product_id, CodebaseORM.verified.is_(True))
+        .all()
+    )
+
+
+def _verified_specs(product_id: str, db: Session) -> List[SpecORM]:
+    return (
+        db.query(SpecORM)
+        .filter(SpecORM.product_id == product_id, SpecORM.verified.is_(True))
+        .all()
+    )
+
+
+def _verified_links(product_id: str, db: Session) -> List[LinksORM]:
+    return (
+        db.query(LinksORM)
+        .filter(LinksORM.product_id == product_id, LinksORM.verified.is_(True))
         .all()
     )
 
@@ -81,43 +90,53 @@ def _verified_nodes(product_id: str, db: Session) -> List[KnowledgeNodeORM]:
     )
 
 
+def _verified_meta(e: Any) -> str:
+    """Build the ``> type | kind | verified_by`` meta line for markdown export."""
+    meta: List[str] = []
+    cls = type(e).__name__.replace("ORM", "").lower()
+    meta.append(f"{cls}")
+    kind = getattr(e, "kind", None)
+    if kind:
+        meta.append(f"kind: {kind}")
+    if e.verified_by:
+        meta.append(f"verified_by: {e.verified_by}")
+    return "> " + " | ".join(meta)
+
+
 def _knowledge_as_json(
     product: ProductORM,
-    artifacts: List[ArtifactORM],
+    codebases: List[CodebaseORM],
+    specs: List[SpecORM],
+    links: List[LinksORM],
     nodes: List[KnowledgeNodeORM],
 ) -> Dict[str, Any]:
+    def _vmeta(e: Any) -> Dict[str, Any]:
+        return {
+            "verified_by": e.verified_by,
+            "verified_at": e.verified_at.isoformat() if e.verified_at else None,
+            "source": e.source,
+        }
+
     return {
-        "product": {
-            "id": product.id,
-            "name": product.name,
-            "summary": product.summary,
-        },
+        "product": {"id": product.id, "name": product.name, "summary": product.summary},
         "exported_at": datetime.utcnow().isoformat() + "Z",
         "verified_only": True,
-        "artifacts": [
-            {
-                "id": a.id,
-                "name": a.name,
-                "type": a.type,
-                "kind": a.kind,
-                "generated_docs": a.generated_docs,
-                "verified_by": a.verified_by,
-                "verified_at": a.verified_at.isoformat() if a.verified_at else None,
-                "source": a.source,
-            }
-            for a in artifacts
+        "codebases": [
+            {"id": c.id, "name": c.name, "generated_docs": c.generated_docs, **_vmeta(c)}
+            for c in codebases
+        ],
+        "specs": [
+            {"id": s.id, "name": s.name, "kind": s.kind, "content": s.content, **_vmeta(s)}
+            for s in specs
+        ],
+        "links": [
+            {"id": l.id, "name": l.name, "content": l.content, **_vmeta(l)}
+            for l in links
         ],
         "nodes": [
             {
-                "id": n.id,
-                "parent_id": n.parent_id,
-                "title": n.title,
-                "slug": n.slug,
-                "node_type": n.node_type,
-                "content_md": n.content_md,
-                "verified_by": n.verified_by,
-                "verified_at": n.verified_at.isoformat() if n.verified_at else None,
-                "source": n.source,
+                "id": n.id, "parent_id": n.parent_id, "title": n.title, "slug": n.slug,
+                "node_type": n.node_type, "content_md": n.content_md, **_vmeta(n),
             }
             for n in nodes
         ],
@@ -126,48 +145,48 @@ def _knowledge_as_json(
 
 def _knowledge_as_markdown(
     product: ProductORM,
-    artifacts: List[ArtifactORM],
+    codebases: List[CodebaseORM],
+    specs: List[SpecORM],
+    links: List[LinksORM],
     nodes: List[KnowledgeNodeORM],
 ) -> str:
-    lines: List[str] = []
-    lines.append(f"# {product.name} — Verified Knowledge")
-    lines.append("")
+    lines: List[str] = [f"# {product.name} — Verified Knowledge", ""]
     if product.summary:
-        lines.append(product.summary)
-        lines.append("")
-    lines.append(
-        f"_Exported {datetime.utcnow().isoformat()}Z — verified content only._"
-    )
+        lines += [product.summary, ""]
+    lines.append(f"_Exported {datetime.utcnow().isoformat()}Z — verified content only._")
     lines.append("")
 
-    if artifacts:
-        lines.append("## Artifacts")
-        lines.append("")
-        for a in artifacts:
-            lines.append(f"### {a.name}")
-            lines.append("")
-            meta = [f"type: {a.type}"]
-            if a.kind:
-                meta.append(f"kind: {a.kind}")
-            if a.verified_by:
-                meta.append(f"verified_by: {a.verified_by}")
-            lines.append("> " + " | ".join(meta))
-            lines.append("")
-            if a.generated_docs:
-                lines.append(a.generated_docs)
-                lines.append("")
+    def _section(title: str, items: List[Any], content_attr: str) -> None:
+        if not items:
+            return
+        lines.extend([f"## {title}", ""])
+        for e in items:
+            lines.extend([f"### {e.name}", "", _verified_meta(e), ""])
+            content = getattr(e, content_attr, None)
+            if content:
+                lines.extend([content, ""])
+
+    _section("Codebases", codebases, "generated_docs")
+    _section("Specifications", specs, "content")
+    _section("Links", links, "content")
 
     if nodes:
-        lines.append("## Knowledge Pages")
-        lines.append("")
+        lines += ["## Knowledge Pages", ""]
         for n in sorted(nodes, key=lambda x: (x.parent_id or "", x.title)):
-            lines.append(f"### {n.title}")
-            lines.append("")
+            lines += [f"### {n.title}", ""]
             if n.content_md:
-                lines.append(n.content_md)
-                lines.append("")
+                lines += [n.content_md, ""]
 
     return "\n".join(lines)
+
+
+def _load_verified(product_id: str, db: Session):
+    return (
+        _verified_codebases(product_id, db),
+        _verified_specs(product_id, db),
+        _verified_links(product_id, db),
+        _verified_nodes(product_id, db),
+    )
 
 
 # --- GET /api/public/products ------------------------------------------------
@@ -198,24 +217,17 @@ def export_knowledge(
     tok: ApiTokenORM = Depends(require_api_token),
     db: Session = Depends(get_db),
 ):
-    """Export VERIFIED knowledge for a product as markdown (default) or json.
-
-    Only artifacts and knowledge nodes with ``verified=True`` are included.
-    """
+    """Export VERIFIED knowledge for a product as markdown (default) or json."""
     fmt = (format or "markdown").lower()
     if fmt not in ("markdown", "json"):
-        raise HTTPException(
-            status_code=400, detail="format must be 'markdown' or 'json'"
-        )
+        raise HTTPException(status_code=400, detail="format must be 'markdown' or 'json'")
     product = db.get(ProductORM, product_id)
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
-    artifacts = _verified_artifacts(product_id, db)
-    nodes = _verified_nodes(product_id, db)
-
+    codebases, specs, links, nodes = _load_verified(product_id, db)
     if fmt == "json":
-        return JSONResponse(content=_knowledge_as_json(product, artifacts, nodes))
-    md = _knowledge_as_markdown(product, artifacts, nodes)
+        return JSONResponse(content=_knowledge_as_json(product, codebases, specs, links, nodes))
+    md = _knowledge_as_markdown(product, codebases, specs, links, nodes)
     return Response(content=md, media_type="text/markdown; charset=utf-8")
 
 
@@ -227,21 +239,14 @@ async def ask(
     tok: ApiTokenORM = Depends(require_api_token),
     db: Session = Depends(get_db),
 ):
-    """Reuse the expert agent to answer a query over a product (SSE stream).
-
-    The expert agent (``api.expert.chat.run_expert_chat``) is imported lazily.
-    If it is not available (e.g. not yet merged) the endpoint returns 501 with
-    a clear message instead of failing at import time.
-    """
+    """Reuse the expert agent to answer a query over a product (SSE stream)."""
     product = db.get(ProductORM, product_id)
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
     try:
         from api.expert.chat import run_expert_chat  # lazy: built in parallel
     except Exception as e:
-        raise HTTPException(
-            status_code=501, detail=f"Expert agent not available: {e}"
-        )
+        raise HTTPException(status_code=501, detail=f"Expert agent not available: {e}")
 
     async def event_stream():
         try:
@@ -252,8 +257,6 @@ async def ask(
                 model=body.model,
                 stream=True,
             )
-            # Support both an async generator (streaming) and a coroutine
-            # returning a complete string.
             if hasattr(agen, "__aiter__"):
                 async for chunk in agen:
                     payload = chunk if isinstance(chunk, str) else str(chunk)
@@ -290,43 +293,28 @@ async def push(
     tok: ApiTokenORM = Depends(require_api_token),
     db: Session = Depends(get_db),
 ):
-    """Push verified docs to a configured integration (Confluence or git).
-
-    Reads the target from the request body or, failing that, from the admin
-    settings store (Confluence if configured, else a configured git host). The
-    integration connector's ``push`` (or ``export``) method is called with a
-    payload containing the verified-knowledge markdown. Returns 501 if no
-    connector is registered or the connector does not support push.
-    """
+    """Push verified docs to a configured integration (Confluence or git)."""
     product = db.get(ProductORM, product_id)
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
-    artifacts = _verified_artifacts(product_id, db)
-    nodes = _verified_nodes(product_id, db)
+    codebases, specs, links, nodes = _load_verified(product_id, db)
     target = (body.target or _default_push_target()).lower()
 
     try:
         from api.integrations import registry as _reg  # lazy: built in parallel
     except Exception as e:
-        raise HTTPException(
-            status_code=501, detail=f"Integrations not available: {e}"
-        )
+        raise HTTPException(status_code=501, detail=f"Integrations not available: {e}")
     getter = getattr(_reg, "get_connector", None)
     connector = getter(target) if callable(getter) else None
     if connector is None:
-        raise HTTPException(
-            status_code=501, detail=f"No connector registered for target '{target}'."
-        )
+        raise HTTPException(status_code=501, detail=f"No connector registered for target '{target}'.")
     push_fn = getattr(connector, "push", None)
     if not callable(push_fn):
         push_fn = getattr(connector, "export", None)
     if not callable(push_fn):
-        raise HTTPException(
-            status_code=501,
-            detail=f"Connector '{target}' does not support push/export.",
-        )
+        raise HTTPException(status_code=501, detail=f"Connector '{target}' does not support push/export.")
 
-    md = _knowledge_as_markdown(product, artifacts, nodes)
+    md = _knowledge_as_markdown(product, codebases, specs, links, nodes)
     payload = {
         "product_id": product_id,
         "product_name": product.name,
@@ -341,13 +329,7 @@ async def push(
         if hasattr(result, "__await__"):
             result = await result
     except Exception as e:
-        raise HTTPException(
-            status_code=502, detail=f"Push to '{target}' failed: {e}"
-        )
+        raise HTTPException(status_code=502, detail=f"Push to '{target}' failed: {e}")
     if isinstance(result, dict):
         return result
-    return {
-        "success": True,
-        "target": target,
-        "message": "Pushed verified knowledge.",
-    }
+    return {"success": True, "target": target, "message": "Pushed verified knowledge."}

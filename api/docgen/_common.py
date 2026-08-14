@@ -117,13 +117,12 @@ class _StandardLLM:
     """Thin non-streaming text generator over the configured local LLM.
 
     Honors admin-configured ``base_url`` / ``api_key`` from
-    ``api.settings_store.get_model_for_task("docgen")`` so docgen reaches the
+    ``api.config.settings.get_model_for_task("docgen")`` so docgen reaches the
     corporate AI gateway instead of falling back to a dead local env default.
     """
 
     def __init__(
         self,
-        provider: str,
         model: Optional[str],
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
@@ -131,11 +130,9 @@ class _StandardLLM:
         import adalflow as adal
         from api.config import get_model_config
 
-        if not provider:
-            provider = os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local")
         if not model:
-            model = os.environ.get("DEEPWIKI_DEFAULT_MODEL", "qwen/qwen3.6-27b")
-        generator_config = get_model_config(provider, model)
+            model = "qwen/qwen3.6-27b"
+        generator_config = get_model_config(model)
         model_client_class = generator_config["model_client"]
         # Thread admin base_url/api_key through to the OpenAI-compatible client
         # so docgen hits the configured endpoint (corporate gateway, LM Studio,
@@ -192,48 +189,44 @@ class _StandardLLM:
 
 def _resolve_docgen_model(
     model: Optional[str],
-) -> Tuple[str, str, Optional[str], Optional[str]]:
-    """Resolve (provider, model, base_url, api_key) for the docgen task.
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """Resolve (model, base_url, api_key) for the docgen task.
 
     Reads admin-configured ``models.docgen.*`` from the Config Abstraction Layer
     (with env fallbacks) so docgen hits the corporate AI gateway when configured.
     """
     try:
-        from api.config_abstraction import get_task_config
+        from api.config.abstraction import get_task_config
 
         cfg = get_task_config("docgen") or {}
-        provider = cfg.get("provider") or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local")
-        resolved_model = model or cfg.get("model") or os.environ.get("DEEPWIKI_DEFAULT_MODEL", "qwen/qwen3.6-27b")
-        return provider, resolved_model, cfg.get("base_url"), cfg.get("api_key")
+        resolved_model = model or cfg.get("model") or "qwen/qwen3.6-27b"
+        return resolved_model, cfg.get("base_url"), cfg.get("api_key")
     except Exception as e:  # pragma: no cover - settings store is import-safe
         logger.debug("get_task_config(docgen) failed; using defaults: %s", e)
         return (
-            os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local"),
-            model or os.environ.get("DEEPWIKI_DEFAULT_MODEL", "qwen/qwen3.6-27b"),
+            model or "qwen/qwen3.6-27b",
             None,
             None,
         )
 
 
 def _safe_build_llm(
-    provider: str,
     model: Optional[str],
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Optional[_StandardLLM]:
     try:
-        return _StandardLLM(provider, model, base_url=base_url, api_key=api_key)
+        return _StandardLLM(model, base_url=base_url, api_key=api_key)
     except Exception as e:  # pragma: no cover - depends on live config/Ollama
         logger.warning(
-            "Could not initialise standard LLM (%s/%s): %s. "
-            "Falling back to RLM/skeleton where possible.", provider, model, e,
+            "Could not initialise standard LLM (%s): %s. "
+            "Falling back to RLM/skeleton where possible.", model, e,
         )
         return None
 
 
 async def _llm_or_none(
     prompt: str,
-    provider: str,
     model: Optional[str],
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -241,7 +234,7 @@ async def _llm_or_none(
     """Run the standard LLM on ``prompt``; return cleaned text or "" on failure."""
     if not prompt:
         return ""
-    llm = _safe_build_llm(provider, model, base_url=base_url, api_key=api_key)
+    llm = _safe_build_llm(model, base_url=base_url, api_key=api_key)
     if llm is None:
         return ""
     try:
@@ -252,7 +245,6 @@ async def _llm_or_none(
 
 
 def _make_repair_llm(
-    provider: str,
     model: Optional[str],
     existing: Optional[_StandardLLM] = None,
     base_url: Optional[str] = None,
@@ -262,13 +254,13 @@ def _make_repair_llm(
 
     Reuses an already-built ``_StandardLLM`` when available (so the codebase
     path doesn't construct a second client); otherwise builds one from the same
-    provider/model/base_url/api_key. Returns None if no LLM could be built
+    model/base_url/api_key. Returns None if no LLM could be built
     (repairs are then skipped and broken diagrams are surfaced with a marker).
     """
     if existing is not None:
         llm = existing
     else:
-        llm = _safe_build_llm(provider, model, base_url=base_url, api_key=api_key)
+        llm = _safe_build_llm(model, base_url=base_url, api_key=api_key)
     if llm is None:
         return None
 
@@ -321,7 +313,7 @@ def _index_in_background(content_or_path: str, dataset_name: str) -> None:
 
     async def _run() -> None:
         try:
-            from api.cognee_manager import add_and_index_document  # lazy: cognee optional
+            from api.cognee import add_and_index_document  # lazy: cognee optional
             await add_and_index_document(content_or_path, dataset_name=dataset_name)
         except Exception as e:  # pragma: no cover - depends on live cognee/DB
             logger.warning("Cognee indexing failed for %r: %s", dataset_name, e)

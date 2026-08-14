@@ -8,7 +8,7 @@
 
 * **Frontend**: Next.js 15 (Turbopack, Bun, React 19, TypeScript, Tailwind CSS, Phosphor Icons).
 * **Backend API**: Python FastAPI (`uvicorn` на порту 8001, SQLAlchemy 2.0 ORM, Pydantic).
-* **База данных**: PostgreSQL 18 + `pgvector` (базы `cognee_db`, таблицы `products`, `artifacts`, `knowledge_nodes`, `data`, `dataset_data`, `graph_node`, `graph_edge`).
+* **База данных**: PostgreSQL 18 + `pgvector` (базы `cognee_db`, таблицы `products`, `codebases`, `specs`, `links`, `knowledge_nodes`, `data`, `dataset_data`, `graph_node`, `graph_edge`).
 * **LLM & Embeddings Gateway**: Локальный OpenAI-совместимый API (LM Studio / vLLM / llama.cpp) или Ollama (модели: `qwen3.6-27b`, `qwen3:8b`, эмбеддинги: `nomic-embed-text-v2-moe`).
 * **RLM Engine (`fast-rlm`)**: Движок рекурсивного рассуждения на базе Deno + Pyodide (изолированный REPL-интерпретатор Python), используемый для длинного контекста кодовых баз.
 * **Knowledge Graph (`cognee` 1.2.2)**: Движок извлечения сущностей, связей и триплетов в Граф Знаний через `instructor` (Pydantic JSON schema mode).
@@ -22,8 +22,8 @@
 ```mermaid
 flowchart TD
     subgraph Frontend["1. Frontend (Next.js 15)"]
-        UI_Add["Пользователь создает Artifact (type: codebase)"] --> UI_Gen["Клик по кнопке 'Generate'"]
-        UI_Gen -->|POST /api/products/.../artifacts/.../generate| API_Start
+        UI_Add["Пользователь создает Codebase"] --> UI_Gen["Клик по кнопке 'Generate'"]
+        UI_Gen -->|POST /api/products/.../codebases/.../generate| API_Start
         UI_Poll["Поллинг /generate/status?job_id=... каждые 2с"] <-- Статус --> API_Status
     end
 
@@ -44,7 +44,7 @@ flowchart TD
     end
 
     subgraph Persistence["4. Сохранение & cognee Indexing"]
-        MermaidFix --> Persist["Persist in DB (artifact.generated_docs + pages)"]
+        MermaidFix --> Persist["Persist in DB (codebase.generated_docs + pages)"]
         Persist --> JobSucceeded["job.status = 'succeeded'"]
         Persist -->|Fire-and-forget| CogneeIndex["add_and_index_document (cognee)"]
         CogneeIndex --> CogneeIngest["cognee.add (DataItem)"]
@@ -63,19 +63,19 @@ flowchart TD
 
 ## 3. Детальное описание этапов
 
-### Шаг 1. Добавление артефакта кодовой базы
-1. Пользователь в UI (`src/app/products/[productId]/page.tsx`) добавляет артефакт типа `codebase`, указывая:
-   * `name`: Название артефакта / сервиса.
+### Шаг 1. Добавление кодовой базы
+1. Пользователь в UI (`src/app/products/[productId]/page.tsx`) добавляет codebase, указывая:
+   * `name`: Название сервиса.
    * `repo_url`: Ссылка на GitHub / GitLab репозиторий.
    * `repo_type`: `github` или `gitlab`.
    * `token`: Git-токен доступа (при необходимости).
-2. Фронтенд отправляет `POST /api/products/{product_id}/artifacts` в FastAPI backend (`api/api.py`).
-3. В Postgres создаётся запись `ArtifactORM` (`id: art_...`, `product_id`, `type: "codebase"`, `repo_url`, `verified: false`).
+2. Фронтенд отправляет `POST /api/products/{product_id}/codebases` в FastAPI backend.
+3. В Postgres создаётся запись `CodebaseORM` (`id: art_...`, `product_id`, `repo_url`, `verified: false`).
 
 ### Шаг 2. Запуск асинхронной генерации (202 Accepted + Job Polling)
 1. Пользователь нажимает кнопку **«Сгенерировать»** (`handleGenerate`).
-2. Фронтенд отправляет запрос `POST /api/products/{product_id}/artifacts/{artifact_id}/generate` с языком (`language: "ru"`).
-3. Backend (`api/api.py`):
+2. Фронтенд отправляет запрос `POST /api/products/{product_id}/codebases/{codebase_id}/generate` с языком (`language: "ru"`).
+3. Backend (`api/routers/docgen.py`):
    * Генерирует уникальный `job_id` (`uuid.uuid4().hex`).
    * Регистрирует задачу в глобальном реестре `_docgen_jobs[job_id]` с начальным состоянием:
      `status: "queued"`, `indexing_status: "idle"`, `indexing_message: "Генерация документации..."`.
@@ -83,7 +83,7 @@ flowchart TD
    * **Мгновенно возвращает ответ `202 Accepted`** с `{"job_id": "...", "status": "queued"}`. Это предотвращает обрыв длительного HTTP-соединения (предотвращает ошибки `ECONNRESET` в Next.js proxy).
 
 ### Шаг 3. Подготовка кодовой базы (Git Clone & Parsing)
-Фоновый поток запускает `_run_docgen_job`, создаёт отдельный `asyncio` event loop и выполняет `generate_codebase_docs()` (`api/artifact_docgen.py`):
+Фоновый поток запускает `_run_docgen_job`, создаёт отдельный `asyncio` event loop и выполняет `generate_codebase_docs()` (`api/docgen/codebase.py`):
 
 1. **Синхронизация репозитория (`api/data_pipeline.py`)**:
    * Вызывается `db_manager._create_repo(..., force_refresh=True)`.
@@ -113,7 +113,7 @@ flowchart TD
    * Если кодовая база превышает этот размер, `_chunk_file_blocks()` автоматически разбивает исходный код на несколько безопасных чанков для Map-Reduce.
 
 ### Шаг 5. Последовательная генерация 7 разделов Wiki
-Специализированный генератор `WikiGenerator` (`api/wiki_generator.py`) последовательно генерирует 7 классических разделов документации:
+Специализированный генератор в `api/docgen/codebase.py` последовательно генерирует 7 классических разделов документации:
 1. **Overview** (Обзор)
 2. **Architecture** (Архитектура и Mermaid C4/компонентные диаграммы)
 3. **Functional** (Функциональные возможности и API)
@@ -128,15 +128,15 @@ flowchart TD
 * Применяется единый гарды-валидатор `VERIFICATION_GUARD` (запрет выдумывания фактов, удаление префиксов номеров строк).
 
 **Двухуровневый генератор (RLM -> LLM Fallback)**:
-* **Основной путь (RLM)**: Если кодовая база большая (>= 20k символов), вызывается `fast-rlm` (`api/rlm_runner.py`), выполняющий рекурсивный поиск фактов в коде.
+* **Основной путь (RLM)**: Если кодовая база большая (>= 20k символов), вызывается `fast-rlm` (`api/rlm/runner.py`), выполняющий рекурсивный поиск фактов в коде.
 * **Фоллбэк (Standard LLM)**: Если RLM сбоит, превышает таймаут или отключается прерывателем `RLM_MAX_FAILURES`, вызов переходит на стандартную локальную модель (`_StandardLLM`).
-* **Гарантия наличия кода**: При фоллбэке исходный код чанка кодовой базы **всегда прикрепляется к промпту** и жестко обрезается функцией `clamp_text_by_tokens(prompt, max_p_tokens)`. Это предотвращает генерацию пустых страниц или появление плашек `_(Раздел не сгенерирован)_`.
+* **Гарантия наличия кода**: При фоллбэке исходный код чанка кодовой базы **всегда прикрепляется к промпту** и жестко обрезается функцией `cap(prompt, max_p_tokens)`. Это предотвращает генерацию пустых страниц или появление плашек `_(Раздел не сгенерирован)_`.
 * **Mermaid Repair Loop (`api/mermaid_verifier.py`)**: Все сгенерированные Mermaid-диаграммы валидируются через парсер Node.js. Если в диаграмме есть синтаксическая ошибка, запускается автоисправление.
 
 ### Шаг 6. Сохранение результатов и начало индексации в cognee
 По завершении генерации всех 7 разделов:
 1. Результаты форматируются в итоговый Markdown и набор страниц `pages`.
-2. Функция `_persist_artifact()` записывает `generated_docs` и `pages` в объект `ArtifactORM`.
+2. Функция `_persist_artifact()` записывает `generated_docs` и `pages` в объект `CodebaseORM`.
 3. Завершается транзакция БД `db.commit()`.
 4. Статус задачи в реестре обновляется:
    * `job["status"] = "succeeded"`
@@ -151,7 +151,7 @@ flowchart TD
 ### Шаг 7. Граф Знаний (cognee `cognify`) & Устранение сбоев
 Во время `cognify()` cognee извлекает сущности и связи между ними:
 1. **Предотвращение бесконечных рекурсий и спама**:
-   * В `api/cognee_manager.py` пропатчен `OpenAIAdapter.acreate_structured_output` через `_ORIG_ACREATE_STRUCTURED_OUTPUT` (идемпотентно).
+   * В `api/cognee/` пропатчен `OpenAIAdapter.acreate_structured_output` через `_ORIG_ACREATE_STRUCTURED_OUTPUT` (идемпотентно).
    * Вызовы `instructor` ограничены таймаутом `asyncio.wait_for(..., timeout=30.0)`.
    * Из условий повтора tenacity исключены `asyncio.CancelledError` и `BadRequestError`.
    * При таймауте отдельного чанка метод `_construct_dummy_model()` создаёт пустой объект Pydantic без вызова `ValidationError`, благодаря чему cognee продолжает обработку остальных чанков и **успешно завершает индексацию**.
@@ -160,7 +160,7 @@ flowchart TD
    * `job["indexing_message"] = "Документы сгенерированы и граф знаний успешно обновлён."`
 
 ### Шаг 8. Поллинг и нотификации в UI
-Фронтенд (`src/app/products/[productId]/page.tsx`) опрашивает статус эндпоинта `GET /api/products/{product_id}/artifacts/{artifact_id}/generate/status?job_id=...`:
+Фронтенд (`src/app/products/[productId]/page.tsx`) опрашивает статус эндпоинта `GET /api/products/{product_id}/codebases/{codebase_id}/generate/status?job_id=...`:
 
 1. **Фаза 1 (Генерация)**: Пока `status === "running"`, отображается индикатор загрузки (Spinner).
 2. **Фаза 2 (Переход к индексации)**:

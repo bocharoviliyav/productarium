@@ -5,7 +5,6 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import {
   ArrowLeft,
-  Article,
   Chats,
   FileText,
   GitBranch,
@@ -36,12 +35,12 @@ import {
   cn,
 } from "@/components/ui";
 import {
-  artifactTypeIcon,
-  artifactTypeMeta,
-  type Artifact,
   type ArtifactPage,
+  type Codebase,
   type LinkItem,
+  type Links,
   type Product,
+  type Spec,
   normalizePages,
   parseLinksContent,
   serializeLinksContent,
@@ -52,20 +51,9 @@ const Markdown = dynamic(() => import("@/components/Markdown"), {
   loading: () => <div className="text-sm text-muted">{"Loading…"}</div>,
 });
 
-/** Map a Phosphor icon name to a rendered node. */
-const ICON_BY_NAME: Record<string, React.ReactNode> = {
-  GitBranch: <GitBranch size={18} weight="regular" />,
-  FileText: <FileText size={18} weight="regular" />,
-  LinkSimple: <LinkSimple size={18} weight="regular" />,
-  Article: <Article size={18} weight="regular" />,
-};
+type EntityKind = "codebase" | "spec" | "links";
 
-/** Render the icon for an arbitrary artifact type (incl. legacy ones). */
-function artifactIconFor(type: string): React.ReactNode {
-  return ICON_BY_NAME[artifactTypeIcon(type)] ?? <FileText size={18} weight="regular" />;
-}
-
-export default function ArtifactDocsViewer() {
+export default function EntityDocsViewer() {
   const params = useParams<{ productId: string; artifactId: string }>();
   const { productId, artifactId } = params;
   const router = useRouter();
@@ -82,10 +70,6 @@ export default function ArtifactDocsViewer() {
   const [verified, setVerified] = useState(false);
   const [verifiedBy, setVerifiedBy] = useState<string | null>(null);
 
-  // WYSIWYG editor state. `editing` swaps the read-only render for the editor;
-  // `draftContent` is seeded from the active page's content (or generated_docs
-  // when there are no structured pages, or raw `content` for spec). Saving PUTs
-  // the doc back to the backend, which re-indexes it into cognee.
   const [editing, setEditing] = useState(false);
   const [draftContent, setDraftContent] = useState("");
   const [draftLinks, setDraftLinks] = useState<LinkItem[]>([]);
@@ -110,16 +94,16 @@ export default function ArtifactDocsViewer() {
         setError(t.productNotFound ?? "Product not found.");
         return;
       }
-      if (!res.ok) throw new Error(`Failed to load artifact (${res.status})`);
+      if (!res.ok) throw new Error(`Failed to load (${res.status})`);
       const data = (await res.json()) as Product;
       setProduct(data);
-      const art = data.artifacts.find((a) => a.id === artifactId);
-      setVerified(Boolean(art?.verified));
-      setVerifiedBy(art?.verified_by ?? null);
+      const found = findEntity(data, artifactId);
+      setVerified(Boolean(found?.entity?.verified));
+      setVerifiedBy(found?.entity?.verified_by ?? null);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Failed to load artifact.";
+      const msg = e instanceof Error ? e.message : "Failed to load.";
       setError(msg);
-      notify({ tone: "error", title: t.loadFailedTitle ?? "Failed to load artifact", message: msg });
+      notify({ tone: "error", title: t.loadFailedTitle ?? "Failed to load", message: msg });
     } finally {
       setIsLoading(false);
     }
@@ -129,14 +113,14 @@ export default function ArtifactDocsViewer() {
     fetchProduct();
   }, [fetchProduct]);
 
-  const artifact: Artifact | undefined = useMemo(
-    () => product?.artifacts.find((a) => a.id === artifactId),
-    [product, artifactId],
-  );
+  const { entity, kind } = useMemo(() => {
+    if (!product) return { entity: undefined, kind: undefined as EntityKind | undefined };
+    return findEntity(product, artifactId);
+  }, [product, artifactId]);
 
   const pages: ArtifactPage[] = useMemo(
-    () => (artifact ? normalizePages(artifact.pages) : []),
-    [artifact],
+    () => (entity && kind === "codebase" ? normalizePages((entity as Codebase).pages) : []),
+    [entity, kind],
   );
 
   useEffect(() => {
@@ -150,46 +134,48 @@ export default function ArtifactDocsViewer() {
     [pages, activePageId],
   );
 
-  const meta = artifact ? artifactTypeMeta(artifact.type) : null;
-  const artType = artifact?.type;
-  const isCodebase = artType === "codebase";
-  const isSpec = artType === "spec";
-  const isLinks = artType === "links";
-  // codebase: generated docs/pages are editable. spec/links: the raw `content`
-  // is editable (no generation step). Legacy types fall back to read-only.
-  const hasDocs = Boolean(artifact?.generated_docs || pages.length > 0);
-  const hasRawContent = Boolean(artifact?.content);
+  const isCodebase = kind === "codebase";
+  const isSpec = kind === "spec";
+  const isLinks = kind === "links";
+  const codebase = entity as Codebase | undefined;
+  const spec = entity as Spec | undefined;
+  const linksEntity = entity as Links | undefined;
+
+  const hasDocs = Boolean(codebase?.generated_docs || pages.length > 0);
+  const hasRawContent = Boolean(spec?.content || linksEntity?.content);
   const canEdit =
     (isCodebase && hasDocs) || ((isSpec || isLinks) && hasRawContent);
 
-  // Seed the editor draft whenever the source changes, unless the user is
-  // mid-edit (don't clobber unsaved changes).
   useEffect(() => {
     if (editing) return;
     if (isLinks) {
       setDraftLinks(
-        parseLinksContent(artifact?.content).length
-          ? parseLinksContent(artifact?.content)
+        parseLinksContent(linksEntity?.content).length
+          ? parseLinksContent(linksEntity?.content)
           : [{ url: "", description: "" }],
       );
     } else {
       setDraftContent(
-        activePage ? activePage.content || "" : artifact?.content || artifact?.generated_docs || "",
+        activePage
+          ? activePage.content || ""
+          : spec?.content || codebase?.generated_docs || "",
       );
     }
     setDirty(false);
-  }, [activePage, artifact, editing, isLinks]);
+  }, [activePage, codebase, spec, linksEntity, editing, isLinks]);
 
   const startEditing = () => {
     if (isLinks) {
       setDraftLinks(
-        parseLinksContent(artifact?.content).length
-          ? parseLinksContent(artifact?.content)
+        parseLinksContent(linksEntity?.content).length
+          ? parseLinksContent(linksEntity?.content)
           : [{ url: "", description: "" }],
       );
     } else {
       setDraftContent(
-        activePage ? activePage.content || "" : artifact?.content || artifact?.generated_docs || "",
+        activePage
+          ? activePage.content || ""
+          : spec?.content || codebase?.generated_docs || "",
       );
     }
     setDirty(false);
@@ -197,23 +183,21 @@ export default function ArtifactDocsViewer() {
   };
 
   const save = async () => {
-    if (!artifact || saving) return;
+    if (!kind || saving) return;
     setSaving(true);
     try {
       let payload: Record<string, unknown>;
       if (isLinks) {
-        // Persist the repeater rows as the artifact's raw content (JSON).
-        payload = { raw_content: serializeLinksContent(draftLinks) };
+        payload = { content: serializeLinksContent(draftLinks) };
       } else if (isSpec) {
-        // Spec edits update the raw spec source.
-        payload = { raw_content: draftContent };
+        payload = { content: draftContent };
       } else if (activePage) {
         payload = { page_id: activePage.id, content: draftContent };
       } else {
         payload = { generated_docs: draftContent };
       }
       const res = await fetch(
-        `/api/products/${productId}/artifacts/${artifactId}`,
+        `/api/products/${productId}/${kind}/${artifactId}`,
         {
           method: "PUT",
           credentials: "include",
@@ -247,6 +231,19 @@ export default function ArtifactDocsViewer() {
     }
   };
 
+  const entityLabel = isCodebase
+    ? (tArt?.codebase?.label ?? "Codebase")
+    : isSpec
+      ? (tArt?.spec?.label ?? "Spec")
+      : (tArt?.links?.label ?? "Links");
+  const entityTone = isCodebase ? "blue" : isSpec ? "green" : "yellow";
+  const entityIcon =
+    isCodebase ? <GitBranch size={18} weight="regular" /> :
+    isSpec ? <FileText size={18} weight="regular" /> :
+    <LinkSimple size={18} weight="regular" />;
+
+  const empty = isCodebase ? !hasDocs : !hasRawContent;
+
   return (
     <div className="min-h-screen bg-canvas text-ink">
       <AppHeader />
@@ -264,14 +261,14 @@ export default function ArtifactDocsViewer() {
 
         {isLoading ? (
           <div className="mt-12 flex items-center gap-2 text-sm text-muted">
-            <Spinner /> {t.loading ?? "Loading artifact…"}
+            <Spinner /> {t.loading ?? "Loading…"}
           </div>
-        ) : error || !artifact || !meta ? (
+        ) : error || !entity || !kind ? (
           <div className="mt-12">
             <EmptyState
               icon={<FileText size={20} weight="regular" />}
-              title={t.notAvailable ?? "Artifact not available"}
-              description={error || (t.notFoundFallback ?? "This artifact could not be found.")}
+              title={t.notAvailable ?? "Not available"}
+              description={error || (t.notFoundFallback ?? "This item could not be found.")}
               action={
                 <Link href={`/products/${productId}`}>
                   <Button>{t.backToProduct ?? "Back to product"}</Button>
@@ -281,42 +278,34 @@ export default function ArtifactDocsViewer() {
           </div>
         ) : (
           <>
-            {/* Header + Verified (item 5) */}
+            {/* Header + Verified */}
             <Reveal className="mt-6">
               <div className="flex flex-col gap-4 border-b border-divider pb-6 md:flex-row md:items-center md:justify-between">
                 <div className="flex items-center gap-3">
                   <span className="flex h-10 w-10 items-center justify-center rounded-md bg-surface-2 text-ink">
-                    {artifactIconFor(artifact.type)}
+                    {entityIcon}
                   </span>
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
-                      <Tag tone={meta.tone}>{(tArt?.[artifact.type]?.label as string) ?? meta.label}</Tag>
-                      {artifact.kind && (
-                        <Tag tone="neutral">{artifact.kind}</Tag>
+                      <Tag tone={entityTone}>{entityLabel}</Tag>
+                      {isSpec && spec?.kind && (
+                        <Tag tone="neutral">{spec.kind}</Tag>
                       )}
                       <span className="font-mono text-xs text-muted">
-                        {artifact.id}
+                        {entity.id}
                       </span>
                       {verified && (
-                        <VerifiedBadge
-                          verified={verified}
-                          verifiedBy={verifiedBy}
-                        />
+                        <VerifiedBadge verified={verified} verifiedBy={verifiedBy} />
                       )}
                     </div>
                     <h1 className="mt-2 font-editorial text-2xl tracking-tight text-ink">
-                      {artifact.name}
+                      {entity.name}
                     </h1>
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
                   {canEdit && !editing && (
-                    <Button
-                      type="button"
-                      variant="subtle"
-                      size="sm"
-                      onClick={startEditing}
-                    >
+                    <Button type="button" variant="subtle" size="sm" onClick={startEditing}>
                       <PencilSimple size={14} weight="regular" />
                       {t.edit ?? "Edit"}
                     </Button>
@@ -337,7 +326,7 @@ export default function ArtifactDocsViewer() {
                   )}
                   <VerifiedButton
                     verified={verified}
-                    verifyUrl={`/api/products/${productId}/artifacts/${artifactId}/verify`}
+                    verifyUrl={`/api/products/${productId}/${kind}/${artifactId}/verify`}
                     ownerId={product?.owner_id ?? null}
                     onVerified={(next) => {
                       setVerified(next.verified);
@@ -348,252 +337,216 @@ export default function ArtifactDocsViewer() {
               </div>
             </Reveal>
 
-            {/* Empty state: nothing to show yet. Codebase needs generation;
-             spec/links need authored content; legacy types need generated_docs. */}
-            {(() => {
-              const empty = isCodebase ? !hasDocs : isSpec || isLinks ? !hasRawContent : !hasDocs;
-              if (empty) {
-                return (
-                  <div className="mt-10">
-                    <EmptyState
-                      icon={<FileText size={20} weight="regular" />}
-                      title={t.noDocsTitle ?? "No content yet"}
-                      description={
-                        isCodebase
-                          ? (t.noDocsDesc ?? "")
-                          : (t.noRawContentDesc ?? "Add content from the edit button above.")
-                      }
-                      action={
-                        isCodebase ? (
-                          <Link href={`/products/${productId}`}>
-                            <Button>{t.generateOnProductPage ?? "Generate on product page"}</Button>
-                          </Link>
-                        ) : (
-                          <Button variant="subtle" size="sm" onClick={startEditing}>
-                            <PencilSimple size={14} weight="regular" />
-                            {t.edit ?? "Edit"}
-                          </Button>
-                        )
-                      }
-                    />
-                  </div>
-                );
-              }
-              return null;
-            })()}
+            {/* Empty state */}
+            {empty && (
+              <div className="mt-10">
+                <EmptyState
+                  icon={<FileText size={20} weight="regular" />}
+                  title={t.noDocsTitle ?? "No content yet"}
+                  description={
+                    isCodebase
+                      ? (t.noDocsDesc ?? "")
+                      : (t.noRawContentDesc ?? "Add content from the edit button above.")
+                  }
+                  action={
+                    isCodebase ? (
+                      <Link href={`/products/${productId}`}>
+                        <Button>{t.generateOnProductPage ?? "Generate on product page"}</Button>
+                      </Link>
+                    ) : (
+                      <Button variant="subtle" size="sm" onClick={startEditing}>
+                        <PencilSimple size={14} weight="regular" />
+                        {t.edit ?? "Edit"}
+                      </Button>
+                    )
+                  }
+                />
+              </div>
+            )}
 
-            {(() => {
-              const empty = isCodebase ? !hasDocs : isSpec || isLinks ? !hasRawContent : !hasDocs;
-              if (empty) return null;
+            {!empty && isSpec && (
+              <div className="mt-8 flex flex-col gap-8">
+                <Card className="p-6 md:p-10">
+                  {editing ? (
+                    <div className="flex flex-col gap-4">
+                      <h2 className="font-editorial text-2xl tracking-tight text-ink">
+                        {t.specEditTitle ?? "Edit specification"}
+                      </h2>
+                      <Textarea
+                        value={draftContent}
+                        onChange={(e) => {
+                          setDraftContent(e.target.value);
+                          setDirty(true);
+                        }}
+                        rows={18}
+                        className="font-mono text-xs"
+                        placeholder={t.specPlaceholder ?? ""}
+                      />
+                      <EditorSaveBar
+                        saving={saving}
+                        dirty={dirty}
+                        onSave={save}
+                        saveLabel={t.saveDocument ?? "Save"}
+                      />
+                    </div>
+                  ) : (
+                    <SpecViewer content={spec?.content || ""} kind={spec?.kind} />
+                  )}
+                </Card>
+                <ExpertCta t={t} productId={productId} />
+              </div>
+            )}
 
-              // Spec: single-column structured viewer / raw editor.
-              if (isSpec) {
-                return (
-                  <div className="mt-8 flex flex-col gap-8">
-                    <Card className="p-6 md:p-10">
-                      {editing ? (
-                        <div className="flex flex-col gap-4">
-                          <h2 className="font-editorial text-2xl tracking-tight text-ink">
-                            {t.specEditTitle ?? "Edit specification"}
-                          </h2>
-                          <Textarea
-                            value={draftContent}
-                            onChange={(e) => {
-                              setDraftContent(e.target.value);
-                              setDirty(true);
-                            }}
-                            rows={18}
-                            className="font-mono text-xs"
-                            placeholder={t.specPlaceholder ?? ""}
-                          />
-                          <EditorSaveBar
-                            saving={saving}
-                            dirty={dirty}
-                            onSave={save}
-                            saveLabel={t.saveDocument ?? "Save"}
-                          />
-                        </div>
-                      ) : (
-                        <SpecViewer
-                          content={artifact.content || ""}
-                          kind={artifact.kind ?? undefined}
-                        />
-                      )}
-                    </Card>
-                    <ExpertCta
-                      t={t}
-                      productId={productId}
-                    />
-                  </div>
-                );
-              }
-
-              // Links: single-column table / repeater editor.
-              if (isLinks) {
-                return (
-                  <div className="mt-8 flex flex-col gap-8">
-                    <Card className="p-6 md:p-10">
-                      {editing ? (
-                        <div className="flex flex-col gap-4">
-                          <div className="flex items-center justify-between gap-2">
-                            <h2 className="font-editorial text-2xl tracking-tight text-ink">
-                              {t.linksEditTitle ?? "Edit links"}
-                            </h2>
-                            <Button
+            {!empty && isLinks && (
+              <div className="mt-8 flex flex-col gap-8">
+                <Card className="p-6 md:p-10">
+                  {editing ? (
+                    <div className="flex flex-col gap-4">
+                      <div className="flex items-center justify-between gap-2">
+                        <h2 className="font-editorial text-2xl tracking-tight text-ink">
+                          {t.linksEditTitle ?? "Edit links"}
+                        </h2>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setDraftLinks((rows) => [...rows, { url: "", description: "" }])}
+                        >
+                          <Plus size={14} weight="bold" />
+                          {t.linksAddRow ?? "Add link"}
+                        </Button>
+                      </div>
+                      <div className="grid gap-2">
+                        {draftLinks.map((row, idx) => (
+                          <div
+                            key={idx}
+                            className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_1fr_auto]"
+                          >
+                            <Input
+                              value={row.url}
+                              onChange={(e) =>
+                                setDraftLinks((rows) =>
+                                  rows.map((r, i) => (i === idx ? { ...r, url: e.target.value } : r)),
+                                )
+                              }
+                              placeholder={t.linksUrlPlaceholder ?? "https://…"}
+                            />
+                            <Input
+                              value={row.description ?? ""}
+                              onChange={(e) =>
+                                setDraftLinks((rows) =>
+                                  rows.map((r, i) => (i === idx ? { ...r, description: e.target.value } : r)),
+                                )
+                              }
+                              placeholder={t.linksDescPlaceholder ?? "Description"}
+                            />
+                            <IconButton
                               type="button"
-                              variant="ghost"
-                              size="sm"
+                              aria-label={t.linksRemoveRow ?? "Remove link"}
+                              title={t.linksRemoveRow ?? "Remove link"}
+                              disabled={draftLinks.length <= 1}
                               onClick={() =>
-                                setDraftLinks((rows) => [
-                                  ...rows,
-                                  { url: "", description: "" },
-                                ])
+                                setDraftLinks((rows) =>
+                                  rows.length <= 1
+                                    ? [{ url: "", description: "" }]
+                                    : rows.filter((_, i) => i !== idx),
+                                )
                               }
                             >
-                              <Plus size={14} weight="bold" />
-                              {t.linksAddRow ?? "Add link"}
-                            </Button>
+                              <Trash size={16} weight="regular" />
+                            </IconButton>
                           </div>
-                          <div className="grid gap-2">
-                            {draftLinks.map((row, idx) => (
-                              <div
-                                key={idx}
-                                className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_1fr_auto]"
-                              >
-                                <Input
-                                  value={row.url}
-                                  onChange={(e) =>
-                                    setDraftLinks((rows) =>
-                                      rows.map((r, i) =>
-                                        i === idx ? { ...r, url: e.target.value } : r,
-                                      ),
-                                    )
-                                  }
-                                  placeholder={t.linksUrlPlaceholder ?? "https://…"}
-                                />
-                                <Input
-                                  value={row.description ?? ""}
-                                  onChange={(e) =>
-                                    setDraftLinks((rows) =>
-                                      rows.map((r, i) =>
-                                        i === idx
-                                          ? { ...r, description: e.target.value }
-                                          : r,
-                                      ),
-                                    )
-                                  }
-                                  placeholder={t.linksDescPlaceholder ?? "Description"}
-                                />
-                                <IconButton
-                                  type="button"
-                                  aria-label={t.linksRemoveRow ?? "Remove link"}
-                                  title={t.linksRemoveRow ?? "Remove link"}
-                                  disabled={draftLinks.length <= 1}
-                                  onClick={() =>
-                                    setDraftLinks((rows) =>
-                                      rows.length <= 1
-                                        ? [{ url: "", description: "" }]
-                                        : rows.filter((_, i) => i !== idx),
-                                    )
-                                  }
-                                >
-                                  <Trash size={16} weight="regular" />
-                                </IconButton>
-                              </div>
-                            ))}
-                          </div>
-                          <EditorSaveBar
-                            saving={saving}
-                            dirty={dirty}
-                            onSave={save}
-                            saveLabel={t.saveDocument ?? "Save"}
-                          />
-                        </div>
-                      ) : (
-                        <LinksViewer content={artifact.content || ""} />
-                      )}
-                    </Card>
-                    <ExpertCta t={t} productId={productId} />
-                  </div>
-                );
-              }
+                        ))}
+                      </div>
+                      <EditorSaveBar
+                        saving={saving}
+                        dirty={dirty}
+                        onSave={save}
+                        saveLabel={t.saveDocument ?? "Save"}
+                      />
+                    </div>
+                  ) : (
+                    <LinksViewer content={linksEntity?.content || ""} />
+                  )}
+                </Card>
+                <ExpertCta t={t} productId={productId} />
+              </div>
+            )}
 
-              // Codebase (and legacy generated-doc types): page nav + markdown.
-              return (
-                <div className="mt-8 grid grid-cols-1 gap-8 lg:grid-cols-[240px_1fr]">
-                  <aside className="lg:sticky lg:top-20 lg:self-start">
-                    <SectionHeader title={t.pages ?? "Pages"} className="mb-3" />
-                    {pages.length > 0 ? (
-                      <nav className="flex flex-col gap-0.5">
-                        {pages.map((p) => {
-                          const isActive = p.id === activePageId;
-                          return (
-                            <button
-                              key={p.id}
-                              onClick={() => setActivePageId(p.id)}
-                              disabled={editing}
-                              className={cn(
-                                "rounded-md px-3 py-2 text-left text-sm transition-colors",
-                                "disabled:cursor-not-allowed disabled:opacity-50",
-                                isActive
-                                  ? "bg-surface-2 font-medium text-ink"
-                                  : "text-muted hover:bg-surface-2 hover:text-ink",
-                              )}
-                            >
-                              {p.title}
-                            </button>
-                          );
-                        })}
-                      </nav>
+            {!empty && isCodebase && (
+              <div className="mt-8 grid grid-cols-1 gap-8 lg:grid-cols-[240px_1fr]">
+                <aside className="lg:sticky lg:top-20 lg:self-start">
+                  <SectionHeader title={t.pages ?? "Pages"} className="mb-3" />
+                  {pages.length > 0 ? (
+                    <nav className="flex flex-col gap-0.5">
+                      {pages.map((p) => {
+                        const isActive = p.id === activePageId;
+                        return (
+                          <button
+                            key={p.id}
+                            onClick={() => setActivePageId(p.id)}
+                            disabled={editing}
+                            className={cn(
+                              "rounded-md px-3 py-2 text-left text-sm transition-colors",
+                              "disabled:cursor-not-allowed disabled:opacity-50",
+                              isActive
+                                ? "bg-surface-2 font-medium text-ink"
+                                : "text-muted hover:bg-surface-2 hover:text-ink",
+                            )}
+                          >
+                            {p.title}
+                          </button>
+                        );
+                      })}
+                    </nav>
+                  ) : (
+                    <p className="text-xs text-muted">
+                      {t.noPagesFallback ?? "No structured pages — showing the generated summary."}
+                    </p>
+                  )}
+                </aside>
+
+                <div className="flex flex-col gap-8">
+                  <Card className="p-6 md:p-10">
+                    {editing ? (
+                      <div className="flex flex-col gap-4">
+                        <h2 className="font-editorial text-2xl tracking-tight text-ink">
+                          {activePage ? activePage.title : (t.generatedDocs ?? "Generated documentation")}
+                        </h2>
+                        <MarkdownEditor
+                          value={draftContent}
+                          onChange={(v) => {
+                            setDraftContent(v);
+                            setDirty(true);
+                          }}
+                        />
+                        <EditorSaveBar
+                          saving={saving}
+                          dirty={dirty}
+                          onSave={save}
+                          saveLabel={activePage ? (t.savePage ?? "Save page") : (t.saveDocument ?? "Save document")}
+                        />
+                      </div>
+                    ) : activePage ? (
+                      <article className="prose-editor max-w-none">
+                        <h2 className="font-editorial text-2xl tracking-tight text-ink">
+                          {activePage.title}
+                        </h2>
+                        <Markdown content={activePage.content || ""} />
+                      </article>
                     ) : (
-                      <p className="text-xs text-muted">
-                        {t.noPagesFallback ?? "No structured pages — showing the generated summary."}
-                      </p>
+                      <article className="prose-editor max-w-none">
+                        <h2 className="font-editorial text-2xl tracking-tight text-ink">
+                          {t.generatedDocs ?? "Generated documentation"}
+                        </h2>
+                        <Markdown content={codebase?.generated_docs || ""} />
+                      </article>
                     )}
-                  </aside>
-
-                  <div className="flex flex-col gap-8">
-                    <Card className="p-6 md:p-10">
-                      {editing ? (
-                        <div className="flex flex-col gap-4">
-                          <h2 className="font-editorial text-2xl tracking-tight text-ink">
-                            {activePage ? activePage.title : (t.generatedDocs ?? "Generated documentation")}
-                          </h2>
-                          <MarkdownEditor
-                            value={draftContent}
-                            onChange={(v) => {
-                              setDraftContent(v);
-                              setDirty(true);
-                            }}
-                          />
-                          <EditorSaveBar
-                            saving={saving}
-                            dirty={dirty}
-                            onSave={save}
-                            saveLabel={activePage ? (t.savePage ?? "Save page") : (t.saveDocument ?? "Save document")}
-                          />
-                        </div>
-                      ) : activePage ? (
-                        <article className="prose-editor max-w-none">
-                          <h2 className="font-editorial text-2xl tracking-tight text-ink">
-                            {activePage.title}
-                          </h2>
-                          <Markdown content={activePage.content || ""} />
-                        </article>
-                      ) : (
-                        <article className="prose-editor max-w-none">
-                          <h2 className="font-editorial text-2xl tracking-tight text-ink">
-                            {t.generatedDocs ?? "Generated documentation"}
-                          </h2>
-                          <Markdown content={artifact.generated_docs || ""} />
-                        </article>
-                      )}
-                    </Card>
-                    <ExpertCta t={t} productId={productId} />
-                  </div>
+                  </Card>
+                  <ExpertCta t={t} productId={productId} />
                 </div>
-              );
-            })()}
+              </div>
+            )}
           </>
         )}
       </main>
@@ -601,7 +554,21 @@ export default function ArtifactDocsViewer() {
   );
 }
 
-/** Compact "Ask expert" CTA card reused across artifact viewer layouts. */
+/** Find a codebase/spec/links entity by id across the product's three lists. */
+function findEntity(
+  product: Product,
+  entityId: string,
+): { entity: Codebase | Spec | Links | undefined; kind: EntityKind | undefined } {
+  const c = product.codebases.find((x) => x.id === entityId);
+  if (c) return { entity: c, kind: "codebase" };
+  const s = product.specs.find((x) => x.id === entityId);
+  if (s) return { entity: s, kind: "spec" };
+  const l = product.links.find((x) => x.id === entityId);
+  if (l) return { entity: l, kind: "links" };
+  return { entity: undefined, kind: undefined };
+}
+
+/** Compact "Ask expert" CTA card reused across viewer layouts. */
 function ExpertCta({
   t,
   productId,

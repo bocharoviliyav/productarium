@@ -1,126 +1,154 @@
-"""Product/Artifact repository — ORM<->Pydantic mapping + persistence.
+"""Product/Codebase/Spec/Links repository — ORM<->Pydantic mapping + persistence.
 
-Extracted from the former ``api/api.py`` monolith so routers stay thin.
-All Product/Artifact DB access (load, upsert, artifact add/remove, type
-normalization) lives here. No FastAPI dependencies — pure SQLAlchemy.
+All Product + child-entity DB access (load, upsert, add/remove, content update)
+lives here. No FastAPI dependencies — pure SQLAlchemy.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import List, Optional
+from datetime import datetime
+from typing import Any, List, Optional, Tuple
 
 from sqlalchemy.orm import Session, selectinload
 
 from api.db import get_db  # re-exported so routers import it from the repo
 from api.models import (
-    ArtifactORM,
+    CodebaseORM,
+    LinksORM,
     ProductORM,
-    LEGACY_ARTIFACT_TYPE_MAP,
+    SpecORM,
 )
-from api.schemas import Artifact, Product
+from api.schemas import Codebase, Links, Product, Spec
 
 logger = logging.getLogger(__name__)
 
 
-def normalize_artifact_type(a: Artifact):
-    """Map a (possibly legacy) artifact type to the new (type, kind) pair.
+# --- ORM<->Pydantic mapping -------------------------------------------------
+def _codebase_orm_from_pydantic(c: Codebase) -> CodebaseORM:
+    return CodebaseORM(
+        id=c.id,
+        name=c.name,
+        repo_url=c.repo_url,
+        repo_type=c.repo_type,
+        token=c.token,
+        generated_docs=c.generated_docs,
+        pages=c.pages,
+        verified=c.verified,
+        verified_by=c.verified_by,
+        verified_at=c.verified_at,
+        source=c.source or "manual",
+    )
 
-    Legacy openapi/asyncapi -> spec (+kind), testcase -> documentation (+kind).
-    New types are passed through; an explicit kind on the request wins.
-    """
-    if a.type in LEGACY_ARTIFACT_TYPE_MAP:
-        new_type, default_kind = LEGACY_ARTIFACT_TYPE_MAP[a.type]
-        return new_type, a.kind or default_kind
-    return a.type, a.kind
+
+def _spec_orm_from_pydantic(s: Spec) -> SpecORM:
+    return SpecORM(
+        id=s.id,
+        name=s.name,
+        kind=s.kind or "openapi",
+        content=s.content,
+        verified=s.verified,
+        verified_by=s.verified_by,
+        verified_at=s.verified_at,
+        source=s.source or "manual",
+    )
 
 
-def artifact_orm_from_pydantic(a: Artifact) -> ArtifactORM:
-    """Build a new (transient) ArtifactORM from a Pydantic Artifact."""
-    norm_type, kind = normalize_artifact_type(a)
-    return ArtifactORM(
-        id=a.id,
-        name=a.name,
-        type=norm_type,
-        kind=kind,
-        repo_url=a.repo_url,
-        repo_type=a.repo_type,
-        token=a.token,
-        content=a.content,
-        allure_url=a.allure_url,
-        generated_docs=a.generated_docs,
-        pages=a.pages,
-        verified=a.verified,
-        verified_by=a.verified_by,
-        verified_at=a.verified_at,
-        source=a.source or "manual",
+def _links_orm_from_pydantic(l: Links) -> LinksORM:
+    return LinksORM(
+        id=l.id,
+        name=l.name,
+        content=l.content,
+        verified=l.verified,
+        verified_by=l.verified_by,
+        verified_at=l.verified_at,
+        source=l.source or "manual",
     )
 
 
 def orm_to_product(p_orm: ProductORM) -> Product:
-    """Convert a ProductORM (with loaded artifacts) to the Pydantic Product.
-
-    Field names/shapes match the previous JSON-file schema exactly so the
-    frontend and Phase B consumers stay compatible. created_at/updated_at are
-    intentionally NOT exposed in the public response shape.
-    """
+    """Convert a ProductORM (with children eagerly loaded) to the Pydantic Product."""
     return Product(
         id=p_orm.id,
         name=p_orm.name,
         description=p_orm.description,
         summary=p_orm.summary,
         owner_id=p_orm.owner_id,
-        artifacts=[
-            Artifact(
-                id=a.id,
-                name=a.name,
-                type=a.type,
-                kind=a.kind,
-                repo_url=a.repo_url,
-                repo_type=a.repo_type,
-                token=a.token,
-                content=a.content,
-                allure_url=a.allure_url,
-                generated_docs=a.generated_docs,
-                pages=a.pages,
-                verified=a.verified,
-                verified_by=a.verified_by,
-                verified_at=a.verified_at,
-                source=a.source,
+        codebases=[
+            Codebase(
+                id=c.id,
+                name=c.name,
+                repo_url=c.repo_url,
+                repo_type=c.repo_type,
+                token=c.token,
+                generated_docs=c.generated_docs,
+                pages=c.pages,
+                verified=c.verified,
+                verified_by=c.verified_by,
+                verified_at=c.verified_at,
+                source=c.source,
             )
-            for a in p_orm.artifacts
+            for c in p_orm.codebases
+        ],
+        specs=[
+            Spec(
+                id=s.id,
+                name=s.name,
+                kind=s.kind,
+                content=s.content,
+                verified=s.verified,
+                verified_by=s.verified_by,
+                verified_at=s.verified_at,
+                source=s.source,
+            )
+            for s in p_orm.specs
+        ],
+        links=[
+            Links(
+                id=l.id,
+                name=l.name,
+                content=l.content,
+                verified=l.verified,
+                verified_by=l.verified_by,
+                verified_at=l.verified_at,
+                source=l.source,
+            )
+            for l in p_orm.links
         ],
     )
 
 
-def load_product_orm(db: Session, product_id: str) -> Optional[ProductORM]:
-    """Fetch a single ProductORM with its artifacts eagerly loaded."""
+# --- Product queries --------------------------------------------------------
+def _load_options():
     return (
-        db.query(ProductORM)
-        .options(selectinload(ProductORM.artifacts))
-        .filter(ProductORM.id == product_id)
-        .first()
+        selectinload(ProductORM.codebases),
+        selectinload(ProductORM.specs),
+        selectinload(ProductORM.links),
     )
+
+
+def load_product_orm(db: Session, product_id: str) -> Optional[ProductORM]:
+    """Fetch a single ProductORM with its codebases/specs/links eagerly loaded."""
+    q = db.query(ProductORM).filter(ProductORM.id == product_id)
+    for opt in _load_options():
+        q = q.options(opt)
+    return q.first()
 
 
 def list_products(db: Session) -> List[Product]:
-    """List all products with artifacts eagerly loaded, as Pydantic models."""
-    products = (
-        db.query(ProductORM)
-        .options(selectinload(ProductORM.artifacts))
-        .all()
-    )
-    return [orm_to_product(p) for p in products]
+    """List all products with children eagerly loaded, as Pydantic models."""
+    q = db.query(ProductORM)
+    for opt in _load_options():
+        q = q.options(opt)
+    return [orm_to_product(p) for p in q.all()]
 
 
 def upsert_product(db: Session, product: Product) -> ProductORM:
-    """Insert or update a Product and fully replace its artifacts.
+    """Insert or update a Product and fully replace its codebases/specs/links.
 
-    Mirrors the previous JSON ``save_product`` overwrite semantics (full
-    replace of the artifacts list) so POST/PUT stay drop-in compatible.
-    Existing artifact rows are deleted and flushed before the new ones are
-    inserted to avoid PK collisions within a single flush.
+    Mirrors the previous JSON overwrite semantics (full replace of the child
+    lists) so POST/PUT stay drop-in compatible.
     """
     p_orm = db.get(ProductORM, product.id)
     if p_orm is None:
@@ -138,82 +166,125 @@ def upsert_product(db: Session, product: Product) -> ProductORM:
         p_orm.summary = product.summary
         p_orm.owner_id = product.owner_id
 
-    db.query(ArtifactORM).filter(
-        ArtifactORM.product_id == product.id
-    ).delete(synchronize_session=False)
+    for model in (CodebaseORM, SpecORM, LinksORM):
+        db.query(model).filter(model.product_id == product.id).delete(
+            synchronize_session=False
+        )
     db.flush()
-    for a in product.artifacts:
-        new_a = artifact_orm_from_pydantic(a)
-        new_a.product_id = product.id
-        db.add(new_a)
+    for c in product.codebases:
+        orm = _codebase_orm_from_pydantic(c)
+        orm.product_id = product.id
+        db.add(orm)
+    for s in product.specs:
+        orm = _spec_orm_from_pydantic(s)
+        orm.product_id = product.id
+        db.add(orm)
+    for l in product.links:
+        orm = _links_orm_from_pydantic(l)
+        orm.product_id = product.id
+        db.add(orm)
 
     db.commit()
     db.refresh(p_orm)
     return p_orm
 
 
-def add_artifact(db: Session, product_id: str, artifact: Artifact) -> Product:
-    """Add (or dedupe-replace) an artifact on a product. Returns the product."""
+def delete_product(db: Session, product_id: str) -> None:
+    """Delete a product (children cascade). No-op if missing."""
+    p_orm = db.get(ProductORM, product_id)
+    if p_orm is not None:
+        db.delete(p_orm)
+        db.commit()
+
+
+# --- Per-type add / delete --------------------------------------------------
+def _add_child(db: Session, product_id: str, orm, collection: str) -> Product:
     p_orm = load_product_orm(db, product_id)
     if p_orm is None:
         raise ValueError("Product not found")
-    existing = next((a for a in p_orm.artifacts if a.id == artifact.id), None)
+    existing = next((x for x in getattr(p_orm, collection) if x.id == orm.id), None)
     if existing is not None:
-        p_orm.artifacts.remove(existing)  # cascade delete-orphan
-        db.flush()  # flush DELETE before INSERT to avoid PK collision
-    p_orm.artifacts.append(artifact_orm_from_pydantic(artifact))
+        getattr(p_orm, collection).remove(existing)
+        db.flush()
+    getattr(p_orm, collection).append(orm)
     db.commit()
     db.refresh(p_orm)
     return orm_to_product(p_orm)
 
 
-def delete_artifact(db: Session, product_id: str, artifact_id: str) -> Product:
-    """Remove an artifact from a product. Returns the refreshed product."""
+def _delete_child(db: Session, product_id: str, entity_id: str, model, collection: str) -> Product:
     p_orm = load_product_orm(db, product_id)
     if p_orm is None:
         raise ValueError("Product not found")
-    existing = next((a for a in p_orm.artifacts if a.id == artifact_id), None)
+    existing = next((x for x in getattr(p_orm, collection) if x.id == entity_id), None)
     if existing is not None:
-        p_orm.artifacts.remove(existing)  # cascade delete-orphan
+        getattr(p_orm, collection).remove(existing)
         db.commit()
     db.refresh(p_orm)
     return orm_to_product(p_orm)
 
 
-def update_artifact_content(
+def add_codebase(db: Session, product_id: str, codebase: Codebase) -> Product:
+    orm = _codebase_orm_from_pydantic(codebase)
+    orm.product_id = product_id
+    return _add_child(db, product_id, orm, "codebases")
+
+
+def add_spec(db: Session, product_id: str, spec: Spec) -> Product:
+    orm = _spec_orm_from_pydantic(spec)
+    orm.product_id = product_id
+    return _add_child(db, product_id, orm, "specs")
+
+
+def add_links(db: Session, product_id: str, links: Links) -> Product:
+    orm = _links_orm_from_pydantic(links)
+    orm.product_id = product_id
+    return _add_child(db, product_id, orm, "links")
+
+
+def delete_codebase(db: Session, product_id: str, codebase_id: str) -> Product:
+    return _delete_child(db, product_id, codebase_id, CodebaseORM, "codebases")
+
+
+def delete_spec(db: Session, product_id: str, spec_id: str) -> Product:
+    return _delete_child(db, product_id, spec_id, SpecORM, "specs")
+
+
+def delete_links(db: Session, product_id: str, links_id: str) -> Product:
+    return _delete_child(db, product_id, links_id, LinksORM, "links")
+
+
+# --- Content updates (WYSIWYG saves) ----------------------------------------
+def update_codebase_content(
     db: Session,
     product_id: str,
-    artifact_id: str,
+    codebase_id: str,
     *,
-    pages=None,
+    pages: Optional[dict] = None,
     page_id: Optional[str] = None,
     content: Optional[str] = None,
     generated_docs: Optional[str] = None,
-    raw_content: Optional[str] = None,
-):
-    """Apply one of the WYSIWYG edit shapes to an artifact.
+) -> Tuple[Product, Optional[str]]:
+    """Apply one of the WYSIWYG edit shapes to a codebase's docs.
 
     Returns (product, indexed_text) where indexed_text is what should be
     re-indexed into cognee (may be None). Raises ValueError if product or
-    artifact is missing, or if no edit shape was provided.
+    codebase is missing, or if no edit shape was provided.
     """
     p_orm = load_product_orm(db, product_id)
     if p_orm is None:
         raise ValueError("Product not found")
-    artifact = next((a for a in p_orm.artifacts if a.id == artifact_id), None)
-    if artifact is None:
-        raise ValueError("Artifact not found")
+    codebase = next((c for c in p_orm.codebases if c.id == codebase_id), None)
+    if codebase is None:
+        raise ValueError("Codebase not found")
 
     indexed_text: Optional[str] = None
 
     if pages is not None:
-        # Wholesale replace (e.g. a future full-document editor).
-        artifact.pages = pages
+        codebase.pages = pages
         indexed_text = json.dumps(pages, ensure_ascii=False)
     elif page_id is not None and content is not None:
-        # Upsert a single page's content. ``pages`` is a JSON column persisted
-        # as a dict keyed by page_id; tolerate None / non-dict by rebuilding.
-        current = artifact.pages if isinstance(artifact.pages, dict) else {}
+        current = codebase.pages if isinstance(codebase.pages, dict) else {}
         page = current.get(page_id)
         if page is None:
             current[page_id] = {
@@ -227,20 +298,14 @@ def update_artifact_content(
         else:
             page["content"] = content
             current[page_id] = page
-        artifact.pages = current
+        codebase.pages = current
         indexed_text = content
     elif generated_docs is not None:
-        artifact.generated_docs = generated_docs
+        codebase.generated_docs = generated_docs
         indexed_text = generated_docs
-    elif raw_content is not None:
-        # Spec / links artifacts are authored directly into ``content`` (no
-        # generation step). Replacing it keeps the structured viewer in sync;
-        # the new text is re-indexed so expert Ask recall stays current.
-        artifact.content = raw_content
-        indexed_text = raw_content
     else:
         raise ValueError(
-            "Provide one of: pages, (page_id + content), generated_docs, or raw_content"
+            "Provide one of: pages, (page_id + content), or generated_docs"
         )
 
     db.commit()
@@ -248,9 +313,52 @@ def update_artifact_content(
     return orm_to_product(p_orm), indexed_text
 
 
-def delete_product(db: Session, product_id: str) -> None:
-    """Delete a product (artifacts cascade). No-op if missing."""
-    p_orm = db.get(ProductORM, product_id)
-    if p_orm is not None:
-        db.delete(p_orm)
-        db.commit()
+def update_spec_content(
+    db: Session, product_id: str, spec_id: str, content: Optional[str]
+) -> Tuple[Product, Optional[str]]:
+    """Replace a spec's raw content (authored directly, no generation)."""
+    p_orm = load_product_orm(db, product_id)
+    if p_orm is None:
+        raise ValueError("Product not found")
+    spec = next((s for s in p_orm.specs if s.id == spec_id), None)
+    if spec is None:
+        raise ValueError("Spec not found")
+    spec.content = content
+    db.commit()
+    db.refresh(p_orm)
+    return orm_to_product(p_orm), content
+
+
+def update_links_content(
+    db: Session, product_id: str, links_id: str, content: Optional[str]
+) -> Tuple[Product, Optional[str]]:
+    """Replace a links collection's raw content (JSON array of {url, description})."""
+    p_orm = load_product_orm(db, product_id)
+    if p_orm is None:
+        raise ValueError("Product not found")
+    links = next((l for l in p_orm.links if l.id == links_id), None)
+    if links is None:
+        raise ValueError("Links not found")
+    links.content = content
+    db.commit()
+    db.refresh(p_orm)
+    return orm_to_product(p_orm), content
+
+
+# --- Verification (item 5) --------------------------------------------------
+def verify_child(
+    db: Session, product_id: str, entity_id: str, collection: str, user_id: str
+) -> Product:
+    """Mark a codebase/spec/links entity as verified by ``user_id``."""
+    p_orm = load_product_orm(db, product_id)
+    if p_orm is None:
+        raise ValueError("Product not found")
+    entity = next((x for x in getattr(p_orm, collection) if x.id == entity_id), None)
+    if entity is None:
+        raise ValueError("Entity not found")
+    entity.verified = True
+    entity.verified_by = user_id
+    entity.verified_at = datetime.utcnow()
+    db.commit()
+    db.refresh(p_orm)
+    return orm_to_product(p_orm)

@@ -41,7 +41,7 @@ def sync_runtime_settings() -> None:
         pass
 
     try:
-        from api.settings_store import get_model_for_task
+        from api.config.settings import get_model_for_task
         for task in ("docgen", "expert", "summary"):
             cfg = get_model_for_task(task) or {}
             b_url = cfg.get("base_url")
@@ -55,13 +55,13 @@ def sync_runtime_settings() -> None:
         logger.debug("sync_runtime_settings: env sync skipped: %s", e)
 
     try:
-        from api.cognee_manager import apply_cognee_runtime_config
+        from api.cognee import apply_cognee_runtime_config
         apply_cognee_runtime_config()
     except Exception as e:
         logger.debug("sync_runtime_settings: apply_cognee_runtime_config skipped: %s", e)
 
     try:
-        from api.timeout_config import sync_timeout_env
+        from api.config.timeout import sync_timeout_env
         sync_timeout_env()
     except Exception as e:
         logger.debug("sync_runtime_settings: sync_timeout_env skipped: %s", e)
@@ -78,64 +78,24 @@ def get_task_config(task: str) -> Dict[str, Optional[str]]:
     3. Hardcoded defaults.
     """
     try:
-        from api.settings_store import get_model_for_task
+        from api.config.settings import get_model_for_task
         return get_model_for_task(task)
     except Exception as e:
         logger.debug("get_task_config(%s) fallback: %s", task, e)
         p = f"models.{task}."
-        from api.settings_store import get_setting, get_secret, _sanitize_api_key, _parse_int_setting
+        from api.config.settings import get_setting, get_secret, _sanitize_api_key, _parse_int_setting
         return {
-            "provider": get_setting(p + "provider") or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local"),
-            "model": get_setting(p + "model") or os.environ.get("DEEPWIKI_DEFAULT_MODEL", "qwen/qwen3.6-27b"),
+            "model": get_setting(p + "model") or "qwen/qwen3.6-27b",
             "base_url": get_setting(p + "base_url") or os.environ.get("LOCAL_OPENAI_BASE_URL", "http://localhost:1234/v1"),
             "api_key": _sanitize_api_key(get_secret(p + "api_key")) or os.environ.get("LOCAL_OPENAI_API_KEY", "not-needed"),
             "max_prompt_tokens": _parse_int_setting(get_setting(p + "max_prompt_tokens")),
         }
 
 
-def save_task_config(
-    task: str,
-    provider: str,
-    model: str,
-    base_url: str,
-    api_key: Optional[str] = None,
-    max_prompt_tokens: Optional[int] = None,
-) -> None:
-    """Save model configuration for a task to the DB settings store and apply instantly."""
-    from api.settings_store import set_setting, _sanitize_api_key
-
-    p = f"models.{task}."
-    clean_key = _sanitize_api_key(api_key) if api_key else None
-
-    set_setting(p + "provider", provider)
-    set_setting(p + "model", model)
-    set_setting(p + "base_url", base_url)
-    if clean_key is not None:
-        set_setting(p + "api_key", clean_key, encrypt=True)
-    if max_prompt_tokens is not None:
-        set_setting(p + "max_prompt_tokens", str(max_prompt_tokens))
-
-    # Sync environment variables for process readers
-    if task == "cognee":
-        os.environ["LLM_ENDPOINT"] = base_url
-        if clean_key:
-            os.environ["LLM_API_KEY"] = clean_key
-    elif task == "embedder":
-        os.environ["EMBEDDING_ENDPOINT"] = base_url
-        if clean_key:
-            os.environ["EMBEDDING_API_KEY"] = clean_key
-    elif task in ("docgen", "expert", "summary"):
-        os.environ["LOCAL_OPENAI_BASE_URL"] = base_url
-        if clean_key:
-            os.environ["LOCAL_OPENAI_API_KEY"] = clean_key
-
-    sync_runtime_settings()
-
-
 def bootstrap_config() -> None:
     """Bootstrap configuration at startup, ensuring DB defaults exist and runtime is synced."""
     try:
-        from api.settings_store import bootstrap_secret_key
+        from api.config.settings import bootstrap_secret_key
         bootstrap_secret_key()
     except Exception as e:
         logger.warning("bootstrap_config: secret_key bootstrap failed: %s", e)

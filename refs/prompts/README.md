@@ -16,7 +16,7 @@
 
 ## Реестр промптов
 
-### Wiki-секции (последовательная генерация, `api/wiki_generator.py`; подстановка `str.replace`)
+### Wiki-секции (последовательная генерация, `api/docgen/wiki.py`; подстановка `str.replace`)
 Каждая секция строится на ранее сгенерированных через `{previous_content}` (кроме overview). К каждой секции в рантайме добавляется `_verification_guard.md`.
 
 | Файл | Назначение | Плейсхолдеры | Вывод |
@@ -37,7 +37,7 @@
 
 `structure.md`: контракт вывода — единственный JSON-объект с 7 секциями и фиксированными `id` (`overview, architecture, functional, technical, cicd, lld, datamodel`). Парсится downstream — не менять набор/порядок `id`.
 
-### Артефактные документы (`api/artifact_docgen.py`; подстановка `str.replace`)
+### Артефактные документы (`api/docgen/spec.py`; подстановка `str.replace`)
 | Файл | Назначение | Плейсхолдеры | Вывод |
 |------|-----------|--------------|-------|
 | `openapi_doc.md` | Документация REST API из OpenAPI | `{repo_name} {artifact_name} {previous_content} {content}` | Markdown |
@@ -54,7 +54,7 @@
 | `deep_research_final_iteration.md` | Deep Research, финал | `str.format` | `{repo_type} {repo_url} {repo_name} {language_name}` |
 | `rag_system_prompt.md` | System prompt RAG | jinja-переменная | нет плейсхолдеров |
 
-### Экспертный агент (`api/expert_agent.py`; подстановка `str.replace`)
+### Экспертный агент (`api/expert/`; подстановка `str.replace`)
 Блоки `<product_knowledge>`, `<conversation_history>`, `<query>` добавляются кодом — в теле их не подставляй.
 | Файл | Назначение | Плейсхолдеры |
 |------|-----------|--------------|

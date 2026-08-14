@@ -44,7 +44,7 @@ from sqlalchemy.orm import Session, selectinload
 from api.auth.deps import get_current_user
 from api.db import get_db
 from api.docgen.summary import generate_product_summary
-from api.models import ArtifactORM, KnowledgeNodeORM, ProductORM
+from api.models import KnowledgeNodeORM, ProductORM
 from api.schemas import (
     KnowledgeNode,
     KnowledgeNodeCreate,
@@ -470,7 +470,10 @@ async def generate_summary(
     """
     product = (
         db.query(ProductORM)
-        .options(selectinload(ProductORM.artifacts))
+        .options(
+            selectinload(ProductORM.codebases),
+            selectinload(ProductORM.specs),
+        )
         .filter(ProductORM.id == product_id)
         .first()
     )
@@ -481,7 +484,7 @@ async def generate_summary(
         .filter(KnowledgeNodeORM.product_id == product_id)
         .all()
     )
-    summary = await generate_product_summary(product, product.artifacts, nodes)
+    summary = await generate_product_summary(product, product.codebases, product.specs, nodes)
     if not summary:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

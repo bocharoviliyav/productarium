@@ -28,7 +28,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from api.db import get_db
-from api.models import ArtifactORM, KnowledgeNodeORM, ProductORM
+from api.models import KnowledgeNodeORM, ProductORM
 
 logger = logging.getLogger(__name__)
 
@@ -113,26 +113,32 @@ def _mcp_get_product_knowledge(product_id: str, fmt: str, db: Session) -> str:
     if product is None:
         return f"Error: Product {product_id!r} not found."
 
-    from api.routers.public import _knowledge_as_json, _knowledge_as_markdown, _verified_artifacts, _verified_nodes
+    from api.routers.public import (
+        _knowledge_as_json,
+        _knowledge_as_markdown,
+        _load_verified,
+    )
 
-    artifacts = _verified_artifacts(product_id, db)
-    nodes = _verified_nodes(product_id, db)
+    codebases, specs, links, nodes = _load_verified(product_id, db)
 
-    # If no explicitly verified artifacts/nodes exist yet, export all product artifacts/nodes as draft knowledge
-    if not artifacts:
-        artifacts = db.query(ArtifactORM).filter(ArtifactORM.product_id == product_id).all()
-    if not nodes:
+    # If no verified content exists yet, fall back to ALL product content as
+    # draft knowledge so an MCP agent still sees something before verification.
+    if not (codebases or specs or links or nodes):
+        from api.models import CodebaseORM, LinksORM, SpecORM
+        codebases = db.query(CodebaseORM).filter(CodebaseORM.product_id == product_id).all()
+        specs = db.query(SpecORM).filter(SpecORM.product_id == product_id).all()
+        links = db.query(LinksORM).filter(LinksORM.product_id == product_id).all()
         nodes = db.query(KnowledgeNodeORM).filter(KnowledgeNodeORM.product_id == product_id).all()
 
     if fmt == "json":
-        return json.dumps(_knowledge_as_json(product, artifacts, nodes), ensure_ascii=False, indent=2)
-    return _knowledge_as_markdown(product, artifacts, nodes)
+        return json.dumps(_knowledge_as_json(product, codebases, specs, links, nodes), ensure_ascii=False, indent=2)
+    return _knowledge_as_markdown(product, codebases, specs, links, nodes)
 
 
 async def _mcp_search_product_graph(product_id: str, query: str, top_k: int = 20) -> str:
     dataset_name = f"prod_{product_id}"
     try:
-        from api.cognee_manager import query_cognee
+        from api.cognee import query_cognee
 
         results = await query_cognee(query, dataset_name=dataset_name, top_k=top_k)
         if results:

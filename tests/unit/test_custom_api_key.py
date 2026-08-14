@@ -2,9 +2,9 @@ import os
 import unittest
 from unittest.mock import patch, MagicMock
 
-from api.settings_store import _sanitize_api_key
+from api.config.settings import _sanitize_api_key
 from api.clients.openai_client import OpenAIClient
-from api.config_abstraction import sync_runtime_settings
+from api.config.abstraction import sync_runtime_settings
 
 
 class TestCustomAPIKeyHandling(unittest.TestCase):
@@ -59,7 +59,7 @@ class TestCustomAPIKeyHandling(unittest.TestCase):
         self.assertEqual(kwargs["api_key"], uuid_key)
         self.assertEqual(kwargs["base_url"], base_url)
 
-    @patch("api.settings_store.get_model_for_task")
+    @patch("api.config.settings.get_model_for_task")
     def test_sync_runtime_settings_exports_custom_keys(self, mock_get_model):
         custom_key = "custom-uuid-key-1234"
         custom_url = "https://ai-proxy.company.com/v1"
@@ -79,7 +79,7 @@ class TestCustomAPIKeyHandling(unittest.TestCase):
 
     def test_cognee_rate_limiter_per_loop_primitives(self):
         import asyncio
-        from api.cognee_manager import _cognee_rate_limiter
+        from api.cognee import _cognee_rate_limiter
 
         async def _test():
             sem, lock = _cognee_rate_limiter._get_loop_primitives(2)
@@ -111,7 +111,7 @@ class TestLongRunningTimeouts(unittest.TestCase):
             self._saved[k] = os.environ.pop(k, None)
         # Ensure the admin store does not leak a stored override into these
         # default-value assertions.
-        from api.settings_store import list_settings, set_setting
+        from api.config.settings import list_settings, set_setting
         self._stored_timeouts = [r["key"] for r in list_settings(prefix="timeouts.")]
         for key in self._stored_timeouts:
             set_setting(key, "", encrypt=False)
@@ -123,7 +123,7 @@ class TestLongRunningTimeouts(unittest.TestCase):
             else:
                 os.environ[k] = v
         # Restore the admin-store overrides we cleared (best-effort).
-        from api.settings_store import set_setting
+        from api.config.settings import set_setting
         for key in self._stored_timeouts:
             set_setting(key, "", encrypt=False)
 
@@ -152,7 +152,7 @@ class TestLongRunningTimeouts(unittest.TestCase):
         self.assertEqual(_resolve_retry_max_time(), 30.0)
 
     def test_graph_extraction_timeout_helpers(self):
-        from api.cognee_manager import (
+        from api.cognee import (
             _resolve_graph_extraction_timeout,
             _resolve_cognify_timeout,
         )
@@ -179,8 +179,8 @@ class TestLongRunningTimeouts(unittest.TestCase):
         # timeout so a leftover cognify task gets the full cognify budget
         # instead of being cancelled at a fixed 30s (which previously dropped
         # the connection mid-graph-build).
-        from api.cognee_manager import _resolve_cognify_timeout
-        from api.timeout_config import resolve_docgen_indexing_drain_seconds
+        from api.cognee import _resolve_cognify_timeout
+        from api.config.timeout import resolve_docgen_indexing_drain_seconds
 
         self.assertEqual(resolve_docgen_indexing_drain_seconds(), _resolve_cognify_timeout())
         os.environ["COGNEE_COGNIFY_TIMEOUT"] = "10800"

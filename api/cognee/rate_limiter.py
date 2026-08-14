@@ -25,7 +25,7 @@ class CogneeRateLimiter:
         max_conc = 2
         delay_sec = 0.5
         try:
-            from api.settings_store import get_setting
+            from api.config.settings import get_setting
             mc = get_setting("cognee.max_concurrency") or os.environ.get("COGNEE_MAX_CONCURRENCY")
             if mc:
                 try:

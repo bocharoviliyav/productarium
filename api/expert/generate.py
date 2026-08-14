@@ -58,7 +58,7 @@ def _resolve_use_rlm(
     if use_rlm is False:
         return False
     try:
-        from api.settings_store import get_rlm_mode
+        from api.config.settings import get_rlm_mode
         mode = get_rlm_mode(task)
     except Exception:  # pragma: no cover - settings store import-safe
         mode = "auto"
@@ -79,17 +79,25 @@ async def _rlm_generate(prompt: str, model: Optional[str]) -> str:
     returns "" and the caller falls back to the standard LLM.
     """
     try:
-        from api.timeout_config import resolve_rlm_expert_timeout
+        from api.config.timeout import resolve_rlm_expert_timeout
         rlm_expert_timeout = resolve_rlm_expert_timeout()
     except Exception:
         rlm_expert_timeout = 1800.0
     try:
-        from api.utils import get_model_context_window, clamp_text_by_tokens
+        from api.utils import get_model_context_window
         ctx_win = get_model_context_window(model_name=model, task="expert")
         completion_res = max(1024, min(4096, ctx_win // 4))
         max_prompt_limit = max(1024, ctx_win - completion_res)
         safe_prompt_limit = max(2000, max_prompt_limit - 6000)
-        safe_prompt = clamp_text_by_tokens(prompt, safe_prompt_limit)
+        # RLM is a long-context engine: pass the full prompt when it fits the
+        # model's context window. When it overflows, char-cap to the token
+        # budget (4 chars/token heuristic) so a single RLM call cannot blow
+        # max_prompt_tokens. The expert prompt is already budget-capped in
+        # _build_prompt, so this only fires for very large knowledge blocks.
+        safe_prompt = prompt
+        safe_prompt_chars = safe_prompt_limit * 4
+        if len(prompt) > safe_prompt_chars:
+            safe_prompt = prompt[:safe_prompt_chars] + "\n... (контекст обрезан для RLM)"
 
         from api.rlm.runner import run_rlm_task  # lazy: fast_rlm is optional
 
@@ -111,7 +119,6 @@ async def _rlm_generate(prompt: str, model: Optional[str]) -> str:
 
 async def _generate_answer(
     prompt: str,
-    provider: str,
     model: str,
     base_url: Optional[str],
     api_key: Optional[str],
@@ -123,7 +130,7 @@ async def _generate_answer(
         if text:
             return text
         logger.warning("Expert RLM path empty; falling back to standard LLM.")
-    llm = _safe_build_llm(provider, model, base_url=base_url, api_key=api_key)
+    llm = _safe_build_llm(model, base_url=base_url, api_key=api_key)
     if llm is None:
         return ""
     try:
@@ -135,7 +142,6 @@ async def _generate_answer(
 
 async def _stream_answer(
     prompt: str,
-    provider: str,
     model: str,
     base_url: Optional[str],
     api_key: Optional[str],
@@ -156,7 +162,7 @@ async def _stream_answer(
                 yield ExpertStreamEvent(EVENT_CONTENT, piece)
             return
         logger.warning("Expert RLM stream empty; falling back to standard LLM.")
-    llm = _safe_build_llm(provider, model, base_url=base_url, api_key=api_key)
+    llm = _safe_build_llm(model, base_url=base_url, api_key=api_key)
     if llm is None:
         return
     async for event in llm.stream(prompt):

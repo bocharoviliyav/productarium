@@ -40,7 +40,7 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
     admin_model = None
     admin_max_prompt_tokens = None
     try:
-        from api.settings_store import get_model_for_task
+        from api.config.settings import get_model_for_task
         cfg = get_model_for_task("docgen") or {}
         admin_base_url = cfg.get("base_url")
         admin_api_key = cfg.get("api_key")
@@ -55,31 +55,20 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
         os.environ["OPENAI_API_KEY"] = admin_api_key
         os.environ["LOCAL_OPENAI_API_KEY"] = admin_api_key
     elif not os.environ.get("RLM_MODEL_API_KEY"):
-        key_val = os.environ.get("LOCAL_OPENAI_API_KEY") or os.environ.get("OLLAMA_API_KEY") or "not-needed"
+        key_val = os.environ.get("LOCAL_OPENAI_API_KEY") or "not-needed"
         os.environ["RLM_MODEL_API_KEY"] = key_val
         if key_val not in ("not-needed", "not_needed"):
             os.environ["OPENAI_API_KEY"] = key_val
 
-    # Resolve the OpenAI-compatible base URL for fast-rlm. Precedence:
+    # Resolve the OpenAI-compatible base URL for fast-rlm. Single path:
     #   1. admin models.docgen.base_url (corporate gateway etc.)
-    #   2. RLM_MODEL_BASE_URL  (explicit override)
-    #   3. LOCAL_OPENAI_BASE_URL  (alternative local OpenAI-compatible server,
-    #      e.g. LM Studio on http://host.docker.internal:1234/v1)
-    #   4. OLLAMA_HOST + "/v1"  (the canonical local Ollama host; inside Docker
-    #      this is http://host.docker.internal:11434, which is reachable --
-    #      unlike "localhost", which inside a container points at the container
-    #      itself where Ollama is NOT running -> "Connection error")
-    #   5. http://localhost:11434/v1  (last resort, local dev on the host)
-    # Step 1 is the fix for the corporate-gateway case: previously RLM ignored
-    # the admin config and only read env vars, so it hit a dead LM Studio.
+    #   2. LOCAL_OPENAI_BASE_URL (local OpenAI-compatible server)
+    #   3. http://localhost:11434/v1 (default)
     base_url = (
         admin_base_url
-        or os.environ.get("RLM_MODEL_BASE_URL")
         or os.environ.get("LOCAL_OPENAI_BASE_URL")
+        or "http://localhost:11434/v1"
     )
-    if not base_url:
-        ollama_host = (os.environ.get("OLLAMA_HOST") or "").rstrip("/")
-        base_url = (ollama_host + "/v1") if ollama_host else "http://localhost:11434/v1"
     # Normalize to a clean ``/v1`` base: the fast-rlm Deno engine builds
     # ``new OpenAI({ baseURL })`` and the SDK POSTs to
     # ``${baseURL}/chat/completions``. If the admin pasted a bare host like
@@ -114,17 +103,6 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
     # gateway alias like ``flash`` is what the gateway expects; prefixing with
     # ``openai/`` makes the SDK send ``model: "openai/flash"`` which the
     # gateway rejects as model-not-found -> "Connection error").
-    #
-    # A :11434 URL is a native Ollama server: coerce cloud-style names to a
-    # known local tag (Ollama rejects ``qwen/qwen3.6-27b``). For any other
-    # OpenAI-compatible endpoint (LM Studio, llama.cpp, vLLM, corporate
-    # gateway) pass the model name through verbatim.
-    if ":11434" in base_url or "ollama" in base_url.lower():
-        if "35b" in resolved_model:
-            resolved_model = "qwen3.5:35b-a3b"
-        elif ":" not in resolved_model.split("/")[-1]:
-            # Looks like a cloud/Ollama-mismatched name -> safe local default.
-            resolved_model = "qwen3:8b"
     # Strip a stray litellm provider prefix the admin might have pasted in the
     # settings UI (cognee normalizes its model WITH a prefix, so the admin
     # store sometimes carries ``openai/flash``). fast-rlm's native OpenAI SDK
@@ -153,7 +131,7 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
     # (admin > env > default) so the admin "Timeouts" panel overrides without a
     # restart. Default 3600000ms (1h), floor 30000ms.
     try:
-        from api.timeout_config import resolve_rlm_api_timeout_ms
+        from api.config.timeout import resolve_rlm_api_timeout_ms
         config.api_timeout_ms = resolve_rlm_api_timeout_ms()
     except Exception:
         config.api_timeout_ms = 3600000

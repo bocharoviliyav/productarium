@@ -67,7 +67,7 @@ _MCP_CLIENT_INFO = {"name": "productarium", "version": "1.0"}
 # central resolver is read-through.
 def _default_timeout() -> float:
     try:
-        from api.timeout_config import resolve_integration_http_timeout
+        from api.config.timeout import resolve_integration_http_timeout
         return resolve_integration_http_timeout()
     except Exception:
         return 30.0
@@ -199,7 +199,7 @@ class _StdioProcess:
             if self._proc.poll() is None:
                 self._proc.terminate()
                 try:
-                    from api.timeout_config import resolve_mcp_stdio_wait_timeout
+                    from api.config.timeout import resolve_mcp_stdio_wait_timeout
                     self._proc.wait(timeout=resolve_mcp_stdio_wait_timeout())
                 except Exception:
                     self._proc.kill()
@@ -231,7 +231,7 @@ class McpConnector(IntegrationConnector):
 
     @classmethod
     def get_config(cls) -> Dict[str, Any]:
-        from api.settings_store import get_integration_config
+        from api.config.settings import get_integration_config
 
         return get_integration_config("mcp")
 
@@ -306,7 +306,7 @@ class McpConnector(IntegrationConnector):
     ) -> Optional[Dict[str, Any]]:
         """Send a JSON-RPC POST and return the parsed response dict."""
         import requests
-        from api.ssl_config import requests_verify
+        from api.config.ssl import requests_verify
 
         if timeout is None:
             timeout = _default_timeout()

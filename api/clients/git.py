@@ -178,9 +178,6 @@ def download_repo(
     except Exception as e:
         raise ValueError(f"An unexpected error occurred: {str(e)}")
 
-# Alias for backward compatibility
-download_github_repo = download_repo
-
 def get_github_file_content(repo_url: str, file_path: str, access_token: str = None) -> str:
     """
     Retrieves the content of a file from a GitHub repository using the GitHub API.
@@ -228,7 +225,7 @@ def get_github_file_content(repo_url: str, file_path: str, access_token: str = N
         headers = {}
         if access_token:
             headers["Authorization"] = f"token {access_token}"
-        from api.timeout_config import resolve_git_file_content_timeout
+        from api.config.timeout import resolve_git_file_content_timeout
         logger.info(f"Fetching file content from GitHub API: {api_url}")
         try:
             response = requests.get(api_url, headers=headers, timeout=resolve_git_file_content_timeout())
@@ -294,7 +291,7 @@ def get_gitlab_file_content(repo_url: str, file_path: str, access_token: str = N
         # Encode file path
         encoded_file_path = quote(file_path, safe='')
 
-        from api.timeout_config import resolve_git_file_content_timeout
+        from api.config.timeout import resolve_git_file_content_timeout
         # Try to get the default branch from the project info
         default_branch = None
         try:

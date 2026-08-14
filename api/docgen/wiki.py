@@ -108,28 +108,23 @@ class WikiGenerator:
     
     def __init__(
         self,
-        provider: str = None,
         model: str = None,
         language: str = "ru"
     ):
         """
         Initialize the wiki generator.
-        
+
         Args:
-            provider: LLM provider ('openai_local' or 'ollama'); defaults to
-                the DEEPWIKI_DEFAULT_PROVIDER env var ('openai_local').
-            model: Model name to use; defaults to DEEPWIKI_DEFAULT_MODEL env
-                var ('qwen/qwen3.6-27b').
+            model: Model name to use; defaults to 'qwen/qwen3.6-27b'.
             language: Output language code ('ru', 'en', etc.)
         """
         import os
-        self.provider = provider or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local")
-        self.model = model or os.environ.get("DEEPWIKI_DEFAULT_MODEL", "qwen/qwen3.6-27b")
+        self.model = model or "qwen/qwen3.6-27b"
         self.language = language
         self.generated_sections: Dict[str, str] = {}
         self.context: Optional[WikiSectionContext] = None
         
-        logger.info(f"WikiGenerator initialized with model: {model}, provider: {provider}")
+        logger.info(f"WikiGenerator initialized with model: {model}")
     
     def set_context(self, context: WikiSectionContext):
         """Set the context data for generation"""
@@ -242,11 +237,12 @@ class WikiGenerator:
             prompt_vars = common_vars
         
         # Fill in the template using safe string replacement.
-        # NOTE: str.replace is used (matching websocket_wiki.py) rather than
-        # str.format() because the refs/prompts/*.md templates contain literal
-        # braces in Mermaid/JSON examples that must be preserved verbatim.
-        # str.format() would raise on those unescaped braces; str.replace only
-        # substitutes exact {var_name} placeholders and leaves the rest intact.
+        # NOTE: str.replace is used (matching api.utils.llm_helpers.safe_replace)
+        # rather than str.format() because the refs/prompts/*.md templates
+        # contain literal braces in Mermaid/JSON examples that must be preserved
+        # verbatim. str.format() would raise on those unescaped braces;
+        # str.replace only substitutes exact {var_name} placeholders and leaves
+        # the rest intact.
         formatted = prompt_template
         for var_name, var_value in prompt_vars.items():
             formatted = formatted.replace("{" + var_name + "}", str(var_value))
@@ -260,9 +256,14 @@ class WikiGenerator:
             formatted = formatted + "\n\n" + _guard
 
         try:
-            from api.utils import get_model_context_window, clamp_text_by_tokens
-            ctx_win = get_model_context_window(provider=self.provider, model_name=self.model, task="docgen")
-            formatted = clamp_text_by_tokens(formatted, max(1024, ctx_win - 2048))
+            from api.utils import get_model_context_window
+            from api.utils.llm_helpers import cap as _cap_text
+            ctx_win = get_model_context_window(model_name=self.model, task="docgen")
+            # Char-cap the formatted prompt to the model's context window (4
+            # chars/token heuristic) so the standard-LLM path stays in budget.
+            # RLM is a long-context engine and receives the full prompt; the cap
+            # only protects the standard-LLM fallback.
+            formatted = _cap_text(formatted, max(4096, (ctx_win - 2048) * 4))
         except Exception:
             pass
 
@@ -551,7 +552,7 @@ if __name__ == "__main__":
         modules=["auth", "users", "posts"],
     )
     
-    generator = WikiGenerator(provider="openai_local", model="qwen/qwen3.6-27b", language="ru")
+    generator = WikiGenerator(model="qwen/qwen3.6-27b", language="ru")
     generator.set_context(context)
     
     print("WikiGenerator initialized successfully")

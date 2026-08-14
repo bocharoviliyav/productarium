@@ -8,7 +8,7 @@ Covers:
 - GET .../generate/status?job_id=... reports queued -> running -> succeeded.
 - 404s for a missing artifact (POST) and an unknown job_id (status).
 
-The heavy ``generate_artifact_documentation`` pipeline is monkeypatched with an
+The heavy ``generate_codebase_docs`` pipeline is monkeypatched with an
 instant async fake so the worker thread completes in milliseconds. The worker
 thread reads ``api.docgen.jobs.SessionLocal`` at runtime (its import site), so
 the test rebinds it to the isolated StaticPool SQLite engine (one shared
@@ -90,13 +90,14 @@ def _build_app(db_mod, monkeypatch):
 
 
 def _seed(db_mod):
-    from api.models import ArtifactORM, ProductORM
+    from api.models import CodebaseORM, ProductORM
     with db_mod.SessionLocal() as db:
         db.add(ProductORM(id="prod_1", name="Acme"))
         db.flush()
-        db.add(ArtifactORM(
-            id="art_1", product_id="prod_1", name="svc", type="links",
-            content='[{"url":"https://x","title":"X"}]', source="manual",
+        db.add(CodebaseORM(
+            id="art_1", product_id="prod_1", name="svc",
+            repo_url="https://github.com/x/y", repo_type="github",
+            source="manual",
         ))
         db.commit()
 
@@ -108,24 +109,24 @@ class TestAsyncDocgen:
         _app, client = _build_app(db_mod, monkeypatch)
 
         # Instant async fake for the heavy pipeline; it persists docs onto the
-        # artifact ORM (loaded in the worker's own session) and returns.
-        import api.docgen as adg
+        # codebase ORM (loaded in the worker's own session) and returns.
+        import api.docgen.codebase as adg
 
         async def _fake(artifact, product, **kwargs):
             artifact.generated_docs = "# Generated\n\nfake"
             artifact.pages = {
-                "page_links": {
-                    "id": "page_links", "title": "Links",
+                "page_overview": {
+                    "id": "page_overview", "title": "Overview",
                     "content": "# Generated", "filePaths": [],
                     "importance": "medium", "relatedPages": [],
                 }
             }
             return artifact.generated_docs
 
-        monkeypatch.setattr(adg, "generate_artifact_documentation", _fake)
+        monkeypatch.setattr(adg, "generate_codebase_docs", _fake)
 
         resp = client.post(
-            "/api/products/prod_1/artifacts/art_1/generate",
+            "/api/products/prod_1/codebases/art_1/generate",
             json={"language": "en"},
         )
         assert resp.status_code == 202
@@ -139,7 +140,7 @@ class TestAsyncDocgen:
         last = None
         while time.time() < deadline:
             s = client.get(
-                "/api/products/prod_1/artifacts/art_1/generate/status",
+                "/api/products/prod_1/codebases/art_1/generate/status",
                 params={"job_id": job_id},
             )
             assert s.status_code == 200
@@ -151,13 +152,13 @@ class TestAsyncDocgen:
         assert last["status"] == "succeeded", last
         assert last["docs_chars"] == len("# Generated\n\nfake")
 
-        # The generated docs were committed to the artifact in the shared DB.
-        from api.models import ArtifactORM
+        # The generated docs were committed to the codebase in the shared DB.
+        from api.models import CodebaseORM
         with db_mod.SessionLocal() as db:
-            art = db.get(ArtifactORM, "art_1")
+            art = db.get(CodebaseORM, "art_1")
             assert art is not None
             assert art.generated_docs == "# Generated\n\nfake"
-            assert art.pages is not None and "page_links" in art.pages
+            assert art.pages is not None and "page_overview" in art.pages
 
     def test_generate_404_missing_artifact(self, monkeypatch):
         db_mod = _setup_db()
@@ -167,7 +168,7 @@ class TestAsyncDocgen:
             db.commit()
         _app, client = _build_app(db_mod, monkeypatch)
         resp = client.post(
-            "/api/products/prod_1/artifacts/ghost/generate",
+            "/api/products/prod_1/codebases/ghost/generate",
             json={"language": "en"},
         )
         assert resp.status_code == 404
@@ -177,35 +178,35 @@ class TestAsyncDocgen:
         _seed(db_mod)
         _app, client = _build_app(db_mod, monkeypatch)
         resp = client.get(
-            "/api/products/prod_1/artifacts/art_1/generate/status",
+            "/api/products/prod_1/codebases/art_1/generate/status",
             params={"job_id": "does-not-exist"},
         )
         assert resp.status_code == 404
 
     def test_status_404_job_of_other_artifact(self, monkeypatch):
-        """A real job_id but queried against a different artifact must 404
-        (prevents cross-artifact status reads)."""
+        """A real job_id but queried against a different codebase must 404
+        (prevents cross-codebase status reads)."""
         db_mod = _setup_db()
         _seed(db_mod)
         _app, client = _build_app(db_mod, monkeypatch)
 
-        import api.docgen as adg
+        import api.docgen.codebase as adg
 
         async def _fake(artifact, product, **kwargs):
             artifact.generated_docs = "ok"
             return artifact.generated_docs
 
-        monkeypatch.setattr(adg, "generate_artifact_documentation", _fake)
+        monkeypatch.setattr(adg, "generate_codebase_docs", _fake)
         resp = client.post(
-            "/api/products/prod_1/artifacts/art_1/generate",
+            "/api/products/prod_1/codebases/art_1/generate",
             json={"language": "en"},
         )
         assert resp.status_code == 202
         job_id = resp.json()["job_id"]
 
-        # Same product, WRONG artifact -> 404.
+        # Same product, WRONG codebase -> 404.
         bad = client.get(
-            "/api/products/prod_1/artifacts/art_other/generate/status",
+            "/api/products/prod_1/codebases/art_other/generate/status",
             params={"job_id": job_id},
         )
         assert bad.status_code == 404
@@ -218,10 +219,11 @@ class TestAsyncDocgen:
         gates the docgen job."""
         import asyncio
         import api.api as api_mod
-        import api.docgen as adg
-        import api.cognee_manager as cm
+        import api.docgen as adg_pkg
+        import api.docgen.codebase as adg
+        import api.cognee as cm
         import api.docgen.jobs as dj
-        from api.models import ArtifactORM
+        from api.models import CodebaseORM
 
         _indexed = {"v": False}
 
@@ -237,8 +239,8 @@ class TestAsyncDocgen:
         async def _fake(artifact, product, **kwargs):
             artifact.generated_docs = "# Generated\n\ncontent"
             artifact.pages = {
-                "page_links": {
-                    "id": "page_links", "title": "Links",
+                "page_overview": {
+                    "id": "page_overview", "title": "Overview",
                     "content": "# Generated", "filePaths": [],
                     "importance": "medium", "relatedPages": [],
                 }
@@ -247,10 +249,10 @@ class TestAsyncDocgen:
             # main loop captured (via `with TestClient`), it hands off to the
             # main loop; the worker drain finds no pending tasks and returns
             # immediately — the job does NOT wait for the 300s cognify.
-            adg._index_in_background("repo_dir", "prod_prod_1")
+            adg_pkg._index_in_background("repo_dir", "prod_prod_1")
             return artifact.generated_docs
 
-        monkeypatch.setattr(adg, "generate_artifact_documentation", _fake)
+        monkeypatch.setattr(adg, "generate_codebase_docs", _fake)
 
         db_mod = _setup_db()
         _seed(db_mod)
@@ -272,7 +274,7 @@ class TestAsyncDocgen:
 
         with client:
             resp = client.post(
-                "/api/products/prod_1/artifacts/art_1/generate",
+                "/api/products/prod_1/codebases/art_1/generate",
                 json={"language": "en"},
             )
             assert resp.status_code == 202
@@ -284,7 +286,7 @@ class TestAsyncDocgen:
             last = None
             while time.time() < deadline:
                 s = client.get(
-                    "/api/products/prod_1/artifacts/art_1/generate/status",
+                    "/api/products/prod_1/codebases/art_1/generate/status",
                     params={"job_id": job_id},
                 )
                 assert s.status_code == 200
@@ -299,7 +301,7 @@ class TestAsyncDocgen:
 
         # Docs were committed despite indexing still running in the background.
         with db_mod.SessionLocal() as db:
-            art = db.get(ArtifactORM, "art_1")
+            art = db.get(CodebaseORM, "art_1")
             assert art is not None
             assert (art.generated_docs or "").startswith("# Generated")
 
@@ -311,7 +313,7 @@ class TestAsyncDocgen:
         _seed(db_mod)
         _app, client = _build_app(db_mod, monkeypatch)
 
-        import api.docgen as adg
+        import api.docgen.codebase as adg
 
         async def _fake(artifact, product, **kwargs):
             # Simulate a total generation failure: every section is the
@@ -322,9 +324,9 @@ class TestAsyncDocgen:
                 "и перезапустите генерацию."
             )
 
-        monkeypatch.setattr(adg, "generate_artifact_documentation", _fake)
+        monkeypatch.setattr(adg, "generate_codebase_docs", _fake)
         resp = client.post(
-            "/api/products/prod_1/artifacts/art_1/generate",
+            "/api/products/prod_1/codebases/art_1/generate",
             json={"language": "en"},
         )
         assert resp.status_code == 202
@@ -334,7 +336,7 @@ class TestAsyncDocgen:
         last = None
         while time.time() < deadline:
             s = client.get(
-                "/api/products/prod_1/artifacts/art_1/generate/status",
+                "/api/products/prod_1/codebases/art_1/generate/status",
                 params={"job_id": job_id},
             )
             assert s.status_code == 200
@@ -347,8 +349,8 @@ class TestAsyncDocgen:
         assert "Не удалось сгенерировать" in (last.get("error") or "")
 
         # No placeholder-only docs were committed as a success.
-        from api.models import ArtifactORM
+        from api.models import CodebaseORM
         with db_mod.SessionLocal() as db:
-            art = db.get(ArtifactORM, "art_1")
+            art = db.get(CodebaseORM, "art_1")
             assert art is not None
             assert not (art.generated_docs or "").strip()

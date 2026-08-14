@@ -17,7 +17,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from api.timeout_config import (
+from api.config.timeout import (
     TIMEOUT_KEYS,
     TimeoutKey,
     _BY_ENV,
@@ -69,10 +69,10 @@ class _EnvGuard:
     def __enter__(self):
         for k in self._env:
             self._saved_env[k] = os.environ.pop(k, None)
-        from api.settings_store import list_settings
+        from api.config.settings import list_settings
         self._saved_store = [r["key"] for r in list_settings(prefix="timeouts.")]
         # Clear any stored override so the env/default layers are tested clean.
-        from api.settings_store import set_setting
+        from api.config.settings import set_setting
         for key in self._saved_store:
             set_setting(key, "", encrypt=False)
         return self
@@ -83,7 +83,7 @@ class _EnvGuard:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-        from api.settings_store import set_setting
+        from api.config.settings import set_setting
         for key in self._saved_store:
             set_setting(key, "", encrypt=False)
         return False
@@ -137,7 +137,7 @@ class TestTimeoutConfig(unittest.TestCase):
 
     def test_admin_store_overrides_env_and_default(self):
         env_vars = [k.env_var for k in TIMEOUT_KEYS]
-        with patch("api.settings_store.get_setting") as mock_get, _EnvGuard(env_vars, []):
+        with patch("api.config.settings.get_setting") as mock_get, _EnvGuard(env_vars, []):
             # First call (admin store) returns a stored override; the env var
             # is also set, but the admin store must win.
             def _get(key, *a, **kw):
@@ -167,7 +167,7 @@ class TestTimeoutConfig(unittest.TestCase):
 
     def test_invalid_admin_store_falls_back_to_env(self):
         env_vars = [k.env_var for k in TIMEOUT_KEYS]
-        with patch("api.settings_store.get_setting") as mock_get, _EnvGuard(env_vars, []):
+        with patch("api.config.settings.get_setting") as mock_get, _EnvGuard(env_vars, []):
             def _get(key, *a, **kw):
                 if key == "timeouts.llm_request":
                     return "garbage"
@@ -188,7 +188,7 @@ class TestTimeoutConfig(unittest.TestCase):
 
     def test_admin_store_below_floor_is_clamped(self):
         env_vars = [k.env_var for k in TIMEOUT_KEYS]
-        with patch("api.settings_store.get_setting") as mock_get, _EnvGuard(env_vars, []):
+        with patch("api.config.settings.get_setting") as mock_get, _EnvGuard(env_vars, []):
             def _get(key, *a, **kw):
                 if key == "timeouts.llm_request":
                     return "1"
@@ -236,7 +236,7 @@ class TestTimeoutConfig(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_sync_timeout_env_exports_admin_store_to_env(self):
         env_vars = [k.env_var for k in TIMEOUT_KEYS]
-        with patch("api.settings_store.get_setting") as mock_get, _EnvGuard(env_vars, []):
+        with patch("api.config.settings.get_setting") as mock_get, _EnvGuard(env_vars, []):
             def _get(key, *a, **kw):
                 if key == "timeouts.llm_request":
                     return "5555"
@@ -247,7 +247,7 @@ class TestTimeoutConfig(unittest.TestCase):
 
     def test_sync_timeout_env_skips_invalid_admin_store(self):
         env_vars = [k.env_var for k in TIMEOUT_KEYS]
-        with patch("api.settings_store.get_setting") as mock_get, _EnvGuard(env_vars, []):
+        with patch("api.config.settings.get_setting") as mock_get, _EnvGuard(env_vars, []):
             def _get(key, *a, **kw):
                 if key == "timeouts.llm_request":
                     return "garbage"

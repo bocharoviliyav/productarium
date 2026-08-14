@@ -14,8 +14,8 @@ This package splits the former ``api/cognee_manager.py`` (1529 LOC) by concern:
   ``reindex_product_knowledge_graph``, stale-data reconciliation.
 - ``query`` — ``query_cognee``.
 
-Public API (the symbols callers import as ``from api.cognee_manager import X``
-or ``api.cognee_manager.X``) is re-exported below.
+Public API (the symbols callers import as ``from api.cognee import X``
+or ``api.cognee.X``) is re-exported below.
 """
 
 # IMPORTANT: _runtime must be imported first — it sets env vars and imports

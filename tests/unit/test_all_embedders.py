@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Unit tests for DeepWiki embedder configuration, factory, and pipeline functions.
+Unit tests for embedder configuration, factory, and pipeline functions.
+
+The embedder layer now uses a single OpenAI-compatible provider
+(``embedder_openai_local`` via OpenAIClient) that covers every local
+server (Ollama, LM Studio, llama.cpp, vLLM, ...). There is no longer a
+provider/``embedder_type`` switch — every supported server exposes the
+same ``/v1/embeddings`` endpoint — so these tests cover the single path.
 """
 
-import os
 import sys
 import logging
-from unittest.mock import patch, MagicMock
 from pathlib import Path
 
 # Add project root to sys.path
@@ -21,135 +25,53 @@ logger = logging.getLogger(__name__)
 
 
 class TestEmbedderConfiguration:
-    """Test embedder configuration system."""
+    """Test the single OpenAI-compatible embedder configuration."""
 
     def test_config_loading(self):
-        """Test that embedder configurations load properly."""
-        from api.config import configs, CLIENT_CLASSES
+        """The embedder config is loaded under a single key."""
+        from api.config import configs
 
-        # With the unified OpenAI-compatible provider, only the
-        # ``embedder_openai_local`` config exists; ``embedder_ollama`` was
-        # removed. Both client classes remain importable.
-        assert 'embedder_openai_local' in configs, "OpenAI local embedder config missing"
-
-        assert 'OpenAIClient' in CLIENT_CLASSES, "OpenAIClient missing from CLIENT_CLASSES"
-        assert 'OllamaClient' in CLIENT_CLASSES, "OllamaClient missing from CLIENT_CLASSES"
-
-    def test_embedder_type_detection(self):
-        """Test embedder type detection functions."""
-        from api.config import get_embedder_type, is_ollama_embedder, is_openai_local_embedder
-
-        current_type = get_embedder_type()
-        assert current_type in ['ollama', 'openai_local'], f"Invalid embedder type: {current_type}"
-
-        is_ollama = is_ollama_embedder()
-        is_openai_local = is_openai_local_embedder()
-        assert isinstance(is_ollama, bool), "is_ollama_embedder should return boolean"
-        assert isinstance(is_openai_local, bool), "is_openai_local_embedder should return boolean"
+        assert 'embedder_openai_local' in configs, "embedder_openai_local config missing"
 
     def test_get_embedder_config(self):
-        """Test getting embedder config."""
+        """get_embedder_config() returns a dict with a resolved client."""
         from api.config import get_embedder_config
 
         config = get_embedder_config()
         assert isinstance(config, dict), "Config should be dict"
-        assert 'model_client' in config or 'client_class' in config, "No client specified in embedder config"
+        assert 'model_client' in config, "No model_client in embedder config"
 
 
 class TestEmbedderFactory:
     """Test the embedder factory function."""
 
-    def test_get_embedder_with_explicit_type(self):
-        """Test get_embedder with explicit embedder_type parameter."""
-        from api.tools.embedder import get_embedder
-
-        # Test Ollama embedder
-        try:
-            ollama_embedder = get_embedder(embedder_type='ollama')
-            assert ollama_embedder is not None, "Ollama embedder should be created"
-        except Exception as e:
-            logger.warning(f"Ollama embedder creation failed: {e}")
-
-        # Test OpenAI local embedder
-        try:
-            openai_embedder = get_embedder(embedder_type='openai_local')
-            assert openai_embedder is not None, "OpenAI local embedder should be created"
-        except Exception as e:
-            logger.warning(f"OpenAI local embedder creation failed: {e}")
-
-    def test_get_embedder_with_legacy_params(self):
-        """Test get_embedder with legacy parameter."""
-        from api.tools.embedder import get_embedder
-
-        try:
-            ollama_embedder = get_embedder(is_local_ollama=True)
-            assert ollama_embedder is not None, "Ollama embedder should be created with is_local_ollama=True"
-        except Exception as e:
-            logger.warning(f"Ollama embedder creation failed: {e}")
-
     def test_get_embedder_auto_detection(self):
-        """Test get_embedder with automatic type detection."""
+        """get_embedder() with no args builds the single embedder."""
         from api.tools.embedder import get_embedder
 
         embedder = get_embedder()
-        assert embedder is not None, "Auto-detected embedder should be created"
+        assert embedder is not None, "Embedder should be created"
 
 
 class TestDataPipelineFunctions:
     """Test data pipeline functions that use embedders."""
 
     def test_count_tokens(self):
-        """Test token counting."""
+        """count_tokens uses tiktoken (no provider param)."""
         from api.repositories.documents import count_tokens
 
         test_text = "This is a test string for token counting."
-        for embedder_type in [None, 'ollama', 'openai_local']:
-            token_count = count_tokens(test_text, embedder_type=embedder_type)
-            assert isinstance(token_count, int), "Token count should be an integer"
-            assert token_count > 0, "Token count should be positive"
+        token_count = count_tokens(test_text)
+        assert isinstance(token_count, int), "Token count should be an integer"
+        assert token_count > 0, "Token count should be positive"
 
     def test_prepare_data_pipeline(self):
-        """Test data pipeline preparation."""
+        """prepare_data_pipeline() builds a callable pipeline (no params)."""
         from api.repositories.documents import prepare_data_pipeline
 
-        for embedder_type in [None, 'ollama', 'openai_local']:
-            try:
-                pipeline = prepare_data_pipeline(embedder_type=embedder_type)
-                assert pipeline is not None, "Data pipeline should be created"
-                assert hasattr(pipeline, '__call__'), "Pipeline should be callable"
-            except Exception as e:
-                logger.warning(f"Pipeline creation failed for embedder_type={embedder_type}: {e}")
-
-
-class TestEnvironmentVariableHandling:
-    """Test embedder selection via environment variables."""
-
-    def test_embedder_type_env_var(self):
-        """Test embedder selection via DEEPWIKI_EMBEDDER_TYPE environment variable.
-
-        With the unified OpenAI-compatible provider, ``get_embedder_type()``
-        always returns ``'openai_local'`` regardless of the env var (the env
-        var is now inert). The module-level ``EMBEDDER_TYPE`` still reflects
-        the raw env value for backwards compatibility.
-        """
-        import importlib
-        import api.config
-
-        original_value = os.environ.get('DEEPWIKI_EMBEDDER_TYPE')
-
         try:
-            for et in ['ollama', 'openai_local']:
-                os.environ['DEEPWIKI_EMBEDDER_TYPE'] = et
-                importlib.reload(api.config)
-
-                from api.config import EMBEDDER_TYPE, get_embedder_type
-                assert EMBEDDER_TYPE == et, f"EMBEDDER_TYPE should be {et}"
-                # get_embedder_type() is hardcoded to 'openai_local'
-                assert get_embedder_type() == 'openai_local', \
-                    f"get_embedder_type() should always return 'openai_local' (got {get_embedder_type()!r})"
-        finally:
-            if original_value is not None:
-                os.environ['DEEPWIKI_EMBEDDER_TYPE'] = original_value
-            elif 'DEEPWIKI_EMBEDDER_TYPE' in os.environ:
-                del os.environ['DEEPWIKI_EMBEDDER_TYPE']
-            importlib.reload(api.config)
+            pipeline = prepare_data_pipeline()
+            assert pipeline is not None, "Data pipeline should be created"
+            assert hasattr(pipeline, '__call__'), "Pipeline should be callable"
+        except Exception as e:
+            logger.warning(f"Pipeline creation failed: {e}")

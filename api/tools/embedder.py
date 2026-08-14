@@ -1,20 +1,17 @@
 import adalflow as adal
 
-from api.config import configs, get_embedder_type
+from api.config import configs
 
 
-def get_embedder(is_local_ollama: bool = False, embedder_type: str = None, base_url: str = None, api_key: str = None) -> adal.Embedder:
+def get_embedder(base_url: str = None, api_key: str = None) -> adal.Embedder:
     """Get embedder based on configuration or parameters.
 
     Every supported local server (Ollama, LM Studio, llama.cpp, vLLM, ...)
     exposes an OpenAI-compatible /v1/embeddings endpoint, so a single
-    OpenAIClient-based embedder covers all cases. The legacy
-    ``is_local_ollama`` / ``embedder_type`` parameters are kept for backwards
-    compatibility with callers but no longer select a different client.
+    OpenAIClient-based embedder covers all cases.
 
     Args:
-        is_local_ollama: Legacy parameter (ignored).
-        embedder_type: Legacy parameter (ignored).
+
         base_url: Custom base URL for the embedder provider.
         api_key: Custom API key for the embedder provider.
 
@@ -24,11 +21,10 @@ def get_embedder(is_local_ollama: bool = False, embedder_type: str = None, base_
     # Thread admin-configured embedder model/base_url/api_key into the single
     # OpenAI-compatible embedder config.
     try:
-        from api.settings_store import get_model_for_task
+        from api.config.settings import get_model_for_task
         emb_cfg = get_model_for_task("embedder") or {}
-        if emb_cfg.get("model"):
-            if "embedder_openai_local" in configs:
-                configs["embedder_openai_local"]["model_kwargs"]["model"] = emb_cfg["model"]
+        if emb_cfg.get("model") and "embedder_openai_local" in configs:
+            configs["embedder_openai_local"]["model_kwargs"]["model"] = emb_cfg["model"]
         if not base_url and emb_cfg.get("base_url"):
             base_url = emb_cfg["base_url"]
         if not api_key and emb_cfg.get("api_key"):

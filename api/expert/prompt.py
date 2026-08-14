@@ -10,7 +10,8 @@ Split out of the former ``api/expert_agent.py`` (Step 6). Owns:
   ``api.docgen._common``, so each module keeps its own).
 - ``_chunk_text``: split text into incremental pieces for chunked streaming.
 - ``_build_prompt``: assemble the full expert prompt from a loaded template,
-  dynamically clamping knowledge/history to the model's context window.
+  passing full knowledge/history when they fit the context window and
+  char-capping each to its budget share when they overflow.
 
 ``_safe_replace`` / ``cap`` / ``strip_inline_line_numbers`` are shared
 (generic text helpers) and imported from ``api.utils.llm_helpers``.
@@ -116,7 +117,6 @@ def _build_prompt(
     history: str,
     query: str,
     language_name: Optional[str] = None,
-    provider: Optional[str] = None,
     base_url: Optional[str] = None,
     model: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -128,8 +128,10 @@ def _build_prompt(
     and the query are appended as structured blocks (NOT substituted into the
     template) so the template body stays small and Mermaid/JSON-safe.
 
-    Dynamically clamps knowledge and history to fit the target model's actual
-    context window.
+    Knowledge and history are passed in full when they fit the model's context
+    window (RLM benefits from the full context); when they overflow, each is
+    char-capped to its share of the budget so the standard-LLM path still gets
+    a usable prompt instead of blowing the context.
     """
     system = _safe_replace(
         template,
@@ -145,26 +147,39 @@ def _build_prompt(
     if _guard:
         system = system + "\n\n" + _guard
 
+    # Resolve the model's context window so the standard-LLM path stays in
+    # budget. RLM is a long-context engine and ignores this cap (it receives
+    # the full prompt); the cap only protects the standard-LLM fallback.
     try:
-        from api.utils import get_model_context_window, clamp_text_by_tokens, _count_tokens
-        ctx_win = get_model_context_window(provider=provider, base_url=base_url, model_name=model, api_key=api_key, task="expert")
+        from api.utils import get_model_context_window, _count_tokens
+        ctx_win = get_model_context_window(base_url=base_url, model_name=model, api_key=api_key, task="expert")
     except Exception:
         ctx_win = 8192
-        from api.utils import clamp_text_by_tokens, _count_tokens
+        from api.utils import _count_tokens
 
-    # Reserve 2048 tokens for system instructions, query, and LLM output completion
+    # Reserve tokens for system instructions, query, and LLM output completion.
     avail_tokens = max(1024, ctx_win - 2048)
+    # Approximate chars-per-token for the char cap fallback (4 is the standard
+    # heuristic used by _count_tokens' own fallback).
+    avail_chars = avail_tokens * 4
 
-    # 1. Clamp history to at most 1/3 of available prompt budget
+    # 1. History gets at most 1/3 of the budget (keep the tail: most recent
+    #    turns are most relevant).
+    history_budget_chars = max(2048, avail_chars // 3)
     clamped_history = ""
     if history:
-        history_budget = max(512, avail_tokens // 3)
-        clamped_history = clamp_text_by_tokens(history, history_budget, preserve_tail=True)
+        clamped_history = history if len(history) <= history_budget_chars else (
+            "... (ранняя история обрезана для контекста)\n" + history[-history_budget_chars:]
+        )
 
-    # 2. Clamp knowledge to the remaining prompt budget
-    history_tokens = _count_tokens(clamped_history)
-    knowledge_budget = max(512, avail_tokens - history_tokens)
-    clamped_knowledge = clamp_text_by_tokens(knowledge, knowledge_budget, preserve_tail=False)
+    # 2. Knowledge gets the remaining budget (keep the head: knowledge is
+    #    retrieved top-first by cognee, so the most relevant docs come first).
+    knowledge_budget_chars = max(2048, avail_chars - len(clamped_history))
+    clamped_knowledge = ""
+    if knowledge:
+        clamped_knowledge = knowledge if len(knowledge) <= knowledge_budget_chars else (
+            knowledge[:knowledge_budget_chars] + "\n... (часть знаний обрезана для контекста)"
+        )
 
     prompt = system + "\n\n"
     if clamped_history:

@@ -25,7 +25,7 @@ class GitLabConnector(IntegrationConnector, GitConnector):
 
     @classmethod
     def get_config(cls) -> Dict[str, Any]:
-        from api.settings_store import get_git_creds
+        from api.config.settings import get_git_creds
 
         return get_git_creds("gitlab")
 
@@ -55,7 +55,7 @@ class GitLabConnector(IntegrationConnector, GitConnector):
             import requests
         except Exception as e:  # pragma: no cover
             return {"success": False, "message": f"requests unavailable: {e}"}
-        from api.ssl_config import requests_verify
+        from api.config.ssl import requests_verify
 
         token = self._token()
         if not token:
@@ -63,7 +63,7 @@ class GitLabConnector(IntegrationConnector, GitConnector):
         base = self._api_base().rstrip("/")
         url = f"{base}/api/v4/user"
         try:
-            from api.timeout_config import resolve_integration_http_timeout
+            from api.config.timeout import resolve_integration_http_timeout
             resp = requests.get(
                 url, headers=self.auth_headers(), timeout=resolve_integration_http_timeout(),
                 verify=requests_verify(),

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # ``create_secure_ssl_context`` -> ``ssl.create_default_context()``, which honors
 # the ``SSL_CERT_FILE`` env var, so setting it here (from the admin panel / env)
 # makes cognee trust a corporate root cert. See api/ssl_config.py.
-from api.ssl_config import apply_ssl_env, apply_cognee_ssl_patch
+from api.config.ssl import apply_ssl_env, apply_cognee_ssl_patch
 apply_ssl_env()
 
 # Postgres settings for cognee metadata/graph storage.
@@ -129,7 +129,7 @@ def _host_to_v1(host: str) -> str:
 def _resolve_embedding_dimensions(model_name: str) -> int:
     """Infer embedding dimensions from model name or admin settings/env."""
     try:
-        from api.settings_store import get_setting
+        from api.config.settings import get_setting
         stored = get_setting("models.embedder.dimensions")
         if stored:
             return int(stored.strip())
@@ -333,7 +333,7 @@ os.environ.setdefault("COGNEE_SKIP_CONNECTION_TEST", "true")
 # Best-effort: shrink the cognee LLM connection timeout if cognee honors it.
 # Resolved through the central timeout config (admin > env > default).
 try:
-    from api.timeout_config import resolve_cognee_llm_connection_timeout
+    from api.config.timeout import resolve_cognee_llm_connection_timeout
     os.environ.setdefault("COGNEE_LLM_CONNECTION_TIMEOUT", str(int(resolve_cognee_llm_connection_timeout())))
 except Exception:  # pragma: no cover - defensive
     os.environ.setdefault("COGNEE_LLM_CONNECTION_TIMEOUT", "10")
@@ -356,7 +356,7 @@ logger.info(
 # Must be >= the per-request HTTP timeout (llm_request) so a genuinely
 # slow-but-progressing call is not killed before it can return.
 def _resolve_graph_extraction_timeout() -> float:
-    from api.timeout_config import resolve_cognee_graph_extraction_timeout
+    from api.config.timeout import resolve_cognee_graph_extraction_timeout
     return resolve_cognee_graph_extraction_timeout()
 
 
@@ -368,7 +368,7 @@ def _resolve_graph_extraction_timeout() -> float:
 # this ceiling. Resolved through the central timeout config (admin > env >
 # default). Default 7200s (2h) to accommodate very large repos, floor 300s.
 def _resolve_cognify_timeout() -> float:
-    from api.timeout_config import resolve_cognee_cognify_timeout
+    from api.config.timeout import resolve_cognee_cognify_timeout
     return resolve_cognee_cognify_timeout()
 
 

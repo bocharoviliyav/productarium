@@ -81,12 +81,12 @@ def _patch_llm(monkeypatch, text: str = "FAKE ANSWER", chunks: List[str] | None 
 
 
 def _patch_cognee(monkeypatch, payload: str):
-    """Patch api.cognee_manager.query_cognee to return ``payload``."""
+    """Patch api.cognee.query_cognee to return ``payload``."""
 
     async def _fake_query(query: str, dataset_name: str, top_k: int = 20) -> str:
         return payload
 
-    monkeypatch.setattr("api.cognee_manager.query_cognee", _fake_query)
+    monkeypatch.setattr("api.cognee.query_cognee", _fake_query)
 
 
 def _patch_rlm(monkeypatch, result: str, success: bool = True):
@@ -216,17 +216,16 @@ class TestKnowledgeRetrieval:
     def test_retrieve_falls_back_to_artifact_docs(self, monkeypatch):
         import api.expert as ea
         db = _sqlite_db()
-        from api.models import ArtifactORM, ProductORM
+        from api.models import CodebaseORM, ProductORM
 
         with db.SessionLocal() as session:
             session.add(ProductORM(id="prod_1", name="Acme"))
             session.flush()
             session.add(
-                ArtifactORM(
+                CodebaseORM(
                     id="art_1",
                     product_id="prod_1",
                     name="svc",
-                    type="codebase",
                     generated_docs="# Svc\nthe docs",
                     pages={"page_overview": {"id": "page_overview", "title": "Overview",
                                              "content": "PAGE CONTENT"}},
@@ -288,7 +287,7 @@ class TestRunExpertDoc:
 
     def test_rlm_used_for_long_context(self, monkeypatch):
         import api.expert as ea
-        import api.settings_store as ss
+        import api.config.settings as ss
         monkeypatch.setattr(ss, "get_rlm_mode", lambda task: "auto")
         # Big knowledge -> prompt >= RLM_MIN_CHARS -> RLM path.
         _patch_cognee(monkeypatch, "K" * (ea.RLM_MIN_CHARS + 5000))
@@ -339,7 +338,7 @@ class TestRunExpertChat:
     def test_stream_uses_rlm_for_long_context(self, monkeypatch):
         import api.expert as ea
         from api.expert.types import EVENT_CONTENT, ExpertStreamEvent
-        import api.settings_store as ss
+        import api.config.settings as ss
         monkeypatch.setattr(ss, "get_rlm_mode", lambda task: "auto")
         _patch_cognee(monkeypatch, "K" * (ea.RLM_MIN_CHARS + 5000))
         _patch_rlm(monkeypatch, "RLM CHUNKED ANSWER")
@@ -395,7 +394,7 @@ class TestRunExpertChat:
         import api.expert.chat as chat
         captured: dict = {}
 
-        async def _fake_generate_answer(prompt, provider, model, base_url, api_key, use_rlm):
+        async def _fake_generate_answer(prompt, model, base_url, api_key, use_rlm):
             captured["prompt"] = prompt
             return "ok"
 
@@ -426,7 +425,7 @@ class TestReasoningExtraction:
         from api.expert.llm import _extract_chunk_fields
         # DeepSeek / DashScope shape: choices[0].delta.reasoning_content
         chunk = {"choices": [{"delta": {"content": "Hello", "reasoning_content": "thinking..."}}]}
-        content, reasoning = _extract_chunk_fields(chunk, "openai_local")
+        content, reasoning = _extract_chunk_fields(chunk)
         assert content == "Hello"
         assert reasoning == "thinking..."
 
@@ -434,7 +433,7 @@ class TestReasoningExtraction:
         from api.expert.llm import _extract_chunk_fields
         # Ollama /v1 shape: choices[0].delta.reasoning (vLLM rename)
         chunk = {"choices": [{"delta": {"reasoning": "the model thinking here..."}}]}
-        content, reasoning = _extract_chunk_fields(chunk, "openai_local")
+        content, reasoning = _extract_chunk_fields(chunk)
         assert content is None
         assert reasoning == "the model thinking here..."
 
@@ -442,22 +441,16 @@ class TestReasoningExtraction:
         from api.expert.llm import _extract_chunk_fields
         # Ollama native shape: message.thinking + message.content
         chunk = {"message": {"content": "Hello!", "thinking": "Let me think..."}}
-        content, reasoning = _extract_chunk_fields(chunk, "ollama")
+        content, reasoning = _extract_chunk_fields(chunk)
         assert content == "Hello!"
         assert reasoning == "Let me think..."
 
     def test_extract_chunk_fields_none_when_no_reasoning(self):
         from api.expert.llm import _extract_chunk_fields
         chunk = {"choices": [{"delta": {"content": "Hello"}}]}
-        content, reasoning = _extract_chunk_fields(chunk, "openai_local")
+        content, reasoning = _extract_chunk_fields(chunk)
         assert content == "Hello"
         assert reasoning is None
-
-    def test_extract_chunk_text_backward_compat_returns_content_only(self):
-        from api.expert.llm import _extract_chunk_text
-        chunk = {"choices": [{"delta": {"content": "Hello", "reasoning_content": "hidden"}}]}
-        text = _extract_chunk_text(chunk, "openai_local")
-        assert text == "Hello"
 
 
 class TestThinkingParser:
@@ -588,43 +581,12 @@ class TestExpertRouter:
     def test_ask_streams_sse(self, app_and_client, monkeypatch):
         _, client = app_and_client
         import api.routers.expert as expert_router
+        from api.expert.types import EVENT_CONTENT, ExpertStreamEvent
 
         def _fake_chat(product_id, query, messages, model, stream=True, use_rlm=None, **kwargs):
             async def gen():
-                yield "Hello"
-                yield " world"
-            return gen()
-
-        monkeypatch.setattr(expert_router, "run_expert_chat", _fake_chat)
-        resp = client.post("/api/products/prod_1/ask", json={"query": "hi"})
-        assert resp.status_code == 200
-        assert resp.headers["content-type"].startswith("text/event-stream")
-        body = resp.text
-        assert 'data: {"content": "Hello"}' in body
-        assert 'data: {"content": " world"}' in body
-        assert "data: [DONE]" in body
-class TestExpertRouter:
-    @pytest.fixture
-    def app_and_client(self, monkeypatch):
-        # Auth disabled -> get_current_user returns the system user (no cookie).
-        import api.auth.deps as deps
-        monkeypatch.setattr(deps, "AUTH_PROVIDER", "none")
-        from fastapi import FastAPI
-        from fastapi.testclient import TestClient
-        import api.routers.expert as expert_router
-
-        app = FastAPI()
-        app.include_router(expert_router.router)
-        return app, TestClient(app)
-
-    def test_ask_streams_sse(self, app_and_client, monkeypatch):
-        _, client = app_and_client
-        import api.routers.expert as expert_router
-
-        def _fake_chat(product_id, query, messages, model, stream=True, use_rlm=None, **kwargs):
-            async def gen():
-                yield "Hello"
-                yield " world"
+                yield ExpertStreamEvent(EVENT_CONTENT, "Hello")
+                yield ExpertStreamEvent(EVENT_CONTENT, " world")
             return gen()
 
         monkeypatch.setattr(expert_router, "run_expert_chat", _fake_chat)

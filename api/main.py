@@ -1,6 +1,7 @@
+import logging
 import os
 import sys
-import logging
+
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -11,14 +12,16 @@ load_dotenv()
 # encrypted admin settings (models.*/api_key, confluence.token) and JWT
 # session signing stable across restarts instead of using a new ephemeral
 # per-process key on each boot. Non-fatal; see api/settings_store.py.
-from api.settings_store import bootstrap_secret_key
+from api.config.settings import bootstrap_secret_key
+
 bootstrap_secret_key()
 
 # Apply SSL/TLS configuration (corporate CA bundle / skip-verify) BEFORE any
 # HTTP client (requests, httpx, openai SDK, cognee) is constructed, so the
 # default-trust-store consumers honor SSL_CERT_FILE for an enterprise AI
 # gateway. See api/ssl_config.py.
-from api.ssl_config import apply_ssl_env
+from api.config.ssl import apply_ssl_env
+
 apply_ssl_env()
 
 from api.utils import setup_logging
@@ -39,29 +42,24 @@ is_development = os.environ.get("NODE_ENV") != "production"
 if is_development:
     import watchfiles
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    logs_dir = os.path.join(current_dir, "logs")
-    
+
     original_watch = watchfiles.watch
     def patched_watch(*args, **kwargs):
-        # Only watch the api directory but exclude logs subdirectory
-        # Instead of watching the entire api directory, watch specific subdirectories
+        # Watch the api directory (files + subdirs) but exclude logs.
         api_subdirs = []
         for item in os.listdir(current_dir):
             item_path = os.path.join(current_dir, item)
-            if os.path.isdir(item_path) and item != "logs":
+            if os.path.isdir(item_path) and item != "logs" or os.path.isfile(item_path) and item.endswith(".py"):
                 api_subdirs.append(item_path)
-            elif os.path.isfile(item_path) and item.endswith(".py"):
-                api_subdirs.append(item_path)
-        
+
         return original_watch(*api_subdirs, **kwargs)
     watchfiles.watch = patched_watch
 
 import uvicorn
 
-# Log configuration info (no cloud API keys required)
-from api.config import OLLAMA_HOST, LOCAL_OPENAI_BASE_URL
-logger.info(f"DeepWiki Local Mode - Ollama host: {OLLAMA_HOST}")
-logger.info(f"Local OpenAI API endpoint: {LOCAL_OPENAI_BASE_URL}")
+from api.config import LOCAL_OPENAI_BASE_URL
+
+logger.info(f"OpenAI API endpoint: {LOCAL_OPENAI_BASE_URL}")
 
 if __name__ == "__main__":
     # Get port from environment variable or use default

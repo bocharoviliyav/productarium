@@ -1,10 +1,9 @@
-"""OpenAPI / AsyncAPI / Testcase documentation (standard LLM + stdlib render).
+"""OpenAPI / AsyncAPI documentation (standard LLM + stdlib render).
 
-Split out of the former ``api/artifact_docgen.py`` (Step 4). Spec artifacts are
-parsed with stdlib json/yaml into a structured skeleton, then enriched via the
-standard LLM (``refs/prompts/<kind>_doc.md``). Test-case artifacts render an
-Allure URL as a LINK only (never fetched). All paths index into cognee and
-persist ``generated_docs`` + ``pages``.
+Spec artifacts are parsed with stdlib json/yaml into a structured skeleton,
+then enriched via the standard LLM (``refs/prompts/<kind>_doc.md``). The
+enriched markdown is written back onto the spec's ``content`` and indexed into
+cognee in the background.
 
 Shared LLM/persistence helpers live in ``api.docgen._common``.
 """
@@ -27,7 +26,6 @@ from api.docgen._common import (
     _resolve_docgen_model,
     _llm_or_none,
     _make_repair_llm,
-    _persist_artifact,
     _cognee_dataset,
     _index_in_background,
     _product_name,
@@ -45,9 +43,9 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # Spec parsing (stdlib json/yaml) + structured renderers
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 def _parse_spec(content: str) -> Optional[dict]:
     text = (content or "").strip()
     if not text:
@@ -175,75 +173,58 @@ def _render_asyncapi_skeleton(spec: dict) -> str:
     return "\n".join(md)
 
 
-def _render_raw_fallback(label: str, content: str, artifact: Any) -> str:
-    name = getattr(artifact, "name", None) or label
+def _render_raw_fallback(label: str, content: str, spec: Any) -> str:
+    name = getattr(spec, "name", None) or label
     md = f"# {label}: {name}\n\n"
     md += "_(Не удалось разобрать спецификацию; показано исходное содержимое.)_\n\n"
-    md += f"```yaml\n{_cap(content, 4000)}\n```\n"
+    md += f"```yaml\n{_cap(content, 4000)}\n```"
     return md
 
 
-def _render_testcase_skeleton(content: str, allure_url: str, artifact: Any) -> str:
-    name = getattr(artifact, "name", None) or "Тест-кейсы"
-    md = f"# Тест-кейсы: {name}\n\n"
-    if allure_url:
-        md += f"**Отчёт Allure:** [{allure_url}]({allure_url})\n\n"
-    if content:
-        md += content + "\n"
-    else:
-        md += "_(Содержимое тест-кейсов не предоставлено; см. ссылку Allure выше.)_\n"
-    return md
-
-
-# ---------------------------------------------------------------------------
-# OpenAPI / AsyncAPI / Testcase documentation (standard LLM + stdlib render)
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# OpenAPI / AsyncAPI documentation (standard LLM + stdlib render)
+# --------------------------------------------------------------------------- #
 async def _generate_spec_doc(
-    artifact: Any,
+    spec: Any,
     product: Any,
     *,
     spec_kind: str,
     template_file: str,
     render_skeleton,
-    page_id: str,
-    page_title: str,
-    provider: str,
     model: Optional[str],
     language: str,
 ) -> str:
-    """Shared flow for openapi/asyncapi: parse -> structured render + LLM enrich."""
-    content = (getattr(artifact, "content", "") or "").strip()
+    """Shared flow for openapi/asyncapi: parse -> structured render + LLM enrich.
+
+    The enriched markdown is written back onto the spec's ``content`` (specs
+    carry a single content field, no pages/generated_docs) and indexed into cognee.
+    """
+    content = (getattr(spec, "content", "") or "").strip()
     if not content:
-        raise ValueError(f"{spec_kind} artifact has empty content.")
+        raise ValueError(f"{spec_kind} spec has empty content.")
 
     # Resolve admin docgen config (models.docgen.*) so the LLM enrichment hits
-    # the configured gateway. Per-request provider/model overrides win.
-    r_provider, r_model, r_base_url, r_api_key = _resolve_docgen_model(model)
-    provider = provider or r_provider
+    # the configured gateway. Per-request model override wins.
+    r_model, r_base_url, r_api_key = _resolve_docgen_model(model)
     model = model or r_model
 
-    from api.utils import get_model_context_window, clamp_text_by_tokens
-    ctx_win = get_model_context_window(provider=provider, base_url=r_base_url, model_name=model, api_key=r_api_key, task="docgen")
-    content_token_limit = max(1024, ctx_win - 2048)
-    clamped_content = clamp_text_by_tokens(content, content_token_limit)
-
-    spec = _parse_spec(content)
-    skeleton = render_skeleton(spec) if spec else ""
+    parsed = _parse_spec(content)
+    skeleton = render_skeleton(parsed) if parsed else ""
     if not skeleton:
-        skeleton = _render_raw_fallback(spec_kind, content, artifact)
+        skeleton = _render_raw_fallback(spec_kind, content, spec)
 
     template = load_prompt_file(template_file, "")
     prompt = _with_verification_guard(_safe_replace(
         template,
         {
-            "repo_name": _product_name(product, artifact),
-            "artifact_name": getattr(artifact, "name", None) or spec_kind,
+            "repo_name": _product_name(product, spec),
+            "artifact_name": getattr(spec, "name", None) or spec_kind,
             "previous_content": "",
-            "content": clamped_content,
+            "content": content,
         },
     ))
     llm_text = await _llm_or_none(
-        prompt, provider, model, base_url=r_base_url, api_key=r_api_key
+        prompt, model, base_url=r_base_url, api_key=r_api_key
     )
     docs = llm_text or skeleton
     if not docs:
@@ -255,114 +236,44 @@ async def _generate_spec_doc(
     # Node verifier is unavailable.
     try:
         docs, _mstats = await run_repair_loop(
-            docs, _make_repair_llm(provider, model, base_url=r_base_url, api_key=r_api_key)
+            docs, _make_repair_llm(model, base_url=r_base_url, api_key=r_api_key)
         )
     except Exception as e:  # pragma: no cover - verifier must never break gen
         logger.warning("Mermaid repair loop failed for %s doc: %s", spec_kind, e)
 
-    pages = {
-        page_id: {
-            "id": page_id,
-            "title": page_title,
-            "content": docs,
-            "filePaths": [],
-            "importance": "high",
-            "relatedPages": [],
-        }
-    }
-    _persist_artifact(artifact, docs, pages)
-    _index_in_background(content, _cognee_dataset(product))
+    # Specs carry a single ``content`` field: write the enriched doc back onto it.
+    try:
+        spec.content = docs
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Could not write enriched docs onto spec: %s", e)
+
+    _index_in_background(docs, _cognee_dataset(product))
     return docs
 
 
 async def generate_openapi_docs(
-    artifact: Any, product: Any, provider: str = None,
+    spec: Any, product: Any,
     model: Optional[str] = None, language: str = "ru",
 ) -> str:
     """Generate OpenAPI documentation (stdlib render + standard-LLM enrichment)."""
     return await _generate_spec_doc(
-        artifact, product,
+        spec, product,
         spec_kind="OpenAPI",
         template_file="openapi_doc.md",
         render_skeleton=_render_openapi_skeleton,
-        page_id="page_openapi",
-        page_title="OpenAPI",
-        provider=provider, model=model, language=language,
+        model=model, language=language,
     )
 
 
 async def generate_asyncapi_docs(
-    artifact: Any, product: Any, provider: str = None,
+    spec: Any, product: Any,
     model: Optional[str] = None, language: str = "ru",
 ) -> str:
     """Generate AsyncAPI documentation (stdlib render + standard-LLM enrichment)."""
     return await _generate_spec_doc(
-        artifact, product,
+        spec, product,
         spec_kind="AsyncAPI",
         template_file="asyncapi_doc.md",
         render_skeleton=_render_asyncapi_skeleton,
-        page_id="page_asyncapi",
-        page_title="AsyncAPI",
-        provider=provider, model=model, language=language,
+        model=model, language=language,
     )
-
-
-async def generate_testcase_docs(
-    artifact: Any, product: Any, provider: str = None,
-    model: Optional[str] = None, language: str = "ru",
-) -> str:
-    """Generate test-case documentation. Allure URL is a LINK only (never fetched)."""
-    content = (getattr(artifact, "content", "") or "").strip()
-    allure_url = (getattr(artifact, "allure_url", "") or "").strip()
-    if not content and not allure_url:
-        raise ValueError("Test case artifact has no content and no Allure URL.")
-
-    # Resolve admin docgen config (models.docgen.*) for the LLM enrichment.
-    r_provider, r_model, r_base_url, r_api_key = _resolve_docgen_model(model)
-    provider = provider or r_provider
-    model = model or r_model
-
-    from api.utils import get_model_context_window, clamp_text_by_tokens
-    ctx_win = get_model_context_window(provider=provider, base_url=r_base_url, model_name=model, api_key=r_api_key, task="docgen")
-    content_token_limit = max(1024, ctx_win - 2048)
-
-    content_block = content or ""
-    if allure_url:
-        content_block += (
-            "\n\n[Allure-отчёт]"
-            f"({allure_url})"
-            " (ссылка предоставлена вручную; данные Allure не загружаются автоматически)."
-        )
-    clamped_content_block = clamp_text_by_tokens(content_block, content_token_limit)
-
-    template = load_prompt_file("testcase_doc.md", "")
-    prompt = _with_verification_guard(_safe_replace(
-        template,
-        {
-            "repo_name": _product_name(product, artifact),
-            "artifact_name": getattr(artifact, "name", None) or "Тест-кейсы",
-            "previous_content": "",
-            "content": clamped_content_block,
-        },
-    ))
-    llm_text = await _llm_or_none(
-        prompt, provider, model, base_url=r_base_url, api_key=r_api_key
-    )
-    skeleton = _render_testcase_skeleton(content, allure_url, artifact)
-    docs = llm_text or skeleton
-    if not docs:
-        docs = skeleton
-
-    pages = {
-        "page_testcase": {
-            "id": "page_testcase",
-            "title": "Тест-кейсы",
-            "content": docs,
-            "filePaths": [],
-            "importance": "high",
-            "relatedPages": [],
-        }
-    }
-    _persist_artifact(artifact, docs, pages)
-    _index_in_background(content_block, _cognee_dataset(product))
-    return docs

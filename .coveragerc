@@ -1,0 +1,18 @@
+[run]
+source = api
+branch = False
+# Tests live under tests/; only measure the api package.
+omit =
+    api/main.py
+    api/__pycache__/*
+
+[report]
+show_missing = True
+skip_covered = False
+# Lines matching these regexes are excluded from coverage (not counted as
+# missing). Defaults (pragma) are kept plus the module entry-point guard.
+exclude_lines =
+    pragma: no cover
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:

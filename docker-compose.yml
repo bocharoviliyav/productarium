@@ -36,7 +36,7 @@ services:
       - NODE_ENV=production
       - SERVER_BASE_URL=http://localhost:${PORT:-8001}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - LOG_FILE_PATH=${LOG_FILE_PATH:-api/logs/application.log}
+      - LOG_FORMAT=${LOG_FORMAT:-logfmt}
       # --- Postgres + pgvector for cognee ---
       - DB_PROVIDER=postgres
       - DB_HOST=postgres
@@ -62,15 +62,11 @@ services:
       # On Docker Desktop (macOS/Windows) host.docker.internal already resolves.
       # LM Studio exposes /v1/chat/completions, /v1/embeddings, /v1/models.
       # We keep the OLLAMA_HOST var pointing at LM Studio too, because some
-      # code paths (cognee_manager, RAG fallback) still key off OLLAMA_HOST.
+      # code paths (api/cognee/, RAG fallback) still key off OLLAMA_HOST.
       - OLLAMA_HOST=${LM_STUDIO_HOST:-http://host.docker.internal:1234}
       - LOCAL_OPENAI_BASE_URL=${LM_STUDIO_HOST:-http://host.docker.internal:1234}/v1
       - LOCAL_OPENAI_API_KEY=${LOCAL_OPENAI_API_KEY:-not-needed}
       - LOCAL_OPENAI_MODEL=${LOCAL_OPENAI_MODEL:-qwen/qwen3.6-27b}
-      # --- DeepWiki-wide defaults (used by api.py / settings_store / etc.) ---
-      - DEEPWIKI_DEFAULT_PROVIDER=${DEEPWIKI_DEFAULT_PROVIDER:-openai_local}
-      - DEEPWIKI_DEFAULT_MODEL=${DEEPWIKI_DEFAULT_MODEL:-qwen/qwen3.6-27b}
-      - DEEPWIKI_EMBEDDER_TYPE=${DEEPWIKI_EMBEDDER_TYPE:-openai_local}
       # --- cognee -> LM Studio (OpenAI-compatible; NO cloud API key) ---
       # cognee's LLM provider "openai" POSTs to {LLM_ENDPOINT}/chat/completions.
       # CRITICAL: embeddings provider MUST be "openai_compatible" (NOT "openai").
@@ -131,7 +127,7 @@ services:
       # Connection-pool args for cognee's async Postgres engines (Fix #2:
       # asyncpg cross-loop crash). NullPool opens a fresh connection per
       # checkout so no asyncpg connection ever crosses event loops.
-      # The create_async_engine monkeypatch in api/cognee_manager.py converts
+      # The create_async_engine monkeypatch in api/cognee/ converts
       # "nullpool" string to NullPool class across relational, graph, and vector stores.
       # JSON literal is single-quoted so YAML/compose treat it as a plain string.
       - 'POOL_ARGS={"poolclass": "nullpool", "pool_pre_ping": true}'
@@ -147,7 +143,6 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ~/.adalflow:/root/.adalflow      # Persist repository and embedding data
-      - ./api/logs:/app/api/logs          # Persist log files across container restarts
       - deno_cache:/root/.deno            # Persist Deno + fast-rlm package cache
     # Resource limits for docker-compose up (not Swarm mode)
     mem_limit: 6g

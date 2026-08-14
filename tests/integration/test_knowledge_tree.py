@@ -137,227 +137,43 @@ class TestProductSummary:
                 assert "node content" in prompt
                 return "```markdown\nAcme is a service.\n```"
 
-        # _safe_build_summary_llm now takes base_url/api_key kwargs (so the
-        # summary LLM can reach a corporate gateway); accept **kwargs here.
-        monkeypatch.setattr(ks, "_safe_build_summary_llm", lambda p, m, **kw: _FakeLLM())
+        # _safe_build_summary_llm takes (model, base_url=..., api_key=...).
+        monkeypatch.setattr(ks, "_safe_build_summary_llm", lambda m, **kw: _FakeLLM())
         product = SimpleNamespace(id="prod_1", name="Acme")
-        artifacts = [SimpleNamespace(id="art_1", name="svc", generated_docs="artifact docs")]
+        codebases = [SimpleNamespace(id="art_1", name="svc", generated_docs="artifact docs")]
         nodes = [SimpleNamespace(id="node_1", title="P1", content_md="node content")]
-        out = asyncio.run(ks.generate_product_summary(product, artifacts, nodes))
+        out = asyncio.run(ks.generate_product_summary(product, codebases, [], nodes))
         assert out == "Acme is a service."
 
     def test_summary_empty_when_no_content(self):
         import api.docgen.summary as ks
         product = SimpleNamespace(id="prod_1", name="Acme")
-        out = asyncio.run(ks.generate_product_summary(product, [], []))
+        out = asyncio.run(ks.generate_product_summary(product, [], [], []))
         assert out == ""
 
     def test_summary_empty_when_llm_unavailable(self, monkeypatch):
         import api.docgen.summary as ks
-        monkeypatch.setattr(ks, "_safe_build_summary_llm", lambda p, m, **kw: None)
+        monkeypatch.setattr(ks, "_safe_build_summary_llm", lambda m, **kw: None)
         product = SimpleNamespace(id="prod_1", name="Acme")
-        artifacts = [SimpleNamespace(id="a", name="a", generated_docs="some docs")]
-        out = asyncio.run(ks.generate_product_summary(product, artifacts, []))
+        codebases = [SimpleNamespace(id="a", name="a", generated_docs="some docs")]
+        out = asyncio.run(ks.generate_product_summary(product, codebases, [], []))
         assert out == ""
 
     def test_collect_summary_content_caps_large_input(self):
         import api.docgen.summary as ks
 
-        # The clamp contract is TOKEN-based (clamp_text_by_tokens), with
-        # SUMMARY_CONTEXT_MAX_CHARS only as a char-cap fallback if the
-        # tokenizer fails to init. The default token budget is 6000, and
-        # normal-density text (Russian/code at ~4 chars/token) exceeds it at
-        # ~24k chars, so token-clamping fires and the output carries the
-        # token-clamp suffix ("... обрезано для контекста").
-        #
-        # NOTE: a pathological "x" * N input must NOT be used here. tiktoken
-        # compresses repeated "x" at ~8 chars/token, so 25000 "x" are only
-        # ~3125 tokens -> UNDER the 6000-token budget -> no clamping fires ->
-        # the output exceeds SUMMARY_CONTEXT_MAX_CHARS and the assertions fail.
-        # That input bypasses the real contract the test is supposed to cover.
+        # _collect_summary_content concatenates codebase/specs/node docs and
+        # char-caps the result to SUMMARY_CONTEXT_MAX_CHARS via the char-based
+        # _cap helper (token-based clamping was removed in the cleanup).
         unit = "Артефакт: файл структуры кодовой базы. "
-        big = unit * 1300  # ~50k chars -> ~12k tokens -> exceeds 6000-token budget
+        big = unit * 1300  # ~50k chars -> well over the 20k char cap
         assert len(big) > ks.SUMMARY_CONTEXT_MAX_CHARS
-        artifacts = [SimpleNamespace(id="a", name="a", generated_docs=big)]
-        out = ks._collect_summary_content(artifacts, [])
-        # Token-clamping fired: output is well under the raw input length and
-        # under a token-budget-derived char ceiling (~6000 tokens * 4 chars).
+        codebases = [SimpleNamespace(id="a", name="a", generated_docs=big)]
+        out = ks._collect_summary_content(codebases, [], [])
+        # Char-clamping fired: output is capped and carries the truncation suffix.
         assert len(out) < len(big)
-        assert len(out) <= 25000
+        assert len(out) <= ks.SUMMARY_CONTEXT_MAX_CHARS + 100
         assert "обрезано для контекста" in out
-
-
-# --- New-type dispatch -------------------------------------------------------
-class TestArtifactDocgenDispatch:
-    @pytest.fixture
-    def patched_generators(self, monkeypatch):
-        """Monkeypatch every sub-generator to return a sentinel; no LLM/cognee."""
-        import api.docgen.dispatcher as adg
-        sentinels = {}
-
-        def _mk(name):
-            async def _f(artifact, product, *a, **k):
-                return name
-            return _f
-
-        for name in (
-            "generate_codebase_docs", "generate_openapi_docs",
-            "generate_asyncapi_docs", "generate_testcase_docs",
-            "generate_links_docs", "generate_documentation_docs",
-            "generate_guides_docs",
-        ):
-            sentinels[name] = name.upper()
-            monkeypatch.setattr(adg, name, _mk(name.upper()))
-        return adg
-
-    def _art(self, atype, kind=None):
-        return SimpleNamespace(
-            id="art_1", name="svc", type=atype, kind=kind,
-            repo_url=None, repo_type=None, token=None, content="c",
-            allure_url=None, generated_docs=None, pages=None,
-        )
-
-    def test_codebase_routes(self, patched_generators):
-        adg = patched_generators
-        out = asyncio.run(adg.generate_artifact_documentation(self._art("codebase"), SimpleNamespace(id="prod_1")))
-        assert out == "GENERATE_CODEBASE_DOCS"
-
-    def test_spec_default_openapi(self, patched_generators):
-        adg = patched_generators
-        out = asyncio.run(adg.generate_artifact_documentation(self._art("spec"), SimpleNamespace(id="prod_1")))
-        assert out == "GENERATE_OPENAPI_DOCS"
-
-    def test_spec_kind_asyncapi(self, patched_generators):
-        adg = patched_generators
-        out = asyncio.run(adg.generate_artifact_documentation(self._art("spec", kind="asyncapi"), SimpleNamespace(id="prod_1")))
-        assert out == "GENERATE_ASYNCAPI_DOCS"
-
-    def test_links_routes(self, patched_generators):
-        adg = patched_generators
-        out = asyncio.run(adg.generate_artifact_documentation(self._art("links"), SimpleNamespace(id="prod_1")))
-        assert out == "GENERATE_LINKS_DOCS"
-
-    def test_guides_routes(self, patched_generators):
-        adg = patched_generators
-        out = asyncio.run(adg.generate_artifact_documentation(self._art("guides"), SimpleNamespace(id="prod_1")))
-        assert out == "GENERATE_GUIDES_DOCS"
-
-    def test_documentation_default_routes(self, patched_generators):
-        adg = patched_generators
-        out = asyncio.run(adg.generate_artifact_documentation(self._art("documentation"), SimpleNamespace(id="prod_1")))
-        assert out == "GENERATE_DOCUMENTATION_DOCS"
-
-    def test_documentation_kind_testcase_routes(self, patched_generators):
-        adg = patched_generators
-        out = asyncio.run(adg.generate_artifact_documentation(self._art("documentation", kind="testcase"), SimpleNamespace(id="prod_1")))
-        assert out == "GENERATE_TESTCASE_DOCS"
-
-    # --- legacy type mapping ---
-    def test_legacy_openapi_maps_to_spec_openapi(self, patched_generators):
-        adg = patched_generators
-        out = asyncio.run(adg.generate_artifact_documentation(self._art("openapi"), SimpleNamespace(id="prod_1")))
-        assert out == "GENERATE_OPENAPI_DOCS"
-
-    def test_legacy_asyncapi_maps_to_spec_asyncapi(self, patched_generators):
-        adg = patched_generators
-        out = asyncio.run(adg.generate_artifact_documentation(self._art("asyncapi"), SimpleNamespace(id="prod_1")))
-        assert out == "GENERATE_ASYNCAPI_DOCS"
-
-    def test_legacy_testcase_maps_to_documentation_testcase(self, patched_generators):
-        adg = patched_generators
-        out = asyncio.run(adg.generate_artifact_documentation(self._art("testcase"), SimpleNamespace(id="prod_1")))
-        assert out == "GENERATE_TESTCASE_DOCS"
-
-    def test_unsupported_type_raises(self, patched_generators):
-        adg = patched_generators
-        with pytest.raises(ValueError):
-            asyncio.run(adg.generate_artifact_documentation(self._art("unknown"), SimpleNamespace(id="prod_1")))
-
-
-# --- Real generators (no LLM path) -------------------------------------------
-class TestRealGenerators:
-    @pytest.fixture
-    def no_index(self, monkeypatch):
-        import api.docgen.simple as adg
-        monkeypatch.setattr(adg, "_index_in_background", lambda *a, **k: None)
-        return adg
-
-    def test_render_links_index_json_list(self):
-        from api.docgen.simple import _render_links_index
-        art = SimpleNamespace(name="Useful links")
-        content = '[{"url":"https://a.example","title":"A","description":"aa"},{"url":"https://b.example","title":"B"}]'
-        md = _render_links_index(content, art)
-        assert "# Links: Useful links" in md
-        assert "[A](https://a.example)" in md
-        assert "— aa" in md
-        assert "[B](https://b.example)" in md
-
-    def test_render_links_index_links_wrapper(self):
-        from api.docgen.simple import _render_links_index
-        art = SimpleNamespace(name="L")
-        md = _render_links_index('{"links":[{"url":"https://x","title":"X"}]}', art)
-        assert "[X](https://x)" in md
-
-    def test_render_links_index_non_json_passthrough(self):
-        from api.docgen.simple import _render_links_index
-        art = SimpleNamespace(name="L")
-        md = _render_links_index("## My links\n- [x](https://x)", art)
-        assert "## My links" in md
-
-    def test_render_links_index_empty(self):
-        from api.docgen.simple import _render_links_index
-        art = SimpleNamespace(name="L")
-        md = _render_links_index("", art)
-        assert "Ссылки не предоставлены" in md
-
-    def test_generate_links_docs_persists_and_pages(self, no_index):
-        adg = no_index
-        art = SimpleNamespace(
-            id="art_1", name="Links", type="links", kind=None,
-            content='[{"url":"https://a","title":"A"}]',
-            generated_docs=None, pages=None,
-        )
-        product = SimpleNamespace(id="prod_1")
-        md = asyncio.run(adg.generate_links_docs(art, product))
-        assert "[A](https://a)" in md
-        assert art.generated_docs == md
-        assert art.pages is not None and "page_links" in art.pages
-
-    def test_generate_guides_docs_passthrough(self, no_index):
-        adg = no_index
-        art = SimpleNamespace(
-            id="art_1", name="Onboarding", type="guides", kind=None,
-            content="Step 1: do thing", generated_docs=None, pages=None,
-        )
-        md = asyncio.run(adg.generate_guides_docs(art, SimpleNamespace(id="prod_1")))
-        assert "# Onboarding" in md
-        assert "Step 1: do thing" in md
-        assert art.generated_docs == md
-        assert "page_guides" in art.pages
-
-    def test_generate_documentation_docs_passthrough_when_llm_empty(self, no_index, monkeypatch):
-        adg = no_index
-        # LLM enrichment returns "" -> passthrough content is used verbatim.
-        async def _empty(*a, **k):
-            return ""
-        monkeypatch.setattr(adg, "_llm_or_none", _empty)
-        art = SimpleNamespace(
-            id="art_1", name="Manual doc", type="documentation", kind=None,
-            content="## Intro\nSome text", generated_docs=None, pages=None,
-        )
-        md = asyncio.run(adg.generate_documentation_docs(art, SimpleNamespace(id="prod_1")))
-        assert "## Intro" in md
-        assert art.generated_docs == md
-        assert "page_documentation" in art.pages
-
-    def test_generate_documentation_docs_empty_content_raises(self, no_index):
-        adg = no_index
-        art = SimpleNamespace(
-            id="art_1", name="doc", type="documentation", kind=None,
-            content="   ", generated_docs=None, pages=None,
-        )
-        with pytest.raises(ValueError):
-            asyncio.run(adg.generate_documentation_docs(art, SimpleNamespace(id="prod_1")))
 
 
 # --- Router endpoint integration (SQLite + TestClient) -----------------------
@@ -524,12 +340,12 @@ class TestKnowledgeRouterEndpoints:
         )
 
         # Mock the summary LLM so we don't need live Ollama. The real builder
-        # now accepts base_url/api_key kwargs; accept them here too.
+        # takes (model, base_url=..., api_key=...).
         import api.docgen.summary as ks
         class _FakeLLM:
             async def generate(self, prompt):
                 return "Acme is a service that does X and Y."
-        monkeypatch.setattr(ks, "_safe_build_summary_llm", lambda p, m, **kw: _FakeLLM())
+        monkeypatch.setattr(ks, "_safe_build_summary_llm", lambda m, **kw: _FakeLLM())
 
         r = client.post(f"/api/products/{pid}/summary")
         assert r.status_code == 200, r.text

@@ -55,7 +55,7 @@ async def query_cognee(query: str, dataset_name: str, top_k: int = 20) -> str:
     apply_cognee_runtime_config()
     try:
         from cognee import SearchType
-        from api.timeout_config import resolve_cognee_recall_timeout
+        from api.config.timeout import resolve_cognee_recall_timeout
         recall_timeout = resolve_cognee_recall_timeout()
         logger.info("Querying Cognee knowledge graph (dataset: %s, timeout: %.0fs)...", dataset_name, recall_timeout)
         results = await asyncio.wait_for(

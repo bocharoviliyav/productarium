@@ -8,7 +8,6 @@ from typing import List, Union, Dict, Any
 logger = logging.getLogger(__name__)
 
 from api.clients.openai_client import OpenAIClient
-from adalflow import OllamaClient
 
 # Local configuration - no cloud API keys required
 # Ollama settings
@@ -29,19 +28,8 @@ raw_auth_mode = os.environ.get('DEEPWIKI_AUTH_MODE', 'False')
 WIKI_AUTH_MODE = raw_auth_mode.lower() in ['true', '1', 't']
 WIKI_AUTH_CODE = os.environ.get('DEEPWIKI_AUTH_CODE', '')
 
-# Embedder settings - every supported server exposes an OpenAI-compatible
-# /v1/embeddings endpoint (Ollama, LM Studio, llama.cpp, vLLM, ...), so a single
-# OpenAIClient-based embedder covers all cases.
-EMBEDDER_TYPE = os.environ.get('DEEPWIKI_EMBEDDER_TYPE', 'openai_local').lower()
-
 # Get configuration directory from environment variable, or use default if not set
 CONFIG_DIR = os.environ.get('DEEPWIKI_CONFIG_DIR', None)
-
-# Client class mapping - local providers only
-CLIENT_CLASSES = {
-    "OpenAIClient": OpenAIClient,  # For local OpenAI-compatible APIs
-    "OllamaClient": OllamaClient,
-}
 
 def replace_env_placeholders(config: Union[Dict[str, Any], List[Any], str, Any]) -> Union[Dict[str, Any], List[Any], str, Any]:
     """
@@ -101,21 +89,12 @@ def load_json_config(filename):
 def load_generator_config():
     generator_config = load_json_config("generator.json")
 
-    # Add client classes to each provider (local providers only)
+    # Resolve the model client class for the openai_local provider. Every
+    # supported local server (Ollama, LM Studio, llama.cpp, vLLM, ...)
+    # exposes the OpenAI-compatible /v1 API, so OpenAIClient covers all.
     if "providers" in generator_config:
         for provider_id, provider_config in generator_config["providers"].items():
-            # Try to set client class from client_class
-            if provider_config.get("client_class") in CLIENT_CLASSES:
-                provider_config["model_client"] = CLIENT_CLASSES[provider_config["client_class"]]
-            # Fall back to default mapping based on provider_id
-            elif provider_id in ["ollama", "openai_local"]:
-                default_map = {
-                    "ollama": OllamaClient,
-                    "openai_local": OpenAIClient,
-                }
-                provider_config["model_client"] = default_map[provider_id]
-            else:
-                logger.warning(f"Unknown provider or client class: {provider_id}")
+            provider_config["model_client"] = OpenAIClient
 
     return generator_config
 
@@ -123,12 +102,10 @@ def load_generator_config():
 def load_embedder_config():
     embedder_config = load_json_config("embedder.json")
 
-    # Process client classes (local embedders only)
+    # Resolve the embedder client class (OpenAIClient for all local servers).
     for key in ["embedder_openai_local"]:
-        if key in embedder_config and "client_class" in embedder_config[key]:
-            class_name = embedder_config[key]["client_class"]
-            if class_name in CLIENT_CLASSES:
-                embedder_config[key]["model_client"] = CLIENT_CLASSES[class_name]
+        if key in embedder_config:
+            embedder_config[key]["model_client"] = OpenAIClient
 
     return embedder_config
 
@@ -144,41 +121,6 @@ def get_embedder_config():
         dict: The embedder configuration with model_client resolved
     """
     return configs.get("embedder_openai_local", {})
-
-def is_ollama_embedder():
-    """
-    Check if the current embedder configuration uses OllamaClient.
-
-    Deprecated: with the unified OpenAI-compatible provider, this always
-    returns False. Kept for backwards compatibility with callers that still
-    branch on it.
-
-    Returns:
-        bool: False (always)
-    """
-    return False
-
-def is_openai_local_embedder():
-    """
-    Check if the current embedder configuration uses the local OpenAI-compatible API.
-
-    With the unified provider, this always returns True.
-
-    Returns:
-        bool: True (always)
-    """
-    return True
-
-def get_embedder_type():
-    """
-    Get the current embedder type based on configuration.
-
-    With the unified OpenAI-compatible provider, this always returns 'openai_local'.
-
-    Returns:
-        str: 'openai_local'
-    """
-    return 'openai_local'
 
 # Load repository and file filters configuration
 def load_repo_config():
@@ -277,18 +219,15 @@ if lang_config:
     configs["lang_config"] = lang_config
 
 
-def get_model_config(provider="openai_local", model=None):
+def get_model_config(model=None):
     """
-    Get configuration for the specified provider and model.
+    Get configuration for the model.
 
     Every supported local server (Ollama, LM Studio, llama.cpp, vLLM, ...)
     exposes an OpenAI-compatible /v1 API, so the single ``openai_local``
-    provider (OpenAIClient) is always used. The ``provider`` argument is kept
-    for backwards compatibility with callers but no longer selects a different
-    client; only ``openai_local`` is configured.
+    provider (OpenAIClient) is always used.
 
     Parameters:
-        provider (str): Kept for backwards compatibility; ignored.
         model (str): Model name, or None to use default model
 
     Returns:
@@ -298,19 +237,19 @@ def get_model_config(provider="openai_local", model=None):
     if "providers" not in configs:
         raise ValueError("Provider configuration not loaded")
 
-    provider_config = configs["providers"].get("openai_local") or configs["providers"].get(provider)
+    provider_config = configs["providers"].get("openai_local")
     if not provider_config:
-        raise ValueError(f"Configuration for provider 'openai_local' not found")
+        raise ValueError("Configuration for provider 'openai_local' not found")
 
     model_client = provider_config.get("model_client")
     if not model_client:
-        raise ValueError(f"Model client not specified for provider 'openai_local'")
+        raise ValueError("Model client not specified for provider 'openai_local'")
 
     # If model not provided, use default model for the provider
     if not model:
         model = provider_config.get("default_model")
         if not model:
-            raise ValueError(f"No default model specified for provider 'openai_local'")
+            raise ValueError("No default model specified for provider 'openai_local'")
 
     # Get model parameters (if present)
     model_params = {}
@@ -342,7 +281,7 @@ def fetch_openai_local_models(base_url: str = None):
         list: List of available model names
     """
     import requests
-    from api.ssl_config import requests_verify
+    from api.config.ssl import requests_verify
 
     url = base_url or LOCAL_OPENAI_BASE_URL
     if not url:
@@ -353,7 +292,7 @@ def fetch_openai_local_models(base_url: str = None):
         url = url.rstrip("/") + "/v1"
 
     try:
-        from api.timeout_config import resolve_model_list_timeout
+        from api.config.timeout import resolve_model_list_timeout
         response = requests.get(f"{url}/models", timeout=resolve_model_list_timeout(), verify=requests_verify())
         if response.status_code == 200:
             data = response.json()

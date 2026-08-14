@@ -9,16 +9,11 @@ Pipeline flow:
     _stream_answer()     -> yields ExpertStreamEvent  (RLM wraps chunks as content)
     _run_expert_chat_stream() -> yields ExpertStreamEvent  (adds status events)
     expert router       -> maps ExpertStreamEvent to SSE JSON frames
-
-For backward compatibility, plain ``str`` chunks are still accepted by the
-router (mapped to ``{"content": ...}``), so existing tests/mocks that yield
-bare strings keep working.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union
 
 #: The set of valid event types.
 EVENT_STATUS = "status"
@@ -59,14 +54,8 @@ class ExpertStreamEvent:
         yield self.content
 
 
-# Type alias: the streaming pipeline yields either ExpertStreamEvent (new code)
-# or plain str (backward-compat with old mocks). The router handles both.
-StreamChunk = Union[ExpertStreamEvent, str]
-
-
 __all__ = [
     "ExpertStreamEvent",
-    "StreamChunk",
     "EVENT_STATUS",
     "EVENT_REASONING",
     "EVENT_CONTENT",

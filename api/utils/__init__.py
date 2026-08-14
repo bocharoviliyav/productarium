@@ -4,7 +4,7 @@ Re-exports public names from the focused submodules so existing
 ``from api.utils import X`` call sites keep working after the split:
   * ``api.utils.logging``  — ``setup_logging`` etc.
   * ``api.utils.mcp``      — ``LocalMcpClient``, ``invoke_mcp_tool``, ...
-  * ``api.utils.llm_tokens`` — ``get_model_context_window``, ``clamp_text_by_tokens``, ...
+  * ``api.utils.llm_tokens`` — ``get_model_context_window``, ``_count_tokens``, ...
 """
 
 from api.utils.logging import (
@@ -21,8 +21,6 @@ from api.utils.mcp import (
 from api.utils.llm_tokens import (
     _MODEL_CTX_CACHE,
     _count_tokens,
-    _parse_context_from_name,
-    clamp_text_by_tokens,
     get_model_context_window,
 )
 
@@ -39,7 +37,5 @@ __all__ = [
     # llm_tokens
     "_MODEL_CTX_CACHE",
     "_count_tokens",
-    "_parse_context_from_name",
-    "clamp_text_by_tokens",
     "get_model_context_window",
 ]

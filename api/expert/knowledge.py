@@ -37,10 +37,10 @@ def _product_name_by_id(product_id: str) -> str:
 
 
 def _fallback_artifact_docs(product_id: str) -> str:
-    """Concatenate artifact generated_docs + page content when cognee is empty.
+    """Concatenate codebase generated_docs + spec content when cognee is empty.
 
     Opens its own short-lived session (non-fatal: returns "" on any error or
-    when the product/artifacts are missing).
+    when the product/codebases/specs are missing).
     """
     try:
         from sqlalchemy.orm import selectinload
@@ -51,19 +51,22 @@ def _fallback_artifact_docs(product_id: str) -> str:
         with SessionLocal() as db:
             p = (
                 db.query(ProductORM)
-                .options(selectinload(ProductORM.artifacts))
+                .options(
+                    selectinload(ProductORM.codebases),
+                    selectinload(ProductORM.specs),
+                )
                 .filter(ProductORM.id == product_id)
                 .first()
             )
             if p is None:
                 return ""
             parts: List[str] = []
-            for a in p.artifacts:
-                name = getattr(a, "name", None) or getattr(a, "id", "artifact")
-                docs = getattr(a, "generated_docs", None) or ""
+            for c in p.codebases:
+                name = getattr(c, "name", None) or getattr(c, "id", "codebase")
+                docs = getattr(c, "generated_docs", None) or ""
                 if docs:
-                    parts.append(f"## Artifact: {name}\n{docs}")
-                pages = getattr(a, "pages", None) or {}
+                    parts.append(f"## Codebase: {name}\n{docs}")
+                pages = getattr(c, "pages", None) or {}
                 if isinstance(pages, dict):
                     for page_id, page in pages.items():
                         content = ""
@@ -73,8 +76,13 @@ def _fallback_artifact_docs(product_id: str) -> str:
                             content = page
                         if content:
                             parts.append(
-                                f"## Artifact: {name} / page {page_id}\n{content}"
+                                f"## Codebase: {name} / page {page_id}\n{content}"
                             )
+            for s in p.specs:
+                name = getattr(s, "name", None) or getattr(s, "id", "spec")
+                content = getattr(s, "content", None) or ""
+                if content:
+                    parts.append(f"## Spec: {name}\n{content}")
             return "\n\n".join(parts)
     except Exception as e:
         logger.warning(
@@ -89,7 +97,7 @@ async def _retrieve_product_knowledge(product_id: str, query: str) -> str:
     """
     dataset = f"prod_{product_id}"
     try:
-        from api.cognee_manager import query_cognee
+        from api.cognee import query_cognee
 
         ctx = await query_cognee(query, dataset_name=dataset, top_k=20)
         if ctx:

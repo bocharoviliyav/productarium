@@ -22,7 +22,7 @@ import) so ``api.prompts.reload_prompt_file`` can hot-reload them by reloading
 from __future__ import annotations
 
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from api.utils import setup_logging
 from api.expert.generate import (
@@ -59,12 +59,12 @@ async def _run_expert_chat_collect(
     use_rlm: Optional[bool],
 ) -> str:
     """Non-streaming chat: returns the full answer string."""
-    provider, resolved_model, base_url, api_key = _resolve_expert_model(model)
+    resolved_model, base_url, api_key = _resolve_expert_model(model)
     knowledge = await _retrieve_product_knowledge(product_id, query)
     history = _format_history(messages)
     prompt = _build_prompt(
         _expert_prompt.EXPERT_SYSTEM_PROMPT, _product_name_by_id(product_id), knowledge, history, query,
-        provider=provider, base_url=base_url, model=resolved_model, api_key=api_key,
+        base_url=base_url, model=resolved_model, api_key=api_key,
     )
     use_rlm_resolved = _resolve_use_rlm(use_rlm, "expert", len(prompt))
     logger.info(
@@ -74,7 +74,7 @@ async def _run_expert_chat_collect(
         use_rlm_resolved,
     )
     return await _generate_answer(
-        prompt, provider, resolved_model, base_url, api_key, use_rlm_resolved
+        prompt, resolved_model, base_url, api_key, use_rlm_resolved
     )
 
 
@@ -84,7 +84,7 @@ async def _run_expert_chat_stream(
     messages: List[Dict[str, Any]],
     model: Optional[str],
     use_rlm: Optional[bool],
-) -> AsyncIterator[Union[ExpertStreamEvent, str]]:
+) -> AsyncIterator[ExpertStreamEvent]:
     """Streaming chat: yields status events then answer chunks.
 
     Emits status events so the frontend can show a phase-aware loader:
@@ -92,16 +92,15 @@ async def _run_expert_chat_stream(
     - ``("status", "thinking")`` before the first answer chunk.
     - ``("status", "answering")`` when content starts flowing.
 
-    Yields ``ExpertStreamEvent`` objects (or plain ``str`` for backward
-    compatibility when ``_stream_answer`` yields a bare string).
+    Yields ``ExpertStreamEvent`` objects (status / reasoning / content).
     """
     yield ExpertStreamEvent(EVENT_STATUS, EVENT_RETRIEVING)
-    provider, resolved_model, base_url, api_key = _resolve_expert_model(model)
+    resolved_model, base_url, api_key = _resolve_expert_model(model)
     knowledge = await _retrieve_product_knowledge(product_id, query)
     history = _format_history(messages)
     prompt = _build_prompt(
         _expert_prompt.EXPERT_SYSTEM_PROMPT, _product_name_by_id(product_id), knowledge, history, query,
-        provider=provider, base_url=base_url, model=resolved_model, api_key=api_key,
+        base_url=base_url, model=resolved_model, api_key=api_key,
     )
     use_rlm_resolved = _resolve_use_rlm(use_rlm, "expert", len(prompt))
     logger.info(
@@ -113,11 +112,11 @@ async def _run_expert_chat_stream(
     yield ExpertStreamEvent(EVENT_STATUS, EVENT_THINKING)
     content_started = False
     async for event in _stream_answer(
-        prompt, provider, resolved_model, base_url, api_key, use_rlm_resolved
+        prompt, resolved_model, base_url, api_key, use_rlm_resolved
     ):
         # Emit the "answering" status just before the first content chunk
         # (after any reasoning events have been sent).
-        if not content_started and isinstance(event, ExpertStreamEvent) and event.type == EVENT_CONTENT:
+        if not content_started and event.type == EVENT_CONTENT:
             content_started = True
             yield ExpertStreamEvent(EVENT_STATUS, EVENT_ANSWERING)
         yield event
@@ -166,11 +165,11 @@ async def run_expert_doc(
     Uses the ``expert_agent_doc.md`` prompt variant, includes product knowledge
     (no conversation history), and never streams.
     """
-    provider, resolved_model, base_url, api_key = _resolve_expert_model(model)
+    resolved_model, base_url, api_key = _resolve_expert_model(model)
     knowledge = await _retrieve_product_knowledge(product_id, query)
     prompt = _build_prompt(
         _expert_prompt.EXPERT_DOC_PROMPT, _product_name_by_id(product_id), knowledge, "", query,
-        provider=provider, base_url=base_url, model=resolved_model, api_key=api_key,
+        base_url=base_url, model=resolved_model, api_key=api_key,
     )
     use_rlm_resolved = _resolve_use_rlm(use_rlm, "expert", len(prompt))
     logger.info(
@@ -180,7 +179,7 @@ async def run_expert_doc(
         use_rlm_resolved,
     )
     doc = await _generate_answer(
-        prompt, provider, resolved_model, base_url, api_key, use_rlm_resolved
+        prompt, resolved_model, base_url, api_key, use_rlm_resolved
     )
     if not doc:
         doc = (

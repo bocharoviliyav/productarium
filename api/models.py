@@ -4,7 +4,9 @@ Defines the product-centric data model:
 
 - ``UserORM``          — local + Keycloak users (admin/user roles)
 - ``ProductORM``       — top-level product (no ``type``; +summary, +owner_id)
-- ``ArtifactORM``      — codebase|spec|links|documentation|guides (+kind, +verified*, +source)
+- ``CodebaseORM``      — git repository artifact (repo clone, page tree, generated docs)
+- ``SpecORM``          — OpenAPI/AsyncAPI spec artifact (single yaml/json)
+- ``LinksORM``         — curated external links (kv pairs)
 - ``KnowledgeNodeORM`` — Confluence-like tree of knowledge pages per product
 - ``SettingORM``       — admin config key/value store (optionally encrypted)
 - ``ApiTokenORM``      — public API tokens for external integrations
@@ -12,7 +14,7 @@ Defines the product-centric data model:
 String primary keys (``prod_..``, ``art_..``, ``user_..``, ``node_..``,
 ``tok_..``) keep frontend compatibility. All tables share the same
 Postgres+pgvector database used by cognee (see ``api/db.py``). ``init_db`` is
-idempotent and non-fatal (see the one-shot migration in ``api/db.py``).
+idempotent and non-fatal.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import String, Text, Boolean, ForeignKey, DateTime, JSON
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -29,18 +31,8 @@ class Base(DeclarativeBase):
     pass
 
 
-# --- Legacy artifact type -> new (type, kind) mapping -----------------------
-# Applied by the one-shot migration in api/db.py AND by _artifact_orm_from_pydantic
-# in api/api.py so the data stays consistent regardless of which client wrote it.
-LEGACY_ARTIFACT_TYPE_MAP: dict[str, tuple[str, str]] = {
-    "openapi": ("spec", "openapi"),
-    "asyncapi": ("spec", "asyncapi"),
-    "testcase": ("documentation", "testcase"),
-}
-# The new artifact type enum (contract J).
-ARTIFACT_TYPES: tuple[str, ...] = (
-    "codebase", "spec", "links", "documentation", "guides",
-)
+# The spec subtype enum (openapi|asyncapi) carried on SpecORM.kind.
+SPEC_KINDS: tuple[str, ...] = ("openapi", "asyncapi")
 
 
 class UserORM(Base):
@@ -101,7 +93,15 @@ class ProductORM(Base):
         onupdate=datetime.utcnow,
     )
 
-    artifacts: Mapped[list["ArtifactORM"]] = relationship(
+    codebases: Mapped[list["CodebaseORM"]] = relationship(
+        back_populates="product",
+        cascade="all, delete-orphan",
+    )
+    specs: Mapped[list["SpecORM"]] = relationship(
+        back_populates="product",
+        cascade="all, delete-orphan",
+    )
+    links: Mapped[list["LinksORM"]] = relationship(
         back_populates="product",
         cascade="all, delete-orphan",
     )
@@ -114,10 +114,14 @@ class ProductORM(Base):
         return f"<ProductORM id={self.id!r} name={self.name!r}>"
 
 
-class ArtifactORM(Base):
-    """ORM model for the ``artifacts`` table (belongs to a Product)."""
+class CodebaseORM(Base):
+    """ORM model for the ``codebases`` table — a git repo documented from source.
 
-    __tablename__ = "artifacts"
+    The complex artifact: repo cloning, a JSON tree of generated wiki pages,
+    and the generated docs blob. Owned by exactly one Product.
+    """
+
+    __tablename__ = "codebases"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     product_id: Mapped[str] = mapped_column(
@@ -127,19 +131,12 @@ class ArtifactORM(Base):
         index=True,
     )
     name: Mapped[str] = mapped_column(String(256), nullable=False)
-    # New enum: codebase|spec|links|documentation|guides
-    type: Mapped[str] = mapped_column(String(64), nullable=False)
-    # Subtype (e.g. openapi/asyncapi for spec). Nullable.
-    kind: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     repo_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     repo_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    allure_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     generated_docs: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # Stored in a JSON column; serialized/deserialized transparently.
+    # JSON tree of generated wiki pages, keyed by page id.
     pages: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
-    # Verified flag (item 5) + audit.
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     verified_by: Mapped[Optional[str]] = mapped_column(
         String(64),
@@ -147,7 +144,6 @@ class ArtifactORM(Base):
         nullable=True,
     )
     verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    # Provenance: manual|generated|api|mcp
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
@@ -159,13 +155,94 @@ class ArtifactORM(Base):
         onupdate=datetime.utcnow,
     )
 
-    product: Mapped["ProductORM"] = relationship(back_populates="artifacts")
+    product: Mapped["ProductORM"] = relationship(back_populates="codebases")
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
-        return (
-            f"<ArtifactORM id={self.id!r} name={self.name!r} "
-            f"type={self.type!r} kind={self.kind!r}>"
-        )
+        return f"<CodebaseORM id={self.id!r} name={self.name!r} repo_url={self.repo_url!r}>"
+
+
+class SpecORM(Base):
+    """ORM model for the ``specs`` table — a single OpenAPI/AsyncAPI spec.
+
+    Simple artifact: one yaml/json ``content`` string, rendered by the UI.
+    ``kind`` distinguishes openapi from asyncapi.
+    """
+
+    __tablename__ = "specs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    product_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("products.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False, default="openapi")
+    content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    verified_by: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey("productarium_users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    product: Mapped["ProductORM"] = relationship(back_populates="specs")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return f"<SpecORM id={self.id!r} name={self.name!r} kind={self.kind!r}>"
+
+
+class LinksORM(Base):
+    """ORM model for the ``links`` table — curated external link pairs.
+
+    Simplest artifact: ``content`` holds a JSON array of {url, description}.
+    """
+
+    __tablename__ = "links"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    product_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("products.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    verified_by: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey("productarium_users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    product: Mapped["ProductORM"] = relationship(back_populates="links")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return f"<LinksORM id={self.id!r} name={self.name!r}>"
 
 
 class KnowledgeNodeORM(Base):
@@ -192,11 +269,11 @@ class KnowledgeNodeORM(Base):
     content_md: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # page|folder|branch
     node_type: Mapped[str] = mapped_column(String(32), nullable=False, default="page")
-    artifact_id: Mapped[Optional[str]] = mapped_column(
-        String(64),
-        ForeignKey("artifacts.id", ondelete="SET NULL"),
-        nullable=True,
-    )
+    # Plain nullable id (no FK) pointing at a codebase/spec/links id. A DB-level
+    # FK was dropped when the polymorphic ``artifacts`` table was split into
+    # codebases/specs/links; the app already tolerates stale refs (orphan
+    # handling in the tree builder), so no meaningful integrity is lost.
+    artifact_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     verified_by: Mapped[Optional[str]] = mapped_column(

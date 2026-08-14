@@ -650,53 +650,46 @@ class TestIntegrationsRouter:
         assert client.get("/api/integrations/nope/spaces").status_code == 404
         assert client.post("/api/integrations/nope/test").status_code == 404
 
-    def test_from_integration_creates_documentation_artifact(self, monkeypatch):
+    def test_from_integration_creates_knowledge_node_default(self, monkeypatch):
+        # Non-git pulls now create KnowledgeNodes (the legacy polymorphic
+        # ``documentation`` artifact type was removed along with the
+        # ``artifacts/from-integration`` endpoint that took an artifact_type).
         client, SessionLocal = self._client_and_db(monkeypatch)
-        # Create a product to attach the artifact to.
-        from api.models import ProductORM, ArtifactORM
+        from api.models import ProductORM, KnowledgeNodeORM
 
         with SessionLocal() as session:
             session.add(ProductORM(id="prod_1", name="Acme"))
             session.commit()
         resp = client.post(
-            "/api/products/prod_1/artifacts/from-integration",
+            "/api/products/prod_1/knowledge/from-integration",
             json={"connector": "pull-test", "source_id": "src-1"},
         )
-        assert resp.status_code == 200, resp.text
+        assert resp.status_code == 201, resp.text
         body = resp.json()
-        assert body["type"] == "documentation"  # non-git -> documentation
+        assert body["product_id"] == "prod_1"
         assert body["source"] == "api"
-        assert "src-1" in body["name"]
-        assert "att-md" in body["content"]
-        # Persisted.
+        assert "src-1" in body["title"]
+        assert "att-md" in body["content_md"]
         with SessionLocal() as session:
-            arts = session.query(ArtifactORM).filter_by(product_id="prod_1").all()
-            assert len(arts) == 1
-            assert arts[0].type == "documentation"
+            nodes = session.query(KnowledgeNodeORM).filter_by(product_id="prod_1").all()
+            assert len(nodes) == 1
 
-    def test_from_integration_creates_codebase_for_git(self, monkeypatch):
+    def test_from_integration_codebase_only_for_git(self, monkeypatch):
         client, SessionLocal = self._client_and_db(monkeypatch)
         from api.models import ProductORM
 
         with SessionLocal() as session:
             session.add(ProductORM(id="prod_2", name="Acme2"))
             session.commit()
-        # _PullOnlyConnector is non-git; override via artifact_type to exercise
-        # the codebase branch + repo_url/repo_type propagation.
+        # The codebase endpoint rejects non-git connectors (github/gitlab only).
         resp = client.post(
-            "/api/products/prod_2/artifacts/from-integration",
+            "/api/products/prod_2/codebases/from-integration",
             json={
                 "connector": "pull-test",
                 "source_id": "src-2",
-                "artifact_type": "codebase",
             },
         )
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert body["type"] == "codebase"
-        assert body["repo_url"] == "https://example.com/x"
-        assert body["repo_type"] == "github"
-        assert body["content"] is None  # codebase artifacts store no inline content
+        assert resp.status_code == 400
 
     def test_from_integration_creates_knowledge_node(self, monkeypatch):
         client, SessionLocal = self._client_and_db(monkeypatch)
@@ -706,10 +699,10 @@ class TestIntegrationsRouter:
             session.add(ProductORM(id="prod_3", name="Acme3"))
             session.commit()
         resp = client.post(
-            "/api/products/prod_3/artifacts/from-integration",
-            json={"connector": "pull-test", "source_id": "My Page", "target": "node"},
+            "/api/products/prod_3/knowledge/from-integration",
+            json={"connector": "pull-test", "source_id": "My Page"},
         )
-        assert resp.status_code == 200, resp.text
+        assert resp.status_code == 201, resp.text
         body = resp.json()
         assert body["product_id"] == "prod_3"
         assert body["node_type"] == "page"
@@ -722,12 +715,12 @@ class TestIntegrationsRouter:
     def test_from_integration_unknown_product_404(self, monkeypatch):
         client, _ = self._client_and_db(monkeypatch)
         resp = client.post(
-            "/api/products/no-such-prod/artifacts/from-integration",
+            "/api/products/no-such-prod/knowledge/from-integration",
             json={"connector": "pull-test", "source_id": "x"},
         )
         assert resp.status_code == 404
 
-    def test_from_integration_bad_artifact_type_400(self, monkeypatch):
+    def test_from_integration_unknown_connector_404(self, monkeypatch):
         client, SessionLocal = self._client_and_db(monkeypatch)
         from api.models import ProductORM
 
@@ -735,7 +728,7 @@ class TestIntegrationsRouter:
             session.add(ProductORM(id="prod_4", name="Acme4"))
             session.commit()
         resp = client.post(
-            "/api/products/prod_4/artifacts/from-integration",
-            json={"connector": "pull-test", "source_id": "x", "artifact_type": "bogus"},
+            "/api/products/prod_4/knowledge/from-integration",
+            json={"connector": "nope", "source_id": "x"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 404

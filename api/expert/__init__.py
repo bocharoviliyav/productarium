@@ -2,7 +2,7 @@
 
 Split out of the former ``api/expert_agent.py`` (Step 6 of the backend
 decomposition). Submodules:
-- ``llm``: ``_ExpertLLM`` wrapper, ``_safe_build_llm``, ``_extract_chunk_text``,
+- ``llm``: ``_ExpertLLM`` wrapper, ``_safe_build_llm``, ``_extract_chunk_fields``,
   ``_resolve_expert_model``.
 - ``knowledge``: ``_retrieve_product_knowledge``, ``_fallback_artifact_docs``,
   ``_product_name_by_id``, ``_format_history``.
@@ -44,7 +44,6 @@ from api.expert.llm import (  # noqa: F401
     _ExpertLLM,
     _ThinkingStreamParser,
     _extract_chunk_fields,
-    _extract_chunk_text,
     _resolve_expert_model,
     _safe_build_llm,
     _strip_thinking_tags,
@@ -69,7 +68,6 @@ from api.expert.types import (  # noqa: F401
     EVENT_STATUS,
     EVENT_THINKING,
     ExpertStreamEvent,
-    StreamChunk,
 )
 
 __all__ = [

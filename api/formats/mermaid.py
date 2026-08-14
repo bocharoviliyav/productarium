@@ -12,7 +12,7 @@ Public API
 ----------
 - :data:`MERMAID_VERIFY_ENABLED` — env-only master switch. Per-diagram verify /
   repair timeouts and the repair-attempt budget are resolved per-call through
-  :mod:`api.timeout_config` (admin store > env var > default).
+  :mod:`api.config.timeout` (admin store > env var > default).
 - :func:`extract_mermaid_blocks` — split markdown into fenced mermaid blocks.
 - :func:`verify_diagram` — validate one diagram body via the Node subprocess.
 - :func:`run_repair_loop` — extract → verify → enqueue → repair → splice; the
@@ -46,7 +46,7 @@ import shutil
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from api.timeout_config import (
+from api.config.timeout import (
     resolve_mermaid_max_repair_attempts,
     resolve_mermaid_repair_timeout,
     resolve_mermaid_verify_timeout,
@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 # run_repair_loop returns the markdown unchanged — generation behaves exactly
 # as before. The per-diagram verify timeout, per-LLM-repair-call timeout, and
 # the per-unique-body repair budget are resolved per-call through
-# api.timeout_config (admin store > env var > default); see the
+# api.config.timeout (admin store > env var > default); see the
 # mermaid_verify / mermaid_repair / mermaid_max_repair_attempts entries in
 # TIMEOUT_KEYS. Editing them in the admin panel takes effect on the next
 # verify_diagram / repair_diagram / run_repair_loop call without a restart.
@@ -341,7 +341,7 @@ async def repair_diagram(job: RepairJob, llm: LLMCallable) -> Optional[str]:
     """Ask the LLM to fix ``job``'s diagram; return the repaired body or None.
 
     The repair call is bounded by the mermaid-repair timeout, resolved per call
-    through api.timeout_config. Any failure returns None so the caller can
+    through api.config.timeout. Any failure returns None so the caller can
     decide whether to re-enqueue (within the budget) or give up and mark the
     diagram.
     """

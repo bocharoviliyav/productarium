@@ -11,8 +11,8 @@ Each prompt constant below is a short fallback used only if the corresponding
 edit the matching ``refs/prompts/<name>.md`` file instead.
 """
 
-import os
 import logging
+import os
 from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -56,47 +56,58 @@ Mode: COMPREHENSIVE — provide maximum detail.
 - Priority: quality and completeness over brevity
 </detail_level>\n"""
 
-DETAIL_LEVEL_CONCISE = """\n<detail_level>
-Mode: CONCISE — provide a brief summary.
-- Include only the most important Mermaid diagrams (1-2 per section)
-- Omit code examples, keep only references to files
-- Use shorter tables with key fields only
-- Write 2-3 sentence descriptions per subsection
-- Priority: brevity and clarity over exhaustive detail
-</detail_level>\n"""
-
 LANGUAGE_NAMES = {
     "ru": "Russian (Русский)",
     "en": "English",
-    "ja": "Japanese (日本語)",
-    "zh": "Chinese (中文)",
-    "es": "Spanish (Español)",
-    "kr": "Korean (한국어)",
-    "vi": "Vietnamese (Tiếng Việt)",
-    "pt-br": "Brazilian Portuguese (Português Brasileiro)",
-    "fr": "French (Français)",
 }
 
+# Prompts that should NOT be wrapped with language/detail-level instructions:
+# - Expert + deep research prompts carry a {language_name} placeholder that is
+#   substituted per-request, so a fixed language block would conflict.
+# - Utility prompts (verification guard, mermaid repair) are not standalone
+#   generation prompts and have their own output contracts.
+_UNWRAPPED_PROMPTS = frozenset({
+    "expert_agent_system.md",
+    "expert_agent_doc.md",
+    "deep_research_first_iteration.md",
+    "deep_research_final_iteration.md",
+    "deep_research_intermediate_iteration.md",
+    "_verification_guard.md",
+    "mermaid_repair.md",
+})
 
-def wrap_prompt(prompt: str, language: str = "ru", comprehensive: bool = True) -> str:
-    """Wrap any wiki section prompt with language and detail-level instructions."""
+
+def _default_language() -> str:
+    """Resolve the default output language from lang.json (default 'ru')."""
+    try:
+        from api.config import configs
+        return configs.get("lang_config", {}).get("default", "ru")
+    except Exception:
+        return "ru"
+
+
+def _wrap_prompt(prompt: str, language: str = "ru") -> str:
+    """Wrap a generation prompt with language and detail-level instructions."""
     language_name = LANGUAGE_NAMES.get(language, language)
     lang_block = LANGUAGE_INSTRUCTION.format(language_name=language_name)
-    detail_block = DETAIL_LEVEL_COMPREHENSIVE if comprehensive else DETAIL_LEVEL_CONCISE
+    detail_block = DETAIL_LEVEL_COMPREHENSIVE
     return lang_block + detail_block + prompt
+
+
+def _maybe_wrap(filename: str, content: str) -> str:
+    """Apply language/detail wrapping to generation prompts.
+
+    Skips expert/deep-research prompts (they carry {language_name} for
+    per-request substitution) and utility prompts (verification guard,
+    mermaid repair) which have their own output contracts.
+    """
+    if filename in _UNWRAPPED_PROMPTS or "{language_name}" in content:
+        return content
+    return _wrap_prompt(content, _default_language())
 
 
 # Forward declaration; populated by the dynamic-load block below.
 SECTION_PROMPTS: Dict[str, str] = {}
-
-# ============================================================================
-# PROMPT TEMPLATE FALLBACKS
-# ----------------------------------------------------------------------------
-# The real prompt bodies are stored externally in refs/prompts/*.md and loaded
-# by load_prompt_file() at the bottom of this module. These constants are tiny
-# fallbacks used only when a refs file is missing. They MUST be defined before
-# the load calls (which reference them as fallbacks).
-# ============================================================================
 
 WIKI_OVERVIEW_PROMPT = ""
 WIKI_ARCHITECTURE_PROMPT = ""
@@ -116,10 +127,6 @@ MERMAID_REPAIR_PROMPT = ""
 # from refs/prompts/_verification_guard.md; hot-reloadable via the admin panel.
 VERIFICATION_GUARD = ""
 
-# ============================================================================
-# DYNAMIC PROMPT LOADING FROM REFS
-# ============================================================================
-
 PROMPTS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "refs",
@@ -130,18 +137,20 @@ PROMPTS_DIR = os.path.join(
 def load_prompt_file(filename: str, fallback: str) -> str:
     """Load a prompt template from ``refs/prompts/<filename>``.
 
-    Returns the file content (stripped) if it exists, otherwise ``fallback``.
-    This is the single source of truth for prompt bodies — code references the
-    loaded constants rather than inline strings.
+    Returns the file content (stripped + wrapped) if it exists, otherwise
+    ``fallback`` (also wrapped, unless it carries ``{language_name}``).
+    Generation prompts are automatically prepended with language and
+    detail-level instructions via ``_maybe_wrap``.
     """
+    content = fallback
     try:
         path = os.path.join(PROMPTS_DIR, filename)
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
-                return f.read().strip()
+                content = f.read().strip()
     except Exception as e:
         logger.warning(f"Error loading prompt from {filename}: {e}")
-    return fallback
+    return _maybe_wrap(filename, content)
 
 
 # Registry mapping filename -> module attribute name for all prompts loaded
@@ -205,6 +214,7 @@ def reload_prompt_file(filename: str) -> bool:
     except Exception as e:
         logger.warning("reload_prompt_file: error reading %r: %s", filename, e)
         return False
+    content = _maybe_wrap(filename, content)
     # Update the module-level constant.
     globals()[attr_name] = content
     # SECTION_PROMPTS maps section_id -> prompt text. Reverse-map the section
@@ -221,23 +231,16 @@ def reload_prompt_file(filename: str) -> bool:
     section_id = _section_id_by_attr.get(attr_name)
     if section_id is not None:
         SECTION_PROMPTS[section_id] = content
-    # Expert agent prompts live in api.expert.prompt as module-level constants.
-    # ``api.expert.chat`` reads them via ``api.expert.prompt.<CONST>`` at call
-    # time (not captured at import), so reloading the prompt module updates the
-    # module object the chat path references and the next call picks up the new
-    # text. Best-effort refresh.
+
     if filename in ("expert_agent_system.md", "expert_agent_doc.md"):
         try:
             import importlib
+
             import api.expert.prompt as _ep  # type: ignore
             importlib.reload(_ep)
         except Exception as e:  # pragma: no cover - optional best-effort
             logger.warning("reload_prompt_file: could not reload api.expert.prompt: %s", e)
-    # The verification guard is consumed by name from this module by every
-    # generation path (docgen, expert_agent, wiki_generator). It has
-    # no SECTION_PROMPTS entry; the globals() update above is sufficient for
-    # newly-built prompts to pick it up. (Already-built long-lived generators
-    # re-read it lazily.)
+
     logger.info("reload_prompt_file: refreshed %r -> %s", filename, attr_name)
     return True
 

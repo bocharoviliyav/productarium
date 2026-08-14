@@ -3,17 +3,16 @@
 Split out of the former ``api/expert_agent.py`` (Step 6). Owns the
 ``_ExpertLLM`` adalflow Generator wrapper (non-streaming ``generate`` + async
 ``stream`` with chunked fallback), the ``_safe_build_llm`` graceful-degrade
-factory, ``_extract_chunk_fields`` / ``_extract_chunk_text`` (Ollama + OpenAI
+factory, ``_extract_chunk_fields`` (Ollama + OpenAI
 streaming-chunk shape handling including reasoning/thinking fields),
 ``_ThinkingStreamParser`` (inline ``⬢`` tag splitter), and
-``_resolve_expert_model`` (admin-configured provider/model/
+``_resolve_expert_model`` (admin-configured model/
 base_url/api_key resolution for the ``expert`` task).
 
 ``_ExpertLLM`` mirrors ``api.docgen._common._StandardLLM`` for non-streaming
 generation (file-disjoint per the Wave 2 scope contract) and adds async
 streaming that bypasses the Generator to call the model client's
-``acall(stream=True)`` directly — the same pattern used by
-``api/websocket_wiki.py``.
+``acall(stream=True)`` directly.
 """
 
 from __future__ import annotations
@@ -49,14 +48,12 @@ class _ExpertLLM:
     Mirrors ``api.docgen._common._StandardLLM`` for non-streaming generation
     (adalflow ``Generator`` with ``template=\"{{input_str}}\"``) and adds an async
     ``stream()`` that bypasses the Generator to call the model client's
-    ``acall(stream=True)`` directly — the same pattern used by
-    ``api/websocket_wiki.py``. Honors admin-configured ``base_url`` / ``api_key``
-    from ``api.settings_store.get_model_for_task`` when provided.
+    ``acall(stream=True)`` directly. Honors admin-configured ``base_url`` / ``api_key``
+    from ``api.config.settings.get_model_for_task`` when provided.
     """
 
     def __init__(
         self,
-        provider: str,
         model: Optional[str],
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
@@ -64,7 +61,7 @@ class _ExpertLLM:
         import adalflow as adal
         from api.config import get_model_config
 
-        generator_config = get_model_config(provider, model)
+        generator_config = get_model_config(model)
         client_cls = generator_config["model_client"]
         self.model_kwargs = generator_config["model_kwargs"]
         self.model = self.model_kwargs.get("model", model)
@@ -77,7 +74,6 @@ class _ExpertLLM:
             client_kwargs["base_url"] = base_url
         if api_key:
             client_kwargs["api_key"] = api_key
-        self.provider = provider
         self.model_client = client_cls(**client_kwargs)
         self.generator = adal.Generator(
             template="{{input_str}}",
@@ -93,7 +89,7 @@ class _ExpertLLM:
             # that fills the ``{{input_str}}`` template placeholder), NOT a
             # bare ``input_str=`` kwarg. Passing ``input_str=`` raises
             # ``TypeError: Generator.call() got an unexpected keyword argument
-            # 'input_str'`` (see api/wiki_generator.py:283 for the pattern).
+            # 'input_str'`` (see api/docgen/wiki.py for the pattern).
             result = self.generator(prompt_kwargs={"input_str": prompt})
             # On a model error (e.g. 401 / connection refused) adalflow returns
             # a GeneratorOutput with ``error`` set and ``data=None`` but stores
@@ -155,7 +151,7 @@ class _ExpertLLM:
             produced = False
             async for chunk in response:  # type: ignore[union-attr]
                 content_text, reasoning_text = _extract_chunk_fields(
-                    chunk, self.provider
+                    chunk
                 )
                 # Separate reasoning field (DeepSeek/vLLM/Ollama thinking) —
                 # yield directly, no inline-tag parsing needed.
@@ -331,7 +327,7 @@ def _get_field(obj: Any, *keys: str) -> Optional[str]:
 
 
 def _extract_chunk_fields(
-    chunk: Any, provider: str
+    chunk: Any
 ) -> Tuple[Optional[str], Optional[str]]:
     """Extract ``(content, reasoning)`` deltas from a streaming chunk.
 
@@ -397,48 +393,35 @@ def _extract_chunk_fields(
     return None, None
 
 
-def _extract_chunk_text(chunk: Any, provider: str) -> Optional[str]:
-    """Extract a text delta from a streaming chunk (backward-compat wrapper).
-
-    Delegates to ``_extract_chunk_fields`` and returns only the content part.
-    Kept so existing callers (and tests) that only need content still work.
-    """
-    content, _ = _extract_chunk_fields(chunk, provider)
-    return content
-
-
 def _safe_build_llm(
-    provider: str,
     model: Optional[str],
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Optional[_ExpertLLM]:
     """Build an ``_ExpertLLM`` or return None on any failure (graceful degrade)."""
     try:
-        return _ExpertLLM(provider, model, base_url=base_url, api_key=api_key)
+        return _ExpertLLM(model, base_url=base_url, api_key=api_key)
     except Exception as e:  # pragma: no cover - depends on live config/Ollama
         logger.warning(
-            "Could not initialise expert LLM (%s/%s): %s. "
+            "Could not initialise expert LLM (%s): %s. "
             "Expert answers will be empty until a model is available.",
-            provider,
             model,
             e,
         )
         return None
 
 
-def _resolve_expert_model(model: Optional[str]) -> Tuple[str, str, Optional[str], Optional[str]]:
-    """Resolve (provider, model, base_url, api_key) for the expert task.
+def _resolve_expert_model(model: Optional[str]) -> Tuple[str, Optional[str], Optional[str]]:
+    """Resolve (model, base_url, api_key) for the expert task.
 
     Reads admin-configured ``models.expert.*`` from the Config Abstraction Layer.
     """
     try:
-        from api.config_abstraction import get_task_config
+        from api.config.abstraction import get_task_config
 
         cfg = get_task_config("expert") or {}
-        provider = cfg.get("provider") or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local")
-        resolved_model = model or cfg.get("model") or os.environ.get("DEEPWIKI_DEFAULT_MODEL", "qwen/qwen3.6-27b")
-        return provider, resolved_model, cfg.get("base_url"), cfg.get("api_key")
+        resolved_model = model or cfg.get("model") or "qwen/qwen3.6-27b"
+        return resolved_model, cfg.get("base_url"), cfg.get("api_key")
     except Exception as e:  # pragma: no cover - settings store is import-safe
         logger.debug("get_task_config(expert) failed; using defaults: %s", e)
-        return os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local"), model or os.environ.get("DEEPWIKI_DEFAULT_MODEL", "qwen/qwen3.6-27b"), None, None
+        return model or "qwen/qwen3.6-27b", None, None

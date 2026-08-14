@@ -1,7 +1,7 @@
 """Document reading + FAISS indexing pipeline + DatabaseManager.
 
 Split out of the former ``api/data_pipeline.py`` (Step 5). Owns:
-- ``count_tokens``: tiktoken-based token estimation (embedder-type aware).
+- ``count_tokens``: tiktoken-based token estimation.
 - ``read_all_documents``: recursive directory walk with include/exclude
   filters, producing adalflow ``Document`` objects with file metadata.
 - ``prepare_data_pipeline`` / ``transform_documents_and_save_to_db``: the
@@ -34,17 +34,12 @@ logger = logging.getLogger(__name__)
 # Maximum token limit for OpenAI embedding models
 MAX_EMBEDDING_TOKENS = 8192
 
-def count_tokens(text: str, embedder_type: str = None, is_ollama_embedder: bool = None) -> int:
+def count_tokens(text: str) -> int:
     """
     Count the number of tokens in a text string using tiktoken.
 
     Args:
         text (str): The text to count tokens for.
-        embedder_type (str, optional): DEPRECATED. Kept for backwards
-            compatibility with callers; no longer affects the encoding since
-            every supported server is treated as OpenAI-compatible.
-        is_ollama_embedder (bool, optional): DEPRECATED. Kept for backwards
-            compatibility; ignored.
 
     Returns:
         int: The number of tokens in the text.
@@ -61,7 +56,7 @@ def count_tokens(text: str, embedder_type: str = None, is_ollama_embedder: bool 
         # Rough approximation: 4 characters per token
         return len(text) // 4
 
-def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder: bool = None,
+def read_all_documents(path: str,
                       excluded_dirs: List[str] = None, excluded_files: List[str] = None,
                       included_dirs: List[str] = None, included_files: List[str] = None):
     """
@@ -69,10 +64,6 @@ def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder:
 
     Args:
         path (str): The root directory path.
-        embedder_type (str, optional): The embedder type ('ollama' or 'openai_local').
-                                     If None, will be determined from configuration.
-        is_ollama_embedder (bool, optional): DEPRECATED. Use embedder_type instead.
-                                           If None, will be determined from configuration.
         excluded_dirs
             Overrides the default configuration if provided.
         excluded_files (List[str], optional): List of file patterns to exclude from processing.
@@ -85,9 +76,6 @@ def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder:
     Returns:
         list: A list of Document objects with metadata.
     """
-    # Handle backward compatibility
-    if embedder_type is None and is_ollama_embedder is not None:
-        embedder_type = 'ollama' if is_ollama_embedder else None
     documents = []
     # File extensions to look for, prioritizing code files
     code_extensions = [".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".hpp", ".go", ".rs",
@@ -233,7 +221,7 @@ def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder:
                     )
 
                     # Check token count
-                    token_count = count_tokens(content, embedder_type)
+                    token_count = count_tokens(content)
                     if token_count > MAX_EMBEDDING_TOKENS * 10:
                         logger.warning(f"Skipping large file {relative_path}: Token count ({token_count}) exceeds limit")
                         continue
@@ -266,8 +254,8 @@ def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder:
                     content = f.read()
                     relative_path = os.path.relpath(file_path, path)
 
-                    # Check token count
-                    token_count = count_tokens(content, embedder_type)
+            # Check token count
+                    token_count = count_tokens(content)
                     if token_count > MAX_EMBEDDING_TOKENS:
                         logger.warning(f"Skipping large file {relative_path}: Token count ({token_count}) exceeds limit")
                         continue
@@ -290,16 +278,9 @@ def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder:
     logger.info(f"Found {len(documents)} documents")
     return documents
 
-def prepare_data_pipeline(embedder_type: str = None, is_ollama_embedder: bool = None):
+def prepare_data_pipeline():
     """
     Creates and returns the data transformation pipeline.
-
-    Args:
-        embedder_type (str, optional): DEPRECATED. Kept for backwards
-            compatibility; ignored (every supported server is treated as
-            OpenAI-compatible).
-        is_ollama_embedder (bool, optional): DEPRECATED. Kept for backwards
-            compatibility; ignored.
 
     Returns:
         adal.Sequential: The data transformation pipeline
@@ -324,7 +305,7 @@ def prepare_data_pipeline(embedder_type: str = None, is_ollama_embedder: bool = 
     return data_transformer
 
 def transform_documents_and_save_to_db(
-    documents: List[Document], db_path: str, embedder_type: str = None, is_ollama_embedder: bool = None
+    documents: List[Document], db_path: str
 ) -> LocalDB:
     """
     Transforms a list of documents and saves them to a local database.
@@ -332,13 +313,9 @@ def transform_documents_and_save_to_db(
     Args:
         documents (list): A list of `Document` objects.
         db_path (str): The path to the local database file.
-        embedder_type (str, optional): The embedder type ('ollama' or 'openai_local').
-                                     If None, will be determined from configuration.
-        is_ollama_embedder (bool, optional): DEPRECATED. Use embedder_type instead.
-                                           If None, will be determined from configuration.
     """
     # Get the data transformer
-    data_transformer = prepare_data_pipeline(embedder_type, is_ollama_embedder)
+    data_transformer = prepare_data_pipeline()
 
     # Save the documents to a local database
     db = LocalDB()
@@ -360,7 +337,6 @@ class DatabaseManager:
         self.repo_paths = None
 
     def prepare_database(self, repo_url_or_path: str, repo_type: str = None, access_token: str = None,
-                         embedder_type: str = None, is_ollama_embedder: bool = None,
                          excluded_dirs: List[str] = None, excluded_files: List[str] = None,
                          included_dirs: List[str] = None, included_files: List[str] = None) -> List[Document]:
         """
@@ -370,10 +346,6 @@ class DatabaseManager:
             repo_type(str): Type of repository
             repo_url_or_path (str): The URL or local path of the repository
             access_token (str, optional): Access token for private repositories
-            embedder_type (str, optional): Embedder type to use ('openai', 'google', 'ollama').
-                                         If None, will be determined from configuration.
-            is_ollama_embedder (bool, optional): DEPRECATED. Use embedder_type instead.
-                                               If None, will be determined from configuration.
             excluded_dirs (List[str], optional): List of directories to exclude from processing
             excluded_files (List[str], optional): List of file patterns to exclude from processing
             included_dirs (List[str], optional): List of directories to include exclusively
@@ -382,13 +354,9 @@ class DatabaseManager:
         Returns:
             List[Document]: List of Document objects
         """
-        # Handle backward compatibility
-        if embedder_type is None and is_ollama_embedder is not None:
-            embedder_type = 'ollama' if is_ollama_embedder else None
-
         self.reset_database()
         self._create_repo(repo_url_or_path, repo_type, access_token)
-        return self.prepare_db_index(embedder_type=embedder_type, excluded_dirs=excluded_dirs, excluded_files=excluded_files,
+        return self.prepare_db_index(excluded_dirs=excluded_dirs, excluded_files=excluded_files,
                                    included_dirs=included_dirs, included_files=included_files)
 
     def reset_database(self):
@@ -485,17 +453,13 @@ class DatabaseManager:
             logger.error(f"Failed to create repository structure: {e}")
             raise
 
-    def prepare_db_index(self, embedder_type: str = None, is_ollama_embedder: bool = None,
+    def prepare_db_index(self,
                         excluded_dirs: List[str] = None, excluded_files: List[str] = None,
                         included_dirs: List[str] = None, included_files: List[str] = None) -> List[Document]:
         """
         Prepare the indexed database for the repository.
 
         Args:
-            embedder_type (str, optional): Embedder type to use ('openai', 'google', 'ollama').
-                                         If None, will be determined from configuration.
-            is_ollama_embedder (bool, optional): DEPRECATED. Use embedder_type instead.
-                                               If None, will be determined from configuration.
             excluded_dirs (List[str], optional): List of directories to exclude from processing
             excluded_files (List[str], optional): List of file patterns to exclude from processing
             included_dirs (List[str], optional): List of directories to include exclusively
@@ -519,9 +483,6 @@ class DatabaseManager:
                 return 0
             return 0
 
-        # Handle backward compatibility
-        if embedder_type is None and is_ollama_embedder is not None:
-            embedder_type = 'ollama' if is_ollama_embedder else None
         # check the database
         if self.repo_paths and os.path.exists(self.repo_paths["save_db_file"]):
             logger.info("Loading existing database...")
@@ -555,14 +516,13 @@ class DatabaseManager:
         logger.info("Creating new database...")
         documents = read_all_documents(
             self.repo_paths["save_repo_dir"],
-            embedder_type=embedder_type,
             excluded_dirs=excluded_dirs,
             excluded_files=excluded_files,
             included_dirs=included_dirs,
             included_files=included_files
         )
         self.db = transform_documents_and_save_to_db(
-            documents, self.repo_paths["save_db_file"], embedder_type=embedder_type
+            documents, self.repo_paths["save_db_file"]
         )
         logger.info(f"Total documents: {len(documents)}")
         transformed_docs = self.db.get_transformed_data(key="split_and_embed")

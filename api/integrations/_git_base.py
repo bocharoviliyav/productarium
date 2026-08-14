@@ -186,7 +186,7 @@ class GitConnector:
         except Exception as e:  # pragma: no cover - requests is a core dep
             logger.warning("requests unavailable; cannot list repos for %s: %s", self.repo_type, e)
             return []
-        from api.ssl_config import requests_verify
+        from api.config.ssl import requests_verify
 
         token = self._token()
         if not token:
@@ -200,7 +200,7 @@ class GitConnector:
             for _ in range(self.list_max_pages):
                 if not url:
                     break
-                from api.timeout_config import resolve_integration_http_timeout
+                from api.config.timeout import resolve_integration_http_timeout
                 resp = requests.get(
                     url, headers=headers, timeout=resolve_integration_http_timeout(),
                     verify=requests_verify(),

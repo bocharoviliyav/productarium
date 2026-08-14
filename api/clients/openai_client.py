@@ -56,21 +56,21 @@ T = TypeVar("T")
 # Per-request HTTP timeout for OpenAI-compatible clients. Generation and
 # cognee cognify can run for hours on a local model, so the SDK's default
 # (~600s on the explicit http_client, much less on patched defaults) is far
-# too short. Now resolved through the central :mod:`api.timeout_config` so the
+# too short. Now resolved through the central :mod:`api.config.timeout` so the
 # admin "Timeouts" panel overrides env/default. Default 3600s (1h), floor 60s.
 def _resolve_request_timeout() -> float:
-    from api.timeout_config import resolve_llm_request_timeout
+    from api.config.timeout import resolve_llm_request_timeout
     return resolve_llm_request_timeout()
 
 
 # Total time budget for the backoff retry decorator on transient errors
 # (APITimeoutError / RateLimitError / 5xx). The stock 5s ceiling aborts before a
 # single rate-limited cognee/embedding retry can complete its backoff. Resolved
-# through the central :mod:`api.timeout_config` (admin > env > default).
+# through the central :mod:`api.config.timeout` (admin > env > default).
 # Default 900s (15 min), floor 30s -- long enough to ride out a transient 429
 # storm without hanging a generation indefinitely.
 def _resolve_retry_max_time() -> float:
-    from api.timeout_config import resolve_llm_retry_max_time
+    from api.config.timeout import resolve_llm_retry_max_time
     return resolve_llm_retry_max_time()
 
 
@@ -226,7 +226,7 @@ class OpenAIClient(ModelClient):
         """True when the key is missing or the explicit 'no auth' placeholder."""
         if not api_key:
             return True
-        from api.settings_store import _sanitize_api_key
+        from api.config.settings import _sanitize_api_key
         clean = _sanitize_api_key(api_key)
         return not clean or clean.lower() in ("not-needed", "not_needed")
 
@@ -240,7 +240,7 @@ class OpenAIClient(ModelClient):
         """
         if not api_key:
             return None
-        from api.settings_store import _sanitize_api_key
+        from api.config.settings import _sanitize_api_key
         clean = _sanitize_api_key(api_key)
         if not clean or clean.lower() in ("not-needed", "not_needed"):
             return None
@@ -269,11 +269,11 @@ class OpenAIClient(ModelClient):
     def _ssl_verify(self):
         """Resolve the TLS verify value (corporate CA bundle / skip-verify).
 
-        Reads admin settings + env via api.ssl_config so a runtime save takes
+        Reads admin settings + env via api.config.ssl so a runtime save takes
         effect when the client is (re)built. Returns True / False / a CA path.
         """
         try:
-            from api.ssl_config import httpx_verify
+            from api.config.ssl import httpx_verify
             return httpx_verify()
         except Exception:  # pragma: no cover - defensive
             return True

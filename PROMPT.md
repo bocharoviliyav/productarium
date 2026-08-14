@@ -39,14 +39,14 @@
                         └─────────────────┘
 ```
 
-### Поток данных (Продукт → Артефакт → Документация)
+### Поток данных (Продукт → Codebase/Spec → Документация)
 
-1. Создаётся **Продукт** и добавляются **Артефакты** (codebase через URL репозитория, содержимое спецификации, документация, ссылки, руководства).
-2. **Генерация** доков:
-   - **codebase**: бэкенд клонирует репозиторий (shallow, `--depth=1`), читает файлы, собирает длинный контекст → **fast-rlm** (если ≥20k символов) или стандартный LLM генерирует 7 секций wiki из `refs/prompts/*.md` → `generated_docs` + `pages` сохраняются → репозиторий индексируется в cognee (в фоне).
-   - **spec**: спецификация парсится (stdlib json/yaml) → markdown-скелет + LLM-обогащение → индексация в cognee.
-   - **documentation/guides**: содержимое рендерится/обогащается через LLM → индексация в cognee.
-3. Фронтенд-вьюер рендерит `artifact.pages` (дерево навигации) + markdown/Mermaid; **Экспертный агент** и панель **Ask** используют RAG (FAISS, top_k=20) с дополнением через cognee.
+1. Создаётся **Продукт** и добавляются типизированные сущности **Codebase** (через URL репозитория), **Spec** (содержимое спецификации) или **Links** (JSON-массив ссылок).
+2. **Генерация** доков (per-type эндпоинты):
+   - **codebase** (`POST /api/products/{id}/codebases/{id}/generate`): бэкенд клонирует репозиторий (shallow, `--depth=1`), читает файлы, собирает длинный контекст → **fast-rlm** (если ≥20k символов) или стандартный LLM генерирует 7 секций wiki из `refs/prompts/*.md` → `generated_docs` + `pages` сохраняются → репозиторий индексируется в cognee (в фоне, async 202+poll).
+   - **spec** (`POST /api/products/{id}/specs/{id}/generate`): спецификация парсится (stdlib json/yaml) → markdown-скелет + LLM-обогащение → индексация в cognee.
+   - **links**: генерации нет (только хранение содержимого).
+3. Фронтенд-вьюер рендерит `codebase.pages` (дерево навигации) + markdown/Mermaid; **Экспертный агент** и панель **Ask** используют RAG (FAISS, top_k=20) с дополнением через cognee.
 
 ---
 
@@ -72,18 +72,20 @@
 
 #### `api/api.py`
 
-Главное FastAPI-приложение. CRUD продуктов/артефактов, `/api/products/{id}/artifacts/{id}/generate`, `/api/rlm/run`, legacy wiki-кеш, конфиг моделей. `startup_event()` вызывает `init_db()`, затем `init_cognee()`. Подключает все роутеры через `include_all_routers(app)`.
+Главное FastAPI-приложение. Подключает все роутеры через `include_all_routers(app)`. `startup_event()` вызывает `init_db()`, затем `init_cognee()` (оба non-fatal).
 
 #### `api/routers/` — Авто-обнаруживаемые роутеры
 
 Роутеры авто-обнаруживаются: добавьте `api/routers/<name>.py` с модулем-уровня `router = APIRouter(...)` — он подключится автоматически.
 
-- **`admin.py`** — CRUD под защитой админа + тесты связности для `models`, `git`, `confluence`, `integrations`, `users`, `apitokens`. Секреты шифруются при сохранении, редактируются при чтении.
+- **`admin.py`** — CRUD под защитой админа + тесты связности для `models`, `git`, `confluence`, `integrations`, `rlm`, `ssl`, `cognee`, `timeouts`, `users`, `apitokens`, `prompts`. Секреты шифруются при сохранении, редактируются при чтении.
 - **`auth/`** (в `api/auth/`) — Локальный login/me/logout, настройка при первом запуске, смена/сброс пароля, Keycloak OIDC login/callback.
+- **`docgen.py`** — Per-type генерация: `POST .../codebases/{id}/generate` + status, `POST .../specs/{id}/generate` + status. Links не генерируются.
 - **`expert.py`** — Экспертный агент: SSE-чат (`POST /api/products/{id}/ask`) + генерация документа (`POST /api/products/{id}/ask/doc`).
-- **`integrations.py`** — Список/тест/pull из коннекторов интеграций; создание артефактов или узлов знаний из подтянутого контента.
-- **`knowledge.py`** — CRUD дерева знаний, загрузка через markitdown, переключатель verified, AI-саммари продукта.
-- **`public.py`** — Эндпоинты с API-токен-аутентификацией: экспорт верифицированных знаний, ask, пуш в Confluence/git.
+- **`integrations.py`** — Список/тест/pull из коннекторов интеграций; git-коннекторы создают `CodebaseORM`, non-git — узлы знаний.
+- **`knowledge.py`** — CRUD дерева знаний, загрузка через markitdown, переключатель verified, AI-саммари продукта (`generate_product_summary(product, codebases, specs, nodes)`).
+- **`products.py`** — Per-type создание/удаление/обновление: `POST/DELETE/PUT .../codebases|specs|links/{id}`.
+- **`public.py`** — Эндпоинты с API-токен-аутентификацией: экспорт верифицированных знаний (markdown/json с ключами `codebases`/`specs`/`links`/`nodes`), ask, пуш в Confluence/git.
 
 #### `api/auth/` — Пакет аутентификации
 
@@ -99,8 +101,8 @@
 
 Масштабируемый фреймворк. Авто-обнаружение через `pkgutil`. Каждый коннектор реализует `test()`, `list_spaces()`, `pull(source_id, opts)`:
 
-- **`github.py`** / **`gitlab.py`** — Список репозиториев, клонирование + документирование как артефакты `codebase`.
-- **`confluence.py`** — Список пространств, pull страниц (рекурсивно, с конвертацией вложений через markitdown).
+- **`github.py`** / **`gitlab.py`** — Список репозиториев, клонирование + документирование как `CodebaseORM` (`repo_url`/`repo_type`).
+- **`confluence.py`** — Список пространств, pull страниц (рекурсивно, с конвертацией вложений через markitdown) как узлы знаний.
 - **`mcp.py`** — Model Context Protocol. Транспорт `http` (JSON-RPC `initialize` + `tools/call`) и `stdio` (документированный stub).
 - **`base.py`** / **`registry.py`** — Базовый класс `IntegrationConnector` + реестр авто-обнаружения.
 - **`_git_base.py`** — Общая логика git-коннекторов.
@@ -117,47 +119,49 @@
 
 Клонирование репозиториев (GitHub/GitLab, shallow `--depth=1`), чтение файлов с include/exclude фильтрами, `DatabaseManager` (FAISS-индексы).
 
-#### `api/artifact_docgen.py`
+#### `api/docgen/`
 
-Пайплайн документирования артефактов. `generate_artifact_documentation()` диспетчеризует по типу: codebase→RLM (fast-rlm, если ≥20k символов) или стандартный LLM; spec→stdlib parse + markdown skeleton + LLM enrichment; documentation/guides→LLM. Все пути индексируют в cognee в фоне и сохраняют `generated_docs` + `pages`.
+Пакет генерации документации. Без диспетчера — каждый generate-эндпоинт вызывает свой генератор напрямую. `codebase.py:generate_codebase_docs` (RLM для длинного контекста ≥20k символов, иначе стандартный LLM, 7 секций), `spec.py:generate_openapi_docs`/`generate_asyncapi_docs` (stdlib parse + skeleton + LLM enrichment). `jobs.py` (async 202+poll worker, принимает `entity_type`). `_common.py` (общий `_StandardLLM`, `_index_in_background`). Все пути индексируют в cognee в фоне и сохраняют `generated_docs` + `pages`.
 
-#### `api/expert_agent.py`
+#### `api/expert/`
 
-Экспертный агент (cognee-recall + маршрутизация RLM + стриминг LLM). Тела промптов в `refs/prompts/expert_agent_*.md`.
+Пакет экспертного агента. `chat.py` (cognee-recall + маршрутизация RLM + стриминг LLM), `generate.py` (standalone doc). Тела промптов в `refs/prompts/expert_agent_*.md`.
 
-#### `api/cognee_manager.py`
+#### `api/cognee/`
 
-Интеграция cognee. Настраивается на локальный Ollama для LLM (`cognify` entity extraction) и эмбеддингов — без облачных ключей. `init_cognee()`, `add_and_index_document()`, `query_cognee()` — все async, все non-fatal.
+Интеграция cognee. `_runtime.py` настраивает локальный Ollama для LLM (`cognify` entity extraction) и эмбеддингов — без облачных ключей. `init_cognee()`, `add_and_index_document()`, `query_cognee()`, `reindex_product_knowledge_graph()` — все async, все non-fatal.
 
-#### `api/rlm_runner.py`
+#### `api/rlm/runner.py`
 
-Обёртка fast-rlm (Deno + Pyodide). `run_rlm_task(query, model)` — async, для длинноконтекстных рассуждений. По умолчанию указывает на local Ollama.
+Обёртка fast-rlm (Deno + Pyodide). `run_rlm_task(query, model)` — async, для длинноконтекстных рассуждений. Единый путь: admin config → `LOCAL_OPENAI_BASE_URL` → default.
 
-#### `api/settings_store.py`
+#### `api/config/`
 
-Шифруемое key/value-хранилище настроек админки (модели, git-credentials, confluence, интеграции). Fernet-шифрование через `SETTINGS_SECRET_KEY`.
+Центральный пакет конфигурации. `__init__.py` (JSON-загрузчик, `${ENV_VAR}` плейсхолдеры), `settings.py` (шифруемое key/value-хранилище, Fernet через `SETTINGS_SECRET_KEY`), `timeout.py` (per-key таймауты), `ssl.py` (TLS-патч для корпоративных шлюзов).
 
 #### `api/models.py`
 
-SQLAlchemy 2.0 ORM: `UserORM`, `ProductORM`, `ArtifactORM`, `KnowledgeNodeORM`, `SettingORM`, `ApiTokenORM`.
+SQLAlchemy 2.0 ORM: `UserORM`, `ProductORM`, `CodebaseORM`, `SpecORM`, `LinksORM`, `KnowledgeNodeORM`, `SettingORM`, `ApiTokenORM`.
 
-- **ProductORM**: `id, name, description, type (microservice|monolith|databus_service), artifacts[], created_at, updated_at`.
-- **ArtifactORM**: `id, product_id (FK, cascade delete), name, type (codebase|spec|links|documentation|guides), repo_url, repo_type, token, content, allure_url, generated_docs, pages (JSON), created_at, updated_at`.
-- **KnowledgeNodeORM**: `id, product_id (FK), parent_id, title, type (page|folder|branch), content, source, verified, created_at, updated_at`.
+- **ProductORM**: `id, name, summary, owner_id, created_at, updated_at`. Владеет `codebases`, `specs`, `links`.
+- **CodebaseORM** (таблица `codebases`): `id, product_id (FK CASCADE), name, repo_url, repo_type, token, generated_docs, pages (JSON), verified, source, timestamps`.
+- **SpecORM** (таблица `specs`): `id, product_id (FK CASCADE), name, kind (openapi|asyncapi), content, verified, source, timestamps`.
+- **LinksORM** (таблица `links`): `id, product_id (FK CASCADE), name, content (JSON-массив), verified, source, timestamps`.
+- **KnowledgeNodeORM**: `id, product_id (FK), parent_id, title, slug, node_type (page|folder|branch), content_md, source, verified, created_at, updated_at`.
 
-Persisted in Postgres via SQLAlchemy (`api/db.py`: `init_db()` on startup, `get_db()` FastAPI dependency).
+Persisted in Postgres via SQLAlchemy (`api/db.py`: `init_db()` on startup — `Base.metadata.create_all`, идемпотентно, non-fatal; `get_db()` FastAPI dependency).
 
 #### `api/prompts.py`
 
-Реестр и загрузчик промптов. `WIKI_SECTIONS`, `wrap_prompt()`, `load_prompt_file()` загружают тела из `refs/prompts/*.md`. Тела промптов НЕ в коде (внешние — быстрые правки без изменения кода). Подстановка через `str.replace` (не `.format`) — Mermaid/JSON literal braces остаются неэкранированными.
+Реестр и загрузчик промптов. `load_prompt_file()` применяет `_wrap_prompt(content, language)` после загрузки. `WIKI_SECTIONS`, `load_prompt_file()` загружают тела из `refs/prompts/*.md`. Тела промптов НЕ в коде (внешние — быстрые правки без изменения кода). Подстановка через `str.replace` (не `.format`) — Mermaid/JSON literal braces остаются неэкранированными.
 
-#### `api/wiki_generator.py`
+#### `api/docgen/codebase.py`
 
 Последовательная 7-секционная генерация wiki (Overview → Architecture → Functional → Technical → CI/CD → LLD → Data Model). Каждая секция строит на предыдущих. Тела секций из `refs/prompts/<section>.md`.
 
-#### `api/config.py`
+#### `api/config/__init__.py`
 
-Центральная конфигурация. JSON из `api/config/`, `${ENV_VAR}` плейсхолдеры, провайдеры/эмбеддеры. Ключевые глобалы: `configs`, `OLLAMA_HOST`, `LOCAL_OPENAI_BASE_URL`.
+Центральная конфигурация. JSON из `api/config/`, `${ENV_VAR}` плейсхолдеры. Единый OpenAI-compatible путь (один клиент покрывает Ollama, LM Studio, llama.cpp, vLLM). Ключевые глобалы: `configs`, `OLLAMA_HOST`, `LOCAL_OPENAI_BASE_URL`.
 
 ---
 
@@ -178,8 +182,8 @@ src/
 ├── app/
 │   ├── page.tsx                              # Дашборд продуктов
 │   ├── products/[productId]/
-│   │   ├── page.tsx                          # Детали продукта + артефакты
-│   │   └── artifacts/[artifactId]/page.tsx   # Вьюер доков артефакта
+│   │   ├── page.tsx                          # Детали продукта + codebases/specs/links
+│   │   └── artifacts/[artifactId]/page.tsx   # Универсальный вьюер доков (codebase/spec/links)
 │   ├── api/                                  # Next.js API routes (прокси к backend)
 │   └── wiki/projects/page.tsx               # Legacy: список проектов
 ├── components/
@@ -218,8 +222,8 @@ src/
 
 Коннекторы авто-обнаруживаются в `api/integrations/`. Каждый реализует `test()`, `list_spaces()` и `pull(source_id, opts)`:
 
-- **GitHub** / **GitLab** — список репозиториев, клонирование + документирование как артефакты `codebase`.
-- **Confluence** — список пространств, pull страниц (рекурсивно, с конвертацией вложений через markitdown) как артефакты `documentation` или узлы знаний.
+- **GitHub** / **GitLab** — список репозиториев, клонирование + документирование как `CodebaseORM` (`repo_url`/`repo_type`).
+- **Confluence** — список пространств, pull страниц (рекурсивно, с конвертацией вложений через markitdown) как узлы знаний.
 - **MCP** — коннектор Model Context Protocol. Транспорт `http` (JSON-RPC `initialize` + `tools/call`) и `stdio`.
 
 Админы настраивают коннекторы (credentials шифруются в settings store) и тестируют связность из админ-панели. Подтянутый контент индексируется в продуктовом датасете cognee `prod_{product_id}` в фоне.
@@ -228,7 +232,7 @@ src/
 
 ## Дерево знаний
 
-У каждого Продукта есть дерево **узлов знаний** в стиле Confluence (`page`/`folder`/`branch`). Узлы можно создавать вручную, подтягивать из интеграций Confluence/MCP или загружать как файлы (конвертация в Markdown через markitdown). Узлы и артефакты можно отмечать как **верифицированные**; только верифицированный контент экспортируется или пушится через публичный API.
+У каждого Продукта есть дерево **узлов знаний** в стиле Confluence (`page`/`folder`/`branch`). Узлы можно создавать вручную, подтягивать из интеграций Confluence/MCP или загружать как файлы (конвертация в Markdown через markitdown). Узлы, codebases, specs и links можно отмечать как **верифицированные**; только верифицированный контент экспортируется или пушится через публичный API.
 
 ---
 
@@ -262,7 +266,7 @@ JSON-файлы с поддержкой `${ENV_VAR}` плейсхолдеров 
 - **Auth**: `AUTH_PROVIDER`, `BOOTSTRAP_ADMIN_USERNAME`, `BOOTSTRAP_ADMIN_PASSWORD`, `SETTINGS_SECRET_KEY`.
 - **Keycloak**: `KEYCLOAK_URL`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET`, `KEYCLOAK_REALM`.
 - **Enterprise Git**: `GITHUB_ENTERPRISE_URL`, `GITLAB_SELF_HOSTED_URL`.
-- **Логирование**: `LOG_LEVEL`, `LOG_FILE_PATH`.
+- **Логирование**: `LOG_LEVEL`, `LOG_FORMAT` (`logfmt`/`json`).
 
 ### Системные промпты
 

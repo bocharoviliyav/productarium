@@ -165,17 +165,22 @@ docker-compose up postgres
 
 Модели SQLAlchemy 2.0 ORM в `api/models.py`. Общая БД Postgres+pgvector, разделяемая с cognee. Строковые PK (`prod_…`/`art_…`/`user_…`/`node_…`/`tok_…`) сохраняют совместимость с фронтендом.
 
-### ProductORM (таблица `products`)
-`id, name, description, summary (AI-генерируемое), owner_id (FK users.id), artifacts[], created_at, updated_at`.
+Без полиморфной сущности артефакта — три отдельных типизированных ORM-модели + таблицы:
 
-### ArtifactORM (таблица `artifacts`)
-`id, product_id (FK, cascade delete), name, type, kind, repo_url, repo_type, token, content, allure_url, generated_docs, pages (JSON), verified, verified_by, verified_at, source, created_at, updated_at`.
-- `type` — enum: `codebase | spec | links | documentation | guides` (последние два — legacy).
-- `kind` — подтип для spec: `openapi | asyncapi`.
-- `LEGACY_ARTIFACT_TYPE_MAP` нормализует старые типы: `openapi → (spec, openapi)`, `asyncapi → (spec, asyncapi)`, `testcase → (documentation, testcase)`.
+### ProductORM (таблица `products`)
+`id, name, summary (AI-генерируемое), owner_id (FK users.id), created_at, updated_at`. Владеет связями `codebases`, `specs`, `links` (каждый `cascade="all, delete-orphan"`).
+
+### CodebaseORM (таблица `codebases`)
+`id, product_id (FK CASCADE), name, repo_url, repo_type, token, generated_docs (Text), pages (JSON-дерево), verified, verified_by, verified_at, source, created_at, updated_at`. Сложная сущность — клонирование репо, дерево страниц, сгенерированные доки.
+
+### SpecORM (таблица `specs`)
+`id, product_id (FK CASCADE), name, kind (openapi|asyncapi), content (Text — yaml/json), verified/verified_by/verified_at, source, created_at, updated_at`.
+
+### LinksORM (таблица `links`)
+`id, product_id (FK CASCADE), name, content (Text — JSON-массив {url, description}), verified/verified_by/verified_at, source, created_at, updated_at`.
 
 ### KnowledgeNodeORM (таблица `knowledge_nodes`)
-`id, product_id (FK), parent_id, title, slug, content_md, node_type (page|folder|branch), artifact_id, source, verified, verified_by, verified_at, created_by, created_at, updated_at`. Самореференциальное дерево через `parent_id`, `ON DELETE CASCADE`.
+`id, product_id (FK), parent_id, title, slug, content_md, node_type (page|folder|branch), artifact_id (plain nullable String, без FK), source, verified, verified_by, verified_at, created_by, created_at, updated_at`. Самореференциальное дерево через `parent_id`, `ON DELETE CASCADE`.
 
 ### UserORM (таблица `productarium_users`)
 `id, username, email, password_hash, role (admin|user), provider, must_change_password, created_at`.
@@ -187,7 +192,7 @@ docker-compose up postgres
 `id, user_id (FK), name, token_hash (sha256), created_at, last_used_at`.
 
 ### db.py
-`create_engine` с `pool_pre_ping`, `future=True`; `SessionLocal` + `get_db()` (FastAPI-зависимость); `init_db()` — `Base.metadata.create_all`, идемпотентно, неблокирующе при ошибке; `_run_one_shot_migration()` — аддитивные `ALTER` + маппинг legacy-типов.
+`create_engine` с `pool_pre_ping`, `future=True`; `SessionLocal` + `get_db()` (FastAPI-зависимость); `init_db()` — `Base.metadata.create_all`, идемпотентно, неблокирующе при ошибке (без миграций).
 
 ---
 
@@ -197,18 +202,18 @@ docker-compose up postgres
 Загружает `.env`, вызывает `bootstrap_secret_key()`, `apply_ssl_env()`, `setup_logging()`, monkey-patch `watchfiles` (dev), `uvicorn.run` на `PORT` (по умолчанию 8001), reload если `NODE_ENV != production`.
 
 ### `api.py` — основное FastAPI-приложение
-REST-эндпоинты (legacy wiki + CRUD продуктов/артефактов + generate + RLM run + экспертный агент), Pydantic-модели, управление кэшем wiki, конфигурация моделей. `startup_event()` вызывает `init_db()` затем `init_cognee()`. Подключает все роутеры через `include_all_routers(app)`.
+Подключает все роутеры через `include_all_routers(app)`. `startup_event()` вызывает `init_db()`, затем `init_cognee()` (оба неблокирующе).
 
-### `config.py` — центральная конфигурация
-Загружает JSON из `api/config/` с заменой `${ENV_VAR}`-плейсхолдеров (`replace_env_placeholders`). Провайдеры: `ollama` (`OllamaClient`), `openai_local` (`OpenAIClient`). Глобалы: `OLLAMA_HOST`, `LOCAL_OPENAI_BASE_URL`, `EMBEDDER_TYPE`. Функции: `get_model_config`, `get_embedder_config`, `is_ollama_embedder`, `get_embedder_type`, `fetch_ollama_models`, `fetch_openai_local_models`, `get_available_models`. `DEFAULT_EXCLUDED_DIRS/FILES` для чтения репозитория. Словарь `configs` агрегирует generator/embedder/repo/lang.
+### `config/` — центральный пакет конфигурации
+`__init__.py` загружает JSON из `api/config/` с заменой `${ENV_VAR}`-плейсхолдеров (`replace_env_placeholders`). Единый OpenAI-совместимый путь — один клиент (`OpenAIClient`) покрывает все локальные серверы (Ollama, LM Studio, llama.cpp, vLLM). Глобалы: `OLLAMA_HOST`, `LOCAL_OPENAI_BASE_URL`. `settings.py` (зашифрованное хранилище), `timeout.py` (per-key таймауты), `ssl.py` (TLS-патч для корпоративных шлюзов). Функции: `get_model_config`, `get_embedder_config`, `fetch_ollama_models`, `fetch_openai_local_models`, `get_available_models`. Словарь `configs` агрегирует generator/embedder/repo/lang.
 
-### `cognee_manager.py` — интеграция cognee
-Настраивает cognee на **локальный Ollama** (LLM через `/v1`, эмбеддинги через `/api/embed`, `LLM_API_KEY=not-needed`), чтобы `cognify()` работал без облачного ключа. Нормализация имён моделей для litellm (`_normalize_model_for_litellm` → префикс `ollama/` или `openai/`). Функции: `init_cognee()` (неблокирующая), `apply_cognee_runtime_config()` (проталкивает админ-настройки models.cognee/embedder в runtime-синглтоны cognee + чистит `create_embedding_engine` lru_cache), `add_and_index_document`, `query_cognee`, `_reconcile_stale_cognee_data`.
+### `cognee/` — интеграция cognee
+`_runtime.py` настраивает cognee на **локальный Ollama** (LLM через `/v1`, эмбеддинги через `/api/embed`, `LLM_API_KEY=not-needed`), чтобы `cognify()` работал без облачного ключа. Нормализация имён моделей для litellm. Функции: `init_cognee()` (неблокирующая), `apply_cognee_runtime_config()`, `add_and_index_document`, `query_cognee`, `reindex_product_knowledge_graph`.
 
-### `rlm_runner.py` — обёртка fast-rlm
-fast-rlm (Deno + Pyodide, изолированный REPL). `run_rlm_task_sync(query, model_name)` резолвит админ-конфиг `models.docgen`, применяет `RLM_MODEL_BASE_URL/API_KEY/RLM_API_TIMEOUT_MS` (по умолчанию 1800000мс), `config.max_depth=2`, `max_calls_per_subagent=10`. Коэрсит теги Ollama (`qwen3.5:35b-a3b`, `qwen3:8b`). `run_rlm_task` — асинхронная обёртка через `asyncio.to_thread`. `prewarm_rlm_background()` — daemon-поток при загрузке.
+### `rlm/runner.py` — обёртка fast-rlm
+fast-rlm (Deno + Pyodide, изолированный REPL). `run_rlm_task_sync(query, model_name)` резолвит админ-конфиг `models.docgen` (единый путь: admin config → `LOCAL_OPENAI_BASE_URL` → default), `config.max_depth=2`, `max_calls_per_subagent=10`. `run_rlm_task` — асинхронная обёртка через `asyncio.to_thread`. `prewarm_rlm_background()` — daemon-поток при загрузке.
 
-### `settings_store.py` — зашифрованное хранилище
+### `config/settings.py` — зашифрованное хранилище
 Fernet-шифрование key/value поверх `SettingORM`. `bootstrap_secret_key()` персистит ключ в `~/.adalflow/.settings_secret_key`. Функции: `get_setting/set_setting/get_secret/delete_setting/list_settings`. Групповые геттеры: `get_model_for_task(task)` (docgen/expert/summary/cognee/embedder), `get_git_creds`, `get_confluence_creds`, `get_integration_config`. `get_rlm_mode(task)` возвращает `auto/rlm/llm` (форсирует `llm` если fast-rlm недоступен). `_sanitize_api_key` удаляет префикс `Bearer ` и пробелы.
 
 ### `data_pipeline.py` — обработка репозитория
@@ -220,31 +225,23 @@ Fernet-шифрование key/value поверх `SettingORM`. `bootstrap_secr
 ### `rag.py` — RAG над FAISS
 Кастомные классы `Memory`/`CustomConversation`/`DialogTurn` (обход бага adalflow с list-index). Dataclass `RAGAnswer` (`rationale`, `answer`). Класс `RAG`: `prepare_retriever`, `_validate_and_filter_embeddings` (консистентные размеры эмбеддингов), `call()`. Использует `RAG_TEMPLATE` (Jinja) + `RAG_SYSTEM_PROMPT`.
 
-### `wiki_generator.py` — генератор вики
-Класс `WikiGenerator`; `SECTION_ORDER` (`overview, architecture, functional, technical, cicd, lld, datamodel`), `SECTION_NAMES` (русские). `_format_prompt` использует `str.replace` (НЕ `.format` — сохраняет фигурные скобки Mermaid/JSON). `generate_all_sections` с `section_callback`. `create_wiki_section_context` строит `WikiSectionContext`. Тела промптов внешние — в `refs/prompts/*.md`.
+### `docgen/` — пакет генерации документации
+Без диспетчера — каждый generate-эндпоинт вызывает свой генератор напрямую. `codebase.py:generate_codebase_docs` (RLM для длинного контекста ≥20k символов, иначе стандартный LLM, 7 секций), `spec.py:generate_openapi_docs`/`generate_asyncapi_docs` (stdlib parse + skeleton + LLM enrichment). `jobs.py` (async 202+poll worker, принимает `entity_type`). `_common.py` (общий `_StandardLLM`, `_index_in_background`). Настраиваемые параметры: `RLM_MIN_CHARS=20000`, `CODEBASE_BLOB_MAX_CHARS=200000`, `PER_FILE_MAX_CHARS=8000`. Ремонт Mermaid через `run_repair_loop`. `_persist_artifact` — запись `generated_docs` + `pages`.
 
-### `artifact_docgen.py` — диспетчер генерации
-`generate_artifact_documentation()` маршрутизирует по типу:
-- **codebase** → 7 секций через RLM/LLM.
-- **spec + openapi/asyncapi** → stdlib-рендер + LLM-обогащение.
-- **links** → индексация.
-- **documentation (+testcase), guides** → LLM-обогащение.
-
-Настраиваемые параметры: `RLM_MIN_CHARS=20000`, `CODEBASE_BLOB_MAX_CHARS=200000`, `PER_FILE_MAX_CHARS=8000`, `RLM_SECTION_TIMEOUT=1200`, `RLM_MAX_FAILURES=1`. `_StandardLLM` — обёртка. `_generate_section_text` (RLM→LLM fallback, общий `rlm_state`). `_build_codebase_blob`, `_build_file_analysis`, `_parse_spec`, `_render_openapi_skeleton/_render_asyncapi_skeleton`. Ремонт Mermaid через `run_repair_loop`. `_index_in_background` в датасет cognee `prod_{product_id}`. `_persist_artifact` — запись `generated_docs` + `pages`.
-
-### `expert_agent.py` — экспертный агент
-Продукто-скоупный агент. `run_expert_chat` (stream/collect), `run_expert_doc`. `_ExpertLLM` (реплика `_StandardLLM` + async `stream()`). `_retrieve_product_knowledge` (cognee recall top_k=20 → fallback конкатенация доков артефактов). `_build_prompt` добавляет `conversation_history` + блоки `product_knowledge`. Маршрутизация RLM (`_resolve_use_rlm`, `RLM_MIN_CHARS=20000`, `RLM_EXPERT_TIMEOUT=1200`). Загружает `EXPERT_SYSTEM_PROMPT/EXPERT_DOC_PROMPT` из `refs/prompts`. `_chunk_text` для стримингового fallback.
+### `expert/` — пакет экспертного агента
+Продукто-скоупный агент. `chat.py:run_expert_chat` (stream/collect), `generate.py:run_expert_doc`. `_ExpertLLM` (реплика `_StandardLLM` + async `stream()`). `_retrieve_product_knowledge` (cognee recall top_k=20 → fallback конкатенация доков сущностей). `_build_prompt` добавляет `conversation_history` + блоки `product_knowledge`. Маршрутизация RLM (`_resolve_use_rlm`, `RLM_MIN_CHARS=20000`). Загружает `EXPERT_SYSTEM_PROMPT/EXPERT_DOC_PROMPT` из `refs/prompts`.
 
 ### `prompts.py` — реестр + загрузчик промптов
-`WIKI_SECTIONS`, `get_section_title`, `LANGUAGE_INSTRUCTION`, `DETAIL_LEVEL_*`, `wrap_prompt`, `load_prompt_file`, `PROMPT_FILES` (dict filename→attr), `reload_prompt_file` (hot-reload через `importlib.reload` для `expert_agent`), `SECTION_PROMPTS`-реестр. `RAG_TEMPLATE` — inline.
+`WIKI_SECTIONS`, `get_section_title`, `load_prompt_file`, `PROMPT_FILES` (dict filename→attr), `reload_prompt_file` (hot-reload). `load_prompt_file()` применяет `_wrap_prompt(content, language)` после загрузки. `SECTION_PROMPTS`-реестр. `RAG_TEMPLATE` — inline.
 
 ### `schemas.py` — общие Pydantic-схемы
-`Product`, `Artifact`, `UserBase/Create/Out`, `LoginRequest`, `SetupStatus/Request`, `ChangePasswordRequest`, `ResetPasswordRequest`, `UserCreateAdmin/Result`, `KnowledgeNode(+Create/Update)`, `ApiTokenCreate/Out`, `SettingOut/Update`.
+`Product`, `Codebase`, `Spec`, `Links`, `UserBase/Create/Out`, `LoginRequest`, `SetupStatus/Request`, `ChangePasswordRequest`, `ResetPasswordRequest`, `UserCreateAdmin/Result`, `KnowledgeNode(+Create/Update)`, `ApiTokenCreate/Out`, `SettingOut/Update`.
 
 ### Прочие модули
-- `openai_client.py` — кастомный OpenAI-совместимый клиент для локальных LLM-серверов (llama.cpp, vLLM и т.д.).
-- `ollama_patch.py` — интеграция Ollama, проверки существования моделей, патчи обработки документов.
-- `tools/embedder.py` — фабрика `get_embedder()`, создающая `adal.Embedder` по конфигурации провайдера.
+- `clients/openai_client.py` — кастомный OpenAI-совместимый клиент для локальных LLM-серверов (llama.cpp, vLLM и т.д.). Один клиент (без `OllamaClient`).
+- `tools/embedder.py` — фабрика `get_embedder()` (без параметров), создающая `adal.Embedder`.
+- `utils/logging.py` — логирование только в консоль (`LOG_FORMAT` env: `logfmt`/`json`; без файловых хендлеров).
+- `utils/llm_helpers.py` — `cap(text, limit)` char-based хелпер.
 
 ---
 
@@ -281,7 +278,8 @@ Fernet-шифрование key/value поверх `SettingORM`. `bootstrap_secr
 - `GET /api/integrations` — список коннекторов.
 - `POST {name}/test` (admin) — проверка.
 - `GET {name}/spaces` — список пространств.
-- `POST /api/products/{id}/artifacts/from-integration` — pull → артефакт или узел + индексация в cognee.
+- `POST /api/products/{id}/codebases/from-integration` — git pull → `CodebaseORM` + индексация в cognee.
+- `POST /api/products/{id}/knowledge/from-integration` — non-git pull → узел знаний + индексация в cognee.
 
 ---
 
@@ -373,8 +371,7 @@ JSON-файлы поддерживают `${ENV_VAR}`-плейсхолдеры, 
 
 ```mermaid
 flowchart TD
-  G([POST /generate]) --> Disp{Тип артефакта?}
-  Disp -->|codebase| CB[download_repo<br/>git clone --depth=1]
+  G([POST /codebases/.../generate]) --> CB[download_repo<br/>git clone --depth=1]
   CB --> Read[read_all_documents<br/>фильтры + tiktoken]
   Read --> Blob[_build_codebase_blob<br/>max 200k символов]
   Blob --> Len{≥20k символов?}
@@ -384,11 +381,9 @@ flowchart TD
   LLM --> Repair
   Repair --> Pers[_persist_artifact<br/>generated_docs + pages]
   Pers --> Idx[_index_in_background<br/>cognee prod_id]
-  Disp -->|spec| Spec[_parse_spec + skeleton + LLM]
-  Disp -->|links| Links[индексация]
-  Spec --> Pers
-  Links --> Idx
 ```
+
+Генерация per-type (без полиморфной диспетчеризации): `codebases/{id}/generate` вызывает `generate_codebase_docs` (RLM/LLM путь выше); `specs/{id}/generate` вызывает `generate_openapi_docs`/`generate_asyncapi_docs` (stdlib parse + skeleton + LLM enrichment). Links не генерируются. Оба сохраняют `generated_docs` + `pages` и индексируют в cognee.
 
 7 секций генерируются последовательно, каждая строится на основе предыдущих (`create_wiki_section_context`):
 1. **Общая информация** (Overview) — название, стек, возможности, требования, структура.
@@ -412,10 +407,10 @@ flowchart TD
 - `_validate_and_filter_embeddings` — отбрасывает неконсистентные размеры.
 - `top_k=20`, `text_splitter`: chunk_size=350, overlap=100, split_by=word.
 
-### cognee (api/cognee_manager.py)
+### cognee (api/cognee/)
 - Граф знаний Postgres + pgvector.
 - cognee нацелена на **локальный Ollama** для LLM (`cognify` — извлечение сущностей) и эмбеддингов — без облачного ключа.
-- Валидатор cognee требует полные группы `{LLM_MODEL, LLM_ENDPOINT, LLM_API_KEY}` и `{EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, HUGGINGFACE_TOKENIZER}` — `cognee_manager.py` выставляет их все через `setdefault`.
+- Валидатор cognee требует полные группы `{LLM_MODEL, LLM_ENDPOINT, LLM_API_KEY}` и `{EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, HUGGINGFACE_TOKENIZER}` — `api/cognee/_runtime.py` выставляет их все через `setdefault`.
 - `init_cognee()` неблокирующая (откат к SQLite/LanceDB если Postgres недоступен).
 - Датасет продукта: `prod_{product_id}`.
 - `apply_cognee_runtime_config()` — проталкивает админ-настройки в runtime-синглтоны cognee + чистит `create_embedding_engine` lru_cache.
@@ -424,13 +419,12 @@ flowchart TD
 
 ## 14. Рекурсивные языковые модели (RLM)
 
-`rlm_runner.py` оборачивает **fast-rlm** (Deno + Pyodide). REPL RLM изолирован от хост-Python: кодовая база передаётся как длинная контекстная строка; хост FastAPI/cognee НЕ доступны внутри REPL.
+`rlm/runner.py` оборачивает **fast-rlm** (Deno + Pyodide). REPL RLM изолирован от хост-Python: кодовая база передаётся как длинная контекстная строка; хост FastAPI/cognee НЕ доступны внутри REPL.
 
 - **Используется только для длинного контекста** (генерация доков по большим кодовым базам, Deep Research).
-- Простой чат/Ask используют стандартный `OllamaClient` adalflow.
+- Простой чат/Ask используют стандартный LLM-клиент.
 - Откат к стандартному LLM если RLM недоступен или контекст мал (<20k символов).
-- `run_rlm_task_sync(query, model_name)`: резолвит админ-конфиг `models.docgen`, `RLM_API_TIMEOUT_MS` (по умолчанию 1800000мс = 30 мин), `config.max_depth=2`, `max_calls_per_subagent=10`.
-- Коэрсит теги Ollama: `qwen3.5:35b-a3b`, `qwen3:8b`.
+- `run_rlm_task_sync(query, model_name)`: резолвит админ-конфиг `models.docgen` (единый путь: admin config → `LOCAL_OPENAI_BASE_URL` → default), `RLM_API_TIMEOUT_MS` (по умолчанию 1800000мс = 30 мин), `config.max_depth=2`, `max_calls_per_subagent=10`.
 - `prewarm_rlm_background()` — daemon-поток при загрузке для ускорения первого запроса.
 
 ---
@@ -455,7 +449,7 @@ flowchart TD
 ## 16. Валидация данных
 
 ### Pydantic-схемы (api/schemas.py)
-Все REST-запросы/ответы валидируются через Pydantic: `Product`, `Artifact`, `User*`, `LoginRequest`, `SetupStatus/Request`, `ChangePasswordRequest`, `ResetPasswordRequest`, `KnowledgeNode(+Create/Update)`, `ApiTokenCreate/Out`, `SettingOut/Update`.
+Все REST-запросы/ответы валидируются через Pydantic: `Product`, `Codebase`, `Spec`, `Links`, `User*`, `LoginRequest`, `SetupStatus/Request`, `ChangePasswordRequest`, `ResetPasswordRequest`, `KnowledgeNode(+Create/Update)`, `ApiTokenCreate/Out`, `SettingOut/Update`.
 
 ### Валидация эмбеддингов (rag.py)
 `_validate_and_filter_embeddings` отбрасывает векторы неконсистентной размерности перед построением FAISS-индекса.
@@ -464,7 +458,7 @@ flowchart TD
 `_validate_parent_move` — проверка на циклы при перемещении узла (нельзя сделать узел потомком самого себя).
 
 ### Валидация типов артефактов (models.py)
-`LEGACY_ARTIFACT_TYPE_MAP` + `_run_one_shot_migration()` нормализуют legacy-типы. `ARTIFACT_TYPES`-кортеж ограничивает допустимые типы.
+Типизированные ORM-модели (`CodebaseORM`, `SpecORM`, `LinksORM`) ограничивают формы сущностей. `kind` на `SpecORM` принимает только `openapi|asyncapi`.
 
 ### Валидация аутентификации
 - `get_current_user` — верификация JWT, проверка `exp`.
@@ -489,8 +483,8 @@ flowchart TD
 - `page.tsx` — дашборд продуктов: bento-сетка, инлайн-создание, удаление, empty-state.
 - `login/`, `reset-password/` — страницы аутентификации.
 - `admin/` — админ-панель (модели, git, confluence, интеграции, пользователи, токены, промпты, SSL).
-- `products/[productId]/page.tsx` — детали продукта: хедер + бейдж типа, bento артефактов, форма добавления по типу, генерация per-artifact, экспертный агент, дерево знаний.
-- `products/[productId]/artifacts/[artifactId]/page.tsx` — просмотр доков артефакта: дерево навигации из `artifact.pages`, рендер Markdown + Mermaid, scoped Ask.
+- `products/[productId]/page.tsx` — детали продукта: хедер + summary, карточки codebase (repo_url + generate), sidebar спецификаций (бейдж kind), спойлер links, экспертный агент, дерево знаний.
+- `products/[productId]/artifacts/[artifactId]/page.tsx` — универсальный вьюер доков сущностей (codebase/spec/links, диспетчер через `findEntity`): дерево навигации из `codebase.pages`, контент spec/links, рендер Markdown + Mermaid, scoped Ask, редактирование.
 - `products/[productId]/knowledge/[nodeId]/page.tsx` — просмотр/редактирование узла знаний.
 - `api/` — Next.js route handlers (прокси к бэкенду для auth, chat, models, wiki).
 
@@ -505,7 +499,7 @@ flowchart TD
 - `SpecViewer.tsx`, `LinksViewer.tsx`, `MarkdownEditor.tsx`, `VerifiedBadge.tsx`, `AppHeader.tsx`, `Brand.tsx`, `UserMenu.tsx`, `LanguageToggle.tsx`, `AuthGuard.tsx`, `theme-toggle.tsx`, `notifications/*`.
 
 ### `lib/types.ts`
-Shared TypeScript-типы, зеркалящие Pydantic-схемы бэкенда (`Product`, `Artifact`, `KnowledgeNode`, `User`, `ApiToken`, `SettingOut`). Хелперы: `parseLinksContent`/`serializeLinksContent` (мульти-форматный парсинг links), `normalizePages` (3 формы `pages`: dict/массив/wrapper), `artifactToRepoInfo`, `slugify`, `buildKnowledgeTree`, `generateId`, `artifactTypeMeta`/`artifactTypeIcon`. Константы: `ARTIFACT_TYPE_META`, `LEGACY_ARTIFACT_TYPE_META`.
+Shared TypeScript-типы, зеркалящие Pydantic-схемы бэкенда (`Product`, `Codebase`, `Spec`, `Links`, `KnowledgeNode`, `User`, `ApiToken`, `SettingOut`). Хелперы: `parseLinksContent`/`serializeLinksContent` (мульти-форматный парсинг links), `normalizePages` (3 формы `pages`: dict/массив/wrapper), `artifactToRepoInfo`, `slugify`, `buildKnowledgeTree`, `generateId`.
 
 ### `contexts/`
 - `AuthContext.tsx` — состояние аутентификации (проверка cookie, login/logout).
@@ -557,9 +551,9 @@ docker run -p 8001:8001 -p 3000:3000 \
 - `LOCAL_OPENAI_BASE_URL` / `LOCAL_OPENAI_API_KEY` (fallback `not-needed`).
 
 ### Эмбеддер
-- `DEEPWIKI_EMBEDDER_TYPE` (`ollama` по умолчанию).
+Единый OpenAI-совместимый путь — `get_embedder()` (без параметров) создаёт `adal.Embedder`.
 
-### Postgres (продукты/артефакты + cognee)
+### Postgres (продукты/codebases/specs/links + cognee)
 - `DB_PROVIDER`, `DB_HOST` (по умолчанию `localhost`; `postgres` в Docker), `DB_PORT`, `DB_NAME` (`cognee_db`), `DB_USERNAME`, `DB_PASSWORD`; `VECTOR_DB_PROVIDER=pgvector`.
 
 ### cognee LLM (локальный Ollama)
@@ -591,7 +585,7 @@ docker run -p 8001:8001 -p 3000:3000 \
 - `SSL_*`-переменные (обрабатываются `apply_ssl_env()`).
 
 ### Логирование
-- `LOG_LEVEL` (по умолчанию `INFO`), `LOG_FILE_PATH` (по умолчанию `api/logs/application.log`).
+- `LOG_LEVEL` (по умолчанию `INFO`), `LOG_FORMAT` (`logfmt` по умолчанию, опция `json` — только в консоль, без файловых хендлеров).
 
 ### Управление доступом cognee
 - `ENABLE_BACKEND_ACCESS_CONTROL` (по умолчанию `false`).
@@ -632,7 +626,7 @@ bun run build      # проверка сборки
 JSON-файлы в `api/config/` поддерживают `${ENV_VAR}`-плейсхолдеры, резолвятся при загрузке через `replace_env_placeholders()`. Кастомная директория через `DEEPWIKI_CONFIG_DIR`.
 
 ### Система провайдеров
-Два LLM-провайдера в `generator.json`: `ollama` (через adalflow `OllamaClient`) и `openai_local` (через кастомный `OpenAIClient`). Оба поддерживают кастомные модели. Эмбеддер отдельно через `DEEPWIKI_EMBEDDER_TYPE`.
+Единый OpenAI-совместимый путь. Каждый локальный сервер (Ollama, LM Studio, llama.cpp, vLLM) экспонирует `/v1` API, поэтому один клиент (`OpenAIClient`) покрывает все. `api/config/generator.json` перечисляет модели; параметр `provider` не пробрасывается через стек. Эмбеддер через `get_embedder()` (без параметров).
 
 ### Внешние промпты
 Все тела промптов вынесены в `refs/prompts/*.md`. Подстановка через `str.replace` (НЕ `.format`), чтобы Mermaid/JSON-скобки оставались неэкранированными. Hot-reload через `reload_prompt_file()` (`importlib.reload`).

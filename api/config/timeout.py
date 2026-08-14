@@ -283,7 +283,7 @@ def _resolve_with_key(key: str) -> float:
 
     # 1. Admin settings store (import-safe, DB-down-safe).
     try:
-        from api.settings_store import get_setting
+        from api.config.settings import get_setting
 
         store_val = get_setting(setting_key)
     except Exception as e:  # pragma: no cover - settings store is import-safe
@@ -449,7 +449,7 @@ def resolve_provider_test_timeout() -> float:
 def sync_timeout_env() -> None:
     """Export admin-store timeout overrides to their canonical env vars.
 
-    Called from :func:`api.config_abstraction.sync_runtime_settings` at startup
+    Called from :func:`api.config.abstraction.sync_runtime_settings` at startup
     and after every admin save. This makes module-level / subprocess readers
     (e.g. fast-rlm's Pyodide REPL, which reads ``RLM_API_TIMEOUT_MS`` from the
     process environment and cannot reach host Python) see admin-set values
@@ -460,7 +460,7 @@ def sync_timeout_env() -> None:
     """
     for spec in TIMEOUT_KEYS:
         try:
-            from api.settings_store import get_setting
+            from api.config.settings import get_setting
 
             store_val = get_setting(f"timeouts.{spec.key}")
         except Exception as e:  # pragma: no cover - settings store is import-safe

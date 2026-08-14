@@ -165,17 +165,22 @@ Proxy pattern: the frontend does NOT call the backend directly from the browser 
 
 SQLAlchemy 2.0 ORM models in `api/models.py`. Shared Postgres+pgvector DB, shared with cognee. String PKs (`prod_…`/`art_…`/`user_…`/`node_…`/`tok_…`) keep frontend compatibility.
 
-### ProductORM (table `products`)
-`id, name, description, summary (AI-generated), owner_id (FK users.id), artifacts[], created_at, updated_at`.
+No polymorphic artifact entity — three separate typed ORM models + tables:
 
-### ArtifactORM (table `artifacts`)
-`id, product_id (FK, cascade delete), name, type, kind, repo_url, repo_type, token, content, allure_url, generated_docs, pages (JSON), verified, verified_by, verified_at, source, created_at, updated_at`.
-- `type` — enum: `codebase | spec | links | documentation | guides` (the last two are legacy).
-- `kind` — subtype for spec: `openapi | asyncapi`.
-- `LEGACY_ARTIFACT_TYPE_MAP` normalizes legacy types: `openapi → (spec, openapi)`, `asyncapi → (spec, asyncapi)`, `testcase → (documentation, testcase)`.
+### ProductORM (table `products`)
+`id, name, summary (AI-generated), owner_id (FK users.id), created_at, updated_at`. Owns `codebases`, `specs`, `links` relationships (each `cascade="all, delete-orphan"`).
+
+### CodebaseORM (table `codebases`)
+`id, product_id (FK CASCADE), name, repo_url, repo_type, token, generated_docs (Text), pages (JSON tree), verified, verified_by, verified_at, source, created_at, updated_at`. The complex entity — repo cloning, page tree, generated docs.
+
+### SpecORM (table `specs`)
+`id, product_id (FK CASCADE), name, kind (openapi|asyncapi), content (Text — yaml/json), verified/verified_by/verified_at, source, created_at, updated_at`.
+
+### LinksORM (table `links`)
+`id, product_id (FK CASCADE), name, content (Text — JSON array of {url, description}), verified/verified_by/verified_at, source, created_at, updated_at`.
 
 ### KnowledgeNodeORM (table `knowledge_nodes`)
-`id, product_id (FK), parent_id, title, slug, content_md, node_type (page|folder|branch), artifact_id, source, verified, verified_by, verified_at, created_by, created_at, updated_at`. Self-referential tree via `parent_id`, `ON DELETE CASCADE`.
+`id, product_id (FK), parent_id, title, slug, content_md, node_type (page|folder|branch), artifact_id (plain nullable String, no FK), source, verified, verified_by, verified_at, created_by, created_at, updated_at`. Self-referential tree via `parent_id`, `ON DELETE CASCADE`.
 
 ### UserORM (table `productarium_users`)
 `id, username, email, password_hash, role (admin|user), provider, must_change_password, created_at`.
@@ -187,7 +192,7 @@ SQLAlchemy 2.0 ORM models in `api/models.py`. Shared Postgres+pgvector DB, share
 `id, user_id (FK), name, token_hash (sha256), created_at, last_used_at`.
 
 ### db.py
-`create_engine` with `pool_pre_ping`, `future=True`; `SessionLocal` + `get_db()` (FastAPI dependency); `init_db()` — `Base.metadata.create_all`, idempotent, non-fatal on error; `_run_one_shot_migration()` — additive `ALTER` statements + legacy type mapping.
+`create_engine` with `pool_pre_ping`, `future=True`; `SessionLocal` + `get_db()` (FastAPI dependency); `init_db()` — `Base.metadata.create_all`, idempotent, non-fatal on error (no migrations).
 
 ---
 
@@ -197,18 +202,18 @@ SQLAlchemy 2.0 ORM models in `api/models.py`. Shared Postgres+pgvector DB, share
 Loads `.env`, calls `bootstrap_secret_key()`, `apply_ssl_env()`, `setup_logging()`, `watchfiles` monkey-patch (dev), `uvicorn.run` on `PORT` (default 8001), reload if `NODE_ENV != production`.
 
 ### `api.py` — main FastAPI app
-REST endpoints (legacy wiki + Product/Artifact CRUD + generate + RLM run + expert agent), Pydantic models, wiki cache management, model config. `startup_event()` calls `init_db()` then `init_cognee()`. Includes all routers via `include_all_routers(app)`.
+Connects all routers via `include_all_routers(app)`. `startup_event()` calls `init_db()` then `init_cognee()`. Both non-fatal.
 
-### `config.py` — central configuration
-Loads JSON from `api/config/` with `${ENV_VAR}` placeholder replacement (`replace_env_placeholders`). Providers: `ollama` (`OllamaClient`), `openai_local` (`OpenAIClient`). Globals: `OLLAMA_HOST`, `LOCAL_OPENAI_BASE_URL`, `EMBEDDER_TYPE`. Functions: `get_model_config`, `get_embedder_config`, `is_ollama_embedder`, `get_embedder_type`, `fetch_ollama_models`, `fetch_openai_local_models`, `get_available_models`. `DEFAULT_EXCLUDED_DIRS/FILES` for repo reading. The `configs` dict aggregates generator/embedder/repo/lang.
+### `config/` — central configuration package
+`__init__.py` loads JSON from `api/config/` with `${ENV_VAR}` placeholder replacement (`replace_env_placeholders`). Single OpenAI-compatible path — one client (`OpenAIClient`) covers every local server (Ollama, LM Studio, llama.cpp, vLLM). Globals: `OLLAMA_HOST`, `LOCAL_OPENAI_BASE_URL`. `settings.py` (encrypted key/value store), `timeout.py` (per-key timeout overrides), `ssl.py` (TLS patch for corporate gateways). Functions: `get_model_config`, `get_embedder_config`, `fetch_ollama_models`, `fetch_openai_local_models`, `get_available_models`. The `configs` dict aggregates generator/embedder/repo/lang.
 
-### `cognee_manager.py` — cognee integration
-Points cognee at **local Ollama** (LLM via `/v1`, embeddings via `/api/embed`, `LLM_API_KEY=not-needed`) so `cognify()` works with no cloud key. Model-name normalization for litellm (`_normalize_model_for_litellm` → `ollama/` or `openai/` prefix). Functions: `init_cognee()` (non-fatal), `apply_cognee_runtime_config()` (pushes admin models.cognee/embedder settings into cognee runtime singletons + clears the `create_embedding_engine` lru_cache), `add_and_index_document`, `query_cognee`, `_reconcile_stale_cognee_data`.
+### `cognee/` — cognee integration
+`_runtime.py` points cognee at **local Ollama** (LLM via `/v1`, embeddings via `/api/embed`, `LLM_API_KEY=not-needed`) so `cognify()` works with no cloud key. Model-name normalization for litellm. Functions: `init_cognee()` (non-fatal), `apply_cognee_runtime_config()`, `add_and_index_document`, `query_cognee`, `reindex_product_knowledge_graph`.
 
-### `rlm_runner.py` — fast-rlm wrapper
-fast-rlm (Deno + Pyodide, isolated REPL). `run_rlm_task_sync(query, model_name)` resolves the admin `models.docgen` config, applies `RLM_MODEL_BASE_URL/API_KEY/RLM_API_TIMEOUT_MS` (default 1800000ms), `config.max_depth=2`, `max_calls_per_subagent=10`. Coerces Ollama tags (`qwen3.5:35b-a3b`, `qwen3:8b`). `run_rlm_task` — async wrapper via `asyncio.to_thread`. `prewarm_rlm_background()` — daemon thread at boot.
+### `rlm/runner.py` — fast-rlm wrapper
+fast-rlm (Deno + Pyodide, isolated REPL). `run_rlm_task_sync(query, model_name)` resolves the admin `models.docgen` config (single path: admin config → `LOCAL_OPENAI_BASE_URL` → default), `config.max_depth=2`, `max_calls_per_subagent=10`. `run_rlm_task` — async wrapper via `asyncio.to_thread`. `prewarm_rlm_background()` — daemon thread at boot.
 
-### `settings_store.py` — encrypted store
+### `config/settings.py` — encrypted store
 Fernet-encrypted key/value over `SettingORM`. `bootstrap_secret_key()` persists the key to `~/.adalflow/.settings_secret_key`. Functions: `get_setting/set_setting/get_secret/delete_setting/list_settings`. Grouped getters: `get_model_for_task(task)` (docgen/expert/summary/cognee/embedder), `get_git_creds`, `get_confluence_creds`, `get_integration_config`. `get_rlm_mode(task)` returns `auto/rlm/llm` (forces `llm` if fast-rlm unavailable). `_sanitize_api_key` strips the `Bearer ` prefix and whitespace.
 
 ### `data_pipeline.py` — repository processing
@@ -220,31 +225,23 @@ Fernet-encrypted key/value over `SettingORM`. `bootstrap_secret_key()` persists 
 ### `rag.py` — RAG over FAISS
 Custom `Memory`/`CustomConversation`/`DialogTurn` classes (workaround for an adalflow list-index bug). `RAGAnswer` dataclass (`rationale`, `answer`). `RAG` class: `prepare_retriever`, `_validate_and_filter_embeddings` (consistent embedding sizes), `call()`. Uses `RAG_TEMPLATE` (Jinja) + `RAG_SYSTEM_PROMPT`.
 
-### `wiki_generator.py` — wiki generator
-`WikiGenerator` class; `SECTION_ORDER` (`overview, architecture, functional, technical, cicd, lld, datamodel`), `SECTION_NAMES` (Russian). `_format_prompt` uses `str.replace` (NOT `.format` — preserves Mermaid/JSON braces). `generate_all_sections` with `section_callback`. `create_wiki_section_context` builds `WikiSectionContext`. Prompt bodies are external — in `refs/prompts/*.md`.
+### `docgen/` — documentation generation package
+No dispatcher — each generate endpoint calls its generator directly. `codebase.py:generate_codebase_docs` (RLM for long-context ≥20k chars else standard LLM, 7 sections from refs). `spec.py:generate_openapi_docs`/`generate_asyncapi_docs` (stdlib parse + skeleton + LLM enrichment). `jobs.py` (async 202+poll worker, takes `entity_type`). `_common.py` (shared `_StandardLLM`, `_index_in_background`). Tunables: `RLM_MIN_CHARS=20000`, `CODEBASE_BLOB_MAX_CHARS=200000`, `PER_FILE_MAX_CHARS=8000`. Mermaid repair via `run_repair_loop`. `_persist_artifact` writes `generated_docs` + `pages`.
 
-### `artifact_docgen.py` — generation dispatcher
-`generate_artifact_documentation()` routes by type:
-- **codebase** → 7 sections via RLM/LLM.
-- **spec + openapi/asyncapi** → stdlib render + LLM enrichment.
-- **links** → indexing.
-- **documentation (+testcase), guides** → LLM enrichment.
-
-Tunables: `RLM_MIN_CHARS=20000`, `CODEBASE_BLOB_MAX_CHARS=200000`, `PER_FILE_MAX_CHARS=8000`, `RLM_SECTION_TIMEOUT=1200`, `RLM_MAX_FAILURES=1`. `_StandardLLM` wrapper. `_generate_section_text` (RLM→LLM fallback, shared `rlm_state`). `_build_codebase_blob`, `_build_file_analysis`, `_parse_spec`, `_render_openapi_skeleton/_render_asyncapi_skeleton`. Mermaid repair via `run_repair_loop`. `_index_in_background` into cognee dataset `prod_{product_id}`. `_persist_artifact` writes `generated_docs` + `pages`.
-
-### `expert_agent.py` — expert agent
-Product-scoped agent. `run_expert_chat` (stream/collect), `run_expert_doc`. `_ExpertLLM` (replicates `_StandardLLM` + async `stream()`). `_retrieve_product_knowledge` (cognee recall top_k=20 → fallback concatenate artifact docs). `_build_prompt` appends `conversation_history` + `product_knowledge` blocks. RLM routing (`_resolve_use_rlm`, `RLM_MIN_CHARS=20000`, `RLM_EXPERT_TIMEOUT=1200`). Loads `EXPERT_SYSTEM_PROMPT/EXPERT_DOC_PROMPT` from `refs/prompts`. `_chunk_text` for streamed fallback.
+### `expert/` — expert agent package
+Product-scoped agent. `chat.py:run_expert_chat` (stream/collect), `generate.py:run_expert_doc`. `_ExpertLLM` (replicates `_StandardLLM` + async `stream()`). `_retrieve_product_knowledge` (cognee recall top_k=20 → fallback concatenate entity docs). `_build_prompt` appends `conversation_history` + `product_knowledge` blocks. RLM routing (`_resolve_use_rlm`, `RLM_MIN_CHARS=20000`). Loads `EXPERT_SYSTEM_PROMPT/EXPERT_DOC_PROMPT` from `refs/prompts`.
 
 ### `prompts.py` — prompt registry + loader
-`WIKI_SECTIONS`, `get_section_title`, `LANGUAGE_INSTRUCTION`, `DETAIL_LEVEL_*`, `wrap_prompt`, `load_prompt_file`, `PROMPT_FILES` (filename→attr dict), `reload_prompt_file` (hot-reload via `importlib.reload` for `expert_agent`), `SECTION_PROMPTS` registry. `RAG_TEMPLATE` is inline.
+`WIKI_SECTIONS`, `get_section_title`, `load_prompt_file`, `PROMPT_FILES` (filename→attr dict), `reload_prompt_file` (hot-reload). `load_prompt_file()` applies `_wrap_prompt(content, language)` after loading. `SECTION_PROMPTS` registry. `RAG_TEMPLATE` is inline.
 
 ### `schemas.py` — shared Pydantic schemas
-`Product`, `Artifact`, `UserBase/Create/Out`, `LoginRequest`, `SetupStatus/Request`, `ChangePasswordRequest`, `ResetPasswordRequest`, `UserCreateAdmin/Result`, `KnowledgeNode(+Create/Update)`, `ApiTokenCreate/Out`, `SettingOut/Update`.
+`Product`, `Codebase`, `Spec`, `Links`, `UserBase/Create/Out`, `LoginRequest`, `SetupStatus/Request`, `ChangePasswordRequest`, `ResetPasswordRequest`, `UserCreateAdmin/Result`, `KnowledgeNode(+Create/Update)`, `ApiTokenCreate/Out`, `SettingOut/Update`.
 
 ### Other modules
-- `openai_client.py` — custom OpenAI-compatible client for local LLM servers (llama.cpp, vLLM, etc.).
-- `ollama_patch.py` — Ollama integration, model-existence checks, document-processing patches.
-- `tools/embedder.py` — `get_embedder()` factory creating `adal.Embedder` instances from provider config.
+- `clients/openai_client.py` — custom OpenAI-compatible client for local LLM servers (llama.cpp, vLLM, etc.). Single client (no `OllamaClient`).
+- `tools/embedder.py` — `get_embedder()` factory (no params) creating `adal.Embedder` instances.
+- `utils/logging.py` — console-only logging (`LOG_FORMAT` env: `logfmt`/`json`; no file handlers).
+- `utils/llm_helpers.py` — `cap(text, limit)` char-based helper.
 
 ---
 
@@ -281,7 +278,8 @@ Helpers: `build_tree`, `_validate_parent_move` (cycle check).
 - `GET /api/integrations` — list connectors.
 - `POST {name}/test` (admin) — test.
 - `GET {name}/spaces` — list spaces.
-- `POST /api/products/{id}/artifacts/from-integration` — pull → artifact or node + cognee indexing.
+- `POST /api/products/{id}/codebases/from-integration` — git pull → `CodebaseORM` + cognee indexing.
+- `POST /api/products/{id}/knowledge/from-integration` — non-git pull → knowledge node + cognee indexing.
 
 ---
 
@@ -373,8 +371,7 @@ For detailed technical specification of the codebase documentation generation, c
 
 ```mermaid
 flowchart TD
-  G([POST /generate]) --> Disp{Artifact type?}
-  Disp -->|codebase| CB[download_repo<br/>git clone --depth=1]
+  G([POST /codebases/.../generate]) --> CB[download_repo<br/>git clone --depth=1]
   CB --> Read[read_all_documents<br/>filters + tiktoken]
   Read --> Blob[_build_codebase_blob<br/>max 200k chars]
   Blob --> Len{≥20k chars?}
@@ -384,11 +381,9 @@ flowchart TD
   LLM --> Repair
   Repair --> Pers[_persist_artifact<br/>generated_docs + pages]
   Pers --> Idx[_index_in_background<br/>cognee prod_id]
-  Disp -->|spec| Spec[_parse_spec + skeleton + LLM]
-  Disp -->|links| Links[indexing]
-  Spec --> Pers
-  Links --> Idx
 ```
+
+Per-type generation (no polymorphic dispatch): `codebases/{id}/generate` runs `generate_codebase_docs` (RLM/LLM path above); `specs/{id}/generate` runs `generate_openapi_docs`/`generate_asyncapi_docs` (stdlib parse + skeleton + LLM enrichment). Links do not generate. Both persist `generated_docs` + `pages` and index into cognee.
 
 7 sections are generated sequentially, each building on the previous ones (`create_wiki_section_context`):
 1. **Overview** — name, stack, features, requirements, structure.
@@ -412,10 +407,10 @@ Generation is asynchronous: the backend returns `202 + job_id`, heavy work (git 
 - `_validate_and_filter_embeddings` — drops inconsistent dimensions.
 - `top_k=20`, `text_splitter`: chunk_size=350, overlap=100, split_by=word.
 
-### cognee (api/cognee_manager.py)
+### cognee (api/cognee/)
 - Knowledge graph Postgres + pgvector.
 - cognee is pointed at **local Ollama** for LLM (`cognify` — entity extraction) and embeddings — no cloud key.
-- cognee's validator requires the full groups `{LLM_MODEL, LLM_ENDPOINT, LLM_API_KEY}` and `{EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, HUGGINGFACE_TOKENIZER}` — `cognee_manager.py` sets them all via `setdefault`.
+- cognee's validator requires the full groups `{LLM_MODEL, LLM_ENDPOINT, LLM_API_KEY}` and `{EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, HUGGINGFACE_TOKENIZER}` — `api/cognee/_runtime.py` sets them all via `setdefault`.
 - `init_cognee()` is non-fatal (falls back to SQLite/LanceDB if Postgres is down).
 - Product dataset: `prod_{product_id}`.
 - `apply_cognee_runtime_config()` — pushes admin settings into cognee runtime singletons + clears the `create_embedding_engine` lru_cache.
@@ -424,13 +419,12 @@ Generation is asynchronous: the backend returns `202 + job_id`, heavy work (git 
 
 ## 14. Recursive Language Models (RLM)
 
-`rlm_runner.py` wraps **fast-rlm** (Deno + Pyodide). The RLM REPL is isolated from host Python: the codebase is passed as a long-context string; host FastAPI/cognee are NOT reachable inside the REPL.
+`rlm/runner.py` wraps **fast-rlm** (Deno + Pyodide). The RLM REPL is isolated from host Python: the codebase is passed as a long-context string; host FastAPI/cognee are NOT reachable inside the REPL.
 
 - **Used only for long context** (doc generation over large codebases, Deep Research).
-- Simple chat/Ask use the standard adalflow `OllamaClient`.
+- Simple chat/Ask use the standard LLM client.
 - Falls back to the standard LLM if RLM is unavailable or the context is small (<20k chars).
-- `run_rlm_task_sync(query, model_name)`: resolves the admin `models.docgen` config, `RLM_API_TIMEOUT_MS` (default 1800000ms = 30 min), `config.max_depth=2`, `max_calls_per_subagent=10`.
-- Coerces Ollama tags: `qwen3.5:35b-a3b`, `qwen3:8b`.
+- `run_rlm_task_sync(query, model_name)`: resolves the admin `models.docgen` config (single path: admin config → `LOCAL_OPENAI_BASE_URL` → default), `RLM_API_TIMEOUT_MS` (default 1800000ms = 30 min), `config.max_depth=2`, `max_calls_per_subagent=10`.
 - `prewarm_rlm_background()` — daemon thread at boot to speed up the first request.
 
 ---
@@ -455,7 +449,7 @@ Prompts: `EXPERT_SYSTEM_PROMPT`, `EXPERT_DOC_PROMPT` in `refs/prompts/expert_age
 ## 16. Data Validation
 
 ### Pydantic schemas (api/schemas.py)
-All REST requests/responses are validated through Pydantic: `Product`, `Artifact`, `User*`, `LoginRequest`, `SetupStatus/Request`, `ChangePasswordRequest`, `ResetPasswordRequest`, `KnowledgeNode(+Create/Update)`, `ApiTokenCreate/Out`, `SettingOut/Update`.
+All REST requests/responses are validated through Pydantic: `Product`, `Codebase`, `Spec`, `Links`, `User*`, `LoginRequest`, `SetupStatus/Request`, `ChangePasswordRequest`, `ResetPasswordRequest`, `KnowledgeNode(+Create/Update)`, `ApiTokenCreate/Out`, `SettingOut/Update`.
 
 ### Embedding validation (rag.py)
 `_validate_and_filter_embeddings` drops vectors of inconsistent dimensionality before building the FAISS index.
@@ -464,7 +458,7 @@ All REST requests/responses are validated through Pydantic: `Product`, `Artifact
 `_validate_parent_move` — cycle check when moving a node (a node cannot become its own descendant).
 
 ### Artifact-type validation (models.py)
-`LEGACY_ARTIFACT_TYPE_MAP` + `_run_one_shot_migration()` normalize legacy types. The `ARTIFACT_TYPES` tuple constrains allowed types.
+Typed ORM models (`CodebaseORM`, `SpecORM`, `LinksORM`) constrain entity shapes. `kind` on `SpecORM` accepts only `openapi|asyncapi`.
 
 ### Auth validation
 - `get_current_user` — JWT verification, `exp` check.
@@ -489,8 +483,8 @@ All REST requests/responses are validated through Pydantic: `Product`, `Artifact
 - `page.tsx` — products dashboard: bento grid, inline create, delete, empty-state.
 - `login/`, `reset-password/` — auth pages.
 - `admin/` — admin panel (models, git, confluence, integrations, users, tokens, prompts, SSL).
-- `products/[productId]/page.tsx` — product detail: header + type badge, artifacts bento, type-specific add-artifact form, per-artifact Generate, expert agent, knowledge tree.
-- `products/[productId]/artifacts/[artifactId]/page.tsx` — artifact docs viewer: nav tree from `artifact.pages`, Markdown + Mermaid render, scoped Ask.
+- `products/[productId]/page.tsx` — product detail: header + summary, codebase cards (repo_url + generate), spec sidebar (kind tag), links spoiler, expert agent, knowledge tree.
+- `products/[productId]/artifacts/[artifactId]/page.tsx` — generic entity docs viewer (codebase/spec/links, dispatched via `findEntity`): nav tree from `codebase.pages`, spec/links content, Markdown + Mermaid render, scoped Ask, edit.
 - `products/[productId]/knowledge/[nodeId]/page.tsx` — knowledge node view/edit.
 - `api/` — Next.js route handlers (proxied to backend for auth, chat, models, wiki).
 
@@ -505,7 +499,7 @@ All REST requests/responses are validated through Pydantic: `Product`, `Artifact
 - `SpecViewer.tsx`, `LinksViewer.tsx`, `MarkdownEditor.tsx`, `VerifiedBadge.tsx`, `AppHeader.tsx`, `Brand.tsx`, `UserMenu.tsx`, `LanguageToggle.tsx`, `AuthGuard.tsx`, `theme-toggle.tsx`, `notifications/*`.
 
 ### `lib/types.ts`
-Shared TypeScript types mirroring the backend Pydantic schemas (`Product`, `Artifact`, `KnowledgeNode`, `User`, `ApiToken`, `SettingOut`). Helpers: `parseLinksContent`/`serializeLinksContent` (multi-format links parsing), `normalizePages` (3 `pages` shapes: dict/array/wrapper), `artifactToRepoInfo`, `slugify`, `buildKnowledgeTree`, `generateId`, `artifactTypeMeta`/`artifactTypeIcon`. Constants: `ARTIFACT_TYPE_META`, `LEGACY_ARTIFACT_TYPE_META`.
+Shared TypeScript types mirroring the backend Pydantic schemas (`Product`, `Codebase`, `Spec`, `Links`, `KnowledgeNode`, `User`, `ApiToken`, `SettingOut`). Helpers: `parseLinksContent`/`serializeLinksContent` (multi-format links parsing), `normalizePages` (3 `pages` shapes: dict/array/wrapper), `artifactToRepoInfo`, `slugify`, `buildKnowledgeTree`, `generateId`.
 
 ### `contexts/`
 - `AuthContext.tsx` — auth state (cookie check, login/logout).
@@ -557,9 +551,9 @@ Self-signed certificates: place `.crt`/`.pem` files in a `certs/` directory and 
 - `LOCAL_OPENAI_BASE_URL` / `LOCAL_OPENAI_API_KEY` (fallback `not-needed`).
 
 ### Embedder
-- `DEEPWIKI_EMBEDDER_TYPE` (`ollama` default).
+Single OpenAI-compatible path — `get_embedder()` (no params) creates `adal.Embedder` instances.
 
-### Postgres (products/artifacts + cognee)
+### Postgres (products/codebases/specs/links + cognee)
 - `DB_PROVIDER`, `DB_HOST` (default `localhost`; `postgres` in Docker), `DB_PORT`, `DB_NAME` (`cognee_db`), `DB_USERNAME`, `DB_PASSWORD`; `VECTOR_DB_PROVIDER=pgvector`.
 
 ### cognee LLM (local Ollama)
@@ -591,7 +585,7 @@ Self-signed certificates: place `.crt`/`.pem` files in a `certs/` directory and 
 - `SSL_*` variables (handled by `apply_ssl_env()`).
 
 ### Logging
-- `LOG_LEVEL` (default `INFO`), `LOG_FILE_PATH` (default `api/logs/application.log`).
+- `LOG_LEVEL` (default `INFO`), `LOG_FORMAT` (`logfmt` default, `json` option — console-only, no file handlers).
 
 ### cognee access control
 - `ENABLE_BACKEND_ACCESS_CONTROL` (default `false`).
@@ -631,7 +625,7 @@ bun run build      # build check
 JSON files in `api/config/` support `${ENV_VAR}` placeholders, resolved at load time by `replace_env_placeholders()`. Custom directory via `DEEPWIKI_CONFIG_DIR`.
 
 ### Provider system
-Two LLM providers in `generator.json`: `ollama` (via adalflow `OllamaClient`) and `openai_local` (via the custom `OpenAIClient`). Both support custom models. The embedder is controlled separately via `DEEPWIKI_EMBEDDER_TYPE`.
+Single OpenAI-compatible path. Every local server (Ollama, LM Studio, llama.cpp, vLLM) exposes a `/v1` API, so one client (`OpenAIClient`) covers all. `api/config/generator.json` lists models; no `provider` param threaded through the stack. Embedder via `get_embedder()` (no params).
 
 ### Externalized prompts
 All prompt bodies live in `refs/prompts/*.md`. Substitution uses `str.replace` (NOT `.format`) so Mermaid/JSON braces stay unescaped. Hot-reload via `reload_prompt_file()` (`importlib.reload`).

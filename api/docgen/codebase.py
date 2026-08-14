@@ -155,7 +155,7 @@ def _resolve_codebase_chunk_budget() -> int:
     """
     max_prompt = None
     try:
-        from api.settings_store import get_model_for_task
+        from api.config.settings import get_model_for_task
         max_prompt = (get_model_for_task("docgen") or {}).get("max_prompt_tokens")
     except Exception:  # pragma: no cover - settings store import-safe
         max_prompt = None
@@ -402,7 +402,7 @@ def _resolve_use_rlm(use_rlm: Optional[bool], blob_len: int) -> bool:
     if use_rlm is False:
         return False
     try:
-        from api.settings_store import get_rlm_mode
+        from api.config.settings import get_rlm_mode
         mode = get_rlm_mode("docgen")
     except Exception:  # pragma: no cover - settings store import-safe
         mode = "auto"
@@ -434,17 +434,23 @@ async def _attempt_rlm(
     # Resolve the per-section RLM timeout at call time (admin > env > default)
     # so an admin save takes effect without a restart.
     try:
-        from api.timeout_config import resolve_rlm_section_timeout
+        from api.config.timeout import resolve_rlm_section_timeout
         rlm_section_timeout = resolve_rlm_section_timeout()
     except Exception:
         rlm_section_timeout = 1800.0
     try:
-        from api.utils import clamp_text_by_tokens
         ctx_win = _resolve_rlm_context_window() or 8192
         completion_res = max(1024, min(4096, ctx_win // 4))
         max_prompt_limit = max(1024, ctx_win - completion_res)
         safe_query_limit = max(2000, max_prompt_limit - 6000)
-        safe_query = clamp_text_by_tokens(query, safe_query_limit)
+        # Char-cap the query to the token budget (4 chars/token heuristic) so a
+        # single RLM call cannot blow max_prompt_tokens. The codebase is already
+        # split into per-call chunks upstream (_chunk_file_blocks), so this only
+        # fires for a large section prompt + chunk combination.
+        safe_query_chars = safe_query_limit * 4
+        safe_query = query if len(query) <= safe_query_chars else (
+            query[:safe_query_chars] + "\n... (контекст обрезан для RLM)"
+        )
 
         from api.rlm.runner import run_rlm_task  # lazy: fast_rlm is optional
         res = await asyncio.wait_for(
@@ -521,18 +527,19 @@ async def _generate_section_text(
 
     if llm is not None:
         try:
-            from api.utils import clamp_text_by_tokens
+            from api.utils.llm_helpers import cap as _cap_text
             ctx_win = _resolve_rlm_context_window() or 8192
             max_p_tokens = max(1024, ctx_win - 2048)
 
-            # ALWAYS attach codebase_blob when available (clamped to fit model context)
-            # so the standard LLM fallback has actual source code to generate the section from,
-            # even if RLM failed or was skipped.
+            # ALWAYS attach codebase_blob when available (capped to fit model
+            # context) so the standard LLM fallback has actual source code to
+            # generate the section from, even if RLM failed or was skipped.
             prompt = section_prompt
             if codebase_blob:
                 prompt = prompt + _CODEBASE_BLOCK_HEADER + codebase_blob
 
-            prompt = clamp_text_by_tokens(prompt, max_p_tokens)
+            # Char-cap to the token budget (4 chars/token heuristic).
+            prompt = _cap_text(prompt, max_p_tokens * 4)
             txt = _clean_llm_text(await llm.generate(prompt))
             if txt:
                 return txt
@@ -616,11 +623,12 @@ async def _reduce_section_drafts(
         return "\n\n".join(drafts)
     if len(drafts) == 1:
         return drafts[0]
-    from api.utils import clamp_text_by_tokens
+    from api.utils.llm_helpers import cap as _cap_text
     ctx_win = _resolve_rlm_context_window() or 8192
     max_p_tokens = max(1024, ctx_win - 2048)
     joined = "\n\n---\n\n".join(drafts)
-    joined = clamp_text_by_tokens(joined, max_p_tokens)
+    # Char-cap the joined drafts to the token budget (4 chars/token heuristic).
+    joined = _cap_text(joined, max_p_tokens * 4)
     reduce_prompt = (
         "Ниже представлены частичные черновики одного раздела документации,\n"
         "полученные из разных частей кодовой базы. Объедини их в один\n"
@@ -660,8 +668,8 @@ async def _agentic_file_map_summary(
         "классов и методов.\n\n"
         f"<codebase_chunk>\n{block_chunk}\n</codebase_chunk>\n\nAssistant:"
     )
-    from api.utils import clamp_text_by_tokens
-    prompt = _with_verification_guard(clamp_text_by_tokens(prompt, max_tokens))
+    from api.utils.llm_helpers import cap as _cap_text
+    prompt = _with_verification_guard(_cap_text(prompt, max_tokens * 4))
     try:
         return _clean_llm_text(await llm.generate(prompt))
     except Exception as e:
@@ -696,8 +704,8 @@ async def _agentic_bottom_up_docgen(
     if not file_summaries:
         # Fallback to direct prompt if map produced nothing
         combined_blob = "\n\n".join(chunks)
-        from api.utils import clamp_text_by_tokens
-        prompt = clamp_text_by_tokens(section_prompt + _CODEBASE_BLOCK_HEADER + combined_blob, max_p_tokens)
+        from api.utils.llm_helpers import cap as _cap_text
+        prompt = _cap_text(section_prompt + _CODEBASE_BLOCK_HEADER + combined_blob, max_p_tokens * 4)
         try:
             return _clean_llm_text(await llm.generate(prompt))
         except Exception:
@@ -753,7 +761,6 @@ def _raise_if_all_sections_unavailable(sections: Dict[str, str]) -> None:
 async def generate_codebase_docs(
     artifact: Any,
     product: Any,
-    provider: str = None,
     model: Optional[str] = None,
     language: str = "ru",
 ) -> str:
@@ -777,10 +784,8 @@ async def generate_codebase_docs(
 
     # Resolve the docgen LLM config from the admin store (models.docgen.*) so
     # codebase docgen reaches the corporate AI gateway when configured, instead
-    # of the dead env-default LM Studio :1234. Per-request provider/model
-    # overrides (when provided) win over the admin setting.
-    resolved_provider, resolved_model, resolved_base_url, resolved_api_key = _resolve_docgen_model(model)
-    provider = provider or resolved_provider
+    # of the dead env-default LM Studio :1234. Per-request model override wins.
+    resolved_model, resolved_base_url, resolved_api_key = _resolve_docgen_model(model)
     model = model or resolved_model
 
     db_manager = DatabaseManager()
@@ -811,8 +816,8 @@ async def generate_codebase_docs(
             from api.expert.knowledge import _retrieve_product_knowledge
             p_knowledge = await _retrieve_product_knowledge(pid, "architecture functional API specifications")
             if p_knowledge and p_knowledge.strip():
-                from api.utils import clamp_text_by_tokens
-                clamped_kn = clamp_text_by_tokens(p_knowledge, 4000)
+                from api.utils.llm_helpers import cap as _cap_text
+                clamped_kn = _cap_text(p_knowledge, 16000)  # ~4000 tokens
                 readme = (readme or "") + f"\n\n### Дополнительный контекст продукта (Confluence / База знаний):\n{clamped_kn}\n"
         except Exception as e:
             logger.debug("Docgen product knowledge retrieval skipped for %s: %s", pid, e)
@@ -842,13 +847,12 @@ async def generate_codebase_docs(
     # loop ourselves because RLM is async and WikiGenerator.generate_section is
     # synchronous.
     gen = WikiGenerator(
-        provider=provider,
         model=model,
         language=language,
     )
     gen.set_context(context)
 
-    llm = _safe_build_llm(provider, model, base_url=resolved_base_url, api_key=resolved_api_key)
+    llm = _safe_build_llm(model, base_url=resolved_base_url, api_key=resolved_api_key)
     rlm_model = model  # run_rlm_task resolves local Ollama tags itself
     # Shared mutable state across sections: once RLM fails RLM_MAX_FAILURES
     # times within this run, remaining sections skip RLM and go straight to
@@ -858,16 +862,16 @@ async def generate_codebase_docs(
     _resolved_ctx_window = _resolve_rlm_context_window()
     logger.info(
         "Codebase docgen: repo=%s files=%d blob_chars=%d use_rlm=%s chunks=%d "
-        "chunk_budget_tokens=%d provider=%s base_url=%s "
+        "chunk_budget_tokens=%d base_url=%s "
         "model_context_window=%s",
         repo_url, len(documents), len(codebase_blob), use_rlm, len(codebase_chunks),
-        chunk_budget, provider, (resolved_base_url or "<env default>"),
+        chunk_budget, (resolved_base_url or "<env default>"),
         _resolved_ctx_window or "unset (no clamp; relies on max_prompt_tokens)",
     )
 
     sections: Dict[str, str] = {}
     repair_llm = _make_repair_llm(
-        provider, model, llm, base_url=resolved_base_url, api_key=resolved_api_key
+        model, llm, base_url=resolved_base_url, api_key=resolved_api_key
     )
     for section_type in gen.SECTION_ORDER:
         prompt = gen._format_prompt(section_type, context)

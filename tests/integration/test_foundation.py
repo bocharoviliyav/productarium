@@ -41,7 +41,7 @@ def _reload_modules() -> dict[str, Any]:
     """Reload api.db/api.settings_store/api.auth.* after env changes."""
     import api.db as db
     importlib.reload(db)
-    import api.settings_store as ss
+    import api.config.settings as ss
     importlib.reload(ss)
     import api.auth.local as local
     importlib.reload(local)
@@ -57,7 +57,7 @@ class TestORMModels:
         # so we flush inside a session on an isolated SQLite DB to check them.
         mods = _reload_modules()
         mods["db"].init_db()
-        from api.models import UserORM, ARTIFACT_TYPES
+        from api.models import UserORM
         with mods["db"].SessionLocal() as db:
             u = UserORM(id="user_1", username="alice", role="admin")
             db.add(u)
@@ -66,10 +66,6 @@ class TestORMModels:
             assert u.provider == "local"  # default applied at flush
             assert u.password_hash is None
             assert u.provider_subject is None
-        # all five new artifact types are valid strings
-        assert len(ARTIFACT_TYPES) == 5
-        for t in ("codebase", "spec", "links", "documentation", "guides"):
-            assert t in ARTIFACT_TYPES
 
     def test_product_orm_drops_type(self):
         from api.models import ProductORM
@@ -79,18 +75,18 @@ class TestORMModels:
         assert p.summary == "hello"
         assert p.owner_id == "user_1"
 
-    def test_artifact_orm_new_fields(self):
-        from api.models import ArtifactORM
-        a = ArtifactORM(
-            id="art_1", product_id="prod_1", name="svc",
-            type="spec", kind="openapi", verified=True,
-            source="api",
-        )
-        assert a.type == "spec"
-        assert a.kind == "openapi"
-        assert a.verified is True
-        assert a.source == "api"
-        assert a.verified_at is None
+    def test_typed_artifact_orms(self):
+        # ArtifactORM was split into CodebaseORM/SpecORM/LinksORM (the legacy
+        # polymorphic ``type``/``kind`` fields are gone — kind lives on SpecORM).
+        from api.models import CodebaseORM, SpecORM, LinksORM
+        c = CodebaseORM(id="art_1", product_id="prod_1", name="svc", verified=True, source="api")
+        assert c.verified is True
+        assert c.source == "api"
+        assert c.verified_at is None
+        s = SpecORM(id="art_2", product_id="prod_1", name="spec", kind="asyncapi")
+        assert s.kind == "asyncapi"
+        l = LinksORM(id="art_3", product_id="prod_1", name="links", content="[]")
+        assert l.content == "[]"
 
     def test_knowledge_node_tree_fields(self):
         # Defaults (source='manual') apply at flush, so use a session.
@@ -111,12 +107,6 @@ class TestORMModels:
             assert n.source == "manual"  # default applied at flush
             assert n.parent_id is None
 
-    def test_legacy_artifact_type_map(self):
-        from api.models import LEGACY_ARTIFACT_TYPE_MAP
-        assert LEGACY_ARTIFACT_TYPE_MAP["openapi"] == ("spec", "openapi")
-        assert LEGACY_ARTIFACT_TYPE_MAP["asyncapi"] == ("spec", "asyncapi")
-        assert LEGACY_ARTIFACT_TYPE_MAP["testcase"] == ("documentation", "testcase")
-
 
 # --- init_db + one-shot migration -------------------------------------------
 class TestInitDbMigration:
@@ -132,28 +122,31 @@ class TestInitDbMigration:
         from sqlalchemy import inspect
         insp = inspect(mods["db"].engine)
         tables = set(insp.get_table_names())
+        # The polymorphic ``artifacts`` table was split into codebases/specs/links.
         for expected in (
-            "products", "artifacts", "productarium_users", "knowledge_nodes",
-            "settings", "api_tokens",
+            "products", "codebases", "specs", "links", "productarium_users",
+            "knowledge_nodes", "settings", "api_tokens",
         ):
             assert expected in tables, f"missing table {expected}"
 
-    def test_artifact_orm_writes_legacy_normalized(self):
-        """Legacy artifact types round-trip via ORM with kind populated."""
+    def test_typed_artifact_orm_writes_round_trip(self):
+        """CodebaseORM/SpecORM/LinksORM round-trip through the typed tables."""
         mods = _reload_modules()
         mods["db"].init_db()
-        from api.models import ArtifactORM
+        from api.models import CodebaseORM, SpecORM, LinksORM, ProductORM
         with mods["db"].SessionLocal() as db:
-            a = ArtifactORM(
-                id="art_openapi", product_id="prod_1", name="svc",
-                type="openapi", kind="openapi",
-            )
-            db.add(a)
+            db.add(ProductORM(id="prod_1", name="Acme"))
+            db.flush()
+            db.add(CodebaseORM(id="art_cb", product_id="prod_1", name="svc",
+                               generated_docs="# docs", pages={"p": {}}))
+            db.add(SpecORM(id="art_sp", product_id="prod_1", name="spec",
+                          kind="openapi", content="openapi: 3.0"))
+            db.add(LinksORM(id="art_lk", product_id="prod_1", name="links",
+                           content='[{"url":"https://x"}]'))
             db.commit()
-            row = db.get(ArtifactORM, "art_openapi")
-            assert row is not None
-            assert row.type == "openapi"  # newly written values pass through
-            assert row.kind == "openapi"
+            assert db.get(CodebaseORM, "art_cb").generated_docs == "# docs"
+            assert db.get(SpecORM, "art_sp").kind == "openapi"
+            assert db.get(LinksORM, "art_lk").content == '[{"url":"https://x"}]'
 
 
 # --- Settings store ----------------------------------------------------------
@@ -202,7 +195,9 @@ class TestSettingsStore:
         mods = _reload_modules()
         mods["db"].init_db()
         cfg = mods["settings_store"].get_model_for_task("docgen")
-        assert cfg["provider"] in ("ollama", "openai_local")
+        # provider was removed from the return dict (single OpenAI-compatible
+        # provider); model/base_url/api_key remain.
+        assert "provider" not in cfg
         assert cfg["model"]  # non-empty
         assert cfg["base_url"]  # non-empty
         assert cfg["api_key"]  # non-empty
@@ -284,15 +279,15 @@ class TestAuthTokens:
 # --- Cognee bug fix ----------------------------------------------------------
 class TestCogneeSkipConnectionTest:
     def test_skip_defaulted_to_true(self):
-        """api.cognee_manager imports and sets COGNEE_SKIP_CONNECTION_TEST=true."""
-        import api.cognee_manager as cm
+        """api.cognee sets COGNEE_SKIP_CONNECTION_TEST=true."""
+        import api.cognee as cm
         assert os.environ.get("COGNEE_SKIP_CONNECTION_TEST", "").lower() in (
             "1", "true", "t", "yes",
         )
 
     def test_cognee_module_importable(self):
-        """api.cognee_manager must import even if cognee has issues."""
-        import api.cognee_manager as cm
+        """api.cognee must import even if cognee has issues."""
+        import api.cognee as cm
         # _COGNEE_AVAILABLE is defined (True if cognee installed, False otherwise).
         assert hasattr(cm, "_COGNEE_AVAILABLE")
         assert isinstance(cm._COGNEE_AVAILABLE, bool)
@@ -300,14 +295,14 @@ class TestCogneeSkipConnectionTest:
     def test_add_and_index_document_does_not_raise(self):
         """add_and_index_document must never raise, even when DB/cognee is down."""
         import asyncio
-        import api.cognee_manager as cm
+        import api.cognee as cm
         # Should return None on missing-cognee OR log+return None on cognee error.
         result = asyncio.run(cm.add_and_index_document("text", "ds"))
         assert result is None
 
     def test_query_cognee_returns_empty_on_failure(self):
         import asyncio
-        import api.cognee_manager as cm
+        import api.cognee as cm
         out = asyncio.run(cm.query_cognee("q", "ds"))
         # Empty string on any failure (including unavailable cognee).
         assert out == ""
@@ -322,12 +317,19 @@ class TestSchemas:
         assert "summary" in fields
         assert "owner_id" in fields
 
-    def test_artifact_new_enum_and_fields(self):
-        from api.schemas import Artifact
-        fields = Artifact.model_fields
-        assert "type" in fields and "kind" in fields
-        for new_field in ("kind", "verified", "verified_by", "verified_at", "source"):
-            assert new_field in fields
+    def test_typed_artifact_schemas(self):
+        # The polymorphic Artifact schema was split into Codebase/Spec/Links.
+        from api.schemas import Codebase, Spec, Links
+        cb_fields = Codebase.model_fields
+        assert "repo_url" in cb_fields and "pages" in cb_fields
+        sp_fields = Spec.model_fields
+        assert "kind" in sp_fields and "content" in sp_fields
+        lk_fields = Links.model_fields
+        assert "content" in lk_fields
+        # Shared verified/source fields exist on every typed schema.
+        for cls in (Codebase, Spec, Links):
+            for new_field in ("verified", "verified_by", "verified_at", "source"):
+                assert new_field in cls.model_fields
 
     def test_user_out(self):
         from api.schemas import UserOut

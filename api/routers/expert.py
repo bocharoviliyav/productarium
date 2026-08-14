@@ -37,16 +37,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/products", tags=["expert"])
 
 
-def _format_sse(chunk: object) -> str:
-    """Map a stream chunk to an SSE ``data:`` frame.
+def _format_sse(event: ExpertStreamEvent) -> str:
+    """Map an expert stream event to an SSE ``data:`` frame.
 
-    ``ExpertStreamEvent`` → typed frame (``{content}`` / ``{reasoning}`` /
-    ``{status}`` / ``{error}``). Plain ``str`` → ``{"content": ...}``
-    (backward compat with old test mocks that yield bare strings).
+    Produces a typed frame (``{content}`` / ``{reasoning}`` / ``{status}`` /
+    ``{error}``) keyed by the event type.
     """
-    if isinstance(chunk, ExpertStreamEvent):
-        return f"data: {json.dumps({chunk.type: chunk.content}, ensure_ascii=False)}\n\n"
-    return f"data: {json.dumps({'content': str(chunk)}, ensure_ascii=False)}\n\n"
+    return f"data: {json.dumps({event.type: event.content}, ensure_ascii=False)}\n\n"
 
 
 class ChatMessage(BaseModel):

@@ -293,20 +293,17 @@ def _sanitize_api_key(value: Optional[str]) -> Optional[str]:
 def get_model_for_task(task: str) -> Dict[str, Optional[str]]:
     """Resolve a model config for a task (docgen/expert/summary/cognee/embedder).
 
-    Reads keys ``models.<task>.{provider,model,base_url,api_key}`` from the
-    settings store, falling back to environment variables when unset. Also reads
-    the optional ``models.<task>.max_prompt_tokens`` (int) used by fast-rlm:
+    Reads keys ``models.<task>.{model,base_url,api_key}`` from the settings
+    store, falling back to environment variables when unset. Also reads the
+    optional ``models.<task>.max_prompt_tokens`` (int) used by fast-rlm:
     ``None`` when unset (callers keep the fast-rlm default); non-numeric stored
     values are ignored (treated as unset) so a bad value never crashes callers.
 
     Every supported local server (Ollama, LM Studio, llama.cpp, vLLM, ...)
     exposes an OpenAI-compatible ``/v1`` API, so a single defaults path covers
-    all cases. The ``provider`` field is kept (resolved to the stored value or
-    ``openai_local``) for backwards compatibility with callers that still
-    thread it through, but no code branches on it anymore.
+    all cases.
     """
     p = "models.%s." % task
-    provider = get_setting(p + "provider") or os.environ.get("DEEPWIKI_DEFAULT_PROVIDER", "openai_local")
     # OpenAI-compatible defaults: LOCAL_OPENAI_BASE_URL points at the server
     # (LM Studio :1234, llama.cpp, vLLM, Ollama :11434, ...). Ollama exposes
     # the same /v1 surface, so the same defaults work for every local server.
@@ -314,7 +311,6 @@ def get_model_for_task(task: str) -> Dict[str, Optional[str]]:
     default_model = os.environ.get("LOCAL_OPENAI_MODEL") or os.environ.get("RLM_MODEL_NAME") or os.environ.get("LLM_MODEL") or "qwen/qwen3.6-27b"
     default_key = os.environ.get("LOCAL_OPENAI_API_KEY") or os.environ.get("LLM_API_KEY") or "not-needed"
     return {
-        "provider": provider,
         "model": get_setting(p + "model") or default_model,
         "base_url": get_setting(p + "base_url") or default_base,
         "api_key": _sanitize_api_key(get_secret(p + "api_key")) or default_key,

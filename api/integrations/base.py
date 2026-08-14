@@ -17,7 +17,7 @@ can be added by implementing three methods:
   binary attachments (handled via :mod:`api.formats.markitdown`).
 
 Configuration is injected via the constructor (``config`` dict). Connectors
-load their own config from :mod:`api.settings_store` through the classmethod
+load their own config from :mod:`api.config.settings` through the classmethod
 ``get_config()`` so the registry can build a configured instance and report
 whether a connector is ready to use (``is_configured()``).
 

@@ -1,15 +1,11 @@
-"""Async artifact documentation generation (202 + poll) job registry.
+"""Async documentation generation (202 + poll) job registry.
 
-Long-running artifact doc generation (git clone, file read, RLM bootstrap)
-is offloaded to a dedicated ThreadPoolExecutor. The POST returns 202 + job_id
-immediately so the Next.js proxy never holds a long connection (which caused
-ECONNRESET). Each worker thread runs its OWN event loop (the docgen pipeline
-is async) with its OWN SQLAlchemy session, so the main FastAPI event loop is
-never blocked and request-scoped sessions are not shared across threads.
-
-Extracted from the former ``api/api.py`` monolith; the job registry is a
-module-level singleton so the router can submit/poll and the worker threads
-can update job state.
+Long-running doc generation (git clone, file read, RLM bootstrap) is offloaded
+to a dedicated ThreadPoolExecutor. The POST returns 202 + job_id immediately so
+the Next.js proxy never holds a long connection (which caused ECONNRESET). Each
+worker thread runs its OWN event loop (the docgen pipeline is async) with its
+OWN SQLAlchemy session, so the main FastAPI event loop is never blocked and
+request-scoped sessions are not shared across threads.
 """
 
 from __future__ import annotations
@@ -25,7 +21,7 @@ from typing import Any, Dict, Optional
 from sqlalchemy.orm import selectinload
 
 from api.db import SessionLocal
-from api.models import ArtifactORM, ProductORM
+from api.models import ProductORM
 
 logger = logging.getLogger(__name__)
 
@@ -48,14 +44,15 @@ def _docgen_prune_old_jobs(max_age_seconds: int = 3600) -> None:
         _docgen_jobs.pop(jid, None)
 
 
-def create_job(product_id: str, artifact_id: str) -> str:
+def create_job(product_id: str, entity_type: str, entity_id: str) -> str:
     """Register a new queued job and return its id."""
     _docgen_prune_old_jobs()
     job_id = uuid.uuid4().hex
     _docgen_jobs[job_id] = {
         "job_id": job_id,
         "product_id": product_id,
-        "artifact_id": artifact_id,
+        "entity_type": entity_type,
+        "entity_id": entity_id,
         "status": "queued",
         "created_at": time.time(),
         "started_at": None,
@@ -69,22 +66,17 @@ def create_job(product_id: str, artifact_id: str) -> str:
 def submit_job(
     job_id: str,
     product_id: str,
-    artifact_id: str,
-    provider: str,
+    entity_type: str,
+    entity_id: str,
     model: Optional[str],
     language: str,
 ) -> None:
     """Submit the job to the worker thread pool."""
     _docgen_executor.submit(
         _run_docgen_job,
-        job_id,
-        product_id,
-        artifact_id,
-        provider,
-        model,
-        language,
+        job_id, product_id, entity_type, entity_id, model, language,
     )
-    logger.info("Submitted docgen job %s for artifact %s", job_id, artifact_id)
+    logger.info("Submitted docgen job %s for %s %s", job_id, entity_type, entity_id)
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -97,12 +89,12 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
 async def _run_docgen_job_async(
     job_id: str,
     product_id: str,
-    artifact_id: str,
-    provider: str,
+    entity_type: str,
+    entity_id: str,
     model: Optional[str],
     language: str,
 ) -> None:
-    """Async body of a docgen job: loads the artifact in a FRESH DB session
+    """Async body of a docgen job: loads the entity in a FRESH DB session
     (the request session is closed by now), generates docs, commits, and
     records the outcome in the job registry. Runs inside the worker thread's
     own event loop."""
@@ -115,41 +107,55 @@ async def _run_docgen_job_async(
     try:
         p_orm = (
             db.query(ProductORM)
-            .options(selectinload(ProductORM.artifacts))
+            .options(
+                selectinload(ProductORM.codebases),
+                selectinload(ProductORM.specs),
+            )
             .filter(ProductORM.id == product_id)
             .first()
         )
         if p_orm is None:
             raise ValueError("Product not found")
-        artifact = next((a for a in p_orm.artifacts if a.id == artifact_id), None)
-        if artifact is None:
-            raise ValueError("Artifact not found")
-        from api.docgen import generate_artifact_documentation
-        # generate_artifact_documentation writes generated_docs/pages onto the
-        # artifact ORM in-place; persist them in the same transaction.
-        # Pass provider/model straight through (None when unset) so
-        # _resolve_docgen_model resolves the admin-configured alias from the
-        # DB settings store instead of an env-default shadowing it.
-        docs = await generate_artifact_documentation(
-            artifact,
-            p_orm,
-            provider=provider,
-            model=model,
-            language=language or "ru",
-        )
+
+        if entity_type == "codebase":
+            entity = next((c for c in p_orm.codebases if c.id == entity_id), None)
+            if entity is None:
+                raise ValueError("Codebase not found")
+            from api.docgen.codebase import generate_codebase_docs
+            docs = await generate_codebase_docs(
+                entity, p_orm, model=model,
+                language=language or "ru",
+            )
+        elif entity_type == "spec":
+            entity = next((s for s in p_orm.specs if s.id == entity_id), None)
+            if entity is None:
+                raise ValueError("Spec not found")
+            spec_kind = (getattr(entity, "spec_kind", "") or "").lower()
+            from api.docgen.spec import generate_openapi_docs, generate_asyncapi_docs
+            if spec_kind == "asyncapi":
+                docs = await generate_asyncapi_docs(
+                    entity, p_orm, model=model,
+                    language=language or "ru",
+                )
+            else:
+                docs = await generate_openapi_docs(
+                    entity, p_orm, model=model,
+                    language=language or "ru",
+                )
+        else:
+            raise ValueError(f"Unsupported docgen entity_type: {entity_type}")
+
         db.commit()
         job["status"] = "succeeded"
         # Display is decoupled from the knowledge graph: docs are already
         # committed, so the job is a success regardless of how long cognee
         # cognify takes (it can run 20-30 min and is handed off to the main
-        # event loop, NOT gated on the worker thread). Indexing continues in
-        # the background; its own outcome surfaces via cognee logs / admin
-        # reindex, never as a docgen job failure.
+        # event loop, NOT gated on the worker thread).
         job["indexing_status"] = "succeeded"
         job["indexing_message"] = "Документы сгенерированы. Граф знаний обновляется в фоне."
         job["finished_at"] = time.time()
         job["docs_chars"] = len(docs or "")
-        logger.info("Docgen job %s succeeded for artifact %s; cognee indexing handed off to background.", job_id, artifact_id)
+        logger.info("Docgen job %s succeeded for %s %s", job_id, entity_type, entity_id)
     except Exception as e:
         try:
             db.rollback()
@@ -169,46 +175,30 @@ async def _run_docgen_job_async(
 
 
 def _resolve_indexing_drain_seconds() -> float:
-    """Best-effort ceiling for the worker-loop indexing drain.
-
-    Cognee indexing is normally handed off to the MAIN event loop (see
-    ``_index_in_background``) so it survives the worker loop teardown. This drain
-    only catches tasks that were NOT handed off (no main loop at startup, or the
-    handoff failed). It is NON-FATAL: a timeout here never marks the job as
-    failed — docs are already committed.
-
-    Resolved through the central timeout config (admin > env > default). The
-    default DERIVES from the cognee cognify timeout so a leftover cognify task
-    (one that wasn't handed off to the main loop) gets the FULL cognify budget
-    instead of being cancelled at a fixed 30s -- which previously dropped the
-    connection mid-graph-build (the user-flagged api.py-vs-cognify conflict).
-    Floor 5s so a typo can't make the drain instantaneous.
-    """
-    from api.timeout_config import resolve_docgen_indexing_drain_seconds
+    """Best-effort ceiling for the worker-loop indexing drain."""
+    from api.config.timeout import resolve_docgen_indexing_drain_seconds
     return resolve_docgen_indexing_drain_seconds()
 
 
 def _run_docgen_job(
     job_id: str,
     product_id: str,
-    artifact_id: str,
-    provider: str,
+    entity_type: str,
+    entity_id: str,
     model: Optional[str],
     language: str,
 ) -> None:
     """Worker-thread entry point: runs the async job in a brand-new event loop
     so the heavy sync work (git clone, file read, RLM) never touches the main
     loop. Cognee indexing is normally handed off to the MAIN event loop via
-    ``_index_in_background`` (so a 20-30 min cognify survives this loop closing);
-    any leftover tasks on the worker loop are drained best-effort and NON-FATAL
-    — a drain timeout never marks the job as failed because the docs are already
-    committed and display is decoupled from the knowledge graph."""
+    ``_index_in_background``; any leftover tasks on the worker loop are drained
+    best-effort and NON-FATAL — a drain timeout never marks the job as failed
+    because the docs are already committed."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    job = _docgen_jobs.get(job_id)
     try:
         loop.run_until_complete(
-            _run_docgen_job_async(job_id, product_id, artifact_id, provider, model, language)
+            _run_docgen_job_async(job_id, product_id, entity_type, entity_id, model, language)
         )
 
         async def _drain() -> None:
@@ -225,10 +215,6 @@ def _run_docgen_job(
         try:
             loop.run_until_complete(_drain())
         except asyncio.TimeoutError:
-            # Non-fatal: docs are already committed. Indexing either was handed
-            # off to the main loop (the common path) or this drain caught a
-            # leftover task that couldn't finish in time — either way the job's
-            # success / indexing_status (set in _run_docgen_job_async) stands.
             logger.warning(
                 "Docgen background drain timed out for job %s; non-fatal (docs already committed).",
                 job_id,

@@ -57,7 +57,7 @@ async def startup_event():
 
     # Bootstrap configuration abstraction layer (highest precedence to DB settings)
     try:
-        from api.config_abstraction import bootstrap_config
+        from api.config.abstraction import bootstrap_config
         bootstrap_config()
     except Exception as e:
         logger.warning("bootstrap_config failed (non-fatal): %s", e)
@@ -72,7 +72,7 @@ async def startup_event():
     # background. The task reference is kept so the GC does not drop a
     # still-running init. Non-fatal: any failure is logged inside init_cognee.
     try:
-        from api.cognee_manager import init_cognee
+        from api.cognee import init_cognee
         _cognee_init_task = asyncio.create_task(init_cognee())
         # Prevent the loop from garbage-collecting the task before it finishes.
         _cognee_init_task.add_done_callback(

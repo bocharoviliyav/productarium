@@ -45,7 +45,7 @@ class ConfluenceConnector(IntegrationConnector):
 
     @classmethod
     def get_config(cls) -> Dict[str, Any]:
-        from api.settings_store import get_confluence_creds
+        from api.config.settings import get_confluence_creds
 
         return get_confluence_creds()
 
@@ -95,6 +95,17 @@ class ConfluenceConnector(IntegrationConnector):
         server = self.config.get("mcp_server") or "confluence"
         full_source_id = source_id if ":" in source_id else f"{server}:{source_id}"
         pulled = invoke_mcp_tool(full_source_id, opts=opts)
+        # Defensive: an MCP tool result is normally a dict, but some servers
+        # return a bare string (or None). Coerce to a dict-like view so the
+        # downstream .get() calls never raise AttributeError.
+        if not isinstance(pulled, dict):
+            return {
+                "title": source_id,
+                "markdown": str(pulled) if pulled is not None else "",
+                "attachments": [],
+                "page_id": source_id,
+                "source": "confluence_mcp",
+            }
         return {
             "title": pulled.get("title") or source_id,
             "markdown": pulled.get("markdown") or str(pulled),
@@ -130,9 +141,9 @@ class ConfluenceConnector(IntegrationConnector):
         """
         import json
         import requests
-        from api.ssl_config import requests_verify
+        from api.config.ssl import requests_verify
 
-        from api.timeout_config import resolve_integration_http_timeout
+        from api.config.timeout import resolve_integration_http_timeout
         url = f"{self._base()}{path}"
         resp = requests.get(
             url, headers=self._auth_headers(), params=params, timeout=resolve_integration_http_timeout(),
@@ -158,9 +169,9 @@ class ConfluenceConnector(IntegrationConnector):
     def _get_bytes(self, url: str) -> bytes:
         """Download raw bytes (attachment download link)."""
         import requests
-        from api.ssl_config import requests_verify
+        from api.config.ssl import requests_verify
 
-        from api.timeout_config import resolve_integration_http_timeout
+        from api.config.timeout import resolve_integration_http_timeout
         resp = requests.get(
             url, headers=self._auth_headers(), timeout=resolve_integration_http_timeout(),
             verify=requests_verify(),

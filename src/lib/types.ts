@@ -2,26 +2,16 @@
  * Shared domain types and helpers for the Productarium UI.
  *
  * These mirror the public Pydantic response shapes served by the FastAPI
- * backend (api/schemas.py: Product / Artifact / KnowledgeNode / UserOut /
- * ApiTokenOut / SettingOut) so the frontend stays in lock-step with the
- * API contract (contract J) without importing server code.
+ * backend (api/schemas.py: Product / Codebase / Spec / Links / KnowledgeNode /
+ * UserOut / ApiTokenOut / SettingOut) so the frontend stays in lock-step with
+ * the API contract (contract J) without importing server code.
  */
-
-/**
- * Artifact types exposed in the UI. `documentation` and `guides` are intentionally
- * omitted here — they are now authored as knowledge-tree pages instead of
- * artifacts. The backend still accepts/returns them for legacy data; the UI
- * falls back to a neutral label/icon when it encounters an unknown type.
- */
-export type ArtifactType = "codebase" | "spec" | "links";
-
-/** Any artifact type the backend may return, including legacy ones. */
-export type ArtifactTypeAny = ArtifactType | "documentation" | "guides";
-
-/** Subtype for `spec` artifacts (openapi/asyncapi). Optional elsewhere. */
-export type ArtifactKind = "openapi" | "asyncapi" | string;
 
 export type ArtifactSource = "manual" | "generated" | "api" | "mcp";
+
+/* ------------------------------------------------------------------ */
+/* Pages (codebase wiki page tree)                                      */
+/* ------------------------------------------------------------------ */
 
 export interface ArtifactPage {
   id: string;
@@ -33,7 +23,7 @@ export interface ArtifactPage {
 }
 
 /**
- * `Artifact.pages` is typed `Optional[Dict[str, Any]]` on the backend. After
+ * `Codebase.pages` is typed `Optional[Dict[str, Any]]` on the backend. After
  * the doc-gen agent landed, the generate endpoint persists `pages` as a dict
  * keyed by page id: `{ [page_id]: WikiPage }` (WikiPage =
  * { id, title, content, filePaths, importance, relatedPages }). The viewer
@@ -47,18 +37,41 @@ export type ArtifactPages =
   | null
   | undefined;
 
-export interface Artifact {
+/* ------------------------------------------------------------------ */
+/* Codebase / Spec / Links / Product                                    */
+/* ------------------------------------------------------------------ */
+
+export interface Codebase {
   id: string;
   name: string;
-  type: ArtifactType;
-  kind?: ArtifactKind | null;
   repo_url?: string | null;
   repo_type?: string | null;
   token?: string | null;
-  content?: string | null;
-  allure_url?: string | null;
   generated_docs?: string | null;
   pages?: ArtifactPages;
+  verified?: boolean;
+  verified_by?: string | null;
+  verified_at?: string | null;
+  source?: ArtifactSource;
+}
+
+export type SpecKind = "openapi" | "asyncapi";
+
+export interface Spec {
+  id: string;
+  name: string;
+  kind: SpecKind;
+  content?: string | null;
+  verified?: boolean;
+  verified_by?: string | null;
+  verified_at?: string | null;
+  source?: ArtifactSource;
+}
+
+export interface Links {
+  id: string;
+  name: string;
+  content?: string | null; // JSON array of {url, description}
   verified?: boolean;
   verified_by?: string | null;
   verified_at?: string | null;
@@ -73,7 +86,9 @@ export interface Product {
   summary?: string | null;
   /** Owner user id (FK users.id). */
   owner_id?: string | null;
-  artifacts: Artifact[];
+  codebases: Codebase[];
+  specs: Spec[];
+  links: Links[];
 }
 
 /* ------------------------------------------------------------------ */
@@ -159,79 +174,13 @@ export type TagTone =
   | "red"
   | "neutral";
 
-export const ARTIFACT_TYPE_META: Record<
-  ArtifactType,
-  { label: string; tone: TagTone; description: string }
-> = {
-  codebase: {
-    label: "Codebase",
-    tone: "blue",
-    description: "Git repository documented from source.",
-  },
-  spec: {
-    label: "Spec",
-    tone: "green",
-    description: "API / event contract (OpenAPI or AsyncAPI).",
-  },
-  links: {
-    label: "Links",
-    tone: "yellow",
-    description: "Curated external links with descriptions.",
-  },
-};
-
-/** Phosphor icon name hint per artifact type (resolved in components). */
-export const ARTIFACT_TYPE_ICON: Record<ArtifactType, string> = {
-  codebase: "GitBranch",
-  spec: "FileText",
-  links: "LinkSimple",
-};
-
-/**
- * Neutral fallback label/tone/icon for artifact types that the UI no longer
- * creates but the backend may still return (legacy `documentation`/`guides`).
- */
-export const LEGACY_ARTIFACT_TYPE_META: {
-  label: string;
-  tone: TagTone;
-  description: string;
-  icon: string;
-} = {
-  label: "Archive",
-  tone: "neutral",
-  description: "Legacy artifact (now authored as a knowledge page).",
-  icon: "Archive",
-};
-
-/** Resolve display metadata for an arbitrary artifact type string. */
-export function artifactTypeMeta(
-  type: string,
-): { label: string; tone: TagTone; description: string } {
-  if (type in ARTIFACT_TYPE_META) {
-    return ARTIFACT_TYPE_META[type as ArtifactType];
-  }
-  return {
-    label: LEGACY_ARTIFACT_TYPE_META.label,
-    tone: LEGACY_ARTIFACT_TYPE_META.tone,
-    description: LEGACY_ARTIFACT_TYPE_META.description,
-  };
-}
-
-/** Resolve a Phosphor icon name for an arbitrary artifact type string. */
-export function artifactTypeIcon(type: string): string {
-  if (type in ARTIFACT_TYPE_ICON) {
-    return ARTIFACT_TYPE_ICON[type as ArtifactType];
-  }
-  return LEGACY_ARTIFACT_TYPE_META.icon;
-}
-
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
 /**
  * A single curated link, as authored in the UI repeater and persisted as JSON
- * in `artifact.content` (matching the backend `_render_links_index` parser).
+ * in `links.content` (matching the backend `_render_links_index` parser).
  */
 export interface LinkItem {
   url: string;
@@ -239,7 +188,7 @@ export interface LinkItem {
 }
 
 /**
- * Parse a `links` artifact's `content` into a list of link items.
+ * Parse a `links` entity's `content` into a list of link items.
  *
  * The backend accepts several shapes: a JSON array of `{url, description?,
  * title?}` objects, a `{ links: [...] }` wrapper, a single link object, or
@@ -297,12 +246,12 @@ export function serializeLinksContent(items: LinkItem[]): string {
 
 /**
  * Build a RepoInfo (consumed by the existing Ask / WebSocket chat path) from
- * an artifact's git fields. The backend RAG retriever is repo-keyed, so Q&A is
- * only meaningful for codebase artifacts that carry a repo_url. For non-git
- * artifacts this returns null and the UI shows a scoped note instead.
+ * a codebase's git fields. The backend RAG retriever is repo-keyed, so Q&A is
+ * only meaningful for codebases that carry a repo_url. Returns null otherwise
+ * and the UI shows a scoped note instead.
  */
-export function artifactToRepoInfo(
-  artifact: Artifact,
+export function codebaseToRepoInfo(
+  codebase: Codebase,
 ):
   | {
       owner: string;
@@ -313,35 +262,35 @@ export function artifactToRepoInfo(
       repoUrl: string | null;
     }
   | null {
-  if (artifact.type !== "codebase" || !artifact.repo_url) {
+  if (!codebase.repo_url) {
     return null;
   }
   let owner = "";
   let repo = "";
   try {
-    const url = new URL(artifact.repo_url);
+    const url = new URL(codebase.repo_url);
     const parts = url.pathname.split("/").filter(Boolean);
     if (parts.length >= 2) {
       owner = parts[parts.length - 2];
       repo = (parts[parts.length - 1] || "").replace(/\.git$/, "");
     }
   } catch {
-    const parts = artifact.repo_url.split("/").filter(Boolean);
+    const parts = codebase.repo_url.split("/").filter(Boolean);
     if (parts.length >= 2) {
       owner = parts[parts.length - 2];
       repo = (parts[parts.length - 1] || "").replace(/\.git$/, "");
     }
   }
   const type =
-    artifact.repo_type ||
-    (artifact.repo_url.includes("gitlab") ? "gitlab" : "github");
+    codebase.repo_type ||
+    (codebase.repo_url.includes("gitlab") ? "gitlab" : "github");
   return {
     owner,
     repo,
     type,
-    token: artifact.token ?? null,
+    token: codebase.token ?? null,
     localPath: null,
-    repoUrl: artifact.repo_url,
+    repoUrl: codebase.repo_url,
   };
 }
 
@@ -369,7 +318,7 @@ export function normalizePages(pages: ArtifactPages): ArtifactPage[] {
 }
 
 /** A short, stable id for new client-created entities before the server roundtrip. */
-export function generateId(prefix: "prod" | "art" | "node"): string {
+export function generateId(prefix: "prod" | "cb" | "spec" | "links" | "node"): string {
   const rand = Math.random().toString(36).slice(2, 8);
   return `${prefix}_${Date.now().toString(36)}${rand}`;
 }

@@ -66,7 +66,7 @@ def _setup_db():
     """
     import api.db as db
     importlib.reload(db)  # reset _db_ready + module-level engine/SessionLocal
-    import api.settings_store as ss
+    import api.config.settings as ss
     importlib.reload(ss)
 
     engine = create_engine(
@@ -145,7 +145,7 @@ class TestAdminSettings:
         resp = client.put(
             "/api/admin/models",
             json={
-                "models.expert.provider": "ollama",
+                "models.expert.model": "qwen/test-model",
                 "models.expert.base_url": "http://x:11434/v1",
                 "models.expert.api_key": "secret-xyz",
             },
@@ -154,7 +154,7 @@ class TestAdminSettings:
         body = resp.json()
         assert body["success"] is True
         assert set(body["saved"]) == {
-            "models.expert.provider",
+            "models.expert.model",
             "models.expert.base_url",
             "models.expert.api_key",
         }
@@ -164,8 +164,8 @@ class TestAdminSettings:
         assert resp.status_code == 200
         data = resp.json()
         settings = data["settings"]
-        assert settings["models.expert.provider"] == {
-            "value": "ollama", "encrypted": False, "hasKey": True,
+        assert settings["models.expert.model"] == {
+            "value": "qwen/test-model", "encrypted": False, "hasKey": True,
         }
         assert settings["models.expert.base_url"] == {
             "value": "http://x:11434/v1", "encrypted": False, "hasKey": True,
@@ -176,15 +176,15 @@ class TestAdminSettings:
         }
         # Resolved view also redacts the key but reports hasApiKey.
         resolved = data["resolved"]["expert"]
-        assert resolved["provider"] == "ollama"
+        assert resolved["model"] == "qwen/test-model"
         assert resolved["base_url"] == "http://x:11434/v1"
         assert resolved["api_key"] is None
         assert resolved["hasApiKey"] is True
 
         # The secret actually decrypts back via the settings store.
-        import api.settings_store as ss
+        import api.config.settings as ss
         assert ss.get_setting("models.expert.api_key") == "secret-xyz"
-        assert ss.get_setting("models.expert.provider") == "ollama"
+        assert ss.get_setting("models.expert.model") == "qwen/test-model"
 
     def test_put_ignores_keys_outside_group(self):
         db_mod = _setup_db()
@@ -195,14 +195,14 @@ class TestAdminSettings:
         resp = client.put(
             "/api/admin/models",
             json={
-                "models.expert.provider": "ollama",
+                "models.expert.model": "qwen/test-model",
                 "git.github.token": "should-be-ignored",  # wrong group
             },
         )
         assert resp.status_code == 200
-        assert resp.json()["saved"] == ["models.expert.provider"]
+        assert resp.json()["saved"] == ["models.expert.model"]
         # The git token was NOT written.
-        import api.settings_store as ss
+        import api.config.settings as ss
         assert ss.get_setting("git.github.token") is None
 
     def test_unknown_group_404(self):
@@ -307,17 +307,17 @@ class TestAdminApiTokens:
 # --- Public knowledge export (verified filter) ------------------------------
 class TestPublicKnowledgeExport:
     def _seed_product_with_mixed_verified(self, db_mod):
-        from api.models import ArtifactORM, KnowledgeNodeORM, ProductORM
+        from api.models import CodebaseORM, KnowledgeNodeORM, ProductORM
         with db_mod.SessionLocal() as db:
             db.add(ProductORM(id="prod_1", name="Acme", summary="sum"))
             db.flush()
-            db.add(ArtifactORM(
-                id="art_v", product_id="prod_1", name="svc-v", type="spec",
-                kind="openapi", verified=True, generated_docs="docs A",
+            db.add(CodebaseORM(
+                id="art_v", product_id="prod_1", name="svc-v",
+                verified=True, generated_docs="docs A",
                 source="manual",
             ))
-            db.add(ArtifactORM(
-                id="art_u", product_id="prod_1", name="svc-u", type="spec",
+            db.add(CodebaseORM(
+                id="art_u", product_id="prod_1", name="svc-u",
                 verified=False, generated_docs="docs B", source="manual",
             ))
             db.add(KnowledgeNodeORM(
@@ -342,11 +342,11 @@ class TestPublicKnowledgeExport:
         data = resp.json()
         assert data["verified_only"] is True
         assert data["product"]["id"] == "prod_1"
-        arts = [a["id"] for a in data["artifacts"]]
+        arts = [a["id"] for a in data["codebases"]]
         nodes = [n["id"] for n in data["nodes"]]
         assert arts == ["art_v"]
         assert nodes == ["node_v"]
-        assert data["artifacts"][0]["generated_docs"] == "docs A"
+        assert data["codebases"][0]["generated_docs"] == "docs A"
         assert data["nodes"][0]["content_md"] == "node X"
 
     def test_markdown_export_only_verified(self):

@@ -1,12 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import {
   ArrowLeft,
   ArrowRight,
   Article,
+  CaretDown,
+  CaretUp,
   FileText,
   GitBranch,
   Lightning,
@@ -36,37 +38,18 @@ import {
   cn,
 } from "@/components/ui";
 import {
-  artifactTypeIcon,
-  artifactTypeMeta,
-  type Artifact,
-  type ArtifactKind,
-  type ArtifactType,
-  type KnowledgeNode,
+  type Codebase,
   type LinkItem,
   type Product,
+  type Spec,
+  type SpecKind,
   generateId,
+  parseLinksContent,
   serializeLinksContent,
 } from "@/lib/types";
 import { useNotifications } from "@/contexts/NotificationContext";
 
-// Artifact types the UI offers when creating a new artifact.
-// `documentation` and `guides` are no longer creatable here (authored as
-// knowledge pages); legacy artifacts of those types still render via the
-// fallback meta/icon resolvers in lib/types.ts.
-const ARTIFACT_TYPES: ArtifactType[] = ["codebase", "spec", "links"];
-
-/** Map a Phosphor icon name to a rendered node. */
-const ICON_BY_NAME: Record<string, React.ReactNode> = {
-  GitBranch: <GitBranch size={18} weight="regular" />,
-  FileText: <FileText size={18} weight="regular" />,
-  LinkSimple: <LinkSimple size={18} weight="regular" />,
-  Article: <Article size={18} weight="regular" />,
-};
-
-/** Render the icon for an arbitrary artifact type (incl. legacy ones). */
-function artifactIconFor(type: string): React.ReactNode {
-  return ICON_BY_NAME[artifactTypeIcon(type)] ?? <FileText size={18} weight="regular" />;
-}
+type AddType = "codebase" | "spec" | "links";
 
 export default function ProductDetailPage() {
   const router = useRouter();
@@ -77,21 +60,21 @@ export default function ProductDetailPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Add-artifact form
+  // Add-entity form
   const [showForm, setShowForm] = useState(false);
-  const [artName, setArtName] = useState("");
-  const [artType, setArtType] = useState<ArtifactType>("codebase");
-  const [artKind, setArtKind] = useState<ArtifactKind>("openapi");
-  const [artRepoUrl, setArtRepoUrl] = useState("");
-  const [artRepoType, setArtRepoType] = useState("github");
-  const [artToken, setArtToken] = useState("");
-  const [artContent, setArtContent] = useState("");
-  // `links` artifact: repeater rows of {url, description} serialized to JSON.
-  const [artLinks, setArtLinks] = useState<LinkItem[]>([{ url: "", description: "" }]);
-  const [isSavingArtifact, setIsSavingArtifact] = useState(false);
+  const [addType, setAddType] = useState<AddType>("codebase");
+  const [name, setName] = useState("");
+  const [specKind, setSpecKind] = useState<SpecKind>("openapi");
+  const [repoUrl, setRepoUrl] = useState("");
+  const [repoType, setRepoType] = useState("github");
+  const [token, setToken] = useState("");
+  const [content, setContent] = useState("");
+  const [linkRows, setLinkRows] = useState<LinkItem[]>([{ url: "", description: "" }]);
+  const [isSaving, setIsSaving] = useState(false);
 
   const [generatingId, setGeneratingId] = useState<string | null>(null);
-  const [deletingArtId, setDeletingArtId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [linksOpen, setLinksOpen] = useState(false);
 
   const { notify } = useNotifications();
   const { messages, fmt } = useLanguage();
@@ -99,15 +82,11 @@ export default function ProductDetailPage() {
   const tc = messages?.common ?? {};
   const tArt = messages?.artifactTypes ?? {};
 
-  // Tracks whether a product is already loaded so refetch failures surface as
-  // a toast instead of wiping the page with the fatal EmptyState.
   const productRef = useRef<Product | null>(null);
   useEffect(() => {
     productRef.current = product;
   }, [product]);
 
-  // Abort flag for the generate-status polling loop so it stops cleanly when
-  // the component unmounts (e.g. user navigates away mid-generation).
   const generateAbortRef = useRef(false);
   useEffect(() => {
     generateAbortRef.current = false;
@@ -137,8 +116,6 @@ export default function ProductDetailPage() {
       setProduct((await res.json()) as Product);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to load product.";
-      // First load (no product yet) is fatal -> EmptyState; later refetch
-      // failures degrade to a toast so the existing page stays usable.
       if (!productRef.current) {
         setError(msg);
       } else {
@@ -154,86 +131,85 @@ export default function ProductDetailPage() {
   }, [fetchProduct]);
 
   const resetForm = () => {
-    setArtName("");
-    setArtType("codebase");
-    setArtKind("openapi");
-    setArtRepoUrl("");
-    setArtRepoType("github");
-    setArtToken("");
-    setArtContent("");
-    setArtLinks([{ url: "", description: "" }]);
+    setName("");
+    setAddType("codebase");
+    setSpecKind("openapi");
+    setRepoUrl("");
+    setRepoType("github");
+    setToken("");
+    setContent("");
+    setLinkRows([{ url: "", description: "" }]);
   };
 
-  const handleAddArtifact = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!product || !artName.trim() || isSavingArtifact) return;
-    setIsSavingArtifact(true);
-    try {
-      const draft: Artifact = {
-        id: generateId("art"),
-        name: artName.trim(),
-        type: artType,
-        kind: artType === "spec" ? artKind : null,
-        repo_url: artType === "codebase" ? artRepoUrl.trim() || null : null,
-        repo_type: artType === "codebase" ? artRepoType : null,
-        token: artType === "codebase" && artToken ? artToken : null,
-        content:
-          artType === "spec"
-            ? artContent || null
-            : artType === "links"
-              ? serializeLinksContent(artLinks) || null
-              : null,
-        source: "manual",
+  const buildBody = (): Record<string, unknown> => {
+    const base = { name: name.trim(), source: "manual" as const };
+    if (addType === "codebase") {
+      return {
+        ...base,
+        id: generateId("cb"),
+        repo_url: repoUrl.trim() || null,
+        repo_type: repoType,
+        token: token || null,
       };
-      const res = await fetch(`/api/products/${product.id}/artifacts`, {
+    }
+    if (addType === "spec") {
+      return { ...base, id: generateId("spec"), kind: specKind, content: content || null };
+    }
+    return { ...base, id: generateId("links"), content: serializeLinksContent(linkRows) || null };
+  };
+
+  const handleAdd = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!product || !name.trim() || isSaving) return;
+    setIsSaving(true);
+    try {
+      const res = await fetch(`/api/products/${product.id}/${addType}`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(draft),
+        body: JSON.stringify(buildBody()),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || `Failed to add artifact (${res.status})`);
+        throw new Error(err.detail || `Failed to add (${res.status})`);
       }
-      const updated = (await res.json()) as Product;
-      setProduct(updated);
+      setProduct((await res.json()) as Product);
       resetForm();
       setShowForm(false);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Failed to add artifact.";
-      notify({ tone: "error", title: t.addArtifactFailedTitle ?? "Add artifact", message: msg });
+      const msg = e instanceof Error ? e.message : "Failed to add.";
+      notify({ tone: "error", title: t.addArtifactFailedTitle ?? "Add", message: msg });
     } finally {
-      setIsSavingArtifact(false);
+      setIsSaving(false);
     }
   };
 
-  const handleDeleteArtifact = async (artifactId: string) => {
+  const handleDelete = async (type: AddType, entityId: string) => {
     if (!product) return;
-    if (!confirm(t.deleteArtifactConfirm ?? "Delete this artifact?")) return;
-    setDeletingArtId(artifactId);
+    if (!confirm(t.deleteArtifactConfirm ?? "Delete this item?")) return;
+    setDeletingId(entityId);
     try {
       const res = await fetch(
-        `/api/products/${product.id}/artifacts/${artifactId}`,
+        `/api/products/${product.id}/${type}/${entityId}`,
         { method: "DELETE", credentials: "include" },
       );
       if (!res.ok) throw new Error(`Failed to delete (${res.status})`);
-      const updated = (await res.json()) as Product;
-      setProduct(updated);
+      setProduct((await res.json()) as Product);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Failed to delete artifact.";
-      notify({ tone: "error", title: t.deleteArtifactFailedTitle ?? "Delete artifact", message: msg });
+      const msg = e instanceof Error ? e.message : "Failed to delete.";
+      notify({ tone: "error", title: t.deleteArtifactFailedTitle ?? "Delete", message: msg });
     } finally {
-      setDeletingArtId(null);
+      setDeletingId(null);
     }
   };
 
-  const handleGenerate = async (artifactId: string) => {
+  const handleGenerate = async (type: "codebase" | "spec", entityId: string) => {
     if (!product) return;
-    setGeneratingId(artifactId);
+    setGeneratingId(entityId);
     setError(null);
     try {
       const res = await fetch(
-        `/api/products/${product.id}/artifacts/${artifactId}/generate`,
+        `/api/products/${product.id}/${type}/${entityId}/generate`,
         {
           method: "POST",
           credentials: "include",
@@ -245,24 +221,12 @@ export default function ProductDetailPage() {
       if (!res.ok) {
         throw new Error(data.detail || `Generation failed (${res.status})`);
       }
-      // Backward-compatible fast path: a synchronous 200 with generated_docs
-      // (e.g. an alternate implementation) is handled immediately.
-      if (data.generated_docs) {
-        notify({ tone: "success", title: t.genTitle ?? "Generation", message: t.genDone ?? "Documentation generated." });
-        await fetchProduct();
-        return;
-      }
       const jobId = data.job_id;
       if (!jobId) {
         notify({ tone: "info", title: t.genTitle ?? "Generation", message: data.message || data.status || (t.genTriggered ?? "Generation triggered.") });
         await fetchProduct();
         return;
       }
-      // Async 202 + poll: the backend offloads heavy work (git clone, file
-      // read, RLM) to a worker thread, so we poll the status endpoint until
-      // the job succeeds or fails. Display is decoupled from the cognee
-      // knowledge graph — once the job is "succeeded" the docs are committed
-      // and shown immediately, even while cognify continues in the background.
       notify({ tone: "info", title: t.genTitle ?? "Generation", message: t.genStarted ?? "Generation started…" });
       const maxWaitMs = 30 * 60 * 1000;
       const startedAt = Date.now();
@@ -271,7 +235,7 @@ export default function ProductDetailPage() {
         await new Promise((r) => setTimeout(r, 2000));
         if (generateAbortRef.current) return;
         const stRes = await fetch(
-          `/api/products/${product.id}/artifacts/${artifactId}/generate/status?job_id=${encodeURIComponent(jobId)}`,
+          `/api/products/${product.id}/${type}/${entityId}/generate/status?job_id=${encodeURIComponent(jobId)}`,
           { credentials: "include", cache: "no-store" },
         );
         if (stRes.status === 404) {
@@ -282,9 +246,6 @@ export default function ProductDetailPage() {
         }
         const st = await stRes.json().catch(() => ({}));
         if (st.status === "succeeded") {
-          // Docs are already committed and shown now; cognee indexing (if any)
-          // continues in the background and never gates display. Indexing
-          // status is surfaced only as an informational note, never an error.
           notify({
             tone: "success",
             title: t.genTitle ?? "Generation",
@@ -296,7 +257,6 @@ export default function ProductDetailPage() {
         if (st.status === "failed") {
           throw new Error(st.error || st.indexing_message || (t.genFailed ?? "Generation failed."));
         }
-        // queued / running -> keep polling.
       }
       throw new Error(t.genTimeout ?? "Generation timed out.");
     } catch (e) {
@@ -307,27 +267,21 @@ export default function ProductDetailPage() {
     }
   };
 
-  const onTreeSelect = (node: KnowledgeNode) => {
+  const onTreeSelect = (node: { node_type: string; id: string }) => {
     if (node.node_type === "page") {
       router.push(`/products/${productId}/knowledge/${node.id}`);
     }
   };
 
-  const artifactTypeOptions = useMemo(
-    () =>
-      ARTIFACT_TYPES.map((tp) => ({
-        value: tp,
-        label: (tArt?.[tp]?.label as string) ?? artifactTypeMeta(tp).label,
-      })),
-    [tArt],
-  );
+  const codebases = product?.codebases ?? [];
+  const specs = product?.specs ?? [];
+  const links = product?.links ?? [];
 
   return (
     <div className="min-h-screen bg-canvas text-ink">
       <AppHeader />
 
       <main className="mx-auto px-6 py-16">
-        {/* Back */}
         <Reveal>
           <Link
             href="/"
@@ -376,27 +330,72 @@ export default function ProductDetailPage() {
                   variant={showForm ? "ghost" : "primary"}
                 >
                   <Plus size={16} weight="bold" />
-                  {showForm ? tc.close ?? "Close" : t.addArtifact ?? "Add artifact"}
+                  {showForm ? tc.close ?? "Close" : t.addArtifact ?? "Add"}
                 </Button>
               </div>
             </Reveal>
 
-            {/* Summary block (item 4) */}
+            {/* Summary block */}
             <Reveal className="mt-8">
               <SummaryBlock product={product} onRefresh={fetchProduct} />
             </Reveal>
 
-            {/* Add artifact form */}
+            {/* Links — collapsible spoiler under Summary */}
+            {links.length > 0 && (
+              <Reveal className="mt-6">
+                <div className="rounded-lg border border-divider bg-surface">
+                  <button
+                    onClick={() => setLinksOpen((v) => !v)}
+                    className="flex w-full items-center justify-between px-4 py-3 text-left text-sm font-medium text-ink"
+                  >
+                    <span className="inline-flex items-center gap-2">
+                      <LinkSimple size={16} weight="regular" />
+                      {tArt?.links?.label ?? "Links"}
+                      <span className="text-xs text-muted">({links.length})</span>
+                    </span>
+                    {linksOpen ? <CaretUp size={14} weight="bold" /> : <CaretDown size={14} weight="bold" />}
+                  </button>
+                  {linksOpen && (
+                    <div className="border-t border-divider px-4 py-3">
+                      <ul className="flex flex-col gap-2">
+                        {links.map((l) => {
+                          const items = parseLinksContent(l.content);
+                          return items.length === 0 ? null : items.map((it, i) => (
+                            <li key={`${l.id}-${i}`} className="flex flex-col gap-0.5 text-sm">
+                              {it.url ? (
+                                <a
+                                  href={it.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="font-mono text-xs text-ink underline-offset-2 hover:underline"
+                                >
+                                  {it.url}
+                                </a>
+                              ) : null}
+                              {it.description && (
+                                <span className="text-muted">{it.description}</span>
+                              )}
+                            </li>
+                          ));
+                        })}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              </Reveal>
+            )}
+
+            {/* Add form */}
             {showForm && (
               <Reveal className="mt-8">
                 <Card className="p-6">
-                  <form onSubmit={handleAddArtifact} className="grid gap-5">
+                  <form onSubmit={handleAdd} className="grid gap-5">
                     <div className="grid gap-5 md:grid-cols-[1fr_220px]">
                       <div>
-                        <Label>{t.artifactName ?? "Artifact name"}</Label>
+                        <Label>{t.artifactName ?? "Name"}</Label>
                         <Input
-                          value={artName}
-                          onChange={(e) => setArtName(e.target.value)}
+                          value={name}
+                          onChange={(e) => setName(e.target.value)}
                           placeholder={t.namePlaceholder ?? ""}
                           required
                           autoFocus
@@ -405,35 +404,31 @@ export default function ProductDetailPage() {
                       <div>
                         <Label>{t.type ?? "Type"}</Label>
                         <Select
-                          value={artType}
-                          onChange={(e) =>
-                            setArtType(e.target.value as ArtifactType)
-                          }
+                          value={addType}
+                          onChange={(e) => setAddType(e.target.value as AddType)}
                         >
-                          {artifactTypeOptions.map((opt) => (
-                            <option key={opt.value} value={opt.value}>
-                              {opt.label}
-                            </option>
-                          ))}
+                          <option value="codebase">{tArt?.codebase?.label ?? "Codebase"}</option>
+                          <option value="spec">{tArt?.spec?.label ?? "Spec"}</option>
+                          <option value="links">{tArt?.links?.label ?? "Links"}</option>
                         </Select>
                       </div>
                     </div>
 
-                    {artType === "codebase" && (
+                    {addType === "codebase" && (
                       <div className="grid gap-5 md:grid-cols-[1fr_180px]">
                         <div className="md:col-span-2">
                           <Label>{t.gitUrl ?? "Git URL"}</Label>
                           <Input
-                            value={artRepoUrl}
-                            onChange={(e) => setArtRepoUrl(e.target.value)}
+                            value={repoUrl}
+                            onChange={(e) => setRepoUrl(e.target.value)}
                             placeholder={t.gitUrlPlaceholder ?? ""}
                           />
                         </div>
                         <div>
                           <Label>{t.provider ?? "Provider"}</Label>
                           <Select
-                            value={artRepoType}
-                            onChange={(e) => setArtRepoType(e.target.value)}
+                            value={repoType}
+                            onChange={(e) => setRepoType(e.target.value)}
                           >
                             <option value="github">{t.github ?? "GitHub"}</option>
                             <option value="gitlab">{t.gitlab ?? "GitLab"}</option>
@@ -443,23 +438,21 @@ export default function ProductDetailPage() {
                           <Label>{t.accessToken ?? "Access token (optional)"}</Label>
                           <Input
                             type="password"
-                            value={artToken}
-                            onChange={(e) => setArtToken(e.target.value)}
+                            value={token}
+                            onChange={(e) => setToken(e.target.value)}
                             placeholder={t.tokenPlaceholder ?? ""}
                           />
                         </div>
                       </div>
                     )}
 
-                    {artType === "spec" && (
+                    {addType === "spec" && (
                       <div className="grid gap-5">
                         <div>
                           <Label>{t.specKind ?? "Spec kind"}</Label>
                           <Select
-                            value={artKind}
-                            onChange={(e) =>
-                              setArtKind(e.target.value as ArtifactKind)
-                            }
+                            value={specKind}
+                            onChange={(e) => setSpecKind(e.target.value as SpecKind)}
                           >
                             <option value="openapi">{t.openapi ?? "OpenAPI (REST)"}</option>
                             <option value="asyncapi">{t.asyncapi ?? "AsyncAPI (events)"}</option>
@@ -468,8 +461,8 @@ export default function ProductDetailPage() {
                         <div>
                           <Label>{t.specLabel ?? "Specification (JSON / YAML)"}</Label>
                           <Textarea
-                            value={artContent}
-                            onChange={(e) => setArtContent(e.target.value)}
+                            value={content}
+                            onChange={(e) => setContent(e.target.value)}
                             placeholder={t.specPlaceholder ?? ""}
                             rows={10}
                           />
@@ -477,29 +470,22 @@ export default function ProductDetailPage() {
                       </div>
                     )}
 
-                    {artType === "links" && (
+                    {addType === "links" && (
                       <div className="grid gap-3">
                         <div className="flex items-center justify-between gap-2">
-                          <Label className="mb-0">
-                            {t.linksLabel ?? "Links"}
-                          </Label>
+                          <Label className="mb-0">{t.linksLabel ?? "Links"}</Label>
                           <Button
                             type="button"
                             variant="ghost"
                             size="sm"
-                            onClick={() =>
-                              setArtLinks((rows) => [
-                                ...rows,
-                                { url: "", description: "" },
-                              ])
-                            }
+                            onClick={() => setLinkRows((r) => [...r, { url: "", description: "" }])}
                           >
                             <Plus size={14} weight="bold" />
                             {t.linksAddRow ?? "Add link"}
                           </Button>
                         </div>
                         <div className="grid gap-2">
-                          {artLinks.map((row, idx) => (
+                          {linkRows.map((row, idx) => (
                             <div
                               key={idx}
                               className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_1fr_auto]"
@@ -507,10 +493,8 @@ export default function ProductDetailPage() {
                               <Input
                                 value={row.url}
                                 onChange={(e) =>
-                                  setArtLinks((rows) =>
-                                    rows.map((r, i) =>
-                                      i === idx ? { ...r, url: e.target.value } : r,
-                                    ),
+                                  setLinkRows((rows) =>
+                                    rows.map((r, i) => (i === idx ? { ...r, url: e.target.value } : r)),
                                   )
                                 }
                                 placeholder={t.linksUrlPlaceholder ?? "https://…"}
@@ -518,25 +502,19 @@ export default function ProductDetailPage() {
                               <Input
                                 value={row.description ?? ""}
                                 onChange={(e) =>
-                                  setArtLinks((rows) =>
-                                    rows.map((r, i) =>
-                                      i === idx
-                                        ? { ...r, description: e.target.value }
-                                        : r,
-                                    ),
+                                  setLinkRows((rows) =>
+                                    rows.map((r, i) => (i === idx ? { ...r, description: e.target.value } : r)),
                                   )
                                 }
-                                placeholder={
-                                  t.linksDescPlaceholder ?? "Description"
-                                }
+                                placeholder={t.linksDescPlaceholder ?? "Description"}
                               />
                               <IconButton
                                 type="button"
                                 aria-label={t.linksRemoveRow ?? "Remove link"}
                                 title={t.linksRemoveRow ?? "Remove link"}
-                                disabled={artLinks.length <= 1}
+                                disabled={linkRows.length <= 1}
                                 onClick={() =>
-                                  setArtLinks((rows) =>
+                                  setLinkRows((rows) =>
                                     rows.length <= 1
                                       ? [{ url: "", description: "" }]
                                       : rows.filter((_, i) => i !== idx),
@@ -552,23 +530,12 @@ export default function ProductDetailPage() {
                     )}
 
                     <div className="flex items-center justify-end gap-2">
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        onClick={() => setShowForm(false)}
-                      >
+                      <Button type="button" variant="ghost" onClick={() => setShowForm(false)}>
                         {tc.cancel ?? "Cancel"}
                       </Button>
-                      <Button
-                        type="submit"
-                        disabled={isSavingArtifact || !artName.trim()}
-                      >
-                        {isSavingArtifact ? (
-                          <Spinner />
-                        ) : (
-                          <Plus size={16} weight="bold" />
-                        )}
-                        {t.saveArtifact ?? "Save artifact"}
+                      <Button type="submit" disabled={isSaving || !name.trim()}>
+                        {isSaving ? <Spinner /> : <Plus size={16} weight="bold" />}
+                        {t.saveArtifact ?? "Save"}
                       </Button>
                     </div>
                   </form>
@@ -576,9 +543,49 @@ export default function ProductDetailPage() {
               </Reveal>
             )}
 
-            {/* Two-column: knowledge tree + main content */}
+            {/* Two-column: (specs + knowledge tree) | main content */}
             <div className="mt-12 grid grid-cols-1 gap-8 lg:grid-cols-[240px_1fr]">
               <aside className="lg:sticky lg:top-20 lg:self-start">
+                {/* Specs — above the knowledge tree */}
+                {specs.length > 0 && (
+                  <div className="mb-3">
+                    <SectionHeader title={tArt?.spec?.label ?? "Specs"} className="mb-2" />
+                    <div className="flex flex-col gap-2">
+                      {specs.map((s: Spec) => {
+                        const isDeleting = deletingId === s.id;
+                        return (
+                          <div
+                            key={s.id}
+                            className="group flex items-center justify-between gap-2 rounded-md border border-divider bg-surface px-3 py-2"
+                          >
+                            <button
+                              onClick={() =>
+                                router.push(`/products/${product.id}/artifacts/${s.id}`)
+                              }
+                              className="flex min-w-0 items-center gap-2 text-left"
+                            >
+                              <FileText size={16} weight="regular" className="shrink-0 text-muted" />
+                              <span className="truncate text-sm text-ink">{s.name}</span>
+                            </button>
+                            <div className="flex items-center gap-1.5">
+                              <Tag tone="green">{s.kind}</Tag>
+                              <IconButton
+                                aria-label={t.deleteArtifact ?? "Delete"}
+                                title={t.deleteArtifact ?? "Delete"}
+                                onClick={() => handleDelete("spec", s.id)}
+                                disabled={isDeleting}
+                                className="opacity-0 transition-opacity group-hover:opacity-100"
+                              >
+                                {isDeleting ? <Spinner /> : <Trash size={14} weight="regular" />}
+                              </IconButton>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
                 <Card className="p-3">
                   <KnowledgeTree
                     productId={product.id}
@@ -589,120 +596,93 @@ export default function ProductDetailPage() {
               </aside>
 
               <div className="flex flex-col gap-12">
-                {/* Artifacts */}
+                {/* Codebases */}
                 <section>
                   <SectionHeader
-                    title={t.artifactsTitle ?? "Artifacts"}
+                    title={tArt?.codebase?.label ?? "Codebases"}
                     subtitle={
-                      product.artifacts?.length
-                        ? fmt(t.artifactsCount, { n: product.artifacts.length })
+                      codebases.length
+                        ? fmt(t.artifactsCount, { n: codebases.length })
                         : (t.artifactsEmptySubtitle ?? "")
                     }
                   />
 
                   <div className="mt-6">
-                    {!product.artifacts || product.artifacts.length === 0 ? (
+                    {codebases.length === 0 ? (
                       <EmptyState
                         icon={<Plus size={20} weight="regular" />}
-                        title={t.noArtifactsTitle ?? "No artifacts yet"}
+                        title={t.noArtifactsTitle ?? "No codebases yet"}
                         description={t.noArtifactsDesc ?? ""}
                         action={
                           <Button onClick={() => setShowForm(true)}>
                             <Plus size={16} weight="bold" />
-                            {t.addArtifact ?? "Add artifact"}
+                            {t.addArtifact ?? "Add"}
                           </Button>
                         }
                       />
                     ) : (
                       <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
-                        {product.artifacts.map((art, i) => {
-                          const meta = artifactTypeMeta(art.type);
-                          const artLabel =
-                            (tArt?.[art.type]?.label as string) ?? meta.label;
-                          const isGenerating = generatingId === art.id;
-                          const isDeleting = deletingArtId === art.id;
-                          // Only codebase artifacts have generated docs to
-                          // preview / (re)generate; spec & links are authored
-                          // directly and rendered from `content`.
-                          const isCodebase = art.type === "codebase";
-                          const hasDocs = isCodebase && Boolean(art.generated_docs);
+                        {codebases.map((c: Codebase, i) => {
+                          const isGenerating = generatingId === c.id;
+                          const isDeleting = deletingId === c.id;
+                          const hasDocs = Boolean(c.generated_docs);
                           return (
-                            <Reveal key={art.id} delayMs={Math.min(i, 6) * 80}>
+                            <Reveal key={c.id} delayMs={Math.min(i, 6) * 80}>
                               <Card
                                 hover
                                 className="group relative flex h-full flex-col overflow-hidden p-6"
                               >
-                                {isGenerating && isCodebase && (
+                                {isGenerating && (
                                   <span className="gen-progress-bar" aria-hidden />
                                 )}
                                 <div className="flex items-start justify-between gap-3">
                                   <div className="flex items-center gap-2.5">
                                     <span className="flex h-9 w-9 items-center justify-center rounded-md bg-surface-2 text-ink">
-                                      {artifactIconFor(art.type)}
+                                      <GitBranch size={18} weight="regular" />
                                     </span>
                                     <div className="min-w-0">
                                       <h3 className="truncate text-sm font-medium text-ink">
-                                        {art.name}
+                                        {c.name}
                                       </h3>
                                       <div className="mt-1 flex flex-wrap items-center gap-2">
-                                        <Tag tone={meta.tone}>{artLabel}</Tag>
-                                        {art.kind && (
-                                          <Tag tone="neutral">{art.kind}</Tag>
-                                        )}
+                                        <Tag tone="blue">{tArt?.codebase?.label ?? "Codebase"}</Tag>
                                         {hasDocs && (
                                           <Tag tone="green">{t.docsReady ?? "Docs ready"}</Tag>
                                         )}
-                                        {art.verified && (
+                                        {c.verified && (
                                           <Tag tone="green">{t.verified ?? "Verified"}</Tag>
                                         )}
                                       </div>
                                     </div>
                                   </div>
                                   <IconButton
-                                    aria-label={t.deleteArtifact ?? "Delete artifact"}
-                                    title={t.deleteArtifact ?? "Delete artifact"}
-                                    onClick={() => handleDeleteArtifact(art.id)}
+                                    aria-label={t.deleteArtifact ?? "Delete"}
+                                    title={t.deleteArtifact ?? "Delete"}
+                                    onClick={() => handleDelete("codebase", c.id)}
                                     disabled={isDeleting}
                                     className="opacity-0 transition-opacity group-hover:opacity-100"
                                   >
-                                    {isDeleting ? (
-                                      <Spinner />
-                                    ) : (
-                                      <Trash size={16} weight="regular" />
-                                    )}
+                                    {isDeleting ? <Spinner /> : <Trash size={16} weight="regular" />}
                                   </IconButton>
                                 </div>
 
-                                {/* Type-specific meta */}
-                                <div className="mt-4 space-y-1 text-xs text-muted">
-                                  {isCodebase && art.repo_url && (
-                                    <p className="truncate font-mono">
-                                      {art.repo_url}
-                                    </p>
-                                  )}
-                                  {art.content && (
-                                    <p className="font-mono">
-                                      {fmt(t.chars, { n: art.content.length })}
-                                    </p>
-                                  )}
-                                </div>
+                                {c.repo_url && (
+                                  <p className="mt-4 truncate font-mono text-xs text-muted">
+                                    {c.repo_url}
+                                  </p>
+                                )}
 
-                                {/* Generated docs preview (codebase only) */}
                                 {hasDocs && (
                                   <div className="mt-4 max-h-28 overflow-hidden rounded-md border border-divider bg-surface-2 p-3 font-mono text-xs leading-relaxed text-muted">
-                                    {art.generated_docs?.slice(0, 280)}
-                                    {(art.generated_docs?.length ?? 0) > 280 &&
-                                      "…"}
+                                    {c.generated_docs?.slice(0, 280)}
+                                    {(c.generated_docs?.length ?? 0) > 280 && "…"}
                                   </div>
                                 )}
 
-                                {/* Actions */}
                                 <div className="mt-6 flex items-center justify-between border-t border-divider pt-4">
                                   <button
                                     onClick={() =>
-                                      router.push(
-                                        `/products/${product.id}/artifacts/${art.id}`,
-                                      )
+                                      router.push(`/products/${product.id}/artifacts/${c.id}`)
                                     }
                                     className={cn(
                                       "inline-flex items-center gap-1 text-xs font-medium text-ink",
@@ -712,21 +692,15 @@ export default function ProductDetailPage() {
                                     {t.openDocs ?? "Open"}
                                     <ArrowRight size={14} weight="bold" />
                                   </button>
-                                  {isCodebase && (
-                                    <Button
-                                      size="sm"
-                                      variant="subtle"
-                                      onClick={() => handleGenerate(art.id)}
-                                      disabled={isGenerating}
-                                    >
-                                      {isGenerating ? (
-                                        <Spinner />
-                                      ) : (
-                                        <Lightning size={14} weight="fill" />
-                                      )}
-                                      {isGenerating ? (t.generating ?? "Generating…") : (t.generate ?? "Generate")}
-                                    </Button>
-                                  )}
+                                  <Button
+                                    size="sm"
+                                    variant="subtle"
+                                    onClick={() => handleGenerate("codebase", c.id)}
+                                    disabled={isGenerating}
+                                  >
+                                    {isGenerating ? <Spinner /> : <Lightning size={14} weight="fill" />}
+                                    {isGenerating ? (t.generating ?? "Generating…") : (t.generate ?? "Generate")}
+                                  </Button>
                                 </div>
                               </Card>
                             </Reveal>
@@ -737,7 +711,7 @@ export default function ProductDetailPage() {
                   </div>
                 </section>
 
-                {/* Expert agent chat (replaces Long-context RLM panel) */}
+                {/* Expert agent chat */}
                 <section>
                   <Reveal>
                     <Card className="p-6 md:p-8">

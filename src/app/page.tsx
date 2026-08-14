@@ -80,7 +80,9 @@ export default function ProductsDashboard() {
         id: generateId("prod"),
         name: name.trim(),
         description: description.trim(),
-        artifacts: [],
+        codebases: [],
+        specs: [],
+        links: [],
       };
       const res = await fetch("/api/products", {
         method: "POST",
@@ -236,7 +238,7 @@ export default function ProductsDashboard() {
           ) : (
             <div className="grid grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-3">
               {products.map((p, i) => {
-                const count = p.artifacts?.length ?? 0;
+                const count = p.codebases.length + p.specs.length + p.links.length;
                 const isDeleting = deletingId === p.id;
                 return (
                   <Reveal key={p.id} delayMs={Math.min(i, 6) * 80}>
