@@ -16,25 +16,9 @@ from typing import Any
 
 import pytest
 
-
-# --- Helpers -----------------------------------------------------------------
-@pytest.fixture(autouse=True)
-def _isolated_env(tmp_path, monkeypatch):
-    """Isolated SQLite DB for every test + temp dirs so we don't touch real ones."""
-    db_file = tmp_path / "test.db"
-    monkeypatch.setenv("DB_PROVIDER", "sqlite")
-    monkeypatch.setenv("DB_HOST", str(tmp_path))
-    monkeypatch.setenv("DB_NAME", str(db_file))
-    monkeypatch.setenv("DB_USERNAME", "")
-    monkeypatch.setenv("DB_PASSWORD", "")
-    monkeypatch.setenv("AUTH_PROVIDER", "local")
-    monkeypatch.setenv("COGNEE_SKIP_CONNECTION_TEST", "true")
-    # Avoid loading a real .env for tests.
-    monkeypatch.setenv("OLLAMA_HOST", "http://localhost:11434")
-    # Set a stable SETTINGS_SECRET_KEY so encryption tests are deterministic.
-    from cryptography.fernet import Fernet
-    monkeypatch.setenv("SETTINGS_SECRET_KEY", Fernet.generate_key().decode())
-    yield
+# The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee/Ollama stubs for every
+# test in this module. No per-module duplicate is needed here.
 
 
 def _reload_modules() -> dict[str, Any]:

@@ -18,23 +18,11 @@ from typing import Any, Dict, Optional
 
 import pytest
 
-
-# --- Shared isolated env (mirrors test_foundation.py) ------------------------
-@pytest.fixture(autouse=True)
-def _isolated_env(tmp_path, monkeypatch):
-    db_file = tmp_path / "test.db"
-    monkeypatch.setenv("DB_PROVIDER", "sqlite")
-    monkeypatch.setenv("DB_HOST", str(tmp_path))
-    monkeypatch.setenv("DB_NAME", str(db_file))
-    monkeypatch.setenv("DB_USERNAME", "")
-    monkeypatch.setenv("DB_PASSWORD", "")
-    monkeypatch.setenv("AUTH_PROVIDER", "none")
-    monkeypatch.setenv("COGNEE_SKIP_CONNECTION_TEST", "true")
-    monkeypatch.setenv("OLLAMA_HOST", "http://localhost:11434")
-    from cryptography.fernet import Fernet
-
-    monkeypatch.setenv("SETTINGS_SECRET_KEY", Fernet.generate_key().decode())
-    yield
+# The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee/Ollama stubs for every
+# test in this module. The router tests override ``get_current_user`` via
+# ``app.dependency_overrides`` (see ``_client_and_db``) so they are independent of
+# the AUTH_PROVIDER env value anyway.
 
 # --- Registry ---------------------------------------------------------------
 class TestRegistry:

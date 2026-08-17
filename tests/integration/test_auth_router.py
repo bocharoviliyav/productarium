@@ -123,10 +123,28 @@ class TestMe:
 # --------------------------------------------------------------------------- #
 class TestLogout:
     def test_logout_clears_cookie(self, isolated_db, monkeypatch):
+        # Establish a session cookie first so we can assert it is actually
+        # cleared (not just that logout returns 200 + a message).
+        with isolated_db.SessionLocal() as db:
+            _create_user(db, "logoutuser", "pass123")
         _, client = _build_client(isolated_db, monkeypatch)
+        login = _login_cookie(client, "logoutuser", "pass123")
+        assert SESSION_COOKIE_NAME in login.cookies
+        assert client.cookies.get(SESSION_COOKIE_NAME)
+
         resp = client.post("/api/auth/logout")
         assert resp.status_code == 200
         assert resp.json()["message"] == "Logged out"
+        # The logout response must emit a Set-Cookie that clears the session
+        # cookie (empty value + Max-Age=0); note ``delete_cookie`` still sets a
+        # Set-Cookie header for the name, so ``SESSION_COOKIE_NAME in
+        # resp.cookies`` is True — the real signal is Max-Age=0 + dropped jar.
+        set_cookies = resp.headers.get_list("set-cookie")
+        matching = [c for c in set_cookies if c.startswith(f"{SESSION_COOKIE_NAME}=")]
+        assert matching, "logout did not emit a Set-Cookie for the session cookie"
+        cleared = matching[0]
+        assert "max-age=0" in cleared.lower()
+        assert not client.cookies.get(SESSION_COOKIE_NAME)
 
 
 # --------------------------------------------------------------------------- #

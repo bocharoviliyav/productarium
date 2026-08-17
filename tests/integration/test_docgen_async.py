@@ -28,17 +28,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-
-@pytest.fixture(autouse=True)
-def _isolated_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("DB_PROVIDER", "sqlite")
-    monkeypatch.setenv("DB_HOST", str(tmp_path))
-    monkeypatch.setenv("DB_NAME", str(tmp_path / "test.db"))
-    monkeypatch.setenv("DB_USERNAME", "")
-    monkeypatch.setenv("DB_PASSWORD", "")
-    monkeypatch.setenv("COGNEE_SKIP_CONNECTION_TEST", "true")
-    monkeypatch.setenv("OLLAMA_HOST", "http://localhost:11434")
-    yield
+# The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee/Ollama stubs for every
+# test in this module. No per-module duplicate is needed here.
 
 
 @pytest.fixture(autouse=True)

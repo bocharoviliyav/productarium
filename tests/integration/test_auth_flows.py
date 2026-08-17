@@ -11,28 +11,15 @@ from __future__ import annotations
 import importlib
 from datetime import datetime
 
-import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-
-@pytest.fixture(autouse=True)
-def _isolated_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("DB_PROVIDER", "sqlite")
-    monkeypatch.setenv("DB_HOST", str(tmp_path))
-    monkeypatch.setenv("DB_NAME", str(tmp_path / "test.db"))
-    monkeypatch.setenv("DB_USERNAME", "")
-    monkeypatch.setenv("DB_PASSWORD", "")
-    monkeypatch.setenv("AUTH_PROVIDER", "local")
-    monkeypatch.setenv("COGNEE_SKIP_CONNECTION_TEST", "true")
-    monkeypatch.setenv("OLLAMA_HOST", "http://localhost:11434")
-    from cryptography.fernet import Fernet
-
-    monkeypatch.setenv("SETTINGS_SECRET_KEY", Fernet.generate_key().decode())
-    yield
+# The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee/Ollama stubs for every
+# test in this module. No per-module duplicate is needed here.
 
 
 def _setup_db():

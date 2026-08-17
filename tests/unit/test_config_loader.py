@@ -93,52 +93,29 @@ class TestLoadJsonConfig:
     def test_loads_from_config_dir(self, monkeypatch, tmp_path):
         cfg_file = tmp_path / "custom.json"
         cfg_file.write_text(json.dumps({"key": "val"}), encoding="utf-8")
-        monkeypatch.setenv("DEEPWIKI_CONFIG_DIR", str(tmp_path))
-        # reload to pick up the new CONFIG_DIR
-        import importlib
-        importlib.reload(config_mod)
-        try:
-            result = config_mod.load_json_config("custom.json")
-            assert result == {"key": "val"}
-        finally:
-            monkeypatch.delenv("DEEPWIKI_CONFIG_DIR", raising=False)
-            importlib.reload(config_mod)
+        # load_json_config reads the module-global CONFIG_DIR at call time, so
+        # patch it directly instead of reloading the module to pick up the env.
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", str(tmp_path))
+        result = config_mod.load_json_config("custom.json")
+        assert result == {"key": "val"}
 
     def test_missing_file_returns_empty_dict(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("DEEPWIKI_CONFIG_DIR", str(tmp_path))
-        import importlib
-        importlib.reload(config_mod)
-        try:
-            assert config_mod.load_json_config("does_not_exist.json") == {}
-        finally:
-            monkeypatch.delenv("DEEPWIKI_CONFIG_DIR", raising=False)
-            importlib.reload(config_mod)
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", str(tmp_path))
+        assert config_mod.load_json_config("does_not_exist.json") == {}
 
     def test_bad_json_returns_empty_dict(self, monkeypatch, tmp_path):
         bad = tmp_path / "bad.json"
         bad.write_text("{not valid json", encoding="utf-8")
-        monkeypatch.setenv("DEEPWIKI_CONFIG_DIR", str(tmp_path))
-        import importlib
-        importlib.reload(config_mod)
-        try:
-            assert config_mod.load_json_config("bad.json") == {}
-        finally:
-            monkeypatch.delenv("DEEPWIKI_CONFIG_DIR", raising=False)
-            importlib.reload(config_mod)
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", str(tmp_path))
+        assert config_mod.load_json_config("bad.json") == {}
 
     def test_env_placeholders_resolved_in_loaded_config(self, monkeypatch, tmp_path):
         monkeypatch.setenv("TEST_EMBED_MODEL", "text-embed-test")
         cfg_file = tmp_path / "testcfg.json"
         cfg_file.write_text(json.dumps({"model": "${TEST_EMBED_MODEL}"}), encoding="utf-8")
-        monkeypatch.setenv("DEEPWIKI_CONFIG_DIR", str(tmp_path))
-        import importlib
-        importlib.reload(config_mod)
-        try:
-            result = config_mod.load_json_config("testcfg.json")
-            assert result == {"model": "text-embed-test"}
-        finally:
-            monkeypatch.delenv("DEEPWIKI_CONFIG_DIR", raising=False)
-            importlib.reload(config_mod)
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", str(tmp_path))
+        result = config_mod.load_json_config("testcfg.json")
+        assert result == {"model": "text-embed-test"}
 
 
 # ---------------------------------------------------------------------------
@@ -186,27 +163,15 @@ class TestLoadLangConfig:
     def test_malformed_returns_default(self, monkeypatch, tmp_path):
         lang_file = tmp_path / "lang.json"
         lang_file.write_text(json.dumps({"only_partial": True}), encoding="utf-8")
-        monkeypatch.setenv("DEEPWIKI_CONFIG_DIR", str(tmp_path))
-        import importlib
-        importlib.reload(config_mod)
-        try:
-            cfg = config_mod.load_lang_config()
-            assert cfg["default"] == "ru"
-            assert "supported_languages" in cfg
-        finally:
-            monkeypatch.delenv("DEEPWIKI_CONFIG_DIR", raising=False)
-            importlib.reload(config_mod)
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", str(tmp_path))
+        cfg = config_mod.load_lang_config()
+        assert cfg["default"] == "ru"
+        assert "supported_languages" in cfg
 
     def test_empty_file_returns_default(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("DEEPWIKI_CONFIG_DIR", str(tmp_path))
-        import importlib
-        importlib.reload(config_mod)
-        try:
-            cfg = config_mod.load_lang_config()
-            assert cfg["default"] == "ru"
-        finally:
-            monkeypatch.delenv("DEEPWIKI_CONFIG_DIR", raising=False)
-            importlib.reload(config_mod)
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", str(tmp_path))
+        cfg = config_mod.load_lang_config()
+        assert cfg["default"] == "ru"
 
 
 # ---------------------------------------------------------------------------
@@ -253,13 +218,9 @@ class TestGetModelConfig:
         assert "temperature" in result["model_kwargs"]
 
     def test_raises_when_no_providers(self, monkeypatch):
-        # Other tests in this file call importlib.reload(config_mod), which
-        # replaces the module-level ``configs`` dict AND the ``get_model_config``
-        # function with new objects. The names imported at the top of this
-        # file still reference the STALE (pre-reload) function, whose closure
-        # reads the STALE dict. So we must both mutate ``config_mod.configs``
-        # (current dict) and call ``config_mod.get_model_config`` (current
-        # function) for the mutation to be visible.
+        # Mutate the live ``configs`` dict (no reload in this module: the
+        # top-level import and ``config_mod.configs`` are the same object) and
+        # call through the module so the mutation is visible.
         monkeypatch.delitem(config_mod.configs, "providers", raising=False)
         with pytest.raises(ValueError, match="Provider configuration not loaded"):
             config_mod.get_model_config()
@@ -282,9 +243,6 @@ class TestGetEmbedderConfig:
         assert "model_kwargs" in cfg or "batch_size" in cfg
 
     def test_returns_empty_when_missing(self, monkeypatch):
-        # Call through config_mod.get_embedder_config (current function) so the
-        # mutation to config_mod.configs is visible — see note in
-        # TestGetModelConfig about importlib.reload creating stale closures.
         monkeypatch.delitem(config_mod.configs, "embedder_openai_local", raising=False)
         assert config_mod.get_embedder_config() == {}
 
@@ -356,18 +314,13 @@ class TestFetchOpenaiLocalModels:
         fetch_openai_local_models("http://localhost:1234/v1")
         assert captured["url"] == "http://localhost:1234/v1/models"
 
-    def test_none_url_returns_empty(self):
+    def test_none_url_returns_empty(self, monkeypatch):
         from api.config import fetch_openai_local_models
 
-        # When base_url is None and LOCAL_OPENAI_BASE_URL is also None
-        import api.config as cfg
-
-        original = cfg.LOCAL_OPENAI_BASE_URL
-        cfg.LOCAL_OPENAI_BASE_URL = None
-        try:
-            assert fetch_openai_local_models(None) == []
-        finally:
-            cfg.LOCAL_OPENAI_BASE_URL = original
+        # When base_url is None and LOCAL_OPENAI_BASE_URL is also None,
+        # fetch_openai_local_models returns [] without calling requests.
+        monkeypatch.setattr(config_mod, "LOCAL_OPENAI_BASE_URL", None)
+        assert fetch_openai_local_models(None) == []
 
 
 class TestGetAvailableModels:

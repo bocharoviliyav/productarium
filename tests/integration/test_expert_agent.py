@@ -15,24 +15,11 @@ from typing import Any, AsyncIterator, Dict, List, Tuple
 
 import pytest
 
-
-# --- Shared fixtures ---------------------------------------------------------
-@pytest.fixture(autouse=True)
-def _isolated_env(tmp_path, monkeypatch):
-    """Isolated SQLite env + temp dirs so tests never touch real services."""
-    db_file = tmp_path / "expert_test.db"
-    monkeypatch.setenv("DB_PROVIDER", "sqlite")
-    monkeypatch.setenv("DB_HOST", str(tmp_path))
-    monkeypatch.setenv("DB_NAME", str(db_file))
-    monkeypatch.setenv("DB_USERNAME", "")
-    monkeypatch.setenv("DB_PASSWORD", "")
-    monkeypatch.setenv("COGNEE_SKIP_CONNECTION_TEST", "true")
-    monkeypatch.setenv("OLLAMA_HOST", "http://localhost:11434")
-    # Auth disabled by default so router tests work without a session cookie.
-    # (api.auth snapshots AUTH_PROVIDER at import, so tests that need it patch
-    #  api.auth.deps.AUTH_PROVIDER directly.)
-    monkeypatch.setenv("AUTH_PROVIDER", "none")
-    yield
+# The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee/Ollama stubs for every
+# test in this module. Auth is NOT disabled by env here: ``api.auth`` snapshots
+# AUTH_PROVIDER at import time, so router tests patch ``api.auth.deps.AUTH_PROVIDER``
+# directly (see ``TestExpertRouter.app_and_client``) regardless of the env value.
 
 
 def _sqlite_db():

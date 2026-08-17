@@ -3,8 +3,6 @@
 Members:
 - ``openai_client`` — OpenAIClient (adalflow ModelClient wrapper for any
   OpenAI-compatible local/remote endpoint: LM Studio, llama.cpp, vLLM, etc.).
-- ``ollama``       — OllamaDocumentProcessor (single-doc embedding workaround
-  for adalflow's Ollama client, which lacks batch embedding support).
 - ``git``          — GitHub/GitLab clone + remote file content APIs
   (``download_repo``, ``get_file_content``, ...).
 """

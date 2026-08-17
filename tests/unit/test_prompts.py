@@ -298,6 +298,170 @@ class TestSectionPrompts:
 
 
 # ---------------------------------------------------------------------------
+# Prompt BODY content validation
+#
+# The tests above assert on the loader's STRUCTURE (section count, keys,
+# wrapping). These tests assert on the prompt BODIES themselves: that each
+# generation prompt carries the {placeholder} tokens the docgen substitution
+# path (WikiGenerator._format_prompt / expert _build_prompt) actually fills in,
+# that no prompt is truncated to a stub (min length), and that the language
+# instruction renders for every supported language. A regression that drops a
+# placeholder or ships a half-written prompt would slip past the structure
+# tests but fails here.
+# ---------------------------------------------------------------------------
+
+class TestPromptContentValidation:
+    # Required placeholders per prompt filename, as actually substituted by the
+    # code paths in api.docgen.wiki._format_prompt (common_vars + per-section
+    # vars) and api.expert.prompt._build_prompt. Only placeholders the code
+    # fills in are required; optional ones (substituted only when non-empty)
+    # are not listed here.
+    REQUIRED_PLACEHOLDERS = {
+        "overview.md": ["{repo_url}", "{repo_name}", "{repo_type}",
+                       "{primary_language}", "{file_count}", "{main_directories}"],
+        "architecture.md": ["{repo_url}", "{repo_name}", "{project_structure}",
+                            "{main_files}", "{previous_content}"],
+        "functional.md": ["{repo_url}", "{repo_name}", "{app_type}",
+                          "{main_modules}", "{api_endpoints}", "{previous_content}"],
+        "technical.md": ["{repo_url}", "{repo_name}", "{tech_stack}",
+                         "{config_files}", "{previous_content}"],
+        "cicd.md": ["{repo_url}", "{repo_name}", "{cicd_files}",
+                    "{docker_files}", "{config_files}", "{previous_content}"],
+        "lld.md": ["{repo_url}", "{repo_name}", "{components}",
+                   "{api_endpoints}", "{modules}", "{previous_content}"],
+        "datamodel.md": ["{repo_url}", "{repo_name}", "{databases}",
+                         "{entities}", "{db_config}", "{previous_content}"],
+        # Expert prompts are substituted via _safe_replace with exactly these
+        # two tokens (expert/prompt.py:_build_prompt).
+        "expert_agent_system.md": ["{product_name}", "{language_name}"],
+        "expert_agent_doc.md": ["{product_name}", "{language_name}"],
+        # Deep research carries repo identity + language placeholders.
+        "deep_research_first_iteration.md": ["{repo_type}", "{repo_url}",
+                                              "{repo_name}", "{language_name}"],
+        "deep_research_intermediate_iteration.md": ["{repo_type}", "{repo_url}",
+                                                    "{repo_name}", "{research_iteration}",
+                                                    "{language_name}"],
+        "deep_research_final_iteration.md": ["{repo_type}", "{repo_url}",
+                                             "{repo_name}", "{language_name}"],
+    }
+
+    def _raw_body(self, filename: str) -> str:
+        """Read the raw, unwrapped prompt body from refs/prompts/<filename>.
+
+        SECTION_PROMPTS / the module constants hold the WRAPPED text (language
+        + detail blocks prepended), so we read the file directly to inspect the
+        body's own placeholders without the wrapper noise.
+        """
+        import os
+        path = os.path.join(PROMPTS_DIR, filename)
+        assert os.path.exists(path), f"prompt file missing: {filename}"
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+
+    def test_section_prompts_contain_required_placeholders(self):
+        # Each section prompt body must carry every {placeholder} the docgen
+        # substitution path fills in. A dropped placeholder would leave a
+        # literal {var} in the final prompt sent to the LLM.
+        for section in WIKI_SECTIONS:
+            filename = f"{section['id']}.md"
+            body = self._raw_body(filename)
+            for placeholder in self.REQUIRED_PLACEHOLDERS[filename]:
+                assert placeholder in body, (
+                    f"{filename} missing required placeholder {placeholder}"
+                )
+
+    def test_expert_prompts_contain_required_placeholders(self):
+        for filename in ("expert_agent_system.md", "expert_agent_doc.md"):
+            body = self._raw_body(filename)
+            for placeholder in self.REQUIRED_PLACEHOLDERS[filename]:
+                assert placeholder in body, (
+                    f"{filename} missing required placeholder {placeholder}"
+                )
+
+    def test_deep_research_prompts_contain_required_placeholders(self):
+        for filename in (
+            "deep_research_first_iteration.md",
+            "deep_research_intermediate_iteration.md",
+            "deep_research_final_iteration.md",
+        ):
+            body = self._raw_body(filename)
+            for placeholder in self.REQUIRED_PLACEHOLDERS[filename]:
+                assert placeholder in body, (
+                    f"{filename} missing required placeholder {placeholder}"
+                )
+
+    def test_all_generation_prompts_meet_min_length(self):
+        # A prompt shorter than 100 chars is almost certainly a stub or a
+        # truncated edit. The real prompt bodies are detailed instructions.
+        min_length = 100
+        for section in WIKI_SECTIONS:
+            filename = f"{section['id']}.md"
+            body = self._raw_body(filename)
+            assert len(body) >= min_length, (
+                f"{filename} is only {len(body)} chars (expected >= {min_length})"
+            )
+
+    def test_expert_and_deep_research_prompts_meet_min_length(self):
+        min_length = 100
+        for filename in (
+            "expert_agent_system.md",
+            "expert_agent_doc.md",
+            "deep_research_first_iteration.md",
+            "deep_research_intermediate_iteration.md",
+            "deep_research_final_iteration.md",
+        ):
+            body = self._raw_body(filename)
+            assert len(body) >= min_length, (
+                f"{filename} is only {len(body)} chars (expected >= {min_length})"
+            )
+
+    def test_verification_guard_non_empty_and_has_provenance_rules(self):
+        # The guard is appended to EVERY generation; an empty/garbled guard
+        # would silently disable grounding. Assert it loads and carries the
+        # core anti-hallucination + citation contract.
+        assert VERIFICATION_GUARD, "VERIFICATION_GUARD loaded empty"
+        assert len(VERIFICATION_GUARD) >= 100
+        guard_lower = VERIFICATION_GUARD.lower()
+        # The guard must mention provenance/citation + the no-invented-facts rule.
+        assert "провенанс" in guard_lower or "provenance" in guard_lower
+        assert "выдумыв" in guard_lower or "invent" in guard_lower
+
+    def test_language_instruction_renders_for_all_supported_languages(self):
+        # LANGUAGE_INSTRUCTION.format() must succeed for every language the
+        # config declares; a stray brace or missing {language_name} would raise
+        # KeyError/INDEXError at runtime per-request.
+        from api.config import configs
+        supported = configs.get("lang_config", {}).get("supported_languages", {})
+        assert supported, "lang_config.supported_languages is empty"
+        for lang_code in supported:
+            # Every supported language must have a display name in LANGUAGE_NAMES,
+            # otherwise _wrap_prompt falls back to the raw code (still works, but
+            # signals a config drift worth catching).
+            assert lang_code in LANGUAGE_NAMES, (
+                f"language {lang_code!r} in lang.json has no LANGUAGE_NAMES entry"
+            )
+            rendered = LANGUAGE_INSTRUCTION.format(language_name=LANGUAGE_NAMES[lang_code])
+            assert "{language_name}" not in rendered, (
+                f"unresolved {{language_name}} for {lang_code}"
+            )
+            assert LANGUAGE_NAMES[lang_code] in rendered
+
+    def test_wrap_prompt_renders_for_all_supported_languages(self):
+        # End-to-end: _wrap_prompt must produce a valid wrapped prompt for every
+        # supported language (exercises LANGUAGE_INSTRUCTION + LANGUAGE_NAMES
+        # + DETAIL_LEVEL_COMPREHENSIVE together).
+        from api.config import configs
+        supported = configs.get("lang_config", {}).get("supported_languages", {})
+        assert supported
+        for lang_code in supported:
+            wrapped = _wrap_prompt("BODY", lang_code)
+            assert wrapped.endswith("BODY")
+            assert DETAIL_LEVEL_COMPREHENSIVE in wrapped
+            # No unresolved placeholder survives.
+            assert "{language_name}" not in wrapped
+
+
+# ---------------------------------------------------------------------------
 # PROMPT_FILES registry
 # ---------------------------------------------------------------------------
 
