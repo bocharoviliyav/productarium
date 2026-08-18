@@ -2,7 +2,7 @@
 
 Covers:
 - ``_strip_provider_prefix`` / ``_normalize_model_for_litellm``: idempotent
-  provider-prefix normalization (openai/ollama/unknown).
+  provider-prefix normalization (openai/unknown).
 - ``_host_to_v1``: trailing-slash / ``/v1`` / ``/embeddings`` stripping.
 - ``_resolve_embedding_dimensions``: model-name heuristics, env override,
   admin-setting override, empty-model fallback.
@@ -49,16 +49,13 @@ from api.cognee._runtime import (
 # --------------------------------------------------------------------------- #
 class TestStripProviderPrefix:
     def test_strips_openai_prefix(self):
-        assert _strip_provider_prefix("openai/qwen3:8b") == "qwen3:8b"
-
-    def test_strips_ollama_prefix(self):
-        assert _strip_provider_prefix("ollama/qwen3:8b") == "qwen3:8b"
+        assert _strip_provider_prefix("openai/qwen/qwen3.6-27b") == "qwen/qwen3.6-27b"
 
     def test_strips_anthropic_prefix(self):
         assert _strip_provider_prefix("anthropic/claude-3") == "claude-3"
 
     def test_no_prefix_unchanged(self):
-        assert _strip_provider_prefix("qwen3:8b") == "qwen3:8b"
+        assert _strip_provider_prefix("qwen/qwen3.6-27b") == "qwen/qwen3.6-27b"
 
     def test_empty_string(self):
         assert _strip_provider_prefix("") == ""
@@ -71,33 +68,30 @@ class TestStripProviderPrefix:
         assert _strip_provider_prefix("openai/org/model") == "org/model"
 
     def test_case_insensitive_prefix(self):
-        assert _strip_provider_prefix("OpenAI/qwen3:8b") == "qwen3:8b"
+        assert _strip_provider_prefix("OpenAI/qwen/qwen3.6-27b") == "qwen/qwen3.6-27b"
 
 
 # --------------------------------------------------------------------------- #
 # _normalize_model_for_litellm
 # --------------------------------------------------------------------------- #
 class TestNormalizeModelForLitellm:
-    def test_ollama_provider_prefixes_ollama(self):
-        assert _normalize_model_for_litellm("ollama", "qwen3:8b") == "ollama/qwen3:8b"
+    def test_provider_routes_openai(self):
+        assert _normalize_model_for_litellm("local", "qwen/qwen3.6-27b") == "openai/qwen/qwen3.6-27b"
 
     def test_openai_provider_prefixes_openai(self):
-        assert _normalize_model_for_litellm("openai", "qwen3:8b") == "openai/qwen3:8b"
+        assert _normalize_model_for_litellm("openai", "qwen/qwen3.6-27b") == "openai/qwen/qwen3.6-27b"
 
     def test_custom_provider_prefixes_openai(self):
-        assert _normalize_model_for_litellm("custom", "qwen3:8b") == "openai/qwen3:8b"
+        assert _normalize_model_for_litellm("custom", "qwen/qwen3.6-27b") == "openai/qwen/qwen3.6-27b"
 
     def test_openai_local_provider_prefixes_openai(self):
-        assert _normalize_model_for_litellm("openai_local", "qwen3:8b") == "openai/qwen3:8b"
+        assert _normalize_model_for_litellm("openai_local", "qwen/qwen3.6-27b") == "openai/qwen/qwen3.6-27b"
 
     def test_unknown_provider_prefixes_openai(self):
-        assert _normalize_model_for_litellm("unknown", "qwen3:8b") == "openai/qwen3:8b"
+        assert _normalize_model_for_litellm("unknown", "qwen/qwen3.6-27b") == "openai/qwen/qwen3.6-27b"
 
     def test_idempotent_already_prefixed(self):
-        assert _normalize_model_for_litellm("openai", "openai/qwen3:8b") == "openai/qwen3:8b"
-
-    def test_idempotent_ollama_already_prefixed(self):
-        assert _normalize_model_for_litellm("ollama", "ollama/qwen3:8b") == "ollama/qwen3:8b"
+        assert _normalize_model_for_litellm("openai", "openai/qwen/qwen3.6-27b") == "openai/qwen/qwen3.6-27b"
 
     def test_empty_model_returns_empty(self):
         assert _normalize_model_for_litellm("openai", "") == ""
@@ -106,10 +100,10 @@ class TestNormalizeModelForLitellm:
         assert _normalize_model_for_litellm("openai", None) == ""  # type: ignore[arg-type]
 
     def test_empty_provider_uses_openai_route(self):
-        assert _normalize_model_for_litellm("", "qwen3:8b") == "openai/qwen3:8b"
+        assert _normalize_model_for_litellm("", "qwen/qwen3.6-27b") == "openai/qwen/qwen3.6-27b"
 
     def test_none_provider_uses_openai_route(self):
-        assert _normalize_model_for_litellm(None, "qwen3:8b") == "openai/qwen3:8b"  # type: ignore[arg-type]
+        assert _normalize_model_for_litellm(None, "qwen/qwen3.6-27b") == "openai/qwen/qwen3.6-27b"  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------- #
@@ -117,22 +111,22 @@ class TestNormalizeModelForLitellm:
 # --------------------------------------------------------------------------- #
 class TestHostToV1:
     def test_plain_host_appends_v1(self):
-        assert _host_to_v1("http://localhost:11434") == "http://localhost:11434/v1"
+        assert _host_to_v1("http://localhost:1234") == "http://localhost:1234/v1"
 
     def test_trailing_slash_stripped(self):
-        assert _host_to_v1("http://localhost:11434/") == "http://localhost:11434/v1"
+        assert _host_to_v1("http://localhost:1234/") == "http://localhost:1234/v1"
 
     def test_already_v1_not_doubled(self):
-        assert _host_to_v1("http://localhost:11434/v1") == "http://localhost:11434/v1"
+        assert _host_to_v1("http://localhost:1234/v1") == "http://localhost:1234/v1"
 
     def test_v1_with_trailing_slash(self):
-        assert _host_to_v1("http://localhost:11434/v1/") == "http://localhost:11434/v1"
+        assert _host_to_v1("http://localhost:1234/v1/") == "http://localhost:1234/v1"
 
     def test_embeddings_suffix_stripped(self):
-        assert _host_to_v1("http://localhost:11434/v1/embeddings") == "http://localhost:11434/v1"
+        assert _host_to_v1("http://localhost:1234/v1/embeddings") == "http://localhost:1234/v1"
 
     def test_embeddings_only_suffix(self):
-        assert _host_to_v1("http://localhost:11434/embeddings") == "http://localhost:11434/v1"
+        assert _host_to_v1("http://localhost:1234/embeddings") == "http://localhost:1234/v1"
 
     def test_empty_returns_empty(self):
         assert _host_to_v1("") == ""
@@ -141,7 +135,7 @@ class TestHostToV1:
         assert _host_to_v1(None) == ""  # type: ignore[arg-type]
 
     def test_whitespace_stripped(self):
-        assert _host_to_v1("  http://localhost:11434  ") == "http://localhost:11434/v1"
+        assert _host_to_v1("  http://localhost:1234  ") == "http://localhost:1234/v1"
 
     def test_https_host(self):
         assert _host_to_v1("https://ai.gateway.com") == "https://ai.gateway.com/v1"
@@ -235,7 +229,7 @@ class TestImportTimeEnvDefaults:
 
     def test_default_model_from_env(self):
         # _default_cognee_model is the BARE model name resolved at import time
-        # (RLM_MODEL_NAME > LLM_MODEL > "qwen3:8b"), BEFORE LLM_MODEL is set by
+        # (RLM_MODEL_NAME > LLM_MODEL > "qwen/qwen3.6-27b"), BEFORE LLM_MODEL is set by
         # the setdefault below it. It is a non-empty string; the normalized
         # form is what gets pushed into LLM_MODEL. We assert the bare value is
         # present and (when no override was set) the default bare name.

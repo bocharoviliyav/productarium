@@ -29,7 +29,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 # The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
-# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee/Ollama stubs for every
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee stubs for every
 # test in this module. No per-module duplicate is needed here.
 
 
@@ -213,20 +213,21 @@ class TestAsyncDocgen:
         import api.api as api_mod
         import api.docgen as adg_pkg
         import api.docgen.codebase as adg
-        import api.cognee as cm
+        import api.memory as memory_mod
         import api.docgen.jobs as dj
         from api.models import CodebaseORM
 
         _indexed = {"v": False}
 
-        async def _long_index(content_or_path, dataset_name=None):
-            # Simulates a 20-30 min cognify; runs on the MAIN loop, NOT the
+        async def _long_index(content, product_id, *, source_type="codebase", source_id=None):
+            # Simulates a long memory-backend index (e.g. a cognee cognify or a
+            # large pgvector embed batch); runs on the MAIN loop, NOT the
             # worker loop, so it never gates the docgen job and is cleaned up
             # when the TestClient context exits.
             _indexed["v"] = True
             await asyncio.sleep(300)
 
-        monkeypatch.setattr(cm, "add_and_index_document", _long_index)
+        monkeypatch.setattr(memory_mod, "index_document", _long_index)
 
         async def _fake(artifact, product, **kwargs):
             artifact.generated_docs = "# Generated\n\ncontent"

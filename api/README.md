@@ -1,11 +1,11 @@
 # Productarium API
 
-Backend API for Productarium — a product-centric documentation platform powered by fully local LLMs (Ollama or any OpenAI-compatible server). No cloud API keys required.
+Backend API for Productarium — a product-centric documentation platform powered by fully local LLMs (any OpenAI-compatible server). No cloud API keys required.
 
 ## Features
 
 - **Product-Centric Model**: Products own typed Codebase, Spec, and Links entities plus a Knowledge Node tree (no polymorphic artifact entity).
-- **Local LLM**: single OpenAI-compatible path (Ollama, LM Studio, llama.cpp, vLLM) — no cloud keys.
+- **Local LLM**: single OpenAI-compatible path (LM Studio, llama.cpp, vLLM) — no cloud keys.
 - **Knowledge Graph**: cognee + pgvector index every entity and knowledge node for RAG.
 - **Expert Agent**: streaming chat (SSE) + document generation over indexed knowledge.
 - **fast-rlm**: Recursive Language Models for long-context doc generation (≥20k chars) and Deep Research.
@@ -18,10 +18,9 @@ Backend API for Productarium — a product-centric documentation platform powere
 ### Prerequisites
 
 - **Python 3.11+**
-- **Ollama** running locally:
+- **An OpenAI-compatible server** running locally (LM Studio, llama.cpp, vLLM) with a generation model and an embedding model:
   ```bash
-  ollama pull qwen3:8b           # or qwen3.5:9b, gemma3:12b, etc.
-  ollama pull nomic-embed-text   # required for embeddings
+  # e.g. pull a model in LM Studio / llama.cpp / vLLM (see .env.example)
   ```
 - **PostgreSQL + pgvector** (optional; `docker-compose up postgres`):
   `pgvector/pgvector:pg18-trixie` (user/db: `cognee`/`cognee_db`).
@@ -40,12 +39,11 @@ All configuration is local. See `.env.example` in the project root for the full,
 
 | Variable | Description | Default |
 |---|---|---|
-| `OLLAMA_HOST` | Local Ollama URL | `http://localhost:11434` |
 | `LOCAL_OPENAI_BASE_URL` | Local OpenAI-compatible API URL | `http://localhost:1234/v1` |
 | `LOCAL_OPENAI_API_KEY` | API key for local OpenAI API | `not-needed` |
 | `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USERNAME` / `DB_PASSWORD` | Postgres connection | `localhost` / `5432` / `cognee_db` / `cognee` / `cognee` |
-| `LLM_PROVIDER` / `LLM_ENDPOINT` / `LLM_MODEL` / `LLM_API_KEY` | cognee LLM (local Ollama) | `ollama` / `…/v1` / `qwen3:8b` / `not-needed` |
-| `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | cognee embeddings (local Ollama) | `ollama` / `nomic-embed-text` / `768` |
+| `LLM_PROVIDER` / `LLM_ENDPOINT` / `LLM_MODEL` / `LLM_API_KEY` | cognee LLM (local OpenAI-compatible) | `openai` / `…/v1` / `qwen/qwen3.6-27b` / `not-needed` |
+| `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | cognee embeddings (local OpenAI-compatible) | `openai_compatible` / `text-embedding-nomic-embed-text-v1.5` / `768` |
 | `RLM_MODEL_BASE_URL` / `RLM_MODEL_NAME` | fast-rlm | `…/v1` / `qwen/qwen3.6-27b` |
 | `PORT` | API server port | `8001` |
 | `AUTH_PROVIDER` | Auth mode: `local` / `keycloak` / `both` / `none` | `local` |
@@ -112,10 +110,10 @@ Add new `api/integrations/<name>.py` subclassing `IntegrationConnector` — no c
 - **`data_pipeline.py`** — Repository cloning (GitHub/GitLab, shallow `--depth=1`), file reading with include/exclude filters, `DatabaseManager` (FAISS indices).
 - **`docgen/`** — Documentation generation package. **No dispatcher** — each generate endpoint calls its generator directly. `codebase.py:generate_codebase_docs` (RLM for long-context ≥20k chars else standard LLM, 7 sections from refs), `spec.py:generate_openapi_docs`/`generate_asyncapi_docs` (stdlib parse + skeleton + LLM enrichment). `jobs.py` (async 202+poll worker, takes `entity_type`). `_common.py` (shared `_index_in_background`). All paths index into cognee and persist `generated_docs` + `pages`.
 - **`expert/`** — Expert agent package. `chat.py` (cognee-recall + RLM routing + LLM streaming), `generate.py` (standalone doc). Prompt bodies in `refs/prompts/expert_agent_*.md`.
-- **`cognee/`** — cognee integration (`_runtime.py` configures local Ollama for LLM + embeddings; no cloud key). `init_cognee()`, `add_and_index_document()`, `query_cognee()`, `reindex_product_knowledge_graph()` — all async, all non-fatal.
+- **`cognee/`** — cognee integration (`_runtime.py` configures a local OpenAI-compatible server for LLM + embeddings; no cloud key). `init_cognee()`, `add_and_index_document()`, `query_cognee()`, `reindex_product_knowledge_graph()` — all async, all non-fatal.
 - **`rlm/runner.py`** — fast-rlm wrapper (Deno + Pyodide) for long-context reasoning. Single path: admin config → `LOCAL_OPENAI_BASE_URL` → default.
 - **`config/`** — Central configuration package. `__init__.py` (JSON loader, `${ENV_VAR}` placeholders), `settings.py` (encrypted key/value store, Fernet via `SETTINGS_SECRET_KEY`), `timeout.py` (per-key timeout overrides), `ssl.py` (TLS patch for corporate gateways).
-- **`clients/`** — `openai_client.py` (custom OpenAI-compatible client for local LLM servers). Single client (no `OllamaClient`).
+- **`clients/`** — `openai_client.py` (custom OpenAI-compatible client for local LLM servers). Single client.
 - **`utils/`** — `logging.py` (console-only, `LOG_FORMAT` env: `logfmt`/`json`), `llm_helpers.py` (`cap(text, limit)` char-based), `llm_tokens.py` (`get_model_context_window`, `_count_tokens`).
 - **`models.py`** — SQLAlchemy 2.0 ORM: `UserORM`, `ProductORM`, `CodebaseORM`, `SpecORM`, `LinksORM`, `KnowledgeNodeORM`, `SettingORM`, `ApiTokenORM`.
 - **`db.py`** — SQLAlchemy engine + `SessionLocal` + `get_db()` + `init_db()` (`Base.metadata.create_all`, idempotent, non-fatal).

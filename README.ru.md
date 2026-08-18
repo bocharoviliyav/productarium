@@ -2,7 +2,7 @@
 
 > Продукто-центричная платформа технической документации с полностью локальным LLM/RAG: ни одного облачного API-ключа не требуется.
 
-Productarium превращает репозитории, спецификации, ссылки и страницы знаний в связную, индексированную, верифицируемую документацию. Каждый **Продукт** (микросервис, монолит или databus-сервис) владеет **Артефактами** (кодовая база, спецификация OpenAPI/AsyncAPI, ссылки) и деревом **Узлов знаний**. Генерация документов идёт через локальные модели (Ollama или любой OpenAI-совместимый сервер), длинный контент обрабатывается рекурсивной языковой моделью **fast-rlm**, а для семантического поиска и графа знаний используется **cognee** поверх PostgreSQL + pgvector. Экспертный агент ведёт потоковый чат и формирует самодостаточные Markdown-документы по всей индексированной базе знаний продукта.
+Productarium превращает репозитории, спецификации, ссылки и страницы знаний в связную, индексированную, верифицируемую документацию. Каждый **Продукт** (микросервис, монолит или databus-сервис) владеет **Артефактами** (кодовая база, спецификация OpenAPI/AsyncAPI, ссылки) и деревом **Узлов знаний**. Генерация документов идёт через локальные модели (любой OpenAI-совместимый сервер), длинный контент обрабатывается рекурсивной языковой моделью **fast-rlm**, а для семантического поиска и графа знаний используется **cognee** поверх PostgreSQL + pgvector. Экспертный агент ведёт потоковый чат и формирует самодостаточные Markdown-документы по всей индексированной базе знаний продукта.
 
 [English](./README.md) | [Русский](./README.ru.md)
 
@@ -71,10 +71,9 @@ flowchart LR
 ### Предварительные требования
 - **Python 3.11+**
 - **Node.js** с **bun** (фронтенд использует bun, а не yarn)
-- **Ollama** должна работать локально с моделью генерации и моделью эмбеддингов:
+- **OpenAI-совместимый сервер** должен работать локально (LM Studio, llama.cpp, vLLM) с моделью генерации и моделью эмбеддингов:
   ```bash
-  ollama pull qwen3:8b           # или qwen3.5:9b, gemma3:12b и т.д.
-  ollama pull nomic-embed-text   # обязательно для эмбеддингов
+  # например, поднимите модель в LM Studio / llama.cpp / vLLM (см. .env.example)
   ```
 - **PostgreSQL + pgvector** для персистентности продуктов/артефактов и графа знаний cognee. `docker-compose up postgres` запускает `pgvector/pgvector:pg18-trixie` (user/db: `cognee`/`cognee_db`). Если Postgres недоступен, `init_db()`/`init_cognee()` логируют предупреждение и откатываются (приложение всё равно стартует).
 
@@ -87,7 +86,6 @@ flowchart LR
 | `faiss-cpu` | Векторный поиск (FAISS-индексы) |
 | `tiktoken` | Подсчёт токенов при чтении репозитория |
 | `openai` | OpenAI-совместимый клиент для локальных серверов |
-| `ollama` | Интеграция с Ollama |
 | `cognee` (postgres-binary) | Граф знаний (Postgres + pgvector) |
 | `fast-rlm` | Рекурсивные языковые модели (Deno + Pyodide) |
 | `sqlalchemy` (≥2.0) | ORM, персистентность продуктов/артефактов |
@@ -113,7 +111,7 @@ flowchart LR
 cp .env.example .env
 docker-compose up
 ```
-Поднимаются **postgres** (pgvector) и **deepwiki** (FastAPI `:8001`, Next.js `:3000`). Откройте [http://localhost:3000](http://localhost:3000). При первом запуске UI предложит создать администратора (`AUTH_PROVIDER=local`). Ollama ожидается на хосте; compose мапит `host.docker.internal` на шлюз хоста.
+Поднимаются **postgres** (pgvector) и **deepwiki** (FastAPI `:8001`, Next.js `:3000`). Откройте [http://localhost:3000](http://localhost:3000). При первом запуске UI предложит создать администратора (`AUTH_PROVIDER=local`). OpenAI-совместимый сервер ожидается на хосте; compose мапит `host.docker.internal` на шлюз хоста.
 
 ### Бэкенд (разработка)
 ```bash
@@ -144,9 +142,9 @@ docker-compose up postgres
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Фронтенд      │     │   Бэкенд        │     │   Ollama /      │
+│   Фронтенд      │     │   Бэкенд        │     │   OpenAI-совм.  │
 │   (Next.js 15)  │◄───►│   (FastAPI)     │◄───►│   Локальный LLM │
-│   Порт: 3000    │     │   Порт: 8001    │     │   Порт: 11434   │
+│   Порт: 3000    │     │   Порт: 8001    │     │   (LM Studio)   │
 └─────────────────┘     └────────┬────────┘     └─────────────────┘
                                  │
                         ┌────────▼────────┐
@@ -205,10 +203,10 @@ docker-compose up postgres
 Подключает все роутеры через `include_all_routers(app)`. `startup_event()` вызывает `init_db()`, затем `init_cognee()` (оба неблокирующе).
 
 ### `config/` — центральный пакет конфигурации
-`__init__.py` загружает JSON из `api/config/` с заменой `${ENV_VAR}`-плейсхолдеров (`replace_env_placeholders`). Единый OpenAI-совместимый путь — один клиент (`OpenAIClient`) покрывает все локальные серверы (Ollama, LM Studio, llama.cpp, vLLM). Глобалы: `OLLAMA_HOST`, `LOCAL_OPENAI_BASE_URL`. `settings.py` (зашифрованное хранилище), `timeout.py` (per-key таймауты), `ssl.py` (TLS-патч для корпоративных шлюзов). Функции: `get_model_config`, `get_embedder_config`, `fetch_ollama_models`, `fetch_openai_local_models`, `get_available_models`. Словарь `configs` агрегирует generator/embedder/repo/lang.
+`__init__.py` загружает JSON из `api/config/` с заменой `${ENV_VAR}`-плейсхолдеров (`replace_env_placeholders`). Единый OpenAI-совместимый путь — один клиент (`OpenAIClient`) покрывает все локальные серверы (LM Studio, llama.cpp, vLLM). Глобалы: `LOCAL_OPENAI_BASE_URL`. `settings.py` (зашифрованное хранилище), `timeout.py` (per-key таймауты), `ssl.py` (TLS-патч для корпоративных шлюзов). Функции: `get_model_config`, `get_embedder_config`, `fetch_openai_local_models`, `get_available_models`. Словарь `configs` агрегирует generator/embedder/repo/lang.
 
 ### `cognee/` — интеграция cognee
-`_runtime.py` настраивает cognee на **локальный Ollama** (LLM через `/v1`, эмбеддинги через `/api/embed`, `LLM_API_KEY=not-needed`), чтобы `cognify()` работал без облачного ключа. Нормализация имён моделей для litellm. Функции: `init_cognee()` (неблокирующая), `apply_cognee_runtime_config()`, `add_and_index_document`, `query_cognee`, `reindex_product_knowledge_graph`.
+`_runtime.py` настраивает cognee на **локальный OpenAI-совместимый сервер** (LLM через `/v1`, эмбеддинги через `/v1/embeddings`, `LLM_API_KEY=not-needed`), чтобы `cognify()` работал без облачного ключа. Нормализация имён моделей для litellm. Функции: `init_cognee()` (неблокирующая), `apply_cognee_runtime_config()`, `add_and_index_document`, `query_cognee`, `reindex_product_knowledge_graph`.
 
 ### `rlm/runner.py` — обёртка fast-rlm
 fast-rlm (Deno + Pyodide, изолированный REPL). `run_rlm_task_sync(query, model_name)` резолвит админ-конфиг `models.docgen` (единый путь: admin config → `LOCAL_OPENAI_BASE_URL` → default), `config.max_depth=2`, `max_calls_per_subagent=10`. `run_rlm_task` — асинхронная обёртка через `asyncio.to_thread`. `prewarm_rlm_background()` — daemon-поток при загрузке.
@@ -238,7 +236,7 @@ Fernet-шифрование key/value поверх `SettingORM`. `bootstrap_secr
 `Product`, `Codebase`, `Spec`, `Links`, `UserBase/Create/Out`, `LoginRequest`, `SetupStatus/Request`, `ChangePasswordRequest`, `ResetPasswordRequest`, `UserCreateAdmin/Result`, `KnowledgeNode(+Create/Update)`, `ApiTokenCreate/Out`, `SettingOut/Update`.
 
 ### Прочие модули
-- `clients/openai_client.py` — кастомный OpenAI-совместимый клиент для локальных LLM-серверов (llama.cpp, vLLM и т.д.). Один клиент (без `OllamaClient`).
+- `clients/openai_client.py` — кастомный OpenAI-совместимый клиент для локальных LLM-серверов (llama.cpp, vLLM и т.д.). Один клиент.
 - `tools/embedder.py` — фабрика `get_embedder()` (без параметров), создающая `adal.Embedder`.
 - `utils/logging.py` — логирование только в консоль (`LOG_FORMAT` env: `logfmt`/`json`; без файловых хендлеров).
 - `utils/llm_helpers.py` — `cap(text, limit)` char-based хелпер.
@@ -328,12 +326,11 @@ Issue/verify сессионных JWT (httpOnly cookie `productarium_session`). 
 JSON-файлы поддерживают `${ENV_VAR}`-плейсхолдеры, резолвятся при загрузке через `replace_env_placeholders()` в `config.py`. Кастомная директория конфигов через `DEEPWIKI_CONFIG_DIR`.
 
 ### `generator.json`
-Два провайдера LLM: `ollama` (через adalflow `OllamaClient`, `default_model: qwen3.5:9b`) и `openai_local` (через кастомный `OpenAIClient` для локальных серверов: llama.cpp, vLLM, LM Studio, `default_model: qwen/qwen3.6-27b`). Оба поддерживают кастомные модели с `temperature`/`top_p` (для ollama — `num_ctx: 32000`).
+Один провайдер LLM: `openai_local` (через кастомный `OpenAIClient` для локальных серверов: llama.cpp, vLLM, LM Studio, `default_model: qwen/qwen3.6-27b`). Поддерживает кастомные модели с `temperature`/`top_p`.
 
 ### `embedder.json`
 ```json
 {
-  "embedder_ollama": { "client_class": "OllamaClient", "model_kwargs": { "model": "nomic-embed-text" } },
   "embedder_openai_local": { "batch_size": 100, "client_class": "OpenAIClient", "model_kwargs": { "model": "text-embedding-nomic-embed-text-v1.5" } },
   "retriever": { "top_k": 20 },
   "text_splitter": { "chunk_overlap": 100, "chunk_size": 350, "split_by": "word" }
@@ -409,7 +406,7 @@ flowchart TD
 
 ### cognee (api/cognee/)
 - Граф знаний Postgres + pgvector.
-- cognee нацелена на **локальный Ollama** для LLM (`cognify` — извлечение сущностей) и эмбеддингов — без облачного ключа.
+- cognee нацелена на **локальный OpenAI-совместимый сервер** для LLM (`cognify` — извлечение сущностей) и эмбеддингов — без облачного ключа.
 - Валидатор cognee требует полные группы `{LLM_MODEL, LLM_ENDPOINT, LLM_API_KEY}` и `{EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, HUGGINGFACE_TOKENIZER}` — `api/cognee/_runtime.py` выставляет их все через `setdefault`.
 - `init_cognee()` неблокирующая (откат к SQLite/LanceDB если Postgres недоступен).
 - Датасет продукта: `prod_{product_id}`.
@@ -531,7 +528,7 @@ docker-compose up postgres   # только БД
 ```bash
 docker build -t productarium .
 docker run -p 8001:8001 -p 3000:3000 \
-  -e OLLAMA_HOST=http://host.docker.internal:11434 \
+  -e LOCAL_OPENAI_BASE_URL=http://host.docker.internal:1234/v1 \
   -v ~/.adalflow:/root/.adalflow \
   productarium
 ```
@@ -542,10 +539,8 @@ docker run -p 8001:8001 -p 3000:3000 \
 
 ## 19. Переменные окружения
 
-**Облачные API-ключи НЕ требуются.** Всё работает на локальном Ollama. См. `.env.example`.
+**Облачные API-ключи НЕ требуются.** Всё работает на локальном OpenAI-совместимом сервере. См. `.env.example`.
 
-### Ollama
-- `OLLAMA_HOST` (по умолчанию `http://localhost:11434`).
 
 ### Локальный OpenAI-совместимый API
 - `LOCAL_OPENAI_BASE_URL` / `LOCAL_OPENAI_API_KEY` (fallback `not-needed`).
@@ -556,14 +551,14 @@ docker run -p 8001:8001 -p 3000:3000 \
 ### Postgres (продукты/codebases/specs/links + cognee)
 - `DB_PROVIDER`, `DB_HOST` (по умолчанию `localhost`; `postgres` в Docker), `DB_PORT`, `DB_NAME` (`cognee_db`), `DB_USERNAME`, `DB_PASSWORD`; `VECTOR_DB_PROVIDER=pgvector`.
 
-### cognee LLM (локальный Ollama)
-- `LLM_PROVIDER=ollama`, `LLM_ENDPOINT` (`/v1`), `LLM_MODEL`, `LLM_API_KEY=not-needed`.
+### cognee LLM (локальный OpenAI-compatible)
+- `LLM_PROVIDER=openai`, `LLM_ENDPOINT` (`/v1`), `LLM_MODEL`, `LLM_API_KEY=not-needed`.
 
 ### cognee embeddings
-- `EMBEDDING_PROVIDER=ollama`, `EMBEDDING_MODEL=nomic-embed-text`, `EMBEDDING_ENDPOINT` (`/api/embed`), `EMBEDDING_DIMENSIONS=768`, `HUGGINGFACE_TOKENIZER=nomic-ai/nomic-embed-text-v1.5` (все обязательны вместе по валидатору cognee).
+- `EMBEDDING_PROVIDER=openai_compatible`, `EMBEDDING_MODEL=text-embedding-nomic-embed-text-v1.5`, `EMBEDDING_ENDPOINT` (`/v1`), `EMBEDDING_DIMENSIONS=768`, `HUGGINGFACE_TOKENIZER=nomic-ai/nomic-embed-text-v1.5` (все обязательны вместе по валидатору cognee).
 
 ### fast-rlm
-- `RLM_MODEL_BASE_URL` (по умолчанию `http://localhost:11434/v1`), `RLM_MODEL_API_KEY=not-needed`, `RLM_MODEL_NAME` (по умолчанию `qwen3:8b`), `RLM_API_TIMEOUT_MS` (по умолчанию 1800000).
+- `RLM_MODEL_BASE_URL` (по умолчанию `http://localhost:1234/v1`), `RLM_MODEL_API_KEY=not-needed`, `RLM_MODEL_NAME` (по умолчанию `qwen/qwen3.6-27b`), `RLM_API_TIMEOUT_MS` (по умолчанию 1800000).
 
 ### Auth
 - `AUTH_PROVIDER` (`local` | `keycloak` | `both` | `none`).
@@ -626,7 +621,7 @@ bun run build      # проверка сборки
 JSON-файлы в `api/config/` поддерживают `${ENV_VAR}`-плейсхолдеры, резолвятся при загрузке через `replace_env_placeholders()`. Кастомная директория через `DEEPWIKI_CONFIG_DIR`.
 
 ### Система провайдеров
-Единый OpenAI-совместимый путь. Каждый локальный сервер (Ollama, LM Studio, llama.cpp, vLLM) экспонирует `/v1` API, поэтому один клиент (`OpenAIClient`) покрывает все. `api/config/generator.json` перечисляет модели; параметр `provider` не пробрасывается через стек. Эмбеддер через `get_embedder()` (без параметров).
+Единый OpenAI-совместимый путь. Каждый локальный сервер (LM Studio, llama.cpp, vLLM) экспонирует `/v1` API, поэтому один клиент (`OpenAIClient`) покрывает все. `api/config/generator.json` перечисляет модели; параметр `provider` не пробрасывается через стек. Эмбеддер через `get_embedder()` (без параметров).
 
 ### Внешние промпты
 Все тела промптов вынесены в `refs/prompts/*.md`. Подстановка через `str.replace` (НЕ `.format`), чтобы Mermaid/JSON-скобки оставались неэкранированными. Hot-reload через `reload_prompt_file()` (`importlib.reload`).
@@ -654,8 +649,6 @@ Fernet-шифрование через `SETTINGS_SECRET_KEY` в `settings_store.
 
 ## 22. Решение проблем
 
-- **«Cannot connect to Ollama»** — убедитесь, что Ollama запущена (`ollama serve`) по адресу `OLLAMA_HOST`.
-- **«Model not found»** — `ollama pull qwen3:8b` (или выбранную модель) и `ollama pull nomic-embed-text`.
 - **Предупреждения Postgres при старте** — не критично; приложение откатывается на SQLite/LanceDB для cognee. Запустите `docker-compose up postgres` для полной функциональности.
 - **«Cannot connect to API server»** — убедитесь, что бэкенд запущен на порту 8001.
 - **Ошибки CORS** — запускайте фронтенд и бэкенд на одной машине либо проверьте rewrites в `next.config.ts`.
@@ -680,7 +673,7 @@ Productarium — форк проекта **deepwiki-open**, созданного
 
 Все зависимости используют лицензии, разрешающие коммерческое использование. Подавляющее большинство — пермиссивные (MIT, Apache-2.0, BSD); одна зависимость имеет слабый copyleft (LGPL-3.0-only), что также допускает коммерческое использование, но накладывает обязательства по уведомлению и возможности перелинковки.
 
-**Пермиссивные лицензии (MIT/Apache-2.0/BSD):** adalflow (MIT), cognee (Apache-2.0), fast-rlm (MIT), markitdown (MIT), fastapi (MIT), uvicorn (BSD-3-Clause), pydantic (MIT), sqlalchemy (MIT), faiss-cpu (MIT), tiktoken (MIT), openai (Apache-2.0), cryptography (Apache-2.0 OR BSD-3-Clause), authlib (BSD-3-Clause), passlib (BSD-3-Clause), pyjwt (MIT), jinja2 (BSD-3-Clause), pyyaml (MIT), websockets (BSD-3-Clause), ollama (MIT). Фронтендные зависимости (next, react, mermaid, next-intl, @phosphor-icons/react, geist, react-markdown, remark-gfm) — все MIT; svg-pan-zoom — BSD-2-Clause.
+**Пермиссивные лицензии (MIT/Apache-2.0/BSD):** adalflow (MIT), cognee (Apache-2.0), fast-rlm (MIT), markitdown (MIT), fastapi (MIT), uvicorn (BSD-3-Clause), pydantic (MIT), sqlalchemy (MIT), faiss-cpu (MIT), tiktoken (MIT), openai (Apache-2.0), cryptography (Apache-2.0 OR BSD-3-Clause), authlib (BSD-3-Clause), passlib (BSD-3-Clause), pyjwt (MIT), jinja2 (BSD-3-Clause), pyyaml (MIT), websockets (BSD-3-Clause). Фронтендные зависимости (next, react, mermaid, next-intl, @phosphor-icons/react, geist, react-markdown, remark-gfm) — все MIT; svg-pan-zoom — BSD-2-Clause.
 
 **Слабый copyleft (LGPL-3.0-only):** psycopg (psycopg 3 с extra `[binary]`). Используется как отдельная, немодифицированная библиотека, линкуемая во время выполнения. Согласно LGPL-3.0-only, вы можете использовать и распространять psycopg совместно с Productarium, в том числе в коммерческих целях, при условии, что сама библиотека psycopg остаётся под LGPL-3.0-only, её исходный код доступен, и получатели могут перелинковать Productarium с модифицированной/обновлённой версией psycopg.
 

@@ -1,12 +1,17 @@
 """Unit tests for ``api.expert.knowledge``.
 
 Covers:
-- ``_retrieve_product_knowledge``: cognee recall mocked + fallback artifact docs
-  + confluence fallback + all-empty.
+- ``_retrieve_product_knowledge``: memory-backend recall mocked + fallback
+  artifact docs + confluence fallback + all-empty.
 - ``_fallback_artifact_docs``: codebase generated_docs, codebase pages (dict +
   str), spec content, missing product, empty.
 - ``_product_name_by_id``: found + missing + DB-down.
 - ``_format_history``: empty + turns (user/assistant/other) + skipped invalid.
+
+The expert knowledge path recalls via ``api.memory.query_memory`` (the
+backend-agnostic facade; active backend = pgvector by default, cognee alt).
+Tests inject a fake ``api.memory`` module with a mock ``query_memory`` to avoid
+the real backend (which would need pgvector/cognee + a live embedder).
 """
 
 from __future__ import annotations
@@ -30,16 +35,18 @@ from api.expert.knowledge import (
 )
 
 
-def _install_fake_cognee(monkeypatch, query_cognee_fn):
-    """Inject a fake api.cognee module with a mock query_cognee.
+def _install_fake_memory(monkeypatch, query_memory_fn):
+    """Inject a fake api.memory module with a mock query_memory.
 
-    Under --cov, importing the real api.cognee triggers the api.config ->
-    adalflow -> numpy chain which corrupts numpy's C extension. This fake
-    avoids it.
+    ``_retrieve_product_knowledge`` recalls via ``api.memory.query_memory``
+    (the backend-agnostic facade). Injecting a fake module avoids importing the
+    real backends (which pull in cognee/numpy + a live embedder). The fake
+    ``query_memory`` has the same signature as the facade:
+    ``query_memory(query, product_id, top_k=20) -> str``.
     """
-    fake_cognee = types.ModuleType("api.cognee")
-    fake_cognee.query_cognee = query_cognee_fn
-    monkeypatch.setitem(sys.modules, "api.cognee", fake_cognee)
+    fake_memory = types.ModuleType("api.memory")
+    fake_memory.query_memory = query_memory_fn
+    monkeypatch.setitem(sys.modules, "api.memory", fake_memory)
 
 
 # --------------------------------------------------------------------------- #
@@ -271,23 +278,24 @@ class TestFallbackArtifactDocs:
 # _retrieve_product_knowledge
 # --------------------------------------------------------------------------- #
 class TestRetrieveProductKnowledge:
-    def test_cognee_recall_returns_context(self, monkeypatch):
-        async def _fake_query_cognee(query, dataset_name=None, top_k=20):
-            assert dataset_name == "prod_prod_1"
-            return "cognee recalled knowledge"
+    def test_memory_recall_returns_context(self, monkeypatch):
+        async def _fake_query_memory(query, product_id, top_k=20):
+            assert product_id == "prod_1"
+            assert top_k == 20
+            return "memory recalled knowledge"
 
-        _install_fake_cognee(monkeypatch, _fake_query_cognee)
+        _install_fake_memory(monkeypatch, _fake_query_memory)
 
         result = asyncio.run(_retrieve_product_knowledge("prod_1", "query"))
-        assert result == "cognee recalled knowledge"
+        assert result == "memory recalled knowledge"
 
-    def test_cognee_recall_empty_falls_back_to_artifacts(self, monkeypatch, isolated_db):
+    def test_memory_recall_empty_falls_back_to_artifacts(self, monkeypatch, isolated_db):
         from api.models import CodebaseORM, ProductORM
 
-        async def _fake_query_cognee(query, dataset_name=None, top_k=20):
+        async def _fake_query_memory(query, product_id, top_k=20):
             return ""
 
-        _install_fake_cognee(monkeypatch, _fake_query_cognee)
+        _install_fake_memory(monkeypatch, _fake_query_memory)
 
         db = isolated_db.SessionLocal()
         try:
@@ -303,13 +311,13 @@ class TestRetrieveProductKnowledge:
         result = asyncio.run(_retrieve_product_knowledge("prod_1", "query"))
         assert "fallback docs" in result
 
-    def test_cognee_recall_exception_falls_back_to_artifacts(self, monkeypatch, isolated_db):
+    def test_memory_recall_exception_falls_back_to_artifacts(self, monkeypatch, isolated_db):
         from api.models import CodebaseORM, ProductORM
 
-        async def _fake_query_cognee(query, dataset_name=None, top_k=20):
-            raise RuntimeError("cognee crashed")
+        async def _fake_query_memory(query, product_id, top_k=20):
+            raise RuntimeError("memory backend crashed")
 
-        _install_fake_cognee(monkeypatch, _fake_query_cognee)
+        _install_fake_memory(monkeypatch, _fake_query_memory)
 
         db = isolated_db.SessionLocal()
         try:
@@ -325,21 +333,21 @@ class TestRetrieveProductKnowledge:
         result = asyncio.run(_retrieve_product_knowledge("prod_1", "query"))
         assert "fallback docs" in result
 
-    def test_cognee_empty_and_no_artifacts_returns_empty(self, monkeypatch, isolated_db):
-        async def _fake_query_cognee(query, dataset_name=None, top_k=20):
+    def test_memory_empty_and_no_artifacts_returns_empty(self, monkeypatch, isolated_db):
+        async def _fake_query_memory(query, product_id, top_k=20):
             return ""
 
-        _install_fake_cognee(monkeypatch, _fake_query_cognee)
+        _install_fake_memory(monkeypatch, _fake_query_memory)
 
         # No product -> no artifacts -> empty.
         result = asyncio.run(_retrieve_product_knowledge("prod_missing", "query"))
         assert result == ""
 
-    def test_confluence_fallback_when_cognee_and_artifacts_empty(self, monkeypatch, isolated_db):
-        async def _fake_query_cognee(query, dataset_name=None, top_k=20):
+    def test_confluence_fallback_when_memory_and_artifacts_empty(self, monkeypatch, isolated_db):
+        async def _fake_query_memory(query, product_id, top_k=20):
             return ""
 
-        _install_fake_cognee(monkeypatch, _fake_query_cognee)
+        _install_fake_memory(monkeypatch, _fake_query_memory)
 
         # Mock the Confluence connector path.
         fake_connector = SimpleNamespace()
@@ -354,10 +362,10 @@ class TestRetrieveProductKnowledge:
         assert result == "confluence content"
 
     def test_confluence_fallback_not_configured(self, monkeypatch, isolated_db):
-        async def _fake_query_cognee(query, dataset_name=None, top_k=20):
+        async def _fake_query_memory(query, product_id, top_k=20):
             return ""
 
-        _install_fake_cognee(monkeypatch, _fake_query_cognee)
+        _install_fake_memory(monkeypatch, _fake_query_memory)
 
         fake_connector = SimpleNamespace()
         fake_connector.is_configured = lambda: False
@@ -369,10 +377,10 @@ class TestRetrieveProductKnowledge:
         assert result == ""
 
     def test_confluence_fallback_no_spaces(self, monkeypatch, isolated_db):
-        async def _fake_query_cognee(query, dataset_name=None, top_k=20):
+        async def _fake_query_memory(query, product_id, top_k=20):
             return ""
 
-        _install_fake_cognee(monkeypatch, _fake_query_cognee)
+        _install_fake_memory(monkeypatch, _fake_query_memory)
 
         fake_connector = SimpleNamespace()
         fake_connector.is_configured = lambda: True
@@ -385,10 +393,10 @@ class TestRetrieveProductKnowledge:
         assert result == ""
 
     def test_confluence_fallback_no_markdown(self, monkeypatch, isolated_db):
-        async def _fake_query_cognee(query, dataset_name=None, top_k=20):
+        async def _fake_query_memory(query, product_id, top_k=20):
             return ""
 
-        _install_fake_cognee(monkeypatch, _fake_query_cognee)
+        _install_fake_memory(monkeypatch, _fake_query_memory)
 
         fake_connector = SimpleNamespace()
         fake_connector.is_configured = lambda: True
@@ -402,10 +410,10 @@ class TestRetrieveProductKnowledge:
         assert result == ""
 
     def test_confluence_fallback_exception_returns_empty(self, monkeypatch, isolated_db):
-        async def _fake_query_cognee(query, dataset_name=None, top_k=20):
+        async def _fake_query_memory(query, product_id, top_k=20):
             return ""
 
-        _install_fake_cognee(monkeypatch, _fake_query_cognee)
+        _install_fake_memory(monkeypatch, _fake_query_memory)
 
         def _boom(name):
             raise RuntimeError("registry crashed")
@@ -417,10 +425,10 @@ class TestRetrieveProductKnowledge:
         assert result == ""
 
     def test_confluence_fallback_connector_none(self, monkeypatch, isolated_db):
-        async def _fake_query_cognee(query, dataset_name=None, top_k=20):
+        async def _fake_query_memory(query, product_id, top_k=20):
             return ""
 
-        _install_fake_cognee(monkeypatch, _fake_query_cognee)
+        _install_fake_memory(monkeypatch, _fake_query_memory)
 
         import api.integrations.registry as reg_mod
         monkeypatch.setattr(reg_mod, "get_connector", lambda name: None)
@@ -429,10 +437,10 @@ class TestRetrieveProductKnowledge:
         assert result == ""
 
     def test_confluence_fallback_space_id_from_id_key(self, monkeypatch, isolated_db):
-        async def _fake_query_cognee(query, dataset_name=None, top_k=20):
+        async def _fake_query_memory(query, product_id, top_k=20):
             return ""
 
-        _install_fake_cognee(monkeypatch, _fake_query_cognee)
+        _install_fake_memory(monkeypatch, _fake_query_memory)
 
         captured = {}
 

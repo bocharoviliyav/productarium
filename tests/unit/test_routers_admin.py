@@ -129,7 +129,7 @@ class TestModelsConnectivity:
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.post(
             "/api/admin/models/test",
-            json={"base_url": "http://x:11434/v1", "model": "qwen/test"},
+            json={"base_url": "http://x:1234/v1", "model": "qwen/test"},
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -156,7 +156,7 @@ class TestModelsConnectivity:
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.post(
             "/api/admin/models/test",
-            json={"base_url": "http://x:11434/v1", "model": "qwen/test"},
+            json={"base_url": "http://x:1234/v1", "model": "qwen/test"},
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -175,7 +175,7 @@ class TestModelsConnectivity:
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.post(
             "/api/admin/models/test",
-            json={"base_url": "http://x:11434/v1", "model": "qwen/test"},
+            json={"base_url": "http://x:1234/v1", "model": "qwen/test"},
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -207,7 +207,7 @@ class TestModelsConnectivity:
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.post(
             "/api/admin/models/test",
-            json={"base_url": "http://x:11434/v1", "model": "qwen/test"},
+            json={"base_url": "http://x:1234/v1", "model": "qwen/test"},
         )
         body = resp.json()
         assert body["success"] is False
@@ -241,7 +241,7 @@ class TestModelsConnectivity:
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.post(
             "/api/admin/models/test",
-            json={"base_url": "http://x:11434/v1", "model": "nomic", "task": "embedder"},
+            json={"base_url": "http://x:1234/v1", "model": "nomic", "task": "embedder"},
         )
         body = resp.json()
         assert body["success"] is True
@@ -272,7 +272,7 @@ class TestModelsConnectivity:
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.post(
             "/api/admin/models/test",
-            json={"base_url": "http://x:11434/v1", "model": "qwen/test"},
+            json={"base_url": "http://x:1234/v1", "model": "qwen/test"},
         )
         body = resp.json()
         assert body["success"] is True
@@ -303,7 +303,7 @@ class TestModelsConnectivity:
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.post(
             "/api/admin/models/test",
-            json={"base_url": "http://x:11434/v1", "model": "qwen/test"},
+            json={"base_url": "http://x:1234/v1", "model": "qwen/test"},
         )
         body = resp.json()
         assert body["success"] is True
@@ -330,7 +330,7 @@ class TestModelsConnectivity:
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.post(
             "/api/admin/models/test",
-            json={"base_url": "http://x:11434/v1"},
+            json={"base_url": "http://x:1234/v1"},
         )
         body = resp.json()
         assert body["success"] is True
@@ -601,7 +601,12 @@ class TestPrompts:
         assert resp.status_code == 400
 
 
-# --- Cognee reindex ---------------------------------------------------------
+# --- Cognee reindex (alias → api.memory) ------------------------------------
+# The legacy POST /api/admin/cognee/reindex endpoint now delegates to
+# ``api.memory.reindex_product_memory`` (the backend-agnostic facade), so the
+# active ``memory.backend`` setting governs this path (pgvector by default,
+# cognee alt). Tests patch the facade; the cognee-group GET test below still
+# covers the cognee settings resolved view directly.
 class TestCogneeReindex:
     def test_reindex_success(self, isolated_db, monkeypatch):
         from api.routers import admin as admin_mod
@@ -609,12 +614,8 @@ class TestCogneeReindex:
         async def _fake_reindex(pid):
             return {"reindexed": True, "product_id": pid}
 
-        # Patch at the use-site (the lazy import inside the handler resolves
-        # api.cognee.reindex_product_knowledge_graph).
-        import api.cognee as cognee_mod
-        monkeypatch.setattr(
-            cognee_mod, "reindex_product_knowledge_graph", _fake_reindex
-        )
+        import api.memory as memory_mod
+        monkeypatch.setattr(memory_mod, "reindex_product_memory", _fake_reindex)
 
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.post("/api/admin/cognee/reindex", json={"product_id": "prod_1"})
@@ -629,10 +630,8 @@ class TestCogneeReindex:
             assert pid is None
             return {"reindexed": True}
 
-        import api.cognee as cognee_mod
-        monkeypatch.setattr(
-            cognee_mod, "reindex_product_knowledge_graph", _fake_reindex
-        )
+        import api.memory as memory_mod
+        monkeypatch.setattr(memory_mod, "reindex_product_memory", _fake_reindex)
 
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.post("/api/admin/cognee/reindex")
@@ -645,15 +644,145 @@ class TestCogneeReindex:
         async def _fake_reindex(pid):
             raise RuntimeError("cognee down")
 
-        import api.cognee as cognee_mod
-        monkeypatch.setattr(
-            cognee_mod, "reindex_product_knowledge_graph", _fake_reindex
-        )
+        import api.memory as memory_mod
+        monkeypatch.setattr(memory_mod, "reindex_product_memory", _fake_reindex)
 
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.post("/api/admin/cognee/reindex", json={"product_id": "prod_1"})
         assert resp.status_code == 500
         assert "cognee down" in resp.json()["detail"]
+
+
+# --- Memory endpoints (GET/PUT /api/admin/memory, POST reindex) --------------
+class TestMemoryEndpoints:
+    def test_get_memory_returns_resolved_view(self, isolated_db):
+        from api.routers import admin as admin_mod
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.get("/api/admin/memory")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["group"] == "memory"
+        assert "resolved" in body
+        # Default backend is pgvector; valid_backends lists both options.
+        assert body["resolved"]["backend"] == "pgvector"
+        assert body["resolved"]["valid_backends"] == ["pgvector", "cognee"]
+        # pgvector status fields are present (counts on SQLite are 0).
+        assert "available" in body["resolved"]
+        assert "chunk_count" in body["resolved"]
+        assert "product_count" in body["resolved"]
+
+    def test_get_memory_group_alias_same_view(self, isolated_db):
+        """GET /api/admin/memory (group route) returns the same resolved view."""
+        from api.routers import admin as admin_mod
+
+        app, client = _build_client(isolated_db, admin_mod)
+        # The dedicated /memory route is declared before the /{group} catch-all,
+        # so both hit the same resolved view.
+        resp = client.get("/api/admin/memory")
+        assert resp.status_code == 200
+        assert resp.json()["resolved"]["backend"] == "pgvector"
+
+    def test_put_memory_valid_backend(self, isolated_db):
+        from api.routers import admin as admin_mod
+        import api.config.settings as ss
+        from api.memory.resolver import reset_memory_backend_cache
+
+        reset_memory_backend_cache()
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.put(
+            "/api/admin/memory",
+            json={"memory.backend": "cognee"},
+        )
+        assert resp.status_code == 200
+        assert "memory.backend" in resp.json()["saved"]
+        # The setting was persisted (normalized to lowercase).
+        assert ss.get_setting("memory.backend") == "cognee"
+        # And the resolver now resolves to cognee.
+        from api.memory.resolver import get_memory_backend_name
+        assert get_memory_backend_name() == "cognee"
+        # Restore default to avoid leaking into other tests.
+        ss.set_setting("memory.backend", "pgvector")
+        reset_memory_backend_cache()
+
+    def test_put_memory_invalid_backend_ignored(self, isolated_db):
+        from api.routers import admin as admin_mod
+        import api.config.settings as ss
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.put(
+            "/api/admin/memory",
+            json={"memory.backend": "bogus"},
+        )
+        assert resp.status_code == 200
+        assert "memory.backend" not in resp.json()["saved"]
+        # Nothing was persisted.
+        assert ss.get_setting("memory.backend") is None
+
+    def test_put_memory_case_normalized(self, isolated_db):
+        from api.routers import admin as admin_mod
+        import api.config.settings as ss
+        from api.memory.resolver import reset_memory_backend_cache
+
+        reset_memory_backend_cache()
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.put(
+            "/api/admin/memory",
+            json={"memory.backend": "  CoGnEe  "},
+        )
+        assert resp.status_code == 200
+        assert "memory.backend" in resp.json()["saved"]
+        assert ss.get_setting("memory.backend") == "cognee"
+        # Restore default.
+        ss.set_setting("memory.backend", "pgvector")
+        reset_memory_backend_cache()
+
+    def test_post_memory_reindex_success(self, isolated_db, monkeypatch):
+        from api.routers import admin as admin_mod
+        import api.memory as memory_mod
+
+        async def _fake_reindex(pid):
+            return {"success": True, "reindexed_count": 2, "message": "ok"}
+
+        monkeypatch.setattr(memory_mod, "reindex_product_memory", _fake_reindex)
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.post("/api/admin/memory/reindex", json={"product_id": "prod_1"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        assert body["reindexed_count"] == 2
+
+    def test_post_memory_reindex_no_body(self, isolated_db, monkeypatch):
+        from api.routers import admin as admin_mod
+        import api.memory as memory_mod
+
+        captured: dict = {}
+
+        async def _fake_reindex(pid):
+            captured["pid"] = pid
+            return {"success": True, "reindexed_count": 0}
+
+        monkeypatch.setattr(memory_mod, "reindex_product_memory", _fake_reindex)
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.post("/api/admin/memory/reindex")
+        assert resp.status_code == 200
+        assert captured["pid"] is None
+
+    def test_post_memory_reindex_failure_500(self, isolated_db, monkeypatch):
+        from api.routers import admin as admin_mod
+        import api.memory as memory_mod
+
+        async def _boom(pid):
+            raise RuntimeError("memory backend down")
+
+        monkeypatch.setattr(memory_mod, "reindex_product_memory", _boom)
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.post("/api/admin/memory/reindex", json={"product_id": "prod_1"})
+        assert resp.status_code == 500
+        assert "memory backend down" in resp.json()["detail"]
 
 
 # --- Settings group GETs (resolved views) -----------------------------------
@@ -669,7 +798,9 @@ class TestSettingsGroupGets:
         assert "resolved" in body
         assert "github" in body["resolved"]
         assert "gitlab" in body["resolved"]
-        assert body["resolved"]["github"]["hasToken"] is False
+        # New list shape: each host resolves to a list of accounts.
+        assert isinstance(body["resolved"]["github"], list)
+        assert body["resolved"]["github"] == []
 
     def test_get_confluence_group(self, isolated_db):
         from api.routers import admin as admin_mod
@@ -728,6 +859,31 @@ class TestSettingsGroupGets:
         assert "max_concurrency" in body["resolved"]
         assert "delay_seconds" in body["resolved"]
         assert "rate_limit_rps" in body["resolved"]
+
+    def test_get_embedder_group(self, isolated_db):
+        from api.routers import admin as admin_mod
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.get("/api/admin/embedder")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["group"] == "embedder"
+        assert "resolved" in body
+        assert "max_concurrency" in body["resolved"]
+        assert "delay_seconds" in body["resolved"]
+        assert "rate_limit_rps" in body["resolved"]
+
+    def test_get_memory_group(self, isolated_db):
+        from api.routers import admin as admin_mod
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.get("/api/admin/memory")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["group"] == "memory"
+        assert "resolved" in body
+        assert body["resolved"]["backend"] == "pgvector"
+        assert body["resolved"]["valid_backends"] == ["pgvector", "cognee"]
 
     def test_get_timeouts_group(self, isolated_db):
         from api.routers import admin as admin_mod
@@ -893,6 +1049,88 @@ class TestSettingsPutValidation:
         assert "git.github.token" in resp.json()["saved"]
         # The secret decrypts back.
         assert ss.get_setting("git.github.token") == "ghp_secret123"
+
+    def test_put_git_accounts_roundtrip(self, isolated_db):
+        from api.routers import admin as admin_mod
+        import api.config.settings as ss
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.put(
+            "/api/admin/git",
+            json={
+                "accounts": {
+                    "github": [
+                        {"url": "", "token": "public-tok"},
+                        {"url": "https://github.self.com", "token": "self-tok"},
+                    ]
+                }
+            },
+        )
+        assert resp.status_code == 200
+        assert "github" in resp.json()["saved"]
+        accounts = ss.get_git_accounts("github")
+        assert len(accounts) == 2
+        assert accounts[0]["url"] == ""
+        assert accounts[0]["token"] == "public-tok"
+        assert accounts[1]["url"] == "https://github.self.com"
+        assert accounts[1]["token"] == "self-tok"
+
+    def test_put_git_accounts_preserves_token_when_empty(self, isolated_db):
+        from api.routers import admin as admin_mod
+        import api.config.settings as ss
+
+        app, client = _build_client(isolated_db, admin_mod)
+        # First save with a token.
+        client.put(
+            "/api/admin/git",
+            json={"accounts": {"github": [{"url": "https://github.self.com", "token": "keep-me"}]}},
+        )
+        # Second save with an empty token for the same URL should keep it.
+        resp = client.put(
+            "/api/admin/git",
+            json={"accounts": {"github": [{"url": "https://github.self.com", "token": ""}]}},
+        )
+        assert resp.status_code == 200
+        accounts = ss.get_git_accounts("github")
+        assert len(accounts) == 1
+        assert accounts[0]["token"] == "keep-me"
+
+    def test_put_git_accounts_removes_deleted(self, isolated_db):
+        from api.routers import admin as admin_mod
+        import api.config.settings as ss
+
+        app, client = _build_client(isolated_db, admin_mod)
+        client.put(
+            "/api/admin/git",
+            json={
+                "accounts": {
+                    "github": [
+                        {"url": "https://a.com", "token": "a"},
+                        {"url": "https://b.com", "token": "b"},
+                    ]
+                }
+            },
+        )
+        # Now save only one account; the other should be gone.
+        client.put(
+            "/api/admin/git",
+            json={"accounts": {"github": [{"url": "https://a.com", "token": "a"}]}},
+        )
+        accounts = ss.get_git_accounts("github")
+        assert [a["url"] for a in accounts] == ["https://a.com"]
+
+    def test_put_git_accounts_resolved_view(self, isolated_db):
+        from api.routers import admin as admin_mod
+
+        app, client = _build_client(isolated_db, admin_mod)
+        client.put(
+            "/api/admin/git",
+            json={"accounts": {"github": [{"url": "https://github.com", "token": "tok"}]}},
+        )
+        body = client.get("/api/admin/git").json()
+        assert body["resolved"]["github"] == [
+            {"url": "https://github.com", "token": None, "hasToken": True}
+        ]
 
 
 # --- Users CRUD (create + reset-token) --------------------------------------

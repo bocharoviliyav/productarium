@@ -48,26 +48,17 @@ os.environ["VECTOR_DB_PROVIDER"] = VECTOR_DB_PROVIDER
 #
 # Fix: prefix the model with the litellm provider segment that matches cognee's
 # ``llm_provider``:
-#   provider "ollama"      -> "ollama/<model>"   (used by OllamaAPIAdapter,
-#                                                    which calls the OpenAI SDK
-#                                                    directly and tolerates the
-#                                                    prefix)
 #   provider "openai"/
 #   "openai_local"/
 #   "custom"             -> "openai/<model>"   (litellm openai route with a
 #                                                    custom api_base)
 #
-# Ollama's own adapter ignores the prefix (it talks to the OpenAI-compatible
-# /v1 endpoint directly), so it is safe to add it there too; what matters is
-# that litellm never sees an unprefixed local model name on the openai route.
-#
 # ``_strip_provider_prefix`` first removes any existing ``<provider>/`` segment
-# so repeated applies never double-prefix (``openai/openai/qwen3:8b``).
+# so repeated applies never double-prefix (``openai/openai/qwen/qwen3.6-27b``).
 # litellm's known routing prefixes are an allow-list; a stray slash inside a
 # model name (rare) is left intact by only stripping a *leading* known prefix.
 _LITELLM_PROVIDER_PREFIXES = (
     "openai/",
-    "ollama/",
     "anthropic/",
     "gemini/",
     "mistral/",
@@ -79,7 +70,7 @@ _LITELLM_PROVIDER_PREFIXES = (
 
 
 def _strip_provider_prefix(model: str) -> str:
-    """Remove a leading litellm provider prefix (``openai/``, ``ollama/``, …)."""
+    """Remove a leading litellm provider prefix (``openai/``, ``anthropic/``, …)."""
     if not model:
         return model
     m = model.strip()
@@ -93,18 +84,14 @@ def _strip_provider_prefix(model: str) -> str:
 def _normalize_model_for_litellm(provider: str, model: str) -> str:
     """Return ``model`` with the litellm provider prefix for ``provider``.
 
-    - ``ollama``        -> ``ollama/<model>``
-    - anything else that ends up on the OpenAI/Custom route (openai /
-      openai_local / custom) -> ``openai/<model>``
+    - anything that ends up on the OpenAI/Custom route (openai /
+      openai_local / custom / unknown) -> ``openai/<model>``
 
     Idempotent: an already-prefixed name is not double-prefixed.
     """
     bare = _strip_provider_prefix(model or "")
     if not bare:
         return model or ""
-    prov = (provider or "").strip().lower()
-    if prov == "ollama":
-        return f"ollama/{bare}"
     # openai / openai_local / custom / unknown -> route through litellm's
     # openai-compatible path with a custom api_base.
     return f"openai/{bare}"
@@ -157,55 +144,52 @@ def _resolve_embedding_dimensions(model_name: str) -> int:
 def _resolve_default_provider() -> str:
     """Default cognee LLM provider.
 
-    Every supported local server (Ollama, LM Studio, llama.cpp, vLLM, ...)
+    Every supported local server (LM Studio, llama.cpp, vLLM, ...)
     exposes an OpenAI-compatible ``/v1`` API, so cognee's ``openai`` provider
     (which POSTs to {LLM_ENDPOINT}/chat/completions via the OpenAI SDK) covers
-    all cases. Ollama's :11434 serves the same ``/v1`` surface.
+    all cases.
     """
     return "openai"
 
 
 # --- Local LLM configuration for cognee ---
 # cognee talks to an OpenAI-compatible LLM endpoint. We point it at the SAME
-# local server the rest of DeepWiki uses (Ollama by default, but also LM
-# Studio / llama.cpp / vLLM via LOCAL_OPENAI_BASE_URL). cognee's LLM endpoint
+# local server the rest of DeepWiki uses (LM Studio by default, but also
+# llama.cpp / vLLM via LOCAL_OPENAI_BASE_URL). cognee's LLM endpoint
 # must use the OpenAI-compatible path ("/v1"). A non-empty LLM_API_KEY is
 # required even by local servers that ignore it; we default to "not-needed".
-# NB: ``OLLAMA_HOST`` historically carried the host URL for every provider;
-# we keep that for backwards compat but prefer LOCAL_OPENAI_BASE_URL when set.
 _local_llm_host = (
     os.environ.get("LOCAL_OPENAI_BASE_URL")
-    or os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    or "http://localhost:1234/v1"
 ).rstrip("/")
 # Normalize to a bare host (strip a trailing "/v1") so we can append the right
 # path per cognee's expectations below.
 _local_llm_host = _local_llm_host.removesuffix("/v1")
 
 # The default cognee provider must MATCH the local server we point at, so that
-# the right adapter (OllamaAPIAdapter vs OpenAIAdapter) is selected and the
-# model name is prefixed correctly for litellm. With an empty .env this
-# resolves to ``ollama`` (the fully-local default).
+# the right adapter (OpenAIAdapter) is selected and the model name is prefixed
+# correctly for litellm. With an empty .env this resolves to ``openai`` (the
+# fully-local default).
 _default_cognee_provider = _resolve_default_provider()
 os.environ.setdefault("LLM_PROVIDER", _default_cognee_provider)
 os.environ.setdefault("LLM_ENDPOINT", f"{_local_llm_host}/v1")
-# ``LLM_MODEL`` must carry the litellm provider prefix on the openai route;
-# the ollama adapter tolerates the prefix too. Default bare model is the same
-# RLM/local default, then normalized.
-_default_cognee_model = os.environ.get("RLM_MODEL_NAME") or os.environ.get("LLM_MODEL") or "qwen3:8b"
+# ``LLM_MODEL`` must carry the litellm provider prefix on the openai route.
+# Default bare model is the same RLM/local default, then normalized.
+_default_cognee_model = os.environ.get("RLM_MODEL_NAME") or os.environ.get("LLM_MODEL") or "qwen/qwen3.6-27b"
 os.environ.setdefault("LLM_MODEL", _normalize_model_for_litellm(_default_cognee_provider, _default_cognee_model))
 if not os.environ.get("LLM_API_KEY"):
-    os.environ["LLM_API_KEY"] = os.environ.get("LOCAL_OPENAI_API_KEY") or os.environ.get("OLLAMA_API_KEY") or "not-needed"
+    os.environ["LLM_API_KEY"] = os.environ.get("LOCAL_OPENAI_API_KEY") or "not-needed"
 
 # --- Local embeddings configuration for cognee ---
 # cognee requires embeddings to be configured alongside the LLM; if only one is
 # set it silently falls back to OpenAI (cloud). Every supported local server
-# (Ollama, LM Studio, llama.cpp, vLLM, ...) exposes the OpenAI-compatible
+# (LM Studio, llama.cpp, vLLM, ...) exposes the OpenAI-compatible
 # embeddings shape (POST {endpoint}/embeddings), so the single
-# ``openai_compatible`` provider covers all cases (Ollama's :11434 included).
+# ``openai_compatible`` provider covers all cases.
 #
 # CRITICAL: use ``openai_compatible`` (NOT ``openai``). cognee's embedding
-# dispatch in ``create_embedding_engine`` routes ONLY ``openai_compatible`` and
-# ``ollama`` to safe engines; ANY other value (incl. ``openai``) falls through
+# dispatch in ``create_embedding_engine`` routes ONLY ``openai_compatible`` to
+# safe engines; ANY other value (incl. ``openai``) falls through
 # to ``LiteLLMEmbeddingEngine``, whose ``__init__`` calls
 # ``tiktoken.encoding_for_model(embedding_model)``. For a nomic-embed model
 # name tiktoken has no mapping -> ``KeyError: Could not automatically map
@@ -325,7 +309,7 @@ os.environ.setdefault(
 
 # --- Skip cognee's blocking LLM connection test (item 10 bug fix) -------------
 # cognee runs a blocking LLM connection test during cognify() that times out
-# after ~30s when pointed at a local Ollama that is slow to answer. Setting
+# after ~30s when pointed at a local model that is slow to answer. Setting
 # COGNEE_SKIP_CONNECTION_TEST=true (the default here) disables that test so
 # cognify() starts immediately. Overridable via env. Also best-effort: shrink
 # the cognee LLM connection timeout if cognee honors it.

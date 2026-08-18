@@ -110,8 +110,9 @@ def _product_name(product: Any, artifact: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Standard (non-RLM) LLM wrapper -- adalflow Generator over local Ollama /
-# OpenAI-local. Built lazily from api.config.get_model_config (no cloud keys).
+# Standard (non-RLM) LLM wrapper -- adalflow Generator over the
+# OpenAI-compatible local server. Built lazily from api.config.get_model_config
+# (no cloud keys).
 # ---------------------------------------------------------------------------
 class _StandardLLM:
     """Thin non-streaming text generator over the configured local LLM.
@@ -136,9 +137,9 @@ class _StandardLLM:
         model_client_class = generator_config["model_client"]
         # Thread admin base_url/api_key through to the OpenAI-compatible client
         # so docgen hits the configured endpoint (corporate gateway, LM Studio,
-        # Ollama :11434, ...) rather than the env default. Every supported
-        # server exposes the OpenAI-compatible /v1 API, so OpenAIClient covers
-        # all cases (Ollama included). SSL verify is wired via ssl_config.
+        # ...) rather than the env default. Every supported server exposes the
+        # OpenAI-compatible /v1 API, so OpenAIClient covers all cases. SSL
+        # verify is wired via ssl_config.
         client_kwargs: Dict[str, Any] = {}
         if base_url:
             client_kwargs["base_url"] = base_url
@@ -217,7 +218,7 @@ def _safe_build_llm(
 ) -> Optional[_StandardLLM]:
     try:
         return _StandardLLM(model, base_url=base_url, api_key=api_key)
-    except Exception as e:  # pragma: no cover - depends on live config/Ollama
+    except Exception as e:  # pragma: no cover - depends on live config/LLM
         logger.warning(
             "Could not initialise standard LLM (%s): %s. "
             "Falling back to RLM/skeleton where possible.", model, e,
@@ -239,7 +240,7 @@ async def _llm_or_none(
         return ""
     try:
         return _clean_llm_text(await llm.generate(prompt))
-    except Exception as e:  # pragma: no cover - depends on live Ollama
+    except Exception as e:  # pragma: no cover - depends on live LLM
         logger.warning("Standard LLM generation failed: %s", e)
         return ""
 
@@ -267,7 +268,7 @@ def _make_repair_llm(
     async def _call(prompt: str) -> str:
         try:
             return await llm.generate(prompt)
-        except Exception as e:  # pragma: no cover - depends on live Ollama
+        except Exception as e:  # pragma: no cover - depends on live LLM
             logger.warning("Mermaid repair LLM call failed: %s", e)
             return ""
 
@@ -287,49 +288,69 @@ def _persist_artifact(artifact: Any, markdown: str, pages: Dict[str, Any]) -> No
 
 
 def _cognee_dataset(product: Any) -> str:
-    """Product-scoped cognee dataset name (item 1 cognee-first): ``prod_{product_id}``.
+    """Product-scoped dataset/product key: ``prod_{product_id}``.
 
-    All generated artifact/page content is indexed into a single per-product
-    cognee dataset so the expert agent and Ask can recall across every
-    artifact of the product. Falls back to ``unknown`` if the product has no id.
+    Historically the cognee dataset name; now also the key from which the
+    memory-backend indexing path extracts the ``product_id`` (the active
+    backend — pgvector or cognee — is selected by the ``memory.backend`` admin
+    setting, so callers stay backend-agnostic). Falls back to ``unknown`` if
+    the product has no id.
     """
     pid = getattr(product, "id", None) or getattr(product, "product_id", None) or "unknown"
     return f"prod_{pid}"
 
 
-def _index_in_background(content_or_path: str, dataset_name: str) -> None:
-    """Fire-and-forget cognee indexing. Failures are logged, never fatal.
+def _product_id_from_dataset(dataset_name: str) -> str:
+    """Extract the product id from a ``prod_{id}`` dataset/key string."""
+    if not dataset_name:
+        return ""
+    return dataset_name[len("prod_"):] if dataset_name.startswith("prod_") else dataset_name
 
-    The indexing coroutine is handed off to the long-lived MAIN FastAPI event
-    loop (captured at startup) via ``asyncio.run_coroutine_threadsafe`` so it
-    survives the docgen worker thread's own short-lived loop teardown. This is
-    essential because cognee's ``cognify`` can legitimately run 20-30 min — if
-    it were scheduled on the worker loop, closing that loop when the docgen job
-    finishes would CANCEL the still-running cognify and the graph would never
-    finish building. By moving it to the main loop, the job can return
-    immediately (display is decoupled from the knowledge graph) while indexing
-    continues in the background.
+
+def _index_in_background(
+    content_or_path: str,
+    dataset_name: str,
+    *,
+    source_type: str = "codebase",
+    source_id: Optional[str] = None,
+) -> None:
+    """Fire-and-forget memory-backend indexing. Failures are logged, never fatal.
+
+    Delegates to ``api.memory.index_document`` (active backend: pgvector by
+    default, cognee alt) so the admin ``memory.backend`` switch governs this
+    path too. The indexing coroutine is handed off to the long-lived MAIN
+    FastAPI event loop (captured at startup) via
+    ``asyncio.run_coroutine_threadsafe`` so it survives the docgen worker
+    thread's own short-lived loop teardown. This is essential because a cognee
+    ``cognify`` can legitimately run 20-30 min — if it were scheduled on the
+    worker loop, closing that loop when the docgen job finishes would CANCEL
+    the still-running cognify. By moving it to the main loop, the job can
+    return immediately while indexing continues in the background.
     """
+    product_id = _product_id_from_dataset(dataset_name)
 
     async def _run() -> None:
         try:
-            from api.cognee import add_and_index_document  # lazy: cognee optional
-            await add_and_index_document(content_or_path, dataset_name=dataset_name)
-        except Exception as e:  # pragma: no cover - depends on live cognee/DB
-            logger.warning("Cognee indexing failed for %r: %s", dataset_name, e)
+            from api.memory import index_document  # lazy: backend optional
+            await index_document(
+                content_or_path, product_id,
+                source_type=source_type, source_id=source_id,
+            )
+        except Exception as e:  # pragma: no cover - depends on live backend/DB
+            logger.warning("Memory indexing failed for %r: %s", dataset_name, e)
 
     main_loop = get_main_event_loop()
     if main_loop is not None and main_loop.is_running():
         try:
             asyncio.run_coroutine_threadsafe(_run(), main_loop)
             logger.info(
-                "Scheduled cognee indexing for %r onto the main event loop.",
+                "Scheduled memory indexing for %r onto the main event loop.",
                 dataset_name,
             )
             return
         except RuntimeError as e:  # loop closed between the check and the call
             logger.warning(
-                "Could not schedule cognee indexing on the main loop for %r (%s); "
+                "Could not schedule memory indexing on the main loop for %r (%s); "
                 "falling back to a local task.",
                 dataset_name, e,
             )
@@ -343,6 +364,6 @@ def _index_in_background(content_or_path: str, dataset_name: str) -> None:
     except RuntimeError:
         # No running event loop -- best-effort skip.
         logger.warning(
-            "No running event loop; skipping background cognee indexing for %r.",
+            "No running event loop; skipping background memory indexing for %r.",
             dataset_name,
         )

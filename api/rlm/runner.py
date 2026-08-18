@@ -17,17 +17,50 @@ except Exception as _fast_rlm_import_err:  # pragma: no cover - optional dep
     logger.warning("fast_rlm could not be imported; RLM features disabled: %s", _fast_rlm_import_err)
 
 
-def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
+# --------------------------------------------------------------------------- #
+# Per-scenario recursion budgets (token-based: local providers return no cost
+# so max_money_spent is inert per the fast-rlm docs).
+# Expert: deeper recursion for exhaustive cross-artifact search.
+# Docgen: moderate recursion; the agent reads files on demand via tools.
+# --------------------------------------------------------------------------- #
+RLM_EXPERT_MAX_DEPTH = int(os.environ.get("RLM_EXPERT_MAX_DEPTH", "4"))
+RLM_EXPERT_MAX_CALLS = int(os.environ.get("RLM_EXPERT_MAX_CALLS", "20"))
+RLM_DOCGEN_MAX_DEPTH = int(os.environ.get("RLM_DOCGEN_MAX_DEPTH", "3"))
+RLM_DOCGEN_MAX_CALLS = int(os.environ.get("RLM_DOCGEN_MAX_CALLS", "20"))
+
+
+def get_rlm_session_dir(scope: str) -> str:
+    """Resolve (and lazily create) a persistent on-disk session directory.
+
+    fast-rlm persists the root agent's REPL state (built indexes, parsed
+    corpora, helper functions, query→FINAL ledger) under ``session_dir`` so
+    follow-up ``query()`` calls reuse it (measured ~2.6× cheaper in the docs).
+    One directory per scope (``expert_<product_id>`` or
+    ``docgen_<codebase_id>``); the ``session_id`` distinguishes conversations
+    within a directory.
+
+    Constraint (from the docs): one live query per session dir — no concurrent
+    queries. Expert chat is serial per product (one SSE stream at a time per
+    product), which is acceptable.
     """
-    Runs an iterative reasoning process with fast-rlm.
-    This runs synchronously and should be wrapped in an executor/thread.
+    base = os.path.expanduser("~/.adalflow/rlm_sessions")
+    session_dir = os.path.join(base, scope)
+    try:
+        os.makedirs(session_dir, exist_ok=True)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Could not create RLM session dir %r: %s", session_dir, e)
+    return session_dir
+
+
+def _resolve_rlm_config(model_name: str = None):
+    """Resolve a configured ``RLMConfig`` + model id + base_url for fast-rlm.
+
+    Shared by ``run_rlm_task_sync`` (flat-string path) and
+    ``run_rlm_structured_sync`` (dict + tools + sessions path). Does all the
+    admin-store model/base_url/api_key resolution, env export, and
+    context-window clamping. Returns ``(config, resolved_model, base_url)``
+    or raises if fast_rlm is unavailable.
     """
-    if not _FAST_RLM_AVAILABLE:
-        return {
-            "results": "fast_rlm not available",
-            "usage": {},
-            "success": False,
-        }
     # Resolve the LLM config from the admin store (models.docgen.*) so RLM
     # hits the corporate AI gateway when configured, instead of the dead
     # env-default LM Studio :1234. Falls back to env vars when the store / DB
@@ -63,11 +96,11 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
     # Resolve the OpenAI-compatible base URL for fast-rlm. Single path:
     #   1. admin models.docgen.base_url (corporate gateway etc.)
     #   2. LOCAL_OPENAI_BASE_URL (local OpenAI-compatible server)
-    #   3. http://localhost:11434/v1 (default)
+    #   3. http://localhost:1234/v1 (default, LM Studio)
     base_url = (
         admin_base_url
         or os.environ.get("LOCAL_OPENAI_BASE_URL")
-        or "http://localhost:11434/v1"
+        or "http://localhost:1234/v1"
     )
     # Normalize to a clean ``/v1`` base: the fast-rlm Deno engine builds
     # ``new OpenAI({ baseURL })`` and the SDK POSTs to
@@ -90,11 +123,9 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
     os.environ["RLM_MODEL_BASE_URL"] = base_url
 
     # Resolve model. Admin models.docgen.model wins over the explicit arg / env.
-    # When the endpoint is a native Ollama server, coerce to a known local tag
-    # (Ollama rejects cloud-style names like "qwen/qwen3.6-27b"). For any other
-    # OpenAI-compatible server (LM Studio, llama.cpp, vLLM, corporate gateway)
-    # pass the model name through verbatim -- these servers use their own model
-    # IDs and reject Ollama tags.
+    # The endpoint is an OpenAI-compatible server (LM Studio, llama.cpp, vLLM,
+    # corporate gateway); pass the model name through verbatim -- these servers
+    # use their own model IDs.
     resolved_model = model_name or admin_model or os.environ.get("RLM_MODEL_NAME") or "z-ai/glm-5"
     # fast-rlm's Deno engine builds ``new OpenAI({ apiKey, baseURL })`` and calls
     # ``chat.completions.create({ model: resolvedModel, ... })``. The OpenAI SDK
@@ -111,14 +142,14 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
         from api.cognee._runtime import _strip_provider_prefix
         resolved_model = _strip_provider_prefix(resolved_model)
     except Exception:  # pragma: no cover - import-safe
-        for _pfx in ("openai/", "ollama/"):
-            if resolved_model.startswith(_pfx):
-                resolved_model = resolved_model[len(_pfx):]
-                break
+        if resolved_model.startswith("openai/"):
+            resolved_model = resolved_model[len("openai/"):]
 
     config = RLMConfig.default()
     config.primary_agent = resolved_model
     config.sub_agent = resolved_model
+    # Conservative defaults for the flat-string path; the structured path
+    # applies larger per-scenario budgets (see run_rlm_structured_sync).
     config.max_depth = 2
     config.max_calls_per_subagent = 10
 
@@ -158,7 +189,7 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
 
     # --- Clamp budgets to the MODEL'S REAL context window ----------------------
     # fast-rlm's ``max_prompt_tokens`` (default 200000) is a BUDGET fast-rlm
-    # believes it can use, NOT the model's actual ``num_ctx``. A local Ollama/
+    # believes it can use, NOT the model's actual ``num_ctx``. A local
     # LM Studio / vLLM model's effective ``num_ctx`` defaults to e.g. 8192/32768
     # -- far below 200k. When fast-rlm sends a prompt larger than the gateway's
     # real window, the gateway returns HTTP 400
@@ -191,12 +222,34 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
         _prompt_cap = max(1024, _model_ctx - _completion_budget)
         config.max_prompt_tokens = _prompt_cap
 
+    return config, resolved_model, base_url
+
+
+def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
+    """
+    Runs an iterative reasoning process with fast-rlm.
+    This runs synchronously and should be wrapped in an executor/thread.
+    """
+    if not _FAST_RLM_AVAILABLE:
+        return {
+            "results": "fast_rlm not available",
+            "usage": {},
+            "success": False,
+        }
+    try:
+        config, resolved_model, base_url = _resolve_rlm_config(model_name)
+    except Exception as e:
+        logger.error(f"RLM config resolution failed: {e}", exc_info=True)
+        return {
+            "results": f"Failed to configure RLM task: {str(e)}",
+            "usage": {},
+            "success": False,
+        }
     logger.info(
         f"Triggering fast-rlm task reasoning. Model: {resolved_model}, "
         f"base_url: {base_url}, api_timeout_ms: {config.api_timeout_ms}, "
         f"max_prompt_tokens: {config.max_prompt_tokens}, "
-        f"max_completion_tokens: {getattr(config, 'max_completion_tokens', '?')}, "
-        f"model_context_window: {_model_ctx or 'unset (no clamp)'}"
+        f"max_completion_tokens: {getattr(config, 'max_completion_tokens', '?')}"
     )
     try:
         result = run(query, config=config, verbose=True)
@@ -213,7 +266,7 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
         if "Context size has been exceeded" in _emsg or "context length" in _emsg.lower():
             logger.error(
                 "RLM failed: the model's context window was exceeded. Set "
-                "RLM_MODEL_CONTEXT_WINDOW (or OLLAMA_NUM_CTX) to the model's "
+                "RLM_MODEL_CONTEXT_WINDOW to the model's "
                 "actual num_ctx so prompt/completion budgets are clamped. "
                 "Error: %s",
                 e,
@@ -226,11 +279,190 @@ def run_rlm_task_sync(query: str, model_name: str = None) -> dict:
             "success": False
         }
 
+
+def run_rlm_structured_sync(
+    query,
+    model_name: str = None,
+    output_schema=None,
+    tools=None,
+    env_variables=None,
+    session_dir: str = None,
+    session_id: str = None,
+    max_depth: int = None,
+    max_calls_per_subagent: int = None,
+    task: str = "expert",
+) -> dict:
+    """Run fast-rlm with structured dict input, tools, env vars, and sessions.
+
+    This is the enhanced entry point that unlocks fast-rlm's exhaustive
+    recursive capabilities (the flat ``run_rlm_task`` uses only a string
+    prompt with none of these):
+
+    - ``query`` as a ``dict``: the agent indexes ``context["key"]`` directly
+      instead of re-parsing a stringified blob every turn (fast-rlm best
+      practice). Falls back to the flat-string path if a str is passed.
+    - ``tools``: self-contained Python callables pre-loaded into the root REPL
+      so the agent pulls exactly what it needs (a specific file, a knowledge
+      slice) instead of having the whole corpus in the prompt. Tools run inside
+      the Pyodide REPL and reach product data via HTTP callbacks.
+    - ``env_variables``: credentials/ids injected into ``os.environ`` of every
+      REPL (root + subagents), never in prompts.
+    - ``session_dir`` / ``session_id``: persist the root agent's REPL state
+      (built indexes, helper functions, query→FINAL ledger) between calls so
+      follow-up questions and later docgen sections reuse it (~2.6× cheaper
+      per the docs benchmark). One live query per session dir (no concurrency).
+    - ``output_schema``: a Pydantic class / generic / JSON Schema dict that
+      validates the agent's ``FINAL`` and retries on failure.
+    - Per-scenario recursion budgets: expert (deeper) vs docgen (moderate).
+
+    Defensive: returns the same ``{results, usage, success}`` shape as
+    ``run_rlm_task_sync``. When fast_rlm is unavailable, when ``run()`` rejects
+    the new kwargs (older versions), or on any error, it degrades gracefully —
+    falling back to the flat-string ``run_rlm_task_sync`` where possible.
+    """
+    if not _FAST_RLM_AVAILABLE:
+        return {
+            "results": "fast_rlm not available",
+            "usage": {},
+            "success": False,
+        }
+    try:
+        config, resolved_model, base_url = _resolve_rlm_config(model_name)
+    except Exception as e:
+        logger.error(f"RLM config resolution failed: {e}", exc_info=True)
+        return {
+            "results": f"Failed to configure RLM task: {str(e)}",
+            "usage": {},
+            "success": False,
+        }
+
+    # Apply per-scenario recursion budgets. The flat-string path keeps the
+    # conservative max_depth=2/calls=10; the structured path uses deeper
+    # recursion so the agent can exhaustively explore the corpus.
+    if max_depth is not None:
+        config.max_depth = max_depth
+    elif task == "expert":
+        config.max_depth = RLM_EXPERT_MAX_DEPTH
+    elif task == "docgen":
+        config.max_depth = RLM_DOCGEN_MAX_DEPTH
+    if max_calls_per_subagent is not None:
+        config.max_calls_per_subagent = max_calls_per_subagent
+    elif task == "expert":
+        config.max_calls_per_subagent = RLM_EXPERT_MAX_CALLS
+    elif task == "docgen":
+        config.max_calls_per_subagent = RLM_DOCGEN_MAX_CALLS
+    # Sub-agents inherit the root agent's tools so they can also pull files /
+    # knowledge on demand (default is no inheritance per the docs).
+    try:
+        config.inherit_tools = True
+    except Exception:  # pragma: no cover - older fast-rlm without the field
+        pass
+    # add_session_code_to_context=True (the default) makes follow-up queries
+    # ~2.6× cheaper by carrying the prior REPL state into context.
+    try:
+        config.add_session_code_to_context = True
+    except Exception:  # pragma: no cover - older fast-rlm without the field
+        pass
+
+    logger.info(
+        f"Triggering fast-rlm STRUCTURED reasoning. task={task} Model: {resolved_model}, "
+        f"base_url: {base_url}, max_depth: {config.max_depth}, "
+        f"max_calls_per_subagent: {config.max_calls_per_subagent}, "
+        f"tools: {len(tools) if tools else 0}, session: {session_dir or '-'}/{session_id or '-'}, "
+        f"output_schema: {'yes' if output_schema else 'no'}, "
+        f"query_type: {'dict' if isinstance(query, dict) else 'str'}"
+    )
+
+    # Build the kwargs for run(). Only pass the kwargs fast-rlm supports so an
+    # older version that doesn't know ``tools``/``env_variables``/``sessions``/
+    # ``output_schema`` still works (we probe with a TypeError fallback).
+    run_kwargs = {"config": config, "verbose": True}
+    if output_schema is not None:
+        run_kwargs["output_schema"] = output_schema
+    if tools:
+        run_kwargs["tools"] = tools
+    if env_variables:
+        run_kwargs["env_variables"] = env_variables
+    if session_dir:
+        run_kwargs["session_dir"] = session_dir
+    if session_id:
+        run_kwargs["session_id"] = session_id
+
+    try:
+        result = run(query, **run_kwargs)
+        return {
+            "results": result.get("results", "No result returned"),
+            "usage": result.get("usage", {}),
+            "success": True
+        }
+    except TypeError as e:
+        # Older fast-rlm that rejects one of the new kwargs (tools/
+        # env_variables/session_dir/output_schema). Fall back to the flat-string
+        # path so the run still produces something useful instead of crashing.
+        _emsg = str(e)
+        if "unexpected keyword" in _emsg.lower():
+            logger.warning(
+                "fast-rlm rejected a structured kwarg (%s); falling back to "
+                "flat-string run_rlm_task. Upgrade fast_rlm for tools/sessions.",
+                _emsg,
+            )
+            flat_query = query if isinstance(query, str) else str(query)
+            return run_rlm_task_sync(flat_query, model_name)
+        logger.error(f"Error executing structured RLM reasoning: {e}", exc_info=True)
+        return {
+            "results": f"Failed to execute structured RLM task: {str(e)}",
+            "usage": {},
+            "success": False,
+        }
+    except Exception as e:
+        _emsg = str(e)
+        if "Context size has been exceeded" in _emsg or "context length" in _emsg.lower():
+            logger.error(
+                "RLM structured failed: context window exceeded. Set "
+                "RLM_MODEL_CONTEXT_WINDOW. Error: %s",
+                e,
+            )
+        else:
+            logger.error(f"Error executing structured RLM reasoning: {e}", exc_info=True)
+        return {
+            "results": f"Failed to execute structured RLM task: {str(e)}",
+            "usage": {},
+            "success": False,
+        }
+
 async def run_rlm_task(query: str, model_name: str = None) -> dict:
     """
     Asynchronously runs the fast-rlm task in a separate thread.
     """
     return await asyncio.to_thread(run_rlm_task_sync, query, model_name)
+
+
+async def run_rlm_structured(
+    query,
+    model_name: str = None,
+    output_schema=None,
+    tools=None,
+    env_variables=None,
+    session_dir: str = None,
+    session_id: str = None,
+    max_depth: int = None,
+    max_calls_per_subagent: int = None,
+    task: str = "expert",
+) -> dict:
+    """Async wrapper for ``run_rlm_structured_sync`` (runs in a worker thread)."""
+    return await asyncio.to_thread(
+        run_rlm_structured_sync,
+        query,
+        model_name,
+        output_schema,
+        tools,
+        env_variables,
+        session_dir,
+        session_id,
+        max_depth,
+        max_calls_per_subagent,
+        task,
+    )
 
 
 def prewarm_rlm_background() -> None:
@@ -250,7 +482,7 @@ def prewarm_rlm_background() -> None:
         try:
             res = run_rlm_task_sync(
                 "Reply with the single word: ok",
-                os.environ.get("RLM_MODEL_NAME") or "qwen3:8b",
+                os.environ.get("RLM_MODEL_NAME") or "qwen/qwen3.6-27b",
             )
             # run_rlm_task_sync catches its own exceptions and returns
             # {"success": False}; only a truthy success flag means RLM is

@@ -12,7 +12,7 @@ Covers:
 - Router endpoint integration (create/get/tree/put/delete/verify) over an
   isolated SQLite DB via FastAPI TestClient with dependency overrides.
 
-No live Ollama/Postgres/cognee is required: LLM and cognee indexing are mocked.
+No live LLM/Postgres/cognee is required: LLM and cognee indexing are mocked.
 """
 
 from __future__ import annotations
@@ -39,7 +39,6 @@ def isolated_db(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PASSWORD", "")
     monkeypatch.setenv("AUTH_PROVIDER", "none")
     monkeypatch.setenv("COGNEE_SKIP_CONNECTION_TEST", "true")
-    monkeypatch.setenv("OLLAMA_HOST", "http://localhost:11434")
     import api.db as db
     importlib.reload(db)
     db.init_db()
@@ -339,7 +338,7 @@ class TestKnowledgeRouterEndpoints:
             json={"title": "P", "content_md": "The service does X and Y."},
         )
 
-        # Mock the summary LLM so we don't need live Ollama. The real builder
+        # Mock the summary LLM so we don't need a live LLM. The real builder
         # takes (model, base_url=..., api_key=...).
         import api.docgen.summary as ks
         class _FakeLLM:

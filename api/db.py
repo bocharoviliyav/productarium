@@ -76,18 +76,76 @@ def init_db() -> bool:
     Idempotent: only attempts ``create_all`` once per process. On failure
     (e.g. DB unreachable) logs a warning and returns ``False`` without
     raising, so app startup is never blocked.
+
+    On Postgres also ensures the ``vector`` extension exists (required by the
+    pgvector-direct memory backend's ``knowledge_chunks.embedding`` column)
+    and creates an HNSW index on it for fast cosine search. Both are best-
+    effort and non-fatal; on SQLite (tests) they are skipped.
     """
     global _db_ready
     if _db_ready:
         return True
     try:
+        _ensure_pgvector_extension()
         Base.metadata.create_all(bind=engine)
+        _ensure_hnsw_index()
         _db_ready = True
         logger.info("SQLAlchemy tables ready (url=%s).", _safe_url(DATABASE_URL))
         return True
     except Exception as e:
         logger.warning("create_all failed (non-fatal): %s", e)
         return False
+
+
+def _ensure_pgvector_extension() -> None:
+    """CREATE EXTENSION IF NOT EXISTS vector on Postgres (non-fatal).
+
+    Required by the ``knowledge_chunks.embedding`` pgvector column. Skipped on
+    non-Postgres backends (e.g. SQLite in tests). Requires superuser or the
+    ``pgvector`` extension to be pre-installed in the Postgres image; on a
+    failure (privileges / extension absent) we log and continue — the table
+    creation below will then raise a clearer error if the column type is
+    actually needed, and tests on SQLite never reach this path.
+    """
+    provider = (DB_PROVIDER or "").lower()
+    if provider not in ("postgres", "postgresql"):
+        return
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
+            conn.commit()
+    except Exception as e:  # pragma: no cover - depends on live Postgres
+        logger.warning("Could not create 'vector' extension (non-fatal): %s", e)
+
+
+def _ensure_hnsw_index() -> None:
+    """Create an HNSW index on knowledge_chunks.embedding for cosine search.
+
+    Idempotent: uses ``IF NOT EXISTS``. Skipped on non-Postgres and when
+    pgvector is unavailable. The index accelerates the cosine-distance
+    ``ORDER BY embedding <=> :q`` query in the pgvector memory backend; without
+    it Postgres falls back to a sequential scan (correct but slower). HNSW is
+    chosen over IVFFlat for its build-as-you-go nature (no separate training
+    step) and good recall at low data volumes. Non-fatal.
+    """
+    provider = (DB_PROVIDER or "").lower()
+    if provider not in ("postgres", "postgresql"):
+        return
+    try:
+        from api.models import _PGVECTOR_AVAILABLE
+        if not _PGVECTOR_AVAILABLE:
+            return
+    except Exception:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_knowledge_chunks_embedding_hnsw "
+                "ON knowledge_chunks USING hnsw (embedding vector_cosine_ops)"
+            )
+            conn.commit()
+    except Exception as e:  # pragma: no cover - depends on live Postgres
+        logger.warning("Could not create HNSW index on knowledge_chunks.embedding (non-fatal): %s", e)
 
 
 def _safe_url(url: str) -> str:

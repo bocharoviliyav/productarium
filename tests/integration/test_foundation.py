@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 # The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
-# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee/Ollama stubs for every
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee stubs for every
 # test in this module. No per-module duplicate is needed here.
 
 
@@ -139,8 +139,8 @@ class TestSettingsStore:
         mods = _reload_modules()
         mods["db"].init_db()
         ss = mods["settings_store"]
-        ss.set_setting("models.expert.provider", "ollama", encrypt=False)
-        assert ss.get_setting("models.expert.provider") == "ollama"
+        ss.set_setting("models.expert.provider", "openai", encrypt=False)
+        assert ss.get_setting("models.expert.provider") == "openai"
 
     def test_set_and_get_encrypted_roundtrip(self):
         mods = _reload_modules()
@@ -186,10 +186,10 @@ class TestSettingsStore:
         assert cfg["base_url"]  # non-empty
         assert cfg["api_key"]  # non-empty
 
-    def test_get_git_creds_env_fallback(self):
+    def test_get_git_creds_env_fallback(self, monkeypatch):
         mods = _reload_modules()
         mods["db"].init_db()
-        os.environ["GITHUB_ENTERPRISE_URL"] = "https://ghe.example.com"
+        monkeypatch.setenv("GITHUB_ENTERPRISE_URL", "https://ghe.example.com")
         creds = mods["settings_store"].get_git_creds("github")
         assert creds["url"] == "https://ghe.example.com"
         assert creds["token"] is None

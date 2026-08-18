@@ -13,6 +13,7 @@ import {
   GitBranch,
   Lightning,
   LinkSimple,
+  PencilSimple,
   Plus,
   Sparkle,
   Trash,
@@ -29,27 +30,26 @@ import {
   IconButton,
   Input,
   Label,
+  Modal,
   Reveal,
   SectionHeader,
   Select,
   Spinner,
   Tag,
-  Textarea,
   cn,
 } from "@/components/ui";
 import {
   type Codebase,
-  type LinkItem,
   type Product,
   type Spec,
-  type SpecKind,
+  entityPath,
   generateId,
   parseLinksContent,
   serializeLinksContent,
 } from "@/lib/types";
 import { useNotifications } from "@/contexts/NotificationContext";
 
-type AddType = "codebase" | "spec" | "links";
+type DeleteType = "codebase" | "spec" | "links";
 
 export default function ProductDetailPage() {
   const router = useRouter();
@@ -60,17 +60,19 @@ export default function ProductDetailPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Add-entity form
-  const [showForm, setShowForm] = useState(false);
-  const [addType, setAddType] = useState<AddType>("codebase");
-  const [name, setName] = useState("");
-  const [specKind, setSpecKind] = useState<SpecKind>("openapi");
-  const [repoUrl, setRepoUrl] = useState("");
-  const [repoType, setRepoType] = useState("github");
-  const [token, setToken] = useState("");
-  const [content, setContent] = useState("");
-  const [linkRows, setLinkRows] = useState<LinkItem[]>([{ url: "", description: "" }]);
+  // Codebase ("service") add modal — codebase-only, opened from the
+  // Codebases section header.
+  const [showCodebaseModal, setShowCodebaseModal] = useState(false);
+  const [cbName, setCbName] = useState("");
+  const [cbRepoUrl, setCbRepoUrl] = useState("");
+  const [cbRepoType, setCbRepoType] = useState("github");
   const [isSaving, setIsSaving] = useState(false);
+
+  // In-place link add form (inside the Links spoiler).
+  const [addLinkOpen, setAddLinkOpen] = useState(false);
+  const [linkName, setLinkName] = useState("");
+  const [linkUrl, setLinkUrl] = useState("");
+  const [linkDesc, setLinkDesc] = useState("");
 
   const [generatingId, setGeneratingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -130,52 +132,45 @@ export default function ProductDetailPage() {
     fetchProduct();
   }, [fetchProduct]);
 
-  const resetForm = () => {
-    setName("");
-    setAddType("codebase");
-    setSpecKind("openapi");
-    setRepoUrl("");
-    setRepoType("github");
-    setToken("");
-    setContent("");
-    setLinkRows([{ url: "", description: "" }]);
+  const resetCodebaseForm = () => {
+    setCbName("");
+    setCbRepoUrl("");
+    setCbRepoType("github");
   };
 
-  const buildBody = (): Record<string, unknown> => {
-    const base = { name: name.trim(), source: "manual" as const };
-    if (addType === "codebase") {
-      return {
-        ...base,
-        id: generateId("cb"),
-        repo_url: repoUrl.trim() || null,
-        repo_type: repoType,
-        token: token || null,
-      };
-    }
-    if (addType === "spec") {
-      return { ...base, id: generateId("spec"), kind: specKind, content: content || null };
-    }
-    return { ...base, id: generateId("links"), content: serializeLinksContent(linkRows) || null };
+  const resetLinkForm = () => {
+    setLinkName("");
+    setLinkUrl("");
+    setLinkDesc("");
   };
 
-  const handleAdd = async (e: React.FormEvent) => {
+  // Add a codebase ("service") via the section-header modal. Codebase-only:
+  // no type selector, name + git URL + provider.
+  const handleAddCodebase = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!product || !name.trim() || isSaving) return;
+    if (!product || !cbName.trim() || isSaving) return;
     setIsSaving(true);
     try {
-      const res = await fetch(`/api/products/${product.id}/${addType}`, {
+      const body = {
+        id: generateId("cb"),
+        name: cbName.trim(),
+        repo_url: cbRepoUrl.trim() || null,
+        repo_type: cbRepoType,
+        source: "manual" as const,
+      };
+      const res = await fetch(`/api/products/${product.id}/codebases`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(buildBody()),
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail || `Failed to add (${res.status})`);
       }
       setProduct((await res.json()) as Product);
-      resetForm();
-      setShowForm(false);
+      resetCodebaseForm();
+      setShowCodebaseModal(false);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to add.";
       notify({ tone: "error", title: t.addArtifactFailedTitle ?? "Add", message: msg });
@@ -184,7 +179,42 @@ export default function ProductDetailPage() {
     }
   };
 
-  const handleDelete = async (type: AddType, entityId: string) => {
+  // Add a single link in-place inside the Links spoiler. Creates a Links
+  // entity with one {url, description} item; Name + URL + optional desc.
+  const handleAddLink = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!product || !linkName.trim() || !linkUrl.trim() || isSaving) return;
+    setIsSaving(true);
+    try {
+      const item = { url: linkUrl.trim(), description: linkDesc.trim() || undefined };
+      const body = {
+        id: generateId("links"),
+        name: linkName.trim(),
+        content: serializeLinksContent([item]) || null,
+        source: "manual" as const,
+      };
+      const res = await fetch(`/api/products/${product.id}/links`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `Failed to add (${res.status})`);
+      }
+      setProduct((await res.json()) as Product);
+      resetLinkForm();
+      setAddLinkOpen(false);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Failed to add.";
+      notify({ tone: "error", title: t.addArtifactFailedTitle ?? "Add", message: msg });
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleDelete = async (type: DeleteType, entityId: string) => {
     if (!product) return;
     if (!confirm(t.deleteArtifactConfirm ?? "Delete this item?")) return;
     setDeletingId(entityId);
@@ -208,8 +238,12 @@ export default function ProductDetailPage() {
     setGeneratingId(entityId);
     setError(null);
     try {
+      // The FastAPI generate routes are registered under the PLURAL segment
+      // (codebases / specs), but `type` is the singular form-state value
+      // (codebase / spec). Interpolating it raw produces a 404; route the
+      // segment through entityPath() (see src/lib/types.ts).
       const res = await fetch(
-        `/api/products/${product.id}/${type}/${entityId}/generate`,
+        `/api/products/${product.id}/${entityPath(type)}/${entityId}/generate`,
         {
           method: "POST",
           credentials: "include",
@@ -235,7 +269,7 @@ export default function ProductDetailPage() {
         await new Promise((r) => setTimeout(r, 2000));
         if (generateAbortRef.current) return;
         const stRes = await fetch(
-          `/api/products/${product.id}/${type}/${entityId}/generate/status?job_id=${encodeURIComponent(jobId)}`,
+          `/api/products/${product.id}/${entityPath(type)}/${entityId}/generate/status?job_id=${encodeURIComponent(jobId)}`,
           { credentials: "include", cache: "no-store" },
         );
         if (stRes.status === 404) {
@@ -325,13 +359,6 @@ export default function ProductDetailPage() {
                     {product.description || (t.noDescription ?? "No description provided.")}
                   </p>
                 </div>
-                <Button
-                  onClick={() => setShowForm((v) => !v)}
-                  variant={showForm ? "ghost" : "primary"}
-                >
-                  <Plus size={16} weight="bold" />
-                  {showForm ? tc.close ?? "Close" : t.addArtifact ?? "Add"}
-                </Button>
               </div>
             </Reveal>
 
@@ -340,251 +367,236 @@ export default function ProductDetailPage() {
               <SummaryBlock product={product} onRefresh={fetchProduct} />
             </Reveal>
 
-            {/* Links — collapsible spoiler under Summary */}
-            {links.length > 0 && (
-              <Reveal className="mt-6">
-                <div className="rounded-lg border border-divider bg-surface">
-                  <button
-                    onClick={() => setLinksOpen((v) => !v)}
-                    className="flex w-full items-center justify-between px-4 py-3 text-left text-sm font-medium text-ink"
-                  >
-                    <span className="inline-flex items-center gap-2">
-                      <LinkSimple size={16} weight="regular" />
-                      {tArt?.links?.label ?? "Links"}
-                      <span className="text-xs text-muted">({links.length})</span>
-                    </span>
-                    {linksOpen ? <CaretUp size={14} weight="bold" /> : <CaretDown size={14} weight="bold" />}
-                  </button>
-                  {linksOpen && (
-                    <div className="border-t border-divider px-4 py-3">
-                      <ul className="flex flex-col gap-2">
+            {/* Links — collapsible spoiler under Summary, always rendered so the
+                in-place add form is reachable even when there are no links yet. */}
+            <Reveal className="mt-6">
+              <div className="rounded-lg border border-divider bg-surface">
+                <button
+                  onClick={() => setLinksOpen((v) => !v)}
+                  className="flex w-full items-center justify-between px-4 py-3 text-left text-sm font-medium text-ink"
+                >
+                  <span className="inline-flex items-center gap-2">
+                    <LinkSimple size={16} weight="regular" />
+                    {tArt?.links?.label ?? "Links"}
+                    <span className="text-xs text-muted">({links.length})</span>
+                  </span>
+                  {linksOpen ? <CaretUp size={14} weight="bold" /> : <CaretDown size={14} weight="bold" />}
+                </button>
+                {linksOpen && (
+                  <div className="border-t border-divider px-4 py-3">
+                    {links.length === 0 ? (
+                      <p className="mb-3 text-xs text-muted">
+                        {t.linksEmptyInline ?? "No links yet."}
+                      </p>
+                    ) : (
+                      <ul className="mb-3 flex flex-col gap-3">
                         {links.map((l) => {
                           const items = parseLinksContent(l.content);
-                          return items.length === 0 ? null : items.map((it, i) => (
-                            <li key={`${l.id}-${i}`} className="flex flex-col gap-0.5 text-sm">
-                              {it.url ? (
-                                <a
-                                  href={it.url}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="font-mono text-xs text-ink underline-offset-2 hover:underline"
-                                >
-                                  {it.url}
-                                </a>
-                              ) : null}
-                              {it.description && (
-                                <span className="text-muted">{it.description}</span>
+                          const firstUrl = items.find((it) => it.url?.trim())?.url;
+                          const isDeleting = deletingId === l.id;
+                          return (
+                            <li
+                              key={l.id}
+                              className="rounded-md border border-divider bg-surface-2 p-3"
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                {firstUrl ? (
+                                  <a
+                                    href={firstUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="truncate text-sm font-medium text-ink underline-offset-2 hover:underline"
+                                  >
+                                    {l.name}
+                                  </a>
+                                ) : (
+                                  <span className="truncate text-sm font-medium text-ink">
+                                    {l.name}
+                                  </span>
+                                )}
+                                <div className="flex shrink-0 items-center gap-1.5">
+                                  <IconButton
+                                    aria-label={tc.edit ?? "Edit"}
+                                    title={tc.edit ?? "Edit"}
+                                    onClick={() =>
+                                      router.push(`/products/${product.id}/artifacts/${l.id}`)
+                                    }
+                                  >
+                                    <PencilSimple size={14} weight="regular" />
+                                  </IconButton>
+                                  <IconButton
+                                    aria-label={t.deleteArtifact ?? "Delete"}
+                                    title={t.deleteArtifact ?? "Delete"}
+                                    onClick={() => handleDelete("links", l.id)}
+                                    disabled={isDeleting}
+                                  >
+                                    {isDeleting ? <Spinner /> : <Trash size={14} weight="regular" />}
+                                  </IconButton>
+                                </div>
+                              </div>
+                              {items.length > 0 && (
+                                <ul className="mt-2 flex flex-col gap-1.5">
+                                  {items.map((it, i) => (
+                                    <li key={i} className="flex flex-col gap-0.5 text-sm">
+                                      {it.url ? (
+                                        <a
+                                          href={it.url}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="font-mono text-xs text-ink underline-offset-2 hover:underline"
+                                        >
+                                          {it.url}
+                                        </a>
+                                      ) : null}
+                                      {it.description && (
+                                        <span className="text-muted">{it.description}</span>
+                                      )}
+                                    </li>
+                                  ))}
+                                </ul>
                               )}
                             </li>
-                          ));
+                          );
                         })}
                       </ul>
-                    </div>
-                  )}
-                </div>
-              </Reveal>
-            )}
+                    )}
 
-            {/* Add form */}
-            {showForm && (
-              <Reveal className="mt-8">
-                <Card className="p-6">
-                  <form onSubmit={handleAdd} className="grid gap-5">
-                    <div className="grid gap-5 md:grid-cols-[1fr_220px]">
-                      <div>
-                        <Label>{t.artifactName ?? "Name"}</Label>
+                    {/* In-place add form */}
+                    {addLinkOpen ? (
+                      <form onSubmit={handleAddLink} className="grid gap-2 rounded-md border border-divider bg-surface p-3">
                         <Input
-                          value={name}
-                          onChange={(e) => setName(e.target.value)}
-                          placeholder={t.namePlaceholder ?? ""}
+                          value={linkName}
+                          onChange={(e) => setLinkName(e.target.value)}
+                          placeholder={t.linkName ?? "Link name"}
                           required
                           autoFocus
                         />
-                      </div>
-                      <div>
-                        <Label>{t.type ?? "Type"}</Label>
-                        <Select
-                          value={addType}
-                          onChange={(e) => setAddType(e.target.value as AddType)}
-                        >
-                          <option value="codebase">{tArt?.codebase?.label ?? "Codebase"}</option>
-                          <option value="spec">{tArt?.spec?.label ?? "Spec"}</option>
-                          <option value="links">{tArt?.links?.label ?? "Links"}</option>
-                        </Select>
-                      </div>
-                    </div>
-
-                    {addType === "codebase" && (
-                      <div className="grid gap-5 md:grid-cols-[1fr_180px]">
-                        <div className="md:col-span-2">
-                          <Label>{t.gitUrl ?? "Git URL"}</Label>
-                          <Input
-                            value={repoUrl}
-                            onChange={(e) => setRepoUrl(e.target.value)}
-                            placeholder={t.gitUrlPlaceholder ?? ""}
-                          />
-                        </div>
-                        <div>
-                          <Label>{t.provider ?? "Provider"}</Label>
-                          <Select
-                            value={repoType}
-                            onChange={(e) => setRepoType(e.target.value)}
-                          >
-                            <option value="github">{t.github ?? "GitHub"}</option>
-                            <option value="gitlab">{t.gitlab ?? "GitLab"}</option>
-                          </Select>
-                        </div>
-                        <div>
-                          <Label>{t.accessToken ?? "Access token (optional)"}</Label>
-                          <Input
-                            type="password"
-                            value={token}
-                            onChange={(e) => setToken(e.target.value)}
-                            placeholder={t.tokenPlaceholder ?? ""}
-                          />
-                        </div>
-                      </div>
-                    )}
-
-                    {addType === "spec" && (
-                      <div className="grid gap-5">
-                        <div>
-                          <Label>{t.specKind ?? "Spec kind"}</Label>
-                          <Select
-                            value={specKind}
-                            onChange={(e) => setSpecKind(e.target.value as SpecKind)}
-                          >
-                            <option value="openapi">{t.openapi ?? "OpenAPI (REST)"}</option>
-                            <option value="asyncapi">{t.asyncapi ?? "AsyncAPI (events)"}</option>
-                          </Select>
-                        </div>
-                        <div>
-                          <Label>{t.specLabel ?? "Specification (JSON / YAML)"}</Label>
-                          <Textarea
-                            value={content}
-                            onChange={(e) => setContent(e.target.value)}
-                            placeholder={t.specPlaceholder ?? ""}
-                            rows={10}
-                          />
-                        </div>
-                      </div>
-                    )}
-
-                    {addType === "links" && (
-                      <div className="grid gap-3">
-                        <div className="flex items-center justify-between gap-2">
-                          <Label className="mb-0">{t.linksLabel ?? "Links"}</Label>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => setLinkRows((r) => [...r, { url: "", description: "" }])}
-                          >
-                            <Plus size={14} weight="bold" />
-                            {t.linksAddRow ?? "Add link"}
+                        <Input
+                          value={linkUrl}
+                          onChange={(e) => setLinkUrl(e.target.value)}
+                          placeholder={t.linksUrlPlaceholder ?? "https://…"}
+                          required
+                        />
+                        <Input
+                          value={linkDesc}
+                          onChange={(e) => setLinkDesc(e.target.value)}
+                          placeholder={t.linksDescPlaceholder ?? "Description"}
+                        />
+                        <div className="flex items-center justify-end gap-2">
+                          <Button type="button" variant="ghost" size="sm" onClick={() => setAddLinkOpen(false)}>
+                            {tc.cancel ?? "Cancel"}
+                          </Button>
+                          <Button type="submit" size="sm" disabled={isSaving || !linkName.trim() || !linkUrl.trim()}>
+                            {isSaving ? <Spinner /> : <Plus size={14} weight="bold" />}
+                            {t.addLink ?? "Add link"}
                           </Button>
                         </div>
-                        <div className="grid gap-2">
-                          {linkRows.map((row, idx) => (
-                            <div
-                              key={idx}
-                              className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_1fr_auto]"
-                            >
-                              <Input
-                                value={row.url}
-                                onChange={(e) =>
-                                  setLinkRows((rows) =>
-                                    rows.map((r, i) => (i === idx ? { ...r, url: e.target.value } : r)),
-                                  )
-                                }
-                                placeholder={t.linksUrlPlaceholder ?? "https://…"}
-                              />
-                              <Input
-                                value={row.description ?? ""}
-                                onChange={(e) =>
-                                  setLinkRows((rows) =>
-                                    rows.map((r, i) => (i === idx ? { ...r, description: e.target.value } : r)),
-                                  )
-                                }
-                                placeholder={t.linksDescPlaceholder ?? "Description"}
-                              />
-                              <IconButton
-                                type="button"
-                                aria-label={t.linksRemoveRow ?? "Remove link"}
-                                title={t.linksRemoveRow ?? "Remove link"}
-                                disabled={linkRows.length <= 1}
-                                onClick={() =>
-                                  setLinkRows((rows) =>
-                                    rows.length <= 1
-                                      ? [{ url: "", description: "" }]
-                                      : rows.filter((_, i) => i !== idx),
-                                  )
-                                }
-                              >
-                                <Trash size={16} weight="regular" />
-                              </IconButton>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
+                      </form>
+                    ) : (
+                      <Button type="button" variant="subtle" size="sm" onClick={() => setAddLinkOpen(true)}>
+                        <Plus size={14} weight="bold" />
+                        {t.addLink ?? "Add link"}
+                      </Button>
                     )}
-
-                    <div className="flex items-center justify-end gap-2">
-                      <Button type="button" variant="ghost" onClick={() => setShowForm(false)}>
-                        {tc.cancel ?? "Cancel"}
-                      </Button>
-                      <Button type="submit" disabled={isSaving || !name.trim()}>
-                        {isSaving ? <Spinner /> : <Plus size={16} weight="bold" />}
-                        {t.saveArtifact ?? "Save"}
-                      </Button>
-                    </div>
-                  </form>
-                </Card>
-              </Reveal>
-            )}
-
-            {/* Two-column: (specs + knowledge tree) | main content */}
-            <div className="mt-12 grid grid-cols-1 gap-8 lg:grid-cols-[240px_1fr]">
-              <aside className="lg:sticky lg:top-20 lg:self-start">
-                {/* Specs — above the knowledge tree */}
-                {specs.length > 0 && (
-                  <div className="mb-3">
-                    <SectionHeader title={tArt?.spec?.label ?? "Specs"} className="mb-2" />
-                    <div className="flex flex-col gap-2">
-                      {specs.map((s: Spec) => {
-                        const isDeleting = deletingId === s.id;
-                        return (
-                          <div
-                            key={s.id}
-                            className="group flex items-center justify-between gap-2 rounded-md border border-divider bg-surface px-3 py-2"
-                          >
-                            <button
-                              onClick={() =>
-                                router.push(`/products/${product.id}/artifacts/${s.id}`)
-                              }
-                              className="flex min-w-0 items-center gap-2 text-left"
-                            >
-                              <FileText size={16} weight="regular" className="shrink-0 text-muted" />
-                              <span className="truncate text-sm text-ink">{s.name}</span>
-                            </button>
-                            <div className="flex items-center gap-1.5">
-                              <Tag tone="green">{s.kind}</Tag>
-                              <IconButton
-                                aria-label={t.deleteArtifact ?? "Delete"}
-                                title={t.deleteArtifact ?? "Delete"}
-                                onClick={() => handleDelete("spec", s.id)}
-                                disabled={isDeleting}
-                                className="opacity-0 transition-opacity group-hover:opacity-100"
-                              >
-                                {isDeleting ? <Spinner /> : <Trash size={14} weight="regular" />}
-                              </IconButton>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
                   </div>
                 )}
+              </div>
+            </Reveal>
+
+            {/* Codebase ("service") add modal — opened from the Codebases section header */}
+            <Modal
+              open={showCodebaseModal}
+              onClose={() => setShowCodebaseModal(false)}
+              title={t.addService ?? "Add service"}
+              footer={null}
+            >
+              <form onSubmit={handleAddCodebase} className="grid gap-5">
+                <div>
+                  <Label>{t.serviceName ?? "Name"}</Label>
+                  <Input
+                    value={cbName}
+                    onChange={(e) => setCbName(e.target.value)}
+                    placeholder={t.serviceNamePlaceholder ?? "e.g. Payments API"}
+                    required
+                    autoFocus
+                  />
+                </div>
+                <div className="grid gap-5 md:grid-cols-[1fr_180px]">
+                  <div>
+                    <Label>{t.gitUrl ?? "Git URL"}</Label>
+                    <Input
+                      value={cbRepoUrl}
+                      onChange={(e) => setCbRepoUrl(e.target.value)}
+                      placeholder={t.gitUrlPlaceholder ?? ""}
+                    />
+                  </div>
+                  <div>
+                    <Label>{t.provider ?? "Provider"}</Label>
+                    <Select
+                      value={cbRepoType}
+                      onChange={(e) => setCbRepoType(e.target.value)}
+                    >
+                      <option value="github">{t.github ?? "GitHub"}</option>
+                      <option value="gitlab">{t.gitlab ?? "GitLab"}</option>
+                    </Select>
+                  </div>
+                </div>
+                <div className="flex items-center justify-end gap-2">
+                  <Button type="button" variant="ghost" onClick={() => setShowCodebaseModal(false)}>
+                    {tc.cancel ?? "Cancel"}
+                  </Button>
+                  <Button type="submit" disabled={isSaving || !cbName.trim()}>
+                    {isSaving ? <Spinner /> : <Plus size={16} weight="bold" />}
+                    {t.saveArtifact ?? "Save"}
+                  </Button>
+                </div>
+              </form>
+            </Modal>
+
+            {/* Two-column: (specs + knowledge tree) | main content */}
+            <div className="mt-12 grid grid-cols-1 gap-8 lg:grid-cols-[320px_1fr]">
+              <aside className="lg:sticky lg:top-20 lg:self-start">
+                {/* Specs — above the knowledge tree, styled like the knowledge tree */}
+                <div className="mb-3">
+                  <Card className="p-3">
+                    <div className="flex items-center justify-between px-1 pb-2">
+                      <h3 className="text-xs font-medium uppercase tracking-wide text-muted">
+                        {tArt?.spec?.label ?? "Specs"}
+                      </h3>
+                      <IconButton
+                        aria-label={t.addSpec ?? "Add spec"}
+                        title={t.addSpec ?? "Add spec"}
+                        className="h-7 w-7"
+                        onClick={() => router.push(`/products/${product.id}/specs/new`)}
+                      >
+                        <Plus size={14} weight="bold" />
+                      </IconButton>
+                    </div>
+                    {specs.length === 0 ? (
+                      <div className="rounded-md border border-dashed border-divider bg-surface-2 px-3 py-6 text-center text-xs text-muted">
+                        {t.specEmptyDesc ?? ""}
+                      </div>
+                    ) : (
+                      <nav className="flex flex-col gap-0.5">
+                        {specs.map((s: Spec) => (
+                          <button
+                            key={s.id}
+                            onClick={() =>
+                              router.push(`/products/${product.id}/specs/${s.id}`)
+                            }
+                            className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-sm text-muted transition-colors hover:bg-surface-2 hover:text-ink"
+                          >
+                            <span className="shrink-0 text-muted">
+                              <FileText size={14} weight="regular" />
+                            </span>
+                            <span className="min-w-0 flex-1 truncate">{s.name}</span>
+                            <Tag tone="green">{s.kind}</Tag>
+                          </button>
+                        ))}
+                      </nav>
+                    )}
+                  </Card>
+                </div>
 
                 <Card className="p-3">
                   <KnowledgeTree
@@ -605,6 +617,16 @@ export default function ProductDetailPage() {
                         ? fmt(t.artifactsCount, { n: codebases.length })
                         : (t.artifactsEmptySubtitle ?? "")
                     }
+                    action={
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        onClick={() => setShowCodebaseModal(true)}
+                      >
+                        <Plus size={14} weight="bold" />
+                        {t.addService ?? "Add service"}
+                      </Button>
+                    }
                   />
 
                   <div className="mt-6">
@@ -614,9 +636,9 @@ export default function ProductDetailPage() {
                         title={t.noArtifactsTitle ?? "No codebases yet"}
                         description={t.noArtifactsDesc ?? ""}
                         action={
-                          <Button onClick={() => setShowForm(true)}>
+                          <Button onClick={() => setShowCodebaseModal(true)}>
                             <Plus size={16} weight="bold" />
-                            {t.addArtifact ?? "Add"}
+                            {t.addService ?? "Add service"}
                           </Button>
                         }
                       />

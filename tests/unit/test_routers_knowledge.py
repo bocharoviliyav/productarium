@@ -431,8 +431,8 @@ class TestUpdateNodeMove:
 
         reindex_called = []
 
-        def _fake_index(text, dataset):
-            reindex_called.append((text, dataset))
+        def _fake_index(text, dataset, *, source_type="codebase", source_id=None):
+            reindex_called.append((text, dataset, source_type, source_id))
 
         # Patch at the use-site import path (knowledge.py does
         # `from api.docgen import _index_in_background`).
@@ -452,6 +452,9 @@ class TestUpdateNodeMove:
         assert len(reindex_called) == 1
         assert "new content for reindex" in reindex_called[0][0]
         assert reindex_called[0][1] == "prod_prod_1"
+        # The rerouted caller passes source_type=knowledge_node + the node id.
+        assert reindex_called[0][2] == "knowledge_node"
+        assert reindex_called[0][3] == node["id"]
 
 
 # --- _convert_via_markitdown direct (markitdown returns output) -------------

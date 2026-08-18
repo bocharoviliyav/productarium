@@ -9,7 +9,7 @@
 * **Frontend**: Next.js 15 (Turbopack, Bun, React 19, TypeScript, Tailwind CSS, Phosphor Icons).
 * **Backend API**: Python FastAPI (`uvicorn` на порту 8001, SQLAlchemy 2.0 ORM, Pydantic).
 * **База данных**: PostgreSQL 18 + `pgvector` (базы `cognee_db`, таблицы `products`, `codebases`, `specs`, `links`, `knowledge_nodes`, `data`, `dataset_data`, `graph_node`, `graph_edge`).
-* **LLM & Embeddings Gateway**: Локальный OpenAI-совместимый API (LM Studio / vLLM / llama.cpp) или Ollama (модели: `qwen3.6-27b`, `qwen3:8b`, эмбеддинги: `nomic-embed-text-v2-moe`).
+* **LLM & Embeddings Gateway**: Локальный OpenAI-совместимый API (LM Studio / vLLM / llama.cpp) (модели: `qwen3.6-27b`, эмбеддинги: `nomic-embed-text-v2-moe`).
 * **RLM Engine (`fast-rlm`)**: Движок рекурсивного рассуждения на базе Deno + Pyodide (изолированный REPL-интерпретатор Python), используемый для длинного контекста кодовых баз.
 * **Knowledge Graph (`cognee` 1.2.2)**: Движок извлечения сущностей, связей и триплетов в Граф Знаний через `instructor` (Pydantic JSON schema mode).
 * **MCP Server (`api/routers/mcp_server.py`)**: Нативный сервер Model Context Protocol (спецификация 2024-11-05, HTTP/SSE) для подключения внешних AI-агентов (Claude Desktop, Cursor, Windsurf).
@@ -101,9 +101,9 @@ flowchart TD
 1. **Детектор окна контекста (`api/model_utils.py:get_model_context_window`)**:
    * Определяет размер окна контекста модели (`n_ctx`).
    * Очередность:
-     1. Переменные окружения (`RLM_MODEL_CONTEXT_WINDOW`, `OLLAMA_NUM_CTX`).
+     1. Переменные окружения (`RLM_MODEL_CONTEXT_WINDOW`).
      2. Настройки задачи в базе/админке (`models.docgen.max_prompt_tokens`).
-     3. Прямой запрос к API эндпоинта (`POST /api/show` у Ollama или `GET /v1/models` у OpenAI-compatible gateways) для чтения параметров `max_model_len` / `context_window`.
+     3. Прямой запрос к API эндпоинта (`GET /v1/models` у OpenAI-compatible gateways) для чтения параметров `max_model_len` / `context_window`.
      4. Название модели (например, `32k` -> 32,768 токенов; `qwen3.6-27b` -> 32,768 токенов; `8b` -> 8,192 токена).
      5. Дефолт: 8,192 токена.
 2. **Чанкование кодовой базы (`_resolve_codebase_chunk_budget`)**:

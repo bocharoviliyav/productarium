@@ -3,7 +3,7 @@
 Split out of the former ``api/expert_agent.py`` (Step 6). Owns the
 ``_ExpertLLM`` adalflow Generator wrapper (non-streaming ``generate`` + async
 ``stream`` with chunked fallback), the ``_safe_build_llm`` graceful-degrade
-factory, ``_extract_chunk_fields`` (Ollama + OpenAI
+factory, ``_extract_chunk_fields`` (native + OpenAI
 streaming-chunk shape handling including reasoning/thinking fields),
 ``_ThinkingStreamParser`` (inline ``⬢`` tag splitter), and
 ``_resolve_expert_model`` (admin-configured model/
@@ -33,7 +33,7 @@ from api.expert.types import (
 setup_logging()
 logger = logging.getLogger(__name__)
 
-# Inline thinking tag delimiters used by some models (Ollama/Qwen3 with
+# Inline thinking tag delimiters used by some models (Qwen3 with
 # think:false, or older checkpoints) that inline the reasoning trace directly
 # in the content field instead of emitting a separate field.
 _THINK_OPEN = "<think>"
@@ -66,7 +66,7 @@ class _ExpertLLM:
         self.model_kwargs = generator_config["model_kwargs"]
         self.model = self.model_kwargs.get("model", model)
 
-        # Every supported local server (Ollama, LM Studio, llama.cpp, vLLM, ...)
+        # Every supported local server (LM Studio, llama.cpp, vLLM, ...)
         # exposes the OpenAI-compatible /v1 API, so OpenAIClient covers all
         # cases. SSL verify is wired via ssl_config.
         client_kwargs: Dict[str, Any] = {}
@@ -130,7 +130,7 @@ class _ExpertLLM:
             from adalflow.core.types import ModelType
 
             # Every supported server uses the flat OpenAI-compatible streaming
-            # request shape (Ollama's /v1 endpoint accepts it too).
+            # request shape.
             mk = {
                 "model": self.model,
                 "stream": True,
@@ -153,12 +153,12 @@ class _ExpertLLM:
                 content_text, reasoning_text = _extract_chunk_fields(
                     chunk
                 )
-                # Separate reasoning field (DeepSeek/vLLM/Ollama thinking) —
+                # Separate reasoning field (DeepSeek/vLLM thinking) —
                 # yield directly, no inline-tag parsing needed.
                 if reasoning_text:
                     produced = True
                     yield ExpertStreamEvent(EVENT_REASONING, reasoning_text)
-                # Content may contain inline <think> tags (Ollama/Qwen3 with
+                # Content may contain inline <think> tags (Qwen3 with
                 # think:false). Route through the stateful parser.
                 if content_text:
                     produced = True
@@ -173,7 +173,7 @@ class _ExpertLLM:
             logger.warning(
                 "Expert LLM stream produced no chunks; falling back to generate."
             )
-        except Exception as e:  # pragma: no cover - depends on live Ollama/HTTP
+        except Exception as e:  # pragma: no cover - depends on live HTTP
             logger.warning(
                 "Expert LLM streaming failed (%s); falling back to chunked generate.",
                 e,
@@ -182,7 +182,7 @@ class _ExpertLLM:
         # Fallback: non-streaming generate + chunked yield.
         try:
             text = _clean_llm_text(await self.generate(prompt))
-        except Exception as e:  # pragma: no cover - depends on live Ollama
+        except Exception as e:  # pragma: no cover - depends on live LLM
             logger.warning("Expert LLM fallback generate failed: %s", e)
             return
         # Strip inline thinking tags — the non-streaming fallback can't show
@@ -195,7 +195,7 @@ class _ExpertLLM:
 class _ThinkingStreamParser:
     """Stateful parser for inline ``<think>...</think>`` tags in the content stream.
 
-    Some models (Ollama/Qwen3 with ``think:false``, or older checkpoints)
+    Some models (Qwen3 with ``think:false``, or older checkpoints)
     inline the reasoning trace directly in the ``content`` field using
     ``<think>...</think>`` tags instead of emitting a separate
     ``reasoning_content`` / ``reasoning`` / ``thinking`` field. This parser
@@ -331,12 +331,12 @@ def _extract_chunk_fields(
 ) -> Tuple[Optional[str], Optional[str]]:
     """Extract ``(content, reasoning)`` deltas from a streaming chunk.
 
-    Handles Ollama native (``message.content`` / ``message.thinking``), Ollama
+    Handles native (``message.content`` / ``message.thinking``), OpenAI
     /v1 (``choices[0].delta.reasoning``), DeepSeek/DashScope
     (``choices[0].delta.reasoning_content``), and plain dict shapes. Either
     element of the tuple may be ``None`` if the field is absent or empty.
     """
-    # Ollama native format (object with .message attribute)
+    # native format (object with .message attribute)
     message = getattr(chunk, "message", None)
     if message is not None:
         if isinstance(message, dict):
@@ -401,7 +401,7 @@ def _safe_build_llm(
     """Build an ``_ExpertLLM`` or return None on any failure (graceful degrade)."""
     try:
         return _ExpertLLM(model, base_url=base_url, api_key=api_key)
-    except Exception as e:  # pragma: no cover - depends on live config/Ollama
+    except Exception as e:  # pragma: no cover - depends on live config/LLM
         logger.warning(
             "Could not initialise expert LLM (%s): %s. "
             "Expert answers will be empty until a model is available.",

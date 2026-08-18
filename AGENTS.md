@@ -6,11 +6,7 @@ This file provides guidance to WARP (warp.dev) when working with code in this re
 
 ### Prerequisites
 - **Python 3.11+** and **Node.js** with **bun** (the frontend uses bun, not yarn)
-- **Ollama** must be running locally with at least one generation model and the embedding model:
-  ```bash
-  ollama pull qwen3:8b           # or qwen3.5:9b, gemma3:12b, etc.
-  ollama pull nomic-embed-text   # required for embeddings
-  ```
+- **A local OpenAI-compatible server** (LM Studio, llama.cpp, vLLM) must be running with at least one generation model and the embedding model (e.g. `qwen/qwen3.6-27b` and `text-embedding-nomic-embed-text-v1.5`).
 - **PostgreSQL + pgvector** for product/artifact persistence and the cognee knowledge graph.
   `docker-compose up postgres` starts `pgvector/pgvector:pg18-trixie` (user/db: `cognee`/`cognee_db`).
   If Postgres is unreachable, `init_db()`/`init_cognee()` log a warning and fall back (app still starts).
@@ -89,16 +85,16 @@ No polymorphic artifact entity — three separate typed ORM models + tables:
 - **`integrations/`** — Scalable connector framework. Auto-discovered via `pkgutil`. Connectors: `github`, `gitlab`, `confluence`, `mcp` (stdio/http). Add new `api/integrations/<name>.py` subclassing `IntegrationConnector` — no core changes needed.
 - **`rag.py`** — RAG implementation. Custom `Memory`/`CustomConversation`/`DialogTurn` classes (workaround for adalflow compatibility issues). `RAG` class manages retriever preparation, FAISS index loading, and query processing.
 - **`data_pipeline.py`** — Repository processing: `download_repo()` (git clone with token auth for GitHub/GitLab), `read_all_documents()` (file reading with include/exclude filters), `DatabaseManager` (FAISS index creation/loading/saving), token counting via tiktoken.
-- **`config/`** — Central configuration package. `__init__.py` loads JSON from `api/config/*.json`, resolves `${ENV_VAR}` placeholders. `settings.py` (encrypted key/value store), `timeout.py` (per-key timeout overrides), `ssl.py` (TLS patch for corporate gateways). Key globals: `configs`, `OLLAMA_HOST`, `LOCAL_OPENAI_BASE_URL`.
+- **`config/`** — Central configuration package. `__init__.py` loads JSON from `api/config/*.json`, resolves `${ENV_VAR}` placeholders. `settings.py` (encrypted key/value store), `timeout.py` (per-key timeout overrides), `ssl.py` (TLS patch for corporate gateways). Key globals: `configs`, `LOCAL_OPENAI_BASE_URL`.
 - **`docgen/`** — Documentation generation package. **No dispatcher** — each generate endpoint calls its generator directly. `codebase.py:generate_codebase_docs` (RLM for long-context ≥20k chars else standard LLM, 7 sections from refs; `spec.py:generate_openapi_docs`/`generate_asyncapi_docs` (stdlib parse + markdown skeleton + LLM enrichment). `jobs.py` (async 202+poll worker, takes `entity_type`, calls the right generator directly). `_common.py` (shared `_index_in_background`). All paths index into cognee in the background and persist `generated_docs` + `pages`.
 - **`expert/`** — Expert agent package. `chat.py` (cognee-recall + RLM routing + LLM streaming), `generate.py` (standalone doc). Prompt bodies in `refs/prompts/expert_agent_*.md`.
 - **`prompts.py`** — Prompt **registry + loader only**. `load_prompt_file()` applies `_wrap_prompt(content, language)` after loading (internal; no standalone export). `reload_prompt_file()` also applies wrap. Bodies in `refs/prompts/*.md` with short inline fallbacks.
-- **`clients/`** — `openai_client.py` (custom OpenAI-compatible client for local LLM servers — llama.cpp, vLLM, etc.). Single client (no `OllamaClient`/`CLIENT_CLASSES`).
+- **`clients/`** — `openai_client.py` (custom OpenAI-compatible client for local LLM servers — llama.cpp, vLLM, etc.). Single client (no provider dispatch).
 - **`tools/embedder.py`** — Factory function `get_embedder()` (no params) that creates `adal.Embedder` instances.
 - **`utils/`** — `logging.py` (console-only, `LOG_FORMAT` env: `logfmt` default / `json`; no file handlers), `llm_helpers.py` (`cap(text, limit)` char-based helper), `llm_tokens.py` (`get_model_context_window`, `_count_tokens`).
 - **`models.py`** — SQLAlchemy 2.0 ORM models (`UserORM`, `ProductORM`, `CodebaseORM`, `SpecORM`, `LinksORM`, `KnowledgeNodeORM`, `SettingORM`, `ApiTokenORM`).
 - **`db.py`** — SQLAlchemy engine + `SessionLocal` + `get_db()` dependency + `init_db()` (`Base.metadata.create_all`, idempotent, non-fatal).
-- **`cognee/`** — cognee integration. `_runtime.py` configures cognee for **local Ollama** (LLM via `/v1`, embeddings via `/api/embed`, `LLM_API_KEY=not-needed`) so `cognify()` works with NO cloud key. `init_cognee()`, `add_and_index_document()`, `query_cognee()`, `reindex_product_knowledge_graph()` — all async, all non-fatal.
+- **`cognee/`** — cognee integration. `_runtime.py` configures cognee for a **local OpenAI-compatible server** (LLM via `/v1`, embeddings via the OpenAI-compatible embeddings endpoint, `LLM_API_KEY=not-needed`) so `cognify()` works with NO cloud key. `init_cognee()`, `add_and_index_document()`, `query_cognee()`, `reindex_product_knowledge_graph()` — all async, all non-fatal.
 - **`rlm/runner.py`** — fast-rlm wrapper. `run_rlm_task(query, model)` (async) runs Recursive Language Model reasoning; single path: admin config → `LOCAL_OPENAI_BASE_URL` → default. Used for long-context doc gen + Deep Research only.
 
 ### Frontend Structure (`src/`) — minimalist-ui (Notion/Linear editorial)
@@ -136,7 +132,7 @@ The frontend does NOT call the backend directly from the browser for most endpoi
 `api/config/` JSON files support `${ENV_VAR}` placeholders resolved at load time by `replace_env_placeholders()` in `api/config/__init__.py`. Custom config directory via `DEEPWIKI_CONFIG_DIR`.
 
 ### Provider System
-Single OpenAI-compatible path. Every local server (Ollama, LM Studio, llama.cpp, vLLM) exposes a `/v1` API, so one client (`api/clients/openai_client.py`) covers all. `api/config/generator.json` lists models; no `provider` param threaded through the stack. Embedder via `api/tools/embedder.py:get_embedder()` (no params).
+Single OpenAI-compatible path. Every local server (LM Studio, llama.cpp, vLLM) exposes a `/v1` API, so one client (`api/clients/openai_client.py`) covers all. `api/config/generator.json` lists models; no `provider` param threaded through the stack. Embedder via `api/tools/embedder.py:get_embedder()` (no params).
 
 ### Authentication
 `AUTH_PROVIDER` selects mode: `local` (default — passlib bcrypt + JWT session cookie), `keycloak` (OIDC via authlib), `both` (local + Keycloak endpoints), or `none` (auth disabled). Bootstrap admin created on first startup via `BOOTSTRAP_ADMIN_*` env vars or UI setup. Admins manage users (create with temp password + reset token, role elevation) and API tokens (sha256 hash; plaintext shown once). Secrets in settings store encrypted via Fernet (`SETTINGS_SECRET_KEY`).
@@ -159,7 +155,7 @@ All prompt bodies are externalized to `refs/prompts/*.md` (7 wiki sections, spec
 `rlm/runner.py` wraps **fast-rlm** (Deno + Pyodide). The RLM REPL is isolated from host Python — the codebase is passed as a long-context string; host FastAPI/cognee are NOT reachable inside the REPL. RLM is used **only for long-context tasks** (doc gen over large codebases, Deep Research); simple chat/Ask use the standard LLM client. Falls back to standard LLM if RLM is unavailable or the context is small (<20k chars).
 
 ### Knowledge Graph (cognee)
-`api/cognee/` integrates **cognee** with Postgres + pgvector for the knowledge graph. cognee is pointed at **local Ollama** for both LLM (`cognify` entity extraction) and embeddings, so NO cloud key is required. cognee's config validator requires the full `{LLM_MODEL, LLM_ENDPOINT, LLM_API_KEY}` and `{EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, HUGGINGFACE_TOKENIZER}` groups to be set together — `api/cognee/_runtime.py` sets them all via `setdefault`. `init_cognee()` is non-fatal (falls back to SQLite/LanceDB if Postgres is down).
+`api/cognee/` integrates **cognee** with Postgres + pgvector for the knowledge graph. cognee is pointed at a **local OpenAI-compatible server** for both LLM (`cognify` entity extraction) and embeddings, so NO cloud key is required. cognee's config validator requires the full `{LLM_MODEL, LLM_ENDPOINT, LLM_API_KEY}` and `{EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, HUGGINGFACE_TOKENIZER}` groups to be set together — `api/cognee/_runtime.py` sets them all via `setdefault`. `init_cognee()` is non-fatal (falls back to SQLite/LanceDB if Postgres is down).
 
 ### Memory/Conversation in RAG
 Custom `Memory` and `CustomConversation` classes in `rag.py` replace adalflow's built-in conversation management to work around list index errors. Dialog history is rebuilt from request messages on each call.
@@ -169,13 +165,12 @@ Custom `Memory` and `CustomConversation` classes in `rag.py` replace adalflow's 
 
 ## Environment Variables
 
-**No cloud API keys required.** Everything runs on local Ollama. See `.env.example` (tracked) for the full, documented list. Key groups:
-- **Ollama**: `OLLAMA_HOST` (default `http://localhost:11434`).
+**No cloud API keys required.** Everything runs on a local OpenAI-compatible server. See `.env.example` (tracked) for the full, documented list. Key groups:
 - **Local OpenAI-compatible API**: `LOCAL_OPENAI_BASE_URL` / `LOCAL_OPENAI_API_KEY` (falls back to `not-needed`).
 - **Postgres (products/codebases/specs/links + cognee)**: `DB_PROVIDER`, `DB_HOST` (default `localhost`; `postgres` in Docker), `DB_PORT`, `DB_NAME` (`cognee_db`), `DB_USERNAME`, `DB_PASSWORD`; `VECTOR_DB_PROVIDER=pgvector`.
-- **cognee LLM (local Ollama)**: `LLM_PROVIDER=ollama`, `LLM_ENDPOINT` (`/v1`), `LLM_MODEL`, `LLM_API_KEY=not-needed`.
-- **cognee embeddings**: `EMBEDDING_PROVIDER=ollama`, `EMBEDDING_MODEL=nomic-embed-text`, `EMBEDDING_ENDPOINT` (`/api/embed`), `EMBEDDING_DIMENSIONS=768`, `HUGGINGFACE_TOKENIZER=nomic-ai/nomic-embed-text-v1.5` (all required together by cognee's validator).
-- **fast-rlm**: `RLM_MODEL_BASE_URL` (default `http://localhost:11434/v1`), `RLM_MODEL_API_KEY=not-needed`, `RLM_MODEL_NAME`.
+- **cognee LLM (local OpenAI-compatible)**: `LLM_PROVIDER=openai`, `LLM_ENDPOINT` (`/v1`), `LLM_MODEL`, `LLM_API_KEY=not-needed`.
+- **cognee embeddings**: `EMBEDDING_PROVIDER=openai_compatible`, `EMBEDDING_MODEL=text-embedding-nomic-embed-text-v1.5`, `EMBEDDING_ENDPOINT` (`/v1`), `EMBEDDING_DIMENSIONS=768`, `HUGGINGFACE_TOKENIZER=nomic-ai/nomic-embed-text-v1.5` (all required together by cognee's validator).
+- **fast-rlm**: `RLM_MODEL_BASE_URL` (default `http://localhost:1234/v1`), `RLM_MODEL_API_KEY=not-needed`, `RLM_MODEL_NAME`.
 - **Auth**: `AUTH_PROVIDER` (`local` | `keycloak` | `both` | `none`), `BOOTSTRAP_ADMIN_USERNAME`, `BOOTSTRAP_ADMIN_PASSWORD`, `SETTINGS_SECRET_KEY` (Fernet key for settings encryption + JWT signing).
 - **Keycloak OIDC** (when `AUTH_PROVIDER=keycloak|both`): `KEYCLOAK_URL` (default `http://localhost:8080`), `KEYCLOAK_CLIENT_ID` (default `productarium-frontend`), `KEYCLOAK_CLIENT_SECRET` (empty for public client), `KEYCLOAK_REALM` (default `productarium`).
 - **Application**: `PORT` (default 8001), `SERVER_BASE_URL`, `DEEPWIKI_CONFIG_DIR`.

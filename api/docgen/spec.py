@@ -247,7 +247,10 @@ async def _generate_spec_doc(
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("Could not write enriched docs onto spec: %s", e)
 
-    _index_in_background(docs, _cognee_dataset(product))
+    _index_in_background(
+        docs, _cognee_dataset(product),
+        source_type="spec", source_id=getattr(spec, "id", None),
+    )
     return docs
 
 

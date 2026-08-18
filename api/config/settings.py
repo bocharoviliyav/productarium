@@ -21,6 +21,7 @@ import json
 import logging
 import os
 from typing import Optional, List, Dict, Any
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -299,14 +300,14 @@ def get_model_for_task(task: str) -> Dict[str, Optional[str]]:
     ``None`` when unset (callers keep the fast-rlm default); non-numeric stored
     values are ignored (treated as unset) so a bad value never crashes callers.
 
-    Every supported local server (Ollama, LM Studio, llama.cpp, vLLM, ...)
+    Every supported local server (LM Studio, llama.cpp, vLLM, ...)
     exposes an OpenAI-compatible ``/v1`` API, so a single defaults path covers
     all cases.
     """
     p = "models.%s." % task
     # OpenAI-compatible defaults: LOCAL_OPENAI_BASE_URL points at the server
-    # (LM Studio :1234, llama.cpp, vLLM, Ollama :11434, ...). Ollama exposes
-    # the same /v1 surface, so the same defaults work for every local server.
+    # (LM Studio :1234, llama.cpp, vLLM, ...). The same defaults work for
+    # every local server.
     default_base = os.environ.get("LOCAL_OPENAI_BASE_URL", "http://localhost:1234/v1")
     default_model = os.environ.get("LOCAL_OPENAI_MODEL") or os.environ.get("RLM_MODEL_NAME") or os.environ.get("LLM_MODEL") or "qwen/qwen3.6-27b"
     default_key = os.environ.get("LOCAL_OPENAI_API_KEY") or os.environ.get("LLM_API_KEY") or "not-needed"
@@ -374,6 +375,92 @@ def get_git_creds(host: str) -> Dict[str, Optional[str]]:
         "url": get_setting(p + "url") or os.environ.get(env_url_map.get(host, ""), ""),
         "token": get_secret(p + "token"),
     }
+
+
+# Public hosts used when an account's URL is left blank ("this account is for
+# the public cloud").
+_PUBLIC_GIT_HOSTS = {"github": "github.com", "gitlab": "gitlab.com"}
+
+
+def get_git_accounts(host: str) -> List[Dict[str, Optional[str]]]:
+    """Resolve all git accounts for a host (github|gitlab).
+
+    Reads per-account keys ``git.<host>.accounts.<index>.url`` (plain) and
+    ``git.<host>.accounts.<index>.token`` (encrypted). When no explicit
+    accounts exist, falls back to the legacy single-account
+    :func:`get_git_creds` (``git.<host>.{url,token}`` + env var URL fallback)
+    so existing configuration keeps working unchanged.
+    """
+    prefix = "git.%s.accounts." % host
+    indices: set[int] = set()
+    for row in list_settings(prefix=prefix):
+        rest = row["key"][len(prefix):]
+        if "." not in rest:
+            continue
+        idx_str = rest.split(".", 1)[0]
+        if idx_str.isdigit():
+            indices.add(int(idx_str))
+
+    if not indices:
+        legacy = get_git_creds(host)
+        if legacy.get("url") or legacy.get("token"):
+            return [legacy]
+        return []
+
+    accounts: List[Dict[str, Optional[str]]] = []
+    for i in sorted(indices):
+        url = get_setting(prefix + "%d.url" % i) or ""
+        token = get_secret(prefix + "%d.token" % i)
+        if url or token:
+            accounts.append({"url": url, "token": token})
+    return accounts
+
+
+def _normalize_git_host(url: str) -> str:
+    """Normalize a git account/repo URL to its ``scheme://host:port`` host."""
+    text = (url or "").strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        text = "https://" + text
+    parsed = urlparse(text)
+    netloc = (parsed.netloc or "").lower().rstrip(".")
+    if not netloc:
+        return ""
+    if parsed.scheme:
+        return "%s://%s" % (parsed.scheme.lower(), netloc)
+    return netloc
+
+
+def _git_account_host(account_url: Optional[str], provider: str) -> str:
+    if account_url and account_url.strip():
+        return _normalize_git_host(account_url)
+    return _normalize_git_host(_PUBLIC_GIT_HOSTS.get(provider, ""))
+
+
+def resolve_git_token(
+    repo_url: str, repo_type: Optional[str] = None
+) -> Optional[str]:
+    """Return the token for the account whose host matches ``repo_url``.
+
+    The provider is taken from ``repo_type`` or inferred from the repo URL host
+    (``gitlab`` when the host contains ``gitlab``, else ``github``). Matching is
+    by normalized ``scheme://host[:port]``, case-insensitive. Returns ``None``
+    for public access when no account matches.
+    """
+    repo_url = (repo_url or "").strip()
+    if not repo_url:
+        return None
+    repo_host = _normalize_git_host(repo_url)
+    if not repo_host:
+        return None
+    provider = (repo_type or "").strip().lower()
+    if provider not in _PUBLIC_GIT_HOSTS:
+        provider = "gitlab" if "gitlab" in repo_host else "github"
+    for account in get_git_accounts(provider):
+        if _git_account_host(account.get("url"), provider) == repo_host:
+            return account.get("token") or None
+    return None
 
 
 def get_confluence_creds() -> Dict[str, Optional[str]]:

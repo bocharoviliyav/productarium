@@ -257,12 +257,11 @@ def apply_cognee_runtime_config() -> None:
     try:
         cfg = cognee.config  # type: ignore[attr-defined]
         # --- LLM ---
-        # Every supported local server (Ollama, LM Studio, llama.cpp, vLLM, ...)
+        # Every supported local server (LM Studio, llama.cpp, vLLM, ...)
         # exposes an OpenAI-compatible /v1 API, so cognee's ``openai`` provider
         # (OpenAIAdapter -> POST {endpoint}/chat/completions) covers all cases.
-        # The Productarium provider id (``openai_local`` / ``ollama`` / etc.) is
-        # no longer branched on; the admin-configured model/base_url/api_key from
-        # the ``cognee`` task always win, with env defaults as the fallback.
+        # The admin-configured model/base_url/api_key from the ``cognee`` task
+        # always win, with env defaults as the fallback.
         model = llm_cfg.get("model") or _default_cognee_model
         base_url = llm_cfg.get("base_url") or f"{_local_llm_host}/v1"
         api_key = llm_cfg.get("api_key") or os.environ.get("LLM_API_KEY") or "not-needed"
@@ -304,15 +303,14 @@ def apply_cognee_runtime_config() -> None:
         # --- Embeddings ---
         # cognee's get_embedding_engine() selects the engine by embedding_provider:
         #   "openai_compatible" -> OpenAICompatibleEmbeddingEngine (openai SDK /v1/embeddings)
-        #   "ollama"            -> OllamaEmbeddingEngine  (native /api/embed)
         #   anything else       -> LiteLLMEmbeddingEngine (litellm.aembedding)
         # Every supported local server exposes the OpenAI-compatible
-        # /v1/embeddings endpoint (Ollama's :11434 included), so the single
-        # ``openai_compatible`` provider covers all cases. CRITICAL: do NOT use
-        # ``openai`` here -- it falls through to LiteLLMEmbeddingEngine, whose
-        # __init__ calls tiktoken.encoding_for_model(<nomic model>) and raises
-        # KeyError. ``openai_compatible`` uses the OpenAI SDK directly and falls
-        # back to cl100k_base when transformers is not installed.
+        # /v1/embeddings endpoint, so the single ``openai_compatible`` provider
+        # covers all cases. CRITICAL: do NOT use ``openai`` here -- it falls
+        # through to LiteLLMEmbeddingEngine, whose __init__ calls
+        # tiktoken.encoding_for_model(<nomic model>) and raises KeyError.
+        # ``openai_compatible`` uses the OpenAI SDK directly and falls back to
+        # cl100k_base when transformers is not installed.
         emb_base = (emb_cfg.get("base_url") or "").rstrip("/")
         emb_model = emb_cfg.get("model") or os.environ.get("EMBEDDING_MODEL") or "text-embedding-nomic-embed-text-v1.5"
         emb_key = emb_cfg.get("api_key") or api_key

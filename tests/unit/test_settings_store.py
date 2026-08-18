@@ -262,6 +262,95 @@ class TestGetGitCreds:
         assert creds["token"] is None
 
 
+class TestGetGitAccounts:
+    def _write_accounts(self, host, accounts):
+        for i, acc in enumerate(accounts):
+            if "url" in acc:
+                settings_mod.set_setting(f"git.{host}.accounts.{i}.url", acc["url"], encrypt=False)
+            if "token" in acc:
+                settings_mod.set_setting(f"git.{host}.accounts.{i}.token", acc["token"], encrypt=True)
+
+    def test_empty_when_no_accounts_and_no_legacy(self, isolated_db):
+        assert settings_mod.get_git_accounts("github") == []
+
+    def test_legacy_fallback_single_account(self, isolated_db):
+        settings_mod.set_setting("git.github.url", "https://github.com", encrypt=False)
+        settings_mod.set_setting("git.github.token", "legacy-tok", encrypt=True)
+        accounts = settings_mod.get_git_accounts("github")
+        assert len(accounts) == 1
+        assert accounts[0]["url"] == "https://github.com"
+        assert accounts[0]["token"] == "legacy-tok"
+
+    def test_env_url_fallback_becomes_account(self, monkeypatch, isolated_db):
+        monkeypatch.setenv("GITHUB_ENTERPRISE_URL", "https://github.corp.com")
+        accounts = settings_mod.get_git_accounts("github")
+        assert len(accounts) == 1
+        assert accounts[0]["url"] == "https://github.corp.com"
+        assert accounts[0]["token"] is None
+
+    def test_multiple_accounts(self, isolated_db):
+        self._write_accounts("github", [
+            {"url": "", "token": "public-tok"},
+            {"url": "https://github.selfhosted.com", "token": "self-tok"},
+        ])
+        accounts = settings_mod.get_git_accounts("github")
+        assert len(accounts) == 2
+        assert accounts[0]["url"] == ""
+        assert accounts[0]["token"] == "public-tok"
+        assert accounts[1]["url"] == "https://github.selfhosted.com"
+        assert accounts[1]["token"] == "self-tok"
+
+    def test_skips_empty_url_and_token_rows(self, isolated_db):
+        self._write_accounts("gitlab", [{"url": "", "token": ""}])
+        assert settings_mod.get_git_accounts("gitlab") == []
+
+
+class TestResolveGitToken:
+    def test_public_github_match(self, isolated_db):
+        settings_mod.set_setting("git.github.accounts.0.url", "", encrypt=False)
+        settings_mod.set_setting("git.github.accounts.0.token", "public-tok", encrypt=True)
+        assert settings_mod.resolve_git_token("https://github.com/owner/repo") == "public-tok"
+
+    def test_public_gitlab_match(self, isolated_db):
+        settings_mod.set_setting("git.gitlab.accounts.0.url", "", encrypt=False)
+        settings_mod.set_setting("git.gitlab.accounts.0.token", "gl-tok", encrypt=True)
+        assert (
+            settings_mod.resolve_git_token("https://gitlab.com/group/repo", repo_type="gitlab")
+            == "gl-tok"
+        )
+
+    def test_self_hosted_match(self, isolated_db):
+        settings_mod.set_setting("git.github.accounts.0.url", "https://github.self.com", encrypt=False)
+        settings_mod.set_setting("git.github.accounts.0.token", "self-tok", encrypt=True)
+        assert (
+            settings_mod.resolve_git_token("https://github.self.com/a/b", repo_type="github")
+            == "self-tok"
+        )
+
+    def test_no_match_returns_none(self, isolated_db):
+        settings_mod.set_setting("git.github.accounts.0.url", "https://github.self.com", encrypt=False)
+        settings_mod.set_setting("git.github.accounts.0.token", "self-tok", encrypt=True)
+        assert settings_mod.resolve_git_token("https://github.com/a/b") is None
+
+    def test_legacy_fallback_match(self, isolated_db):
+        settings_mod.set_setting("git.github.url", "https://github.com", encrypt=False)
+        settings_mod.set_setting("git.github.token", "legacy-tok", encrypt=True)
+        assert settings_mod.resolve_git_token("https://github.com/a/b") == "legacy-tok"
+
+    def test_empty_repo_url_returns_none(self, isolated_db):
+        assert settings_mod.resolve_git_token("") is None
+
+    def test_case_insensitive_host(self, isolated_db):
+        settings_mod.set_setting("git.github.accounts.0.url", "https://GitHub.Com", encrypt=False)
+        settings_mod.set_setting("git.github.accounts.0.token", "tok", encrypt=True)
+        assert settings_mod.resolve_git_token("https://github.com/a/b") == "tok"
+
+    def test_infers_gitlab_from_host(self, isolated_db):
+        settings_mod.set_setting("git.gitlab.accounts.0.url", "https://gitlab.corp.com", encrypt=False)
+        settings_mod.set_setting("git.gitlab.accounts.0.token", "corp-tok", encrypt=True)
+        assert settings_mod.resolve_git_token("https://gitlab.corp.com/a/b") == "corp-tok"
+
+
 class TestGetConfluenceCreds:
     def test_env_fallback(self, monkeypatch, isolated_db):
         monkeypatch.setenv("CONFLUENCE_BASE_URL", "https://wiki.corp.com")

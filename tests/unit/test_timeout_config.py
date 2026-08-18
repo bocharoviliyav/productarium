@@ -43,6 +43,7 @@ WRAPPER_TO_KEY = {
     "resolve_cognee_init_timeout": "cognee_init",
     "resolve_cognee_recall_timeout": "cognee_recall",
     "resolve_docgen_indexing_drain_seconds": "docgen_indexing_drain",
+    "resolve_memory_query_timeout": "memory_query",
     "resolve_rlm_api_timeout_ms": "rlm_api_ms",
     "resolve_rlm_section_timeout": "rlm_section",
     "resolve_rlm_expert_timeout": "rlm_expert",

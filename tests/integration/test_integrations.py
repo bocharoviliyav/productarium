@@ -8,7 +8,7 @@ Covers:
   graceful-placeholder path when markitdown is unavailable
 - ``api.integrations._git_base.GitConnector.extract_repo_name``
 
-No live services (no DB / Ollama / network) — HTTP is mocked per-test and the
+No live services (no DB / LLM / network) — HTTP is mocked per-test and the
 settings store uses an isolated SQLite env (mirrors test_foundation.py).
 """
 
@@ -19,7 +19,7 @@ from typing import Any, Dict, Optional
 import pytest
 
 # The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
-# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee/Ollama stubs for every
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee stubs for every
 # test in this module. The router tests override ``get_current_user`` via
 # ``app.dependency_overrides`` (see ``_client_and_db``) so they are independent of
 # the AUTH_PROVIDER env value anyway.
@@ -575,10 +575,14 @@ class TestIntegrationsRouter:
 
         reset_registry()
         register(_PullOnlyConnector)
-        # Avoid real cognee indexing in the background.
-        async def _noop_index(text, dataset_name):
-            return None
-        monkeypatch.setattr(router_mod, "add_and_index_document", _noop_index)
+        # Avoid real memory-backend indexing in the background. The router's
+        # _index_in_background delegates to api.memory.index_document (the
+        # backend-agnostic facade; active backend = pgvector by default,
+        # cognee alt), so patch the facade.
+        import api.memory as memory_mod
+        async def _noop_index(text, product_id, *, source_type="integration", source_id=None):
+            return 1
+        monkeypatch.setattr(memory_mod, "index_document", _noop_index)
 
         engine = create_engine(
             "sqlite://",

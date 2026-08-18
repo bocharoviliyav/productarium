@@ -92,22 +92,28 @@ def _fallback_artifact_docs(product_id: str) -> str:
 
 
 async def _retrieve_product_knowledge(product_id: str, query: str) -> str:
-    """Retrieve product knowledge from cognee (prod_{product_id}); fall back to
-    concatenated artifact docs or live Confluence. Never raises; returns "" if nothing available.
+    """Retrieve product knowledge via the active memory backend (pgvector default,
+    cognee alt); fall back to concatenated artifact docs or live Confluence.
+    Never raises; returns "" if nothing available.
     """
-    dataset = f"prod_{product_id}"
     try:
-        from api.cognee import query_cognee
+        from api.memory import query_memory
 
-        ctx = await query_cognee(query, dataset_name=dataset, top_k=20)
+        ctx = await query_memory(query, product_id, top_k=20)
         if ctx:
             logger.info(
-                "Expert: cognee recall for %r returned %d chars.", dataset, len(ctx)
+                "Expert: memory recall for product %r returned %d chars.",
+                product_id, len(ctx),
             )
             return ctx
-        logger.info("Expert: cognee recall empty for %r; using artifact fallback.", dataset)
+        logger.info(
+            "Expert: memory recall empty for product %r; using artifact fallback.",
+            product_id,
+        )
     except Exception as e:
-        logger.warning("Expert: cognee recall failed for %r: %s", dataset, e)
+        logger.warning(
+            "Expert: memory recall failed for product %r: %s", product_id, e
+        )
 
     fallback_docs = _fallback_artifact_docs(product_id)
     if fallback_docs:

@@ -3,7 +3,7 @@
 Provides:
 - ``_isolated_env`` (autouse): every test gets an isolated SQLite DB + a stable
   ``SETTINGS_SECRET_KEY`` + cognee connection-test skip, so no real Postgres /
-  cognee / Ollama is required and tests never touch the developer's data.
+  cognee is required and tests never touch the developer's data.
 - ``isolated_db``: rebinds ``api.db`` (engine + ``SessionLocal`` + ``_db_ready``
   reset) to an in-memory ``StaticPool`` SQLite engine usable across the worker
   thread FastAPI's TestClient runs in, then runs ``init_db``. Returns the
@@ -37,7 +37,7 @@ import pytest
 # --- Isolated environment (autouse) -----------------------------------------
 @pytest.fixture(autouse=True)
 def _isolated_env(tmp_path_factory, monkeypatch):
-    """Isolated SQLite DB + stable secret + cognee/Ollama stubs for every test.
+    """Isolated SQLite DB + stable secret + cognee stubs for every test.
 
     Uses ``tmp_path_factory`` (session-scoped temp dir) so DB files live under a
     per-test temp path without colliding. ``monkeypatch.setenv`` is
@@ -51,7 +51,6 @@ def _isolated_env(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("DB_PASSWORD", "")
     monkeypatch.setenv("AUTH_PROVIDER", "local")
     monkeypatch.setenv("COGNEE_SKIP_CONNECTION_TEST", "true")
-    monkeypatch.setenv("OLLAMA_HOST", "http://localhost:11434")
     # A stable-per-process Fernet key so encryption roundtrips are deterministic
     # within a test. cryptography is a hard dependency of the project.
     from cryptography.fernet import Fernet

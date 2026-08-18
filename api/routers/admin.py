@@ -50,8 +50,10 @@ from api.schemas import (
 )
 from api.config.settings import (
     _sanitize_api_key,
+    delete_setting,
     get_all_rlm_modes,
     get_confluence_creds,
+    get_git_accounts,
     get_git_creds,
     get_integration_config,
     get_model_for_task,
@@ -76,9 +78,19 @@ _SECRET_SUFFIXES = (".api_key", ".token", ".password", ".secret")
 # ``ssl`` stores TLS config (ssl.ca_bundle path + ssl.verify toggle) for reaching
 # a corporate AI gateway whose cert is signed by an internal CA; NOT secret.
 # ``cognee`` stores knowledge graph rate limiting & concurrency settings; NOT secret.
+# ``embedder`` stores embedder rate limiting & concurrency settings (pgvector
+# memory backend); NOT secret.
 # ``timeouts`` stores per-key timeout overrides (timeouts.<key>) resolved through
 # api.config.timeout (admin store > env var > default); NOT secret.
-_SETTING_GROUPS = ("models", "git", "confluence", "integrations", "rlm", "ssl", "cognee", "timeouts")
+# ``memory`` stores the active memory backend (memory.backend = pgvector|cognee);
+# NOT secret.
+_SETTING_GROUPS = (
+    "models", "git", "confluence", "integrations", "rlm", "ssl", "cognee",
+    "embedder", "timeouts", "memory",
+)
+
+# Valid memory backend names (stored under ``memory.backend``).
+_MEMORY_BACKEND_VALUES = ("pgvector", "cognee")
 
 # Model "tasks" exposed in the admin Models section (contract J / plan D).
 _MODEL_TASKS = ("docgen", "expert", "summary", "cognee", "embedder")
@@ -151,6 +163,48 @@ def _redact_git_creds(creds: Dict[str, Optional[str]]) -> Dict[str, Any]:
     return {"url": creds.get("url"), "token": None, "hasToken": bool(creds.get("token"))}
 
 
+def _redact_git_accounts(accounts: List[Dict[str, Optional[str]]]) -> List[Dict[str, Any]]:
+    return [
+        {"url": a.get("url"), "token": None, "hasToken": bool(a.get("token"))}
+        for a in accounts
+    ]
+
+
+def _save_git_accounts(accounts: Dict[str, Any], saved: List[str]) -> List[str]:
+    """Replace per-host git account lists and return the updated ``saved`` list.
+
+    Tokens are encrypted; an entry with an empty token reuses a previously
+    stored token for the same URL (the UI leaves the token field blank to
+    indicate "keep existing secret"). Deleted accounts are removed.
+    """
+    for host in _GIT_HOSTS:
+        entries = accounts.get(host)
+        if not isinstance(entries, list):
+            continue
+        prefix = f"git.{host}.accounts."
+        previous: Dict[str, Optional[str]] = {}
+        for a in get_git_accounts(host):
+            prev_url = (a.get("url") or "").strip()
+            if prev_url:
+                previous[prev_url] = a.get("token")
+        for row in list_settings(prefix=prefix):
+            delete_setting(row["key"])
+        for i, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            url = str(entry.get("url") or "").strip()
+            token = entry.get("token")
+            token = str(token or "").strip()
+            if not token and url in previous:
+                token = previous[url] or ""
+            set_setting(f"{prefix}{i}.url", url, encrypt=False)
+            if token:
+                set_setting(f"{prefix}{i}.token", token, encrypt=True)
+            saved.append(host)
+    return saved
+
+
+
 def _redact_confluence_creds(creds: Dict[str, Optional[str]]) -> Dict[str, Any]:
     return {
         "base_url": creds.get("base_url"),
@@ -177,14 +231,85 @@ async def trigger_cognee_reindex(
     body: Optional[CogneeReindexRequest] = None,
     _admin: UserORM = Depends(require_admin),
 ):
-    """Manually trigger/force a re-index of the Cognee knowledge graph."""
+    """Re-index the active memory backend (alias kept for backward compat).
+
+    Delegates to ``api.memory.reindex_product_memory`` so the admin
+    ``memory.backend`` switch governs this path too (pgvector by default,
+    cognee alt). The canonical new path is ``POST /api/admin/memory/reindex``.
+    """
     pid = body.product_id if body else None
     try:
-        from api.cognee import reindex_product_knowledge_graph
-        res = await reindex_product_knowledge_graph(pid)
+        from api.memory import reindex_product_memory
+        res = await reindex_product_memory(pid)
         return res
     except Exception as e:
-        logger.error("Admin cognee reindex failed: %s", e, exc_info=True)
+        logger.error("Admin memory reindex failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Reindex failed: {e}")
+
+
+def _memory_status_view() -> Dict[str, Any]:
+    """Build the ``resolved`` view for the admin Memory section.
+
+    Reports the active backend name (resolved with fallback), the valid
+    options, and per-backend availability + counts (non-fatal on DB/embedder
+    down). Used by ``GET /api/admin/memory`` and the ``memory`` group.
+    """
+    from api.memory import get_memory_backend, get_memory_backend_name
+    out: Dict[str, Any] = {
+        "backend": get_memory_backend_name(),
+        "valid_backends": list(_MEMORY_BACKEND_VALUES),
+    }
+    try:
+        backend = get_memory_backend()
+        out.update(backend.status())
+    except Exception as e:  # pragma: no cover - non-fatal
+        logger.warning("memory status() failed: %s", e)
+        out["available"] = False
+    return out
+
+
+@router.get("/memory")
+def get_memory_settings(
+    _admin: UserORM = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Return the active memory backend + status (canonical path for the UI)."""
+    rows = list_settings(prefix="memory.")
+    settings = {
+        r["key"]: _redact_setting(r["key"], r["value"], r["encrypted"]) for r in rows
+    }
+    return {"group": "memory", "settings": settings, "resolved": _memory_status_view()}
+
+
+@router.put("/memory")
+def put_memory_settings(
+    body: Dict[str, Any],
+    admin: UserORM = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Save memory settings (canonical path for the UI).
+
+    Accepts ``{"memory.backend": "pgvector"|"cognee"}``. Delegates validation +
+    sync to the generic ``put_group("memory", ...)`` path so the resolver cache
+    is invalidated via ``sync_runtime_settings``.
+    """
+    return put_group("memory", body, admin=admin)
+
+
+@router.post("/memory/reindex")
+async def trigger_memory_reindex(
+    body: Optional[CogneeReindexRequest] = None,
+    _admin: UserORM = Depends(require_admin),
+):
+    """Rebuild the active memory backend index from source artifacts.
+
+    Delegates to ``api.memory.reindex_product_memory`` (pgvector by default,
+    cognee alt) so the admin ``memory.backend`` switch governs this path.
+    """
+    pid = body.product_id if body else None
+    try:
+        from api.memory import reindex_product_memory
+        return await reindex_product_memory(pid)
+    except Exception as e:
+        logger.error("Admin memory reindex failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Reindex failed: {e}")
 
 
@@ -305,7 +430,7 @@ def get_group(
             }
         elif group == "git":
             resp["resolved"] = {
-                host: _redact_git_creds(get_git_creds(host)) for host in _GIT_HOSTS
+                host: _redact_git_accounts(get_git_accounts(host)) for host in _GIT_HOSTS
             }
         elif group == "confluence":
             resp["resolved"] = _redact_confluence_creds(get_confluence_creds())
@@ -329,6 +454,14 @@ def get_group(
                 "delay_seconds": str(delay_sec),
                 "rate_limit_rps": str(round(1.0 / delay_sec, 2)) if delay_sec > 0 else "0",
             }
+        elif group == "embedder":
+            from api.tools.rate_limiter import _embedder_rate_limiter
+            max_conc, delay_sec = _embedder_rate_limiter.get_rate_settings()
+            resp["resolved"] = {
+                "max_concurrency": str(max_conc),
+                "delay_seconds": str(delay_sec),
+                "rate_limit_rps": str(round(1.0 / delay_sec, 2)) if delay_sec > 0 else "0",
+            }
         elif group == "timeouts":
             # ``resolved`` is the effective per-key timeout AFTER admin store >
             # env var > default + floor, so the UI shows the real value each
@@ -337,6 +470,8 @@ def get_group(
             # so they are already in ``settings`` above.
             from api.config.timeout import get_timeout_resolved_view
             resp["resolved"] = get_timeout_resolved_view()
+        elif group == "memory":
+            resp["resolved"] = _memory_status_view()
         return resp
 
     if group == "users":
@@ -376,6 +511,9 @@ def put_group(
                 status_code=400, detail="Expected a JSON object of setting key -> value"
             )
         saved: List[str] = []
+        if group == "git" and isinstance(body.get("accounts"), dict):
+            saved = _save_git_accounts(body["accounts"], saved)
+            body = {k: v for k, v in body.items() if k != "accounts"}
         for key, value in body.items():
             if not isinstance(key, str) or not key.startswith(f"{group}."):
                 continue
@@ -436,6 +574,15 @@ def put_group(
                         continue
                     # Keep a clean representation: int when whole, else float.
                     str_value = str(int(parsed)) if float(parsed).is_integer() else str(parsed)
+            # Validate memory.backend so an invalid name can't be persisted
+            # (the resolver would fall back to the default, but persisting a
+            # typo would mislead the admin UI into showing it as active).
+            if group == "memory" and key == "memory.backend":
+                v = (value or "").strip().lower() if isinstance(value, str) else value
+                if v not in _MEMORY_BACKEND_VALUES:
+                    logger.warning("Ignoring invalid memory.backend: %r", value)
+                    continue
+                str_value = v
             set_setting(key, str_value, encrypt=encrypt)
             saved.append(key)
 
@@ -606,9 +753,8 @@ def _ping_model_endpoint(
     if api_key and api_key != "not-needed":
         headers["Authorization"] = f"Bearer {api_key}"
     try:
-        # Every supported server (Ollama, LM Studio, llama.cpp, vLLM, ...)
-        # exposes the OpenAI-compatible /v1/models endpoint. Ollama's :11434
-        # also serves /v1/models.
+        # Every supported server (LM Studio, llama.cpp, vLLM, ...)
+        # exposes the OpenAI-compatible /v1/models endpoint.
         url = base_url
         if not url.endswith("/v1"):
             url = url.rstrip("/") + "/v1"

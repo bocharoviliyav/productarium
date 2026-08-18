@@ -47,7 +47,7 @@ import { useLanguage } from "@/contexts/LanguageContext";
 /* Small helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-type Section = "models" | "rlm" | "ssl" | "git" | "confluence" | "integrations" | "prompts" | "cognee" | "timeouts" | "users" | "tokens";
+type Section = "models" | "rlm" | "ssl" | "git" | "confluence" | "integrations" | "prompts" | "memory" | "timeouts" | "users" | "tokens";
 
 const SECTIONS: { key: Section; icon: typeof Gear }[] = [
   { key: "models", icon: Rocket },
@@ -57,7 +57,7 @@ const SECTIONS: { key: Section; icon: typeof Gear }[] = [
   { key: "confluence", icon: Globe },
   { key: "integrations", icon: Plug },
   { key: "prompts", icon: FileText },
-  { key: "cognee", icon: Brain },
+  { key: "memory", icon: Brain },
   { key: "timeouts", icon: Wrench },
   { key: "users", icon: UserCircleGear },
   { key: "tokens", icon: Key },
@@ -373,13 +373,13 @@ function ModelsSection() {
                 label={tm.model ?? "Model"}
                 value={c.model}
                 onChange={(v) => update(task, "model", v)}
-                placeholder="e.g. qwen3:8b"
+                placeholder="e.g. qwen/qwen3.6-27b"
               />
               <Field
                 label={tm.baseUrl ?? "Base URL"}
                 value={c.base_url}
                 onChange={(v) => update(task, "base_url", v)}
-                placeholder="http://localhost:11434/v1"
+                placeholder="http://localhost:1234/v1"
               />
               <Field
                 label={tm.apiKey ?? "API key"}
@@ -663,23 +663,26 @@ function RlmSection() {
 
 const GIT_HOSTS = ["github", "gitlab"] as const;
 type GitHost = (typeof GIT_HOSTS)[number];
-interface GitCred {
+interface GitAccount {
   url: string;
   token: string;
   // UI-only: true when a token is already stored (redacted on the server).
   hasToken: boolean;
 }
-type GitConfig = Record<GitHost, GitCred>;
+type GitConfig = Record<GitHost, GitAccount[]>;
 
 // GET /api/admin/git returns { group, settings, resolved }; the editable
-// per-host creds live under `resolved` (token redacted as hasToken).
+// per-host accounts live under `resolved` (a list per host; token redacted
+// as hasToken).
 interface GitGroupResponse {
   group: string;
   settings: Record<string, unknown>;
-  resolved: Partial<Record<GitHost, { url: string | null; token: string | null; hasToken: boolean }>>;
+  resolved: Partial<
+    Record<GitHost, Array<{ url: string | null; token: string | null; hasToken: boolean }>>
+  >;
 }
 
-const DEFAULT_GIT_CRED: GitCred = { url: "", token: "", hasToken: false };
+const DEFAULT_GIT_ACCOUNT: GitAccount = { url: "", token: "", hasToken: false };
 
 function GitSection() {
   const { getJson, putJson, postJson, notify } = useAdminApi();
@@ -698,12 +701,12 @@ function GitSection() {
       const resolved = data?.resolved ?? {};
       const next = {} as GitConfig;
       for (const host of GIT_HOSTS) {
-        const r = resolved[host];
-        next[host] = {
+        const rows = Array.isArray(resolved[host]) ? (resolved[host] as GitAccount[]) : [];
+        next[host] = rows.map((r) => ({
           url: r?.url ?? "",
           token: "",
           hasToken: Boolean(r?.hasToken),
-        };
+        }));
       }
       setCfg(next);
     } catch (e) {
@@ -722,23 +725,40 @@ function GitSection() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const update = (host: GitHost, key: keyof GitCred, v: string) =>
+  const update = (host: GitHost, idx: number, key: keyof GitAccount, v: string) =>
     setCfg((prev) => {
       if (!prev) return prev;
-      const cur = prev[host] ?? DEFAULT_GIT_CRED;
-      return { ...prev, [host]: { ...cur, [key]: v } };
+      const rows = [...(prev[host] ?? [])];
+      rows[idx] = { ...(rows[idx] ?? DEFAULT_GIT_ACCOUNT), [key]: v };
+      return { ...prev, [host]: rows };
+    });
+
+  const addAccount = (host: GitHost) =>
+    setCfg((prev) => {
+      if (!prev) return prev;
+      const rows = [...(prev[host] ?? [])];
+      rows.push({ ...DEFAULT_GIT_ACCOUNT });
+      return { ...prev, [host]: rows };
+    });
+
+  const removeAccount = (host: GitHost, idx: number) =>
+    setCfg((prev) => {
+      if (!prev) return prev;
+      const rows = [...(prev[host] ?? [])];
+      rows.splice(idx, 1);
+      return { ...prev, [host]: rows };
     });
 
   const save = async (host: GitHost) => {
     if (!cfg) return;
     setSaving(host);
     try {
-      const cur = cfg[host] ?? DEFAULT_GIT_CRED;
-      // PUT contract expects flat keys `git.<host>.{url,token}`. Only send
-      // the token when the admin typed a new value.
-      const body: Record<string, string> = { [`git.${host}.url`]: cur.url };
-      if (cur.token) body[`git.${host}.token`] = cur.token;
-      await putJson("/api/admin/git", body);
+      const accounts = (cfg[host] ?? []).map((a) => ({
+        url: a.url,
+        // Empty token means "keep the existing stored token for this URL".
+        token: a.token,
+      }));
+      await putJson("/api/admin/git", { accounts: { [host]: accounts } });
       await load();
       notify({ tone: "success", title: fmt(tg.savedToast ?? "Saved {host} credentials.", { host }) });
     } catch (e) {
@@ -790,37 +810,51 @@ function GitSection() {
         {tg.intro ?? ""}
       </p>
       {GIT_HOSTS.map((host) => {
-        const c = cfg?.[host] ?? DEFAULT_GIT_CRED;
+        const accounts = cfg?.[host] ?? [];
         return (
           <Card key={host} className="p-5">
-            <h3 className="mb-4 font-editorial text-base tracking-tight text-ink capitalize">
+            <h3 className="mb-1 font-editorial text-base tracking-tight text-ink capitalize">
               {host}
             </h3>
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field
-                label={tg.enterpriseUrl ?? "Enterprise / self-hosted URL"}
-                value={c.url}
-                onChange={(v) => update(host, "url", v)}
-                placeholder="https://git.company.com"
-              />
-              <Field
-                label={tg.accessToken ?? "Access token"}
-                value={c.token}
-                onChange={(v) => update(host, "token", v)}
-                placeholder={
-                  c.hasToken
-                    ? (tg.tokenStored ?? "stored · type to replace")
-                    : (tg.tokenPlaceholder ?? "type to set")
-                }
-                secret
-              />
+            <p className="mb-4 text-[13px] text-muted">
+              {tg.accountsHint ?? ""}
+            </p>
+            <div className="space-y-3">
+              {accounts.map((a, idx) => (
+                <div key={idx} className="grid gap-3 md:grid-cols-[1fr_1fr_auto] md:items-end">
+                  <Field
+                    label={tg.accountUrl ?? "URL"}
+                    value={a.url}
+                    onChange={(v) => update(host, idx, "url", v)}
+                    placeholder={tg.accountUrlPlaceholder ?? "empty = public cloud"}
+                  />
+                  <Field
+                    label={tg.accessToken ?? "Access token"}
+                    value={a.token}
+                    onChange={(v) => update(host, idx, "token", v)}
+                    placeholder={
+                      a.hasToken
+                        ? (tg.tokenStored ?? "stored · type to replace")
+                        : (tg.tokenPlaceholder ?? "type to set")
+                    }
+                    secret
+                  />
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => removeAccount(host, idx)}
+                    aria-label={tg.removeAccount ?? "Remove account"}
+                  >
+                    <Trash size={14} weight="regular" />
+                  </Button>
+                </div>
+              ))}
+              <Button size="sm" variant="ghost" onClick={() => addAccount(host)}>
+                <Plus size={14} weight="regular" /> {tg.addAccount ?? "Add account"}
+              </Button>
             </div>
             <div className="mt-4 flex items-center gap-2">
-              <Button
-                size="sm"
-                onClick={() => save(host)}
-                disabled={saving === host}
-              >
+              <Button size="sm" onClick={() => save(host)} disabled={saving === host}>
                 {saving === host ? (
                   <SpinnerIcon />
                 ) : (
@@ -828,12 +862,7 @@ function GitSection() {
                 )}{" "}
                 {tg.save ?? "Save"}
               </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => test(host)}
-                disabled={testing === host}
-              >
+              <Button size="sm" variant="ghost" onClick={() => test(host)} disabled={testing === host}>
                 {testing === host ? (
                   <SpinnerIcon />
                 ) : (
@@ -1251,10 +1280,10 @@ function IntegrationsSection() {
 /* ------------------------------------------------------------------ */
 /* System prompts section (live-edit refs/prompts/*.md)                */
 /* ------------------------------------------------------------------ */
-/* Cognee Knowledge Graph section                                      */
+/* Rate-limit card (shared by Cognee + Embedder)                      */
 /* ------------------------------------------------------------------ */
 
-interface CogneeGroupResponse {
+interface RateLimitGroupResponse {
   group: string;
   settings: Record<string, { value: string | null }>;
   resolved?: {
@@ -1264,28 +1293,145 @@ interface CogneeGroupResponse {
   };
 }
 
-function CogneeSection() {
+interface RateLimitValues {
+  maxConcurrency: string;
+  delaySeconds: string;
+  rateLimitRps: string;
+}
+
+/**
+ * Render the three rate-limit fields (max concurrency / delay / RPS) plus a
+ * save button. Shared by the Cognee (knowledge graph) and Embedder (pgvector
+ * memory) rate-limit blocks inside the merged memory section.
+ */
+function RateLimitCard({
+  labels,
+  values,
+  onValuesChange,
+  onSave,
+  saving,
+}: {
+  labels: Record<string, string>;
+  values: RateLimitValues;
+  onValuesChange: (patch: Partial<RateLimitValues>) => void;
+  onSave: () => void;
+  saving: boolean;
+}) {
+  return (
+    <Card className="p-5">
+      <div className="grid gap-4 md:grid-cols-3">
+        <Field
+          label={labels.maxConcurrency ?? "Max Concurrency"}
+          value={values.maxConcurrency}
+          onChange={(v) => onValuesChange({ maxConcurrency: v })}
+          placeholder="2"
+        />
+        <Field
+          label={labels.delaySeconds ?? "Delay Between Requests (sec)"}
+          value={values.delaySeconds}
+          onChange={(v) => onValuesChange({ delaySeconds: v })}
+          placeholder="0.5"
+        />
+        <Field
+          label={labels.rateLimitRps ?? "Rate Limit (RPS)"}
+          value={values.rateLimitRps}
+          onChange={(v) => onValuesChange({ rateLimitRps: v })}
+          placeholder="2.0"
+        />
+      </div>
+      <p className="mt-2 text-xs text-muted">
+        {labels.hint ?? ""}
+      </p>
+      <div className="mt-4 flex items-center gap-2">
+        <Button size="sm" onClick={onSave} disabled={saving}>
+          {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />}
+          {labels.save ?? "Save Rate Limits"}
+        </Button>
+      </div>
+    </Card>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Memory section (active backend switch + reindex)                   */
+/* ------------------------------------------------------------------ */
+
+interface MemoryGroupResponse {
+  group: string;
+  settings: Record<string, { value: string | null }>;
+  resolved?: {
+    backend?: string;
+    valid_backends?: string[];
+    available?: boolean;
+    chunk_count?: number;
+    product_count?: number;
+  };
+}
+
+function MemorySection() {
   const { getJson, putJson, postJson, notify } = useAdminApi();
   const { messages } = useLanguage();
   const t = messages?.admin ?? {};
-  const tcg = (t as Record<string, Record<string, string>>)?.cognee ?? {};
+  const tm = t?.memory ?? {};
+  const tcog = t?.cognee ?? {};
+  const temb = t?.embedder ?? {};
 
-  const [maxConcurrency, setMaxConcurrency] = useState("2");
-  const [delaySeconds, setDelaySeconds] = useState("0.5");
-  const [rateLimitRps, setRateLimitRps] = useState("2.0");
+  const [backend, setBackend] = useState("pgvector");
+  const [validBackends, setValidBackends] = useState<string[]>(["pgvector", "cognee"]);
+  const [available, setAvailable] = useState<boolean | null>(null);
+  const [chunkCount, setChunkCount] = useState<number | null>(null);
+  const [productCount, setProductCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [reindexing, setReindexing] = useState(false);
+  const [reindexProductId, setReindexProductId] = useState("");
+
+  // Rate-limit state (Cognee knowledge graph + embedder).
+  const [cogneeRl, setCogneeRl] = useState<RateLimitValues>({
+    maxConcurrency: "2",
+    delaySeconds: "0.5",
+    rateLimitRps: "2.0",
+  });
+  const [embedderRl, setEmbedderRl] = useState<RateLimitValues>({
+    maxConcurrency: "4",
+    delaySeconds: "0.1",
+    rateLimitRps: "10.0",
+  });
+  const [savingCogneeRl, setSavingCogneeRl] = useState(false);
+  const [savingEmbedderRl, setSavingEmbedderRl] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await getJson<CogneeGroupResponse>("/api/admin/cognee");
+      const data = await getJson<MemoryGroupResponse>("/api/admin/memory");
       const r = data?.resolved ?? {};
       const s = data?.settings ?? {};
-      setMaxConcurrency(s["cognee.max_concurrency"]?.value ?? r.max_concurrency ?? "2");
-      setDelaySeconds(s["cognee.delay_seconds"]?.value ?? r.delay_seconds ?? "0.5");
-      setRateLimitRps(s["cognee.rate_limit_rps"]?.value ?? r.rate_limit_rps ?? "2.0");
+      setBackend(s["memory.backend"]?.value ?? r.backend ?? "pgvector");
+      setValidBackends(r.valid_backends ?? ["pgvector", "cognee"]);
+      setAvailable(typeof r.available === "boolean" ? r.available : null);
+      setChunkCount(typeof r.chunk_count === "number" ? r.chunk_count : null);
+      setProductCount(typeof r.product_count === "number" ? r.product_count : null);
+
+      // Load cognee + embedder rate-limit settings in parallel (they are
+      // separate setting groups on the backend).
+      const [cogneeData, embedderData] = await Promise.all([
+        getJson<RateLimitGroupResponse>("/api/admin/cognee"),
+        getJson<RateLimitGroupResponse>("/api/admin/embedder"),
+      ]);
+      const cr = cogneeData?.resolved ?? {};
+      const cs = cogneeData?.settings ?? {};
+      setCogneeRl({
+        maxConcurrency: cs["cognee.max_concurrency"]?.value ?? cr.max_concurrency ?? "2",
+        delaySeconds: cs["cognee.delay_seconds"]?.value ?? cr.delay_seconds ?? "0.5",
+        rateLimitRps: cs["cognee.rate_limit_rps"]?.value ?? cr.rate_limit_rps ?? "2.0",
+      });
+      const er = embedderData?.resolved ?? {};
+      const es = embedderData?.settings ?? {};
+      setEmbedderRl({
+        maxConcurrency: es["embedder.max_concurrency"]?.value ?? er.max_concurrency ?? "4",
+        delaySeconds: es["embedder.delay_seconds"]?.value ?? er.delay_seconds ?? "0.1",
+        rateLimitRps: es["embedder.rate_limit_rps"]?.value ?? er.rate_limit_rps ?? "10.0",
+      });
     } catch (e) {
       notify({
         tone: "error",
@@ -1305,14 +1451,9 @@ function CogneeSection() {
   const save = async () => {
     setSaving(true);
     try {
-      const body: Record<string, string> = {
-        "cognee.max_concurrency": maxConcurrency.trim(),
-        "cognee.delay_seconds": delaySeconds.trim(),
-        "cognee.rate_limit_rps": rateLimitRps.trim(),
-      };
-      await putJson("/api/admin/cognee", body);
+      await putJson("/api/admin/memory", { "memory.backend": backend });
       await load();
-      notify({ tone: "success", title: tcg.savedToast ?? "Saved Cognee config." });
+      notify({ tone: "success", title: tm.savedToast ?? "Memory backend saved." });
     } catch (e) {
       notify({
         tone: "error",
@@ -1324,19 +1465,24 @@ function CogneeSection() {
     }
   };
 
-  const forceReindex = async () => {
+  const reindex = async () => {
     setReindexing(true);
     try {
-      const res = (await postJson("/api/admin/cognee/reindex", {})) as {
+      const body = reindexProductId.trim()
+        ? { product_id: reindexProductId.trim() }
+        : {};
+      const res = (await postJson("/api/admin/memory/reindex", body)) as {
         success?: boolean;
         message?: string;
+        reindexed_count?: number;
       };
       const ok = Boolean(res.success);
       notify({
         tone: ok ? "success" : "error",
-        title: ok ? (tcg.reindexOkTitle ?? "Reindex Complete") : (t.failed ?? "Failed"),
-        message: res.message || (ok ? (tcg.reindexOkMsg ?? "Reindexed Cognee knowledge graph.") : "Reindex failed"),
+        title: ok ? (tm.reindexOkTitle ?? "Reindex complete") : (t.failed ?? "Failed"),
+        message: res.message || (ok ? (tm.reindexOkMsg ?? "Memory index rebuilt.") : "Reindex failed"),
       });
+      if (ok) void load();
     } catch (e) {
       notify({
         tone: "error",
@@ -1348,10 +1494,54 @@ function CogneeSection() {
     }
   };
 
+  const saveCogneeRl = async () => {
+    setSavingCogneeRl(true);
+    try {
+      const body: Record<string, string> = {
+        "cognee.max_concurrency": cogneeRl.maxConcurrency.trim(),
+        "cognee.delay_seconds": cogneeRl.delaySeconds.trim(),
+        "cognee.rate_limit_rps": cogneeRl.rateLimitRps.trim(),
+      };
+      await putJson("/api/admin/cognee", body);
+      await load();
+      notify({ tone: "success", title: tcog.savedToast ?? "Saved Cognee rate limits." });
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.saveFailedTitle ?? "Save failed",
+        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
+      });
+    } finally {
+      setSavingCogneeRl(false);
+    }
+  };
+
+  const saveEmbedderRl = async () => {
+    setSavingEmbedderRl(true);
+    try {
+      const body: Record<string, string> = {
+        "embedder.max_concurrency": embedderRl.maxConcurrency.trim(),
+        "embedder.delay_seconds": embedderRl.delaySeconds.trim(),
+        "embedder.rate_limit_rps": embedderRl.rateLimitRps.trim(),
+      };
+      await putJson("/api/admin/embedder", body);
+      await load();
+      notify({ tone: "success", title: temb.savedToast ?? "Saved embedder rate limits." });
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.saveFailedTitle ?? "Save failed",
+        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
+      });
+    } finally {
+      setSavingEmbedderRl(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center gap-2 text-sm text-muted">
-        <Spinner /> {tcg.loading ?? "Loading Cognee settings…"}
+        <Spinner /> {tm.loading ?? "Loading memory settings…"}
       </div>
     );
   }
@@ -1359,50 +1549,123 @@ function CogneeSection() {
   return (
     <div className="space-y-6">
       <p className="text-[15px] text-muted">
-        {tcg.intro ?? "Configure rate limits and concurrency for Cognee knowledge graph indexing to prevent LLM API rate limit overflow."}
+        {tm.intro ??
+          "Choose the agent memory backend. pgvector (default) is a fast direct vector store; cognee is the knowledge-graph alternative."}
       </p>
 
       <Card className="p-5">
-        <div className="grid gap-4 md:grid-cols-3">
-          <Field
-            label={tcg.maxConcurrency ?? "Max Concurrency"}
-            value={maxConcurrency}
-            onChange={setMaxConcurrency}
-            placeholder="2"
-          />
-          <Field
-            label={tcg.delaySeconds ?? "Delay Between Requests (sec)"}
-            value={delaySeconds}
-            onChange={setDelaySeconds}
-            placeholder="0.5"
-          />
-          <Field
-            label={tcg.rateLimitRps ?? "Rate Limit (RPS)"}
-            value={rateLimitRps}
-            onChange={setRateLimitRps}
-            placeholder="2.0"
-          />
+        <SectionHeader
+          title={tm.backendHeader ?? "Active backend"}
+          subtitle={tm.backendSub ?? "Selects where indexed product knowledge is stored and recalled from."}
+        />
+        <div className="mt-4 flex flex-col gap-2">
+          {validBackends.map((b) => (
+            <label
+              key={b}
+              className="flex items-center gap-3 rounded-md border border-divider px-3 py-2 text-sm hover:bg-surface-2"
+            >
+              <input
+                type="radio"
+                name="memory-backend"
+                value={b}
+                checked={backend === b}
+                onChange={() => setBackend(b)}
+                className="h-4 w-4"
+              />
+              <span className="font-medium text-ink">{b}</span>
+              <span className="text-xs text-muted">
+                {b === "pgvector"
+                  ? (tm.pgvectorDesc ?? "Direct Postgres+pgvector chunk store with HNSW cosine recall (fast, no graph extraction).")
+                  : (tm.cogneeDesc ?? "cognee knowledge graph (LLM-extracted entities/relations; slower indexing).")}
+              </span>
+            </label>
+          ))}
         </div>
-        <p className="mt-2 text-xs text-muted">
-          {tcg.hint ?? "Throttles LLM and embedding requests generated during graph extraction (cognify). Setting max concurrency to 1-3 and delay to 0.5s prevents 429 Too Many Requests errors."}
-        </p>
         <div className="mt-4 flex items-center gap-2">
           <Button size="sm" onClick={save} disabled={saving}>
             {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />}
-            {tcg.save ?? "Save Rate Limits"}
+            {tm.save ?? "Save backend"}
           </Button>
         </div>
       </Card>
 
       <Card className="p-5">
         <SectionHeader
-          title={tcg.reindexHeader ?? "Force Refresh Knowledge Graph"}
-          subtitle={tcg.reindexSub ?? "Manually trigger re-indexing of all products and artifacts into the Cognee knowledge graph."}
+          title={tm.statusHeader ?? "Status"}
+          subtitle={tm.statusSub ?? "Live availability + indexed volume for the active backend."}
         />
-        <div className="mt-4 flex items-center gap-3">
-          <Button size="sm" variant="subtle" onClick={forceReindex} disabled={reindexing}>
+        <div className="mt-4 flex flex-wrap gap-3">
+          <Tag tone={available ? "green" : "neutral"}>
+            {available ? (tm.available ?? "available") : (tm.unavailable ?? "unavailable")}
+          </Tag>
+          {chunkCount !== null && (
+            <Tag tone="neutral">
+              {(tm.chunks ?? "chunks")}: {chunkCount}
+            </Tag>
+          )}
+          {productCount !== null && (
+            <Tag tone="neutral">
+              {(tm.products ?? "products")}: {productCount}
+            </Tag>
+          )}
+        </div>
+      </Card>
+
+      <Card className="p-5">
+        <SectionHeader
+          title={tcog.title ?? "Cognee knowledge graph rate limits"}
+          subtitle={tcog.subtitle ?? "Controls LLM/embedding request throttling during graph extraction (cognify)."}
+        />
+        <div className="mt-4">
+          <RateLimitCard
+            labels={tcog}
+            values={cogneeRl}
+            onValuesChange={(patch) =>
+              setCogneeRl((prev) => ({ ...prev, ...patch }))
+            }
+            onSave={saveCogneeRl}
+            saving={savingCogneeRl}
+          />
+        </div>
+      </Card>
+
+      <Card className="p-5">
+        <SectionHeader
+          title={temb.title ?? "Embedder rate limits"}
+          subtitle={temb.subtitle ?? "Throttles /v1/embeddings calls used by the pgvector memory backend during indexing."}
+        />
+        <div className="mt-4">
+          <RateLimitCard
+            labels={temb}
+            values={embedderRl}
+            onValuesChange={(patch) =>
+              setEmbedderRl((prev) => ({ ...prev, ...patch }))
+            }
+            onSave={saveEmbedderRl}
+            saving={savingEmbedderRl}
+          />
+        </div>
+      </Card>
+
+      <Card className="p-5">
+        <SectionHeader
+          title={tm.reindexHeader ?? "Reindex memory"}
+          subtitle={
+            tm.reindexSub ??
+            "Rebuild the index from source artifacts (codebases, specs, links, knowledge nodes). Leave the product id blank to reindex all products."
+          }
+        />
+        <div className="mt-4 flex flex-wrap items-center gap-2">
+          <div className="min-w-[220px] flex-1">
+            <Input
+              value={reindexProductId}
+              onChange={(e) => setReindexProductId(e.target.value)}
+              placeholder={tm.productIdPlaceholder ?? "product id (blank = all)"}
+            />
+          </div>
+          <Button size="sm" variant="subtle" onClick={reindex} disabled={reindexing}>
             {reindexing ? <SpinnerIcon /> : <ArrowsCounterClockwise size={14} weight="bold" />}
-            {reindexing ? (tcg.reindexing ?? "Reindexing...") : (tcg.reindexBtn ?? "Force Refresh Knowledge Graph")}
+            {reindexing ? (tm.reindexing ?? "Reindexing…") : (tm.reindexBtn ?? "Reindex")}
           </Button>
         </div>
       </Card>
@@ -1430,6 +1693,7 @@ const TIMEOUT_FIELDS: { key: string; group: string }[] = [
   { key: "cognee_init", group: "Cognee" },
   { key: "cognee_recall", group: "Cognee" },
   { key: "docgen_indexing_drain", group: "Cognee" },
+  { key: "memory_query", group: "Memory" },
   { key: "rlm_api_ms", group: "RLM" },
   { key: "rlm_section", group: "RLM" },
   { key: "rlm_expert", group: "RLM" },
@@ -1441,7 +1705,7 @@ const TIMEOUT_FIELDS: { key: string; group: string }[] = [
   { key: "mermaid_max_repair_attempts", group: "Mermaid" },
 ];
 
-const TIMEOUT_GROUPS = ["LLM", "Cognee", "RLM", "Integrations", "Mermaid"] as const;
+const TIMEOUT_GROUPS = ["LLM", "Cognee", "Memory", "RLM", "Integrations", "Mermaid"] as const;
 
 interface TimeoutResolvedEntry {
   value: string;
@@ -2323,7 +2587,7 @@ function AdminShell() {
             {section === "confluence" && <ConfluenceSection />}
             {section === "integrations" && <IntegrationsSection />}
             {section === "prompts" && <PromptsSection />}
-            {section === "cognee" && <CogneeSection />}
+            {section === "memory" && <MemorySection />}
             {section === "timeouts" && <TimeoutsSection />}
             {section === "users" && <UsersSection />}
             {section === "tokens" && <TokensSection />}

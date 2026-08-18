@@ -69,14 +69,30 @@ def _resolve_use_rlm(
     return prompt_len >= RLM_MIN_CHARS
 
 
-async def _rlm_generate(prompt: str, model: Optional[str]) -> str:
+async def _rlm_generate(
+    prompt: str,
+    model: Optional[str],
+    product_id: Optional[str] = None,
+    product_name: Optional[str] = None,
+    query: Optional[str] = None,
+    history: Optional[str] = None,
+) -> str:
     """Run fast-rlm and return cleaned text, or "" on any failure/empty result.
 
-    Capped by the per-section RLM expert timeout (resolved at call time via the
-    central timeout config: admin > env > default) so a hung fast-rlm
-    (first-run bootstrap, dead Pyodide worker, a local model that never
-    returns) cannot hold the expert SSE stream open indefinitely. On timeout we
-    returns "" and the caller falls back to the standard LLM.
+    Two paths:
+    - **Structured path** (when ``product_id`` is supplied): calls
+      ``run_rlm_structured`` with a dict query, the expert retrieval tools, and
+      a per-product session. Knowledge is NOT stringified into the prompt — the
+      agent pulls it on demand via the tools (exhaustive recursive search).
+      Falls back to the flat-string path if the structured call rejects the
+      new kwargs (older fast-rlm) or fails.
+    - **Flat-string path** (no ``product_id``, or structured fallback): the
+      legacy ``run_rlm_task(prompt)`` with the knowledge already in the prompt.
+
+    Both are capped by the per-section RLM expert timeout (resolved at call time
+    via the central timeout config: admin > env > default) so a hung fast-rlm
+    cannot hold the expert SSE stream open indefinitely. On timeout we return
+    "" and the caller falls back to the standard LLM.
     """
     try:
         from api.config.timeout import resolve_rlm_expert_timeout
@@ -99,8 +115,52 @@ async def _rlm_generate(prompt: str, model: Optional[str]) -> str:
         if len(prompt) > safe_prompt_chars:
             safe_prompt = prompt[:safe_prompt_chars] + "\n... (контекст обрезан для RLM)"
 
-        from api.rlm.runner import run_rlm_task  # lazy: fast_rlm is optional
+        from api.rlm.runner import run_rlm_structured, run_rlm_task, get_rlm_session_dir
 
+        # Structured path: dict query + tools + per-product session. The agent
+        # fetches knowledge itself via the tools, so the dict carries the task,
+        # product name, query, and history (NOT the stringified knowledge).
+        if product_id:
+            try:
+                from api.rlm.tools import build_expert_tools, resolve_env_variables
+
+                dict_query = {
+                    "task": prompt,
+                    "product": product_name or product_id,
+                    "query": query or "",
+                    "history": history or "",
+                }
+                tools = build_expert_tools()
+                env_vars = resolve_env_variables(product_id)
+                session_dir = get_rlm_session_dir(f"expert_{product_id}")
+                res = await asyncio.wait_for(
+                    run_rlm_structured(
+                        dict_query,
+                        model_name=model,
+                        tools=tools,
+                        env_variables=env_vars,
+                        session_dir=session_dir,
+                        session_id=product_id,
+                        task="expert",
+                    ),
+                    timeout=rlm_expert_timeout,
+                )
+                if isinstance(res, dict) and res.get("success") and res.get("results"):
+                    return _clean_llm_text(str(res["results"]))
+                # Structured call failed/rejected kwargs -> fall through to the
+                # flat-string path below so the run still produces an answer.
+                if isinstance(res, dict) and not res.get("success"):
+                    logger.info(
+                        "RLM structured path did not succeed (%s); trying flat-string path.",
+                        str(res.get("results"))[:120],
+                    )
+            except Exception as e:  # pragma: no cover - depends on live fast-rlm
+                logger.warning(
+                    "RLM structured expert path failed (%s); falling back to flat-string.",
+                    e,
+                )
+
+        # Flat-string path (legacy, or structured fallback).
         res = await asyncio.wait_for(
             run_rlm_task(safe_prompt, model), timeout=rlm_expert_timeout
         )
@@ -123,10 +183,20 @@ async def _generate_answer(
     base_url: Optional[str],
     api_key: Optional[str],
     use_rlm: bool,
+    product_id: Optional[str] = None,
+    product_name: Optional[str] = None,
+    query: Optional[str] = None,
+    history: Optional[str] = None,
 ) -> str:
     """Non-streaming answer: RLM (long context) -> standard LLM fallback -> ""."""
     if use_rlm:
-        text = await _rlm_generate(prompt, model)
+        text = await _rlm_generate(
+            prompt, model,
+            product_id=product_id,
+            product_name=product_name,
+            query=query,
+            history=history,
+        )
         if text:
             return text
         logger.warning("Expert RLM path empty; falling back to standard LLM.")
@@ -135,7 +205,7 @@ async def _generate_answer(
         return ""
     try:
         return _clean_llm_text(await llm.generate(prompt))
-    except Exception as e:  # pragma: no cover - depends on live Ollama
+    except Exception as e:  # pragma: no cover - depends on live LLM
         logger.warning("Expert standard LLM generate failed: %s", e)
         return ""
 
@@ -146,6 +216,10 @@ async def _stream_answer(
     base_url: Optional[str],
     api_key: Optional[str],
     use_rlm: bool,
+    product_id: Optional[str] = None,
+    product_name: Optional[str] = None,
+    query: Optional[str] = None,
+    history: Optional[str] = None,
 ) -> AsyncIterator[ExpertStreamEvent]:
     """Streaming answer: RLM (chunked) -> standard LLM stream (with fallback).
 
@@ -156,7 +230,13 @@ async def _stream_answer(
     events for thinking-capable models).
     """
     if use_rlm:
-        text = await _rlm_generate(prompt, model)
+        text = await _rlm_generate(
+            prompt, model,
+            product_id=product_id,
+            product_name=product_name,
+            query=query,
+            history=history,
+        )
         if text:
             for piece in _chunk_text(text):
                 yield ExpertStreamEvent(EVENT_CONTENT, piece)

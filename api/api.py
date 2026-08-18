@@ -52,7 +52,8 @@ async def startup_event():
         logger.warning("Could not capture main event loop for docgen indexing: %s", e)
 
     # init_db() is non-fatal: logs a warning and returns False if the DB is
-    # unreachable, so app startup is never blocked.
+    # unreachable, so app startup is never blocked. init_db also creates the
+    # pgvector extension + HNSW index used by the pgvector memory backend.
     init_db()
 
     # Bootstrap configuration abstraction layer (highest precedence to DB settings)
@@ -61,6 +62,21 @@ async def startup_event():
         bootstrap_config()
     except Exception as e:
         logger.warning("bootstrap_config failed (non-fatal): %s", e)
+
+    # Initialize the active memory backend (pgvector default, cognee alt) in the
+    # background so app startup is never blocked. For pgvector this is a no-op
+    # (schema created in init_db); for cognee it runs the (timeout-capped,
+    # non-fatal) init_cognee. Non-fatal on any failure.
+    try:
+        from api.memory import init_memory
+        _memory_init_task = asyncio.create_task(init_memory())
+        _memory_init_task.add_done_callback(
+            lambda t: _cognee_init_tasks.discard(t)
+        )
+        _cognee_init_tasks.add(_memory_init_task)
+        logger.info("Scheduled memory backend init in the background; app startup not blocked.")
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Could not schedule background memory init: %s", e)
 
     # Cognee is a SECONDARY feature (a knowledge-graph index over generated
     # docs). The app must start and serve requests regardless of cognee's

@@ -164,6 +164,32 @@ export interface SettingOut {
 }
 
 /* ------------------------------------------------------------------ */
+/* Entity kinds (codebase / spec / links)                               */
+/* ------------------------------------------------------------------ */
+
+export type EntityKind = "codebase" | "spec" | "links";
+
+/**
+ * Backend URL segment for an entity kind.
+ *
+ * The FastAPI routers (``api/routers/products.py``, ``docgen.py``) register
+ * these sub-resources under the PLURAL segments (``codebases`` / ``specs`` /
+ * ``links``). The UI stores the SINGULAR kind (``codebase`` / ``spec`` /
+ * ``links``) in form state, so every API URL must go through this helper —
+ * interpolating the raw kind directly produces 404s.
+ */
+export function entityPath(kind: EntityKind): string {
+  switch (kind) {
+    case "codebase":
+      return "codebases";
+    case "spec":
+      return "specs";
+    case "links":
+      return "links";
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Tag / badge color mappings (desaturated pastels, minimalist-ui).    */
 /* ------------------------------------------------------------------ */
 

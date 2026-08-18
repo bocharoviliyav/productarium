@@ -2,7 +2,7 @@
 """Unit tests for the product-scoped expert agent (api.expert) and its
 router (api.routers.expert) — Wave 2 scope F.
 
-Runs under pytest (pytest.ini: testpaths=test). No live Ollama / cognee / RLM /
+Runs under pytest (pytest.ini: testpaths=test). No live LLM / cognee / RLM /
 Postgres required: the LLM, cognee recall, and fast-rlm are mocked. The
 fallback-artifact-docs test uses an isolated SQLite DB.
 """
@@ -16,7 +16,7 @@ from typing import Any, AsyncIterator, Dict, List, Tuple
 import pytest
 
 # The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
-# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee/Ollama stubs for every
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee stubs for every
 # test in this module. Auth is NOT disabled by env here: ``api.auth`` snapshots
 # AUTH_PROVIDER at import time, so router tests patch ``api.auth.deps.AUTH_PROVIDER``
 # directly (see ``TestExpertRouter.app_and_client``) regardless of the env value.
@@ -68,12 +68,17 @@ def _patch_llm(monkeypatch, text: str = "FAKE ANSWER", chunks: List[str] | None 
 
 
 def _patch_cognee(monkeypatch, payload: str):
-    """Patch api.cognee.query_cognee to return ``payload``."""
+    """Patch the memory-backend recall path to return ``payload``.
 
-    async def _fake_query(query: str, dataset_name: str, top_k: int = 20) -> str:
+    The expert recalls via ``api.memory.query_memory`` (the backend-agnostic
+    facade; active backend = pgvector by default, cognee alt), so patch the
+    facade rather than the cognee backend directly.
+    """
+
+    async def _fake_query(query: str, product_id: str, top_k: int = 20) -> str:
         return payload
 
-    monkeypatch.setattr("api.cognee.query_cognee", _fake_query)
+    monkeypatch.setattr("api.memory.query_memory", _fake_query)
 
 
 def _patch_rlm(monkeypatch, result: str, success: bool = True):
@@ -418,15 +423,15 @@ class TestReasoningExtraction:
 
     def test_extract_chunk_fields_reads_reasoning_field(self):
         from api.expert.llm import _extract_chunk_fields
-        # Ollama /v1 shape: choices[0].delta.reasoning (vLLM rename)
+        # OpenAI /v1 shape: choices[0].delta.reasoning (vLLM rename)
         chunk = {"choices": [{"delta": {"reasoning": "the model thinking here..."}}]}
         content, reasoning = _extract_chunk_fields(chunk)
         assert content is None
         assert reasoning == "the model thinking here..."
 
-    def test_extract_chunk_fields_reads_ollama_thinking(self):
+    def test_extract_chunk_fields_reads_native_thinking(self):
         from api.expert.llm import _extract_chunk_fields
-        # Ollama native shape: message.thinking + message.content
+        # Native message shape: message.thinking + message.content
         chunk = {"message": {"content": "Hello!", "thinking": "Let me think..."}}
         content, reasoning = _extract_chunk_fields(chunk)
         assert content == "Hello!"

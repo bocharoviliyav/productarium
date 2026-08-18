@@ -18,7 +18,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 # The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
-# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee/Ollama stubs for every
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee stubs for every
 # test in this module. No per-module duplicate is needed here.
 
 

@@ -3,14 +3,15 @@
 /**
  * SpecViewer — a dependency-free viewer for OpenAPI / AsyncAPI specs.
  *
- * Parses JSON specs client-side and renders a structured, collapsible view
- * (info / servers / operations / schemas) inspired by better-openapi-viewer.
- * YAML specs (no YAML parser is bundled) fall back to a styled raw block so
- * the content is still readable; switching the artifact to JSON enables the
- * full structured rendering. No external libraries are used.
+ * Parses JSON and YAML specs client-side and renders a structured,
+ * collapsible view (info / servers / operations / schemas) inspired by
+ * better-openapi-viewer. YAML is parsed with js-yaml (same structured
+ * rendering as JSON); a styled raw block is the last-resort fallback for
+ * genuinely unparseable content.
  */
 
 import { useMemo, useState } from "react";
+import { load as yamlLoad } from "js-yaml";
 import {
   CaretDown,
   CaretRight,
@@ -59,16 +60,33 @@ function parseSpec(content: string, kindHint?: string): ParsedSpec | null {
   const text = content.trim();
   if (!text) return null;
 
-  let doc: Record<string, unknown>;
+  let doc: Record<string, unknown> | null = null;
+
+  // Try JSON first (the common machine-generated case). If it isn't JSON,
+  // fall through to the YAML parser so hand-authored OpenAPI/AsyncAPI specs
+  // get the same structured preview as JSON ones.
   try {
     const parsed = JSON.parse(text);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       doc = parsed as Record<string, unknown>;
-    } else {
-      return null;
     }
   } catch {
-    // Not JSON — likely YAML; caller renders the raw fallback.
+    // Not JSON — try YAML below.
+  }
+
+  if (doc === null) {
+    try {
+      const parsed = yamlLoad(text);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        doc = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Not JSON nor YAML; caller renders the raw fallback.
+      return null;
+    }
+  }
+
+  if (doc === null) {
     return null;
   }
 
@@ -223,14 +241,14 @@ export function SpecViewer({
   const parsed = useMemo(() => parseSpec(content, kind), [content, kind]);
 
   if (!parsed) {
-    // Not JSON (likely YAML) or empty: render a friendly raw fallback.
+    // Unparseable (neither JSON nor YAML) or empty: render a friendly raw fallback.
     return (
       <div className="flex flex-col gap-3">
         <div className="flex items-center gap-2 text-sm text-muted">
           <FileText size={16} weight="regular" />
           <span>
             {content.trim()
-              ? "Structured view is available for JSON specs. This spec looks like YAML — showing the raw source."
+              ? "This spec could not be parsed as JSON or YAML — showing the raw source."
               : "No specification content."}
           </span>
         </div>

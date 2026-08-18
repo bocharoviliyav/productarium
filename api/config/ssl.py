@@ -22,7 +22,7 @@ Two knobs, both runtime-configurable via the admin panel AND env vars:
   has not been exported). A WARNING is logged.
 
 Defaults (empty ``.env``, no admin config): verification ON, default trust
-store. Local HTTP Ollama is unaffected (no TLS).
+store. Local HTTP model servers are unaffected (no TLS).
 
 The admin-panel values win over env vars so a runtime save takes effect
 without a restart for any client that reads the value per call
@@ -299,7 +299,7 @@ def apply_cognee_ssl_patch() -> None:
     export ``SSL_CERT_FILE`` (honored by ``ssl.create_default_context``),
     so the CA case is covered by :func:`apply_ssl_env`. For the skip-verify
     case we monkeypatch the function to return an unverified context so
-    cognee's Ollama/OpenAI-compatible aiohttp embedders stop failing with
+    cognee's OpenAI-compatible aiohttp embedders stop failing with
     ``unable to get local issuer certificate``.
 
     Safe to call when cognee is unavailable (no-op). Never raises.

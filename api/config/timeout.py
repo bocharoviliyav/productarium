@@ -148,6 +148,15 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         label="Docgen indexing drain",
         group="Cognee",
     ),
+    # --- Memory backend (pgvector recall) -------------------------------
+    TimeoutKey(
+        key="memory_query",
+        env_var="MEMORY_QUERY_TIMEOUT_SECONDS",
+        default=30.0,
+        floor=5.0,
+        label="Memory backend semantic query (pgvector cosine)",
+        group="Memory",
+    ),
     # --- RLM (fast-rlm) --------------------------------------------------
     TimeoutKey(
         key="rlm_api_ms",
@@ -391,6 +400,17 @@ def resolve_docgen_indexing_drain_seconds() -> float:
     return resolve_timeout("docgen_indexing_drain")
 
 
+def resolve_memory_query_timeout() -> float:
+    """pgvector cosine-recall query timeout (seconds).
+
+    Caps the top-k semantic query (embed query + ORDER BY embedding <=> :q) so
+    a slow embedder or a contended Postgres cannot stall the expert SSE stream.
+    On timeout the pgvector backend returns "" and the expert falls back to
+    artifact docs.
+    """
+    return resolve_timeout("memory_query")
+
+
 def resolve_rlm_api_timeout_ms() -> int:
     """fast-rlm per-API-call timeout (milliseconds)."""
     return resolve_timeout_int("rlm_api_ms")
@@ -507,6 +527,7 @@ __all__ = [
     "resolve_cognee_cognify_timeout",
     "resolve_cognee_llm_connection_timeout",
     "resolve_docgen_indexing_drain_seconds",
+    "resolve_memory_query_timeout",
     "resolve_rlm_api_timeout_ms",
     "resolve_rlm_section_timeout",
     "resolve_rlm_expert_timeout",

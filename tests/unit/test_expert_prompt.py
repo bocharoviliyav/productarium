@@ -329,7 +329,7 @@ class TestBuildPrompt:
             history="",
             query="q",
             model="some-model",
-            base_url="http://localhost:11434/v1",
+            base_url="http://localhost:1234/v1",
         )
         assert "часть знаний обрезана" in prompt
 

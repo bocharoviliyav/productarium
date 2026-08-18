@@ -381,13 +381,13 @@ class TestIndexInBackground:
         async def _run():
             called = {"v": False}
 
-            async def fake_add(content, dataset_name=None):
+            async def fake_index(content, product_id, *, source_type="codebase", source_id=None):
                 called["v"] = True
-                return ["ok"]
+                return 1
 
-            import api.cognee as cognee_mod
-            cognee_mod.add_and_index_document = fake_add
-            c._index_in_background("content", "dataset_x")
+            import api.memory as memory_mod
+            memory_mod.index_document = fake_index
+            c._index_in_background("content", "prod_dataset_x")
             # Give the create_task a chance to run
             await asyncio.sleep(0.05)
             assert called["v"] is True
@@ -400,15 +400,15 @@ class TestIndexInBackground:
         try:
             called = {"v": False}
 
-            async def fake_add(content, dataset_name=None):
+            async def fake_index(content, product_id, *, source_type="codebase", source_id=None):
                 called["v"] = True
-                return ["ok"]
+                return 1
 
-            import api.cognee as cognee_mod
-            cognee_mod.add_and_index_document = fake_add
+            import api.memory as memory_mod
+            memory_mod.index_document = fake_index
 
             async def _main():
-                c._index_in_background("content", "dataset_x")
+                c._index_in_background("content", "prod_dataset_x")
                 # Let the scheduled coroutine run on this loop
                 await asyncio.sleep(0.05)
                 assert called["v"] is True
@@ -420,13 +420,13 @@ class TestIndexInBackground:
 
     def test_index_failure_is_non_fatal(self):
         async def _run():
-            async def boom(content, dataset_name=None):
-                raise RuntimeError("cognee down")
+            async def boom(content, product_id, *, source_type="codebase", source_id=None):
+                raise RuntimeError("memory backend down")
 
-            import api.cognee as cognee_mod
-            cognee_mod.add_and_index_document = boom
+            import api.memory as memory_mod
+            memory_mod.index_document = boom
             # Must not raise
-            c._index_in_background("content", "dataset_x")
+            c._index_in_background("content", "prod_dataset_x")
             await asyncio.sleep(0.05)
 
         asyncio.run(_run())

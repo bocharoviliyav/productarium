@@ -316,9 +316,12 @@ def update_node(
     if content_changed and node.content_md and node.content_md.strip():
         try:
             from api.docgen import _index_in_background
-            _index_in_background(node.content_md, f"prod_{product_id}")
+            _index_in_background(
+                node.content_md, f"prod_{product_id}",
+                source_type="knowledge_node", source_id=node_id,
+            )
         except Exception as e:  # pragma: no cover - defensive
-            logger.warning("Cognee re-index failed for node %s: %s", node_id, e)
+            logger.warning("Memory re-index failed for node %s: %s", node_id, e)
 
     return _orm_to_node(node)
 

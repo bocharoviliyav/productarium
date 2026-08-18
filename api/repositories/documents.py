@@ -46,7 +46,7 @@ def count_tokens(text: str) -> int:
     """
     try:
         # Use the OpenAI embedding model encoding (text-embedding-3-small).
-        # Ollama/LM Studio/vLLM embedders all accept cl100k_base-equivalent
+        # LM Studio/vLLM embedders all accept cl100k_base-equivalent
         # tokenization, so a single encoding is accurate enough for budgeting.
         encoding = tiktoken.encoding_for_model("text-embedding-3-small")
         return len(encoding.encode(text))

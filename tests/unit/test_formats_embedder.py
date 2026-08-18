@@ -254,7 +254,7 @@ class TestGetEmbedder:
     def test_returns_embedder_instance(self):
         from api.tools.embedder import get_embedder
 
-        embedder = get_embedder(base_url="http://localhost:11434/v1", api_key="not-needed")
+        embedder = get_embedder(base_url="http://localhost:1234/v1", api_key="not-needed")
         assert embedder is not None
         # adal.Embedder has a model_client and model_kwargs
         assert hasattr(embedder, "model_client")
@@ -269,7 +269,7 @@ class TestGetEmbedder:
     def test_uses_custom_api_key(self):
         from api.tools.embedder import get_embedder
 
-        embedder = get_embedder(base_url="http://localhost:11434/v1", api_key="sk-test-key")
+        embedder = get_embedder(base_url="http://localhost:1234/v1", api_key="sk-test-key")
         assert embedder.model_client._api_key == "sk-test-key"
 
     def test_defaults_to_config_base_url(self, monkeypatch):
@@ -301,7 +301,7 @@ class TestGetEmbedder:
     def test_sets_batch_size_attribute(self):
         from api.tools.embedder import get_embedder
 
-        embedder = get_embedder(base_url="http://localhost:11434/v1", api_key="not-needed")
+        embedder = get_embedder(base_url="http://localhost:1234/v1", api_key="not-needed")
         # The config embedder.json has batch_size=100
         assert hasattr(embedder, "batch_size")
         assert embedder.batch_size == 100
@@ -312,7 +312,7 @@ class TestGetEmbedder:
         # Mock get_model_for_task to return a custom embedder model
         monkeypatch.setattr(
             "api.config.settings.get_model_for_task",
-            lambda task: {"model": "custom-emb-model", "base_url": "http://localhost:11434/v1", "api_key": "not-needed"},
+            lambda task: {"model": "custom-emb-model", "base_url": "http://localhost:1234/v1", "api_key": "not-needed"},
         )
         embedder = get_embedder()
         assert embedder.model_kwargs["model"] == "custom-emb-model"

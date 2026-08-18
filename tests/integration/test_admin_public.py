@@ -31,7 +31,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 # The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
-# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee/Ollama stubs for every
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee stubs for every
 # test in this module. No per-module duplicate is needed here.
 
 
@@ -132,7 +132,7 @@ class TestAdminSettings:
             "/api/admin/models",
             json={
                 "models.expert.model": "qwen/test-model",
-                "models.expert.base_url": "http://x:11434/v1",
+                "models.expert.base_url": "http://x:1234/v1",
                 "models.expert.api_key": "secret-xyz",
             },
         )
@@ -154,7 +154,7 @@ class TestAdminSettings:
             "value": "qwen/test-model", "encrypted": False, "hasKey": True,
         }
         assert settings["models.expert.base_url"] == {
-            "value": "http://x:11434/v1", "encrypted": False, "hasKey": True,
+            "value": "http://x:1234/v1", "encrypted": False, "hasKey": True,
         }
         # api_key is a secret: value redacted to null, encrypted=True, hasKey=True
         assert settings["models.expert.api_key"] == {
@@ -163,7 +163,7 @@ class TestAdminSettings:
         # Resolved view also redacts the key but reports hasApiKey.
         resolved = data["resolved"]["expert"]
         assert resolved["model"] == "qwen/test-model"
-        assert resolved["base_url"] == "http://x:11434/v1"
+        assert resolved["base_url"] == "http://x:1234/v1"
         assert resolved["api_key"] is None
         assert resolved["hasApiKey"] is True
 

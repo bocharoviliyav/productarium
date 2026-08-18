@@ -31,24 +31,22 @@ def get_model_context_window(
     """Dynamically resolve the context window size (in tokens) for a given model/endpoint.
 
     Order of precedence:
-    1. Explicit env vars `RLM_MODEL_CONTEXT_WINDOW` or `OLLAMA_NUM_CTX`
+    1. Explicit env var `RLM_MODEL_CONTEXT_WINDOW`
     2. Task/admin config `models.<task>.max_prompt_tokens` / `context_window`
     3. Live API metadata query (cached for 5 minutes):
-       - Ollama: POST {host}/api/show -> parse `model_info` / `parameters`
        - OpenAI-compatible: GET {base_url}/models -> parse `max_model_len` / `context_window` / `max_tokens`
     4. Model name heuristic hints
     5. Safe fallback default: 8192 tokens
     """
     # 1. Environment variable override
-    for env_key in ("RLM_MODEL_CONTEXT_WINDOW", "OLLAMA_NUM_CTX"):
-        raw = os.environ.get(env_key)
-        if raw:
-            try:
-                val = int(str(raw).strip())
-                if val > 0:
-                    return val
-            except (TypeError, ValueError):
-                pass
+    raw = os.environ.get("RLM_MODEL_CONTEXT_WINDOW")
+    if raw:
+        try:
+            val = int(str(raw).strip())
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
 
     # 2. Admin setting override
     if task:

@@ -21,13 +21,16 @@ jinja2 = ">=3.1.2"
 pyyaml = ">=6.0"
 python-dotenv = ">=1.0.0"
 openai = ">=1.76.2"
-ollama = ">=0.4.8"
 aiohttp = ">=3.8.4"
 websockets = ">=11.0.3"
 cognee = { version = "==1.2.2", extras = ["postgres-binary"] }
 fast-rlm = "*"
 sqlalchemy = ">=2.0"
 psycopg = { version = ">=3.1", extras = ["binary"] }
+# pgvector: direct dependency for the pgvector memory backend (cosine recall
+# over the knowledge_chunks table, HNSW index). Also transitive via cognee;
+# declared directly so the pgvector backend works even if cognee is removed.
+pgvector = ">=0.3.0"
 
 # --- Productarium foundation: auth, settings, integrations ---
 # Auth: local (passlib bcrypt) + Keycloak (authlib OIDC) + JWT session cookies.

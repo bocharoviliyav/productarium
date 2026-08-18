@@ -42,4 +42,4 @@ python tests/run_tests.py --integration # Run integration tests only
 
 ## Local Environment
 
-All tests run locally using SQLite in-memory database and mocks/fakes for local LLMs (Ollama / Local OpenAI-compatible API). No cloud API keys required.
+All tests run locally using SQLite in-memory database and mocks/fakes for local LLMs (Local OpenAI-compatible API). No cloud API keys required.

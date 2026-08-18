@@ -352,21 +352,22 @@ class TestHelpers:
     def test_index_in_background_no_running_loop(self, isolated_db, monkeypatch):
         """When there's no running event loop, asyncio.run is used."""
         from api.routers.integrations import _index_in_background
-        import api.routers.integrations as integ_mod
+        import api.memory as memory_mod
 
         called = []
 
-        async def _fake_add(text, dataset_name=None):
-            called.append((text, dataset_name))
-            return ["ok"]
+        async def _fake_index(text, product_id, *, source_type="integration", source_id=None):
+            called.append((text, product_id, source_type, source_id))
+            return 1
 
-        monkeypatch.setattr(integ_mod, "add_and_index_document", _fake_add)
+        monkeypatch.setattr(memory_mod, "index_document", _fake_index)
 
         # Called outside an async context -> no running loop -> asyncio.run.
         _index_in_background("prod_1", "some text")
         assert len(called) == 1
         assert called[0][0] == "some text"
-        assert called[0][1] == "prod_prod_1"
+        assert called[0][1] == "prod_1"
+        assert called[0][2] == "integration"
 
 
 # --- GET /api/integrations --------------------------------------------------

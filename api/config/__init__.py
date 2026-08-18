@@ -9,9 +9,6 @@ logger = logging.getLogger(__name__)
 
 from api.clients.openai_client import OpenAIClient
 
-# Local configuration - no cloud API keys required
-# Ollama settings
-OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
 
 # Local OpenAI-compatible API settings (e.g., LM Studio, llama.cpp server, vLLM,
 # text-generation-webui). Default is LM Studio's OpenAI-compatible endpoint.
@@ -90,7 +87,7 @@ def load_generator_config():
     generator_config = load_json_config("generator.json")
 
     # Resolve the model client class for the openai_local provider. Every
-    # supported local server (Ollama, LM Studio, llama.cpp, vLLM, ...)
+    # supported local server (LM Studio, llama.cpp, vLLM, ...)
     # exposes the OpenAI-compatible /v1 API, so OpenAIClient covers all.
     if "providers" in generator_config:
         for provider_id, provider_config in generator_config["providers"].items():
@@ -113,7 +110,7 @@ def get_embedder_config():
     """
     Get the current embedder configuration.
 
-    Every supported local server (Ollama, LM Studio, llama.cpp, vLLM, ...)
+    Every supported local server (LM Studio, llama.cpp, vLLM, ...)
     exposes an OpenAI-compatible /v1/embeddings endpoint, so the single
     ``embedder_openai_local`` (OpenAIClient) config covers all cases.
 
@@ -199,7 +196,7 @@ lang_config = load_lang_config()
 
 # Update configuration
 if generator_config:
-    configs["default_provider"] = generator_config.get("default_provider", "ollama")
+    configs["default_provider"] = generator_config.get("default_provider", "openai_local")
     configs["providers"] = generator_config.get("providers", {})
 
 # Update embedder configuration
@@ -223,7 +220,7 @@ def get_model_config(model=None):
     """
     Get configuration for the model.
 
-    Every supported local server (Ollama, LM Studio, llama.cpp, vLLM, ...)
+    Every supported local server (LM Studio, llama.cpp, vLLM, ...)
     exposes an OpenAI-compatible /v1 API, so the single ``openai_local``
     provider (OpenAIClient) is always used.
 
@@ -270,7 +267,7 @@ def fetch_openai_local_models(base_url: str = None):
     """
     Fetch available models from a local OpenAI-compatible API.
 
-    Every supported local server (Ollama, LM Studio, llama.cpp, vLLM, ...)
+    Every supported local server (LM Studio, llama.cpp, vLLM, ...)
     exposes the OpenAI-compatible ``/v1/models`` endpoint, so this is the
     single model-listing path.
 

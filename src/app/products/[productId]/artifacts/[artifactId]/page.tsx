@@ -37,10 +37,12 @@ import {
 import {
   type ArtifactPage,
   type Codebase,
+  type EntityKind,
   type LinkItem,
   type Links,
   type Product,
   type Spec,
+  entityPath,
   normalizePages,
   parseLinksContent,
   serializeLinksContent,
@@ -50,8 +52,6 @@ const Markdown = dynamic(() => import("@/components/Markdown"), {
   ssr: false,
   loading: () => <div className="text-sm text-muted">{"Loading…"}</div>,
 });
-
-type EntityKind = "codebase" | "spec" | "links";
 
 export default function EntityDocsViewer() {
   const params = useParams<{ productId: string; artifactId: string }>();
@@ -75,6 +75,7 @@ export default function EntityDocsViewer() {
   const [draftLinks, setDraftLinks] = useState<LinkItem[]>([]);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const fetchProduct = useCallback(async () => {
     setIsLoading(true);
@@ -117,6 +118,14 @@ export default function EntityDocsViewer() {
     if (!product) return { entity: undefined, kind: undefined as EntityKind | undefined };
     return findEntity(product, artifactId);
   }, [product, artifactId]);
+
+  // Specs now have a dedicated editor route; redirect any spec deep link away
+  // from the generic artifact viewer to /products/{id}/specs/{specId}.
+  useEffect(() => {
+    if (kind === "spec" && artifactId) {
+      router.replace(`/products/${productId}/specs/${artifactId}`);
+    }
+  }, [kind, artifactId, productId, router]);
 
   const pages: ArtifactPage[] = useMemo(
     () => (entity && kind === "codebase" ? normalizePages((entity as Codebase).pages) : []),
@@ -197,7 +206,7 @@ export default function EntityDocsViewer() {
         payload = { generated_docs: draftContent };
       }
       const res = await fetch(
-        `/api/products/${productId}/${kind}/${artifactId}`,
+        `/api/products/${productId}/${entityPath(kind)}/${artifactId}`,
         {
           method: "PUT",
           credentials: "include",
@@ -241,6 +250,34 @@ export default function EntityDocsViewer() {
     isCodebase ? <GitBranch size={18} weight="regular" /> :
     isSpec ? <FileText size={18} weight="regular" /> :
     <LinkSimple size={18} weight="regular" />;
+
+  const remove = async () => {
+    if (!kind || !product || deleting) return;
+    if (!confirm(t.deleteConfirm ?? "Delete this item?")) return;
+    setDeleting(true);
+    try {
+      const res = await fetch(
+        `/api/products/${productId}/${entityPath(kind)}/${artifactId}`,
+        { method: "DELETE", credentials: "include" },
+      );
+      if (res.status === 401) {
+        router.replace(
+          `/login?next=/products/${productId}/artifacts/${artifactId}`,
+        );
+        return;
+      }
+      if (!res.ok) throw new Error(`Delete failed (${res.status})`);
+      router.push(`/products/${productId}`);
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.deleteFailedTitle ?? "Delete failed",
+        message: e instanceof Error ? e.message : "Delete failed",
+      });
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   const empty = isCodebase ? !hasDocs : !hasRawContent;
 
@@ -326,13 +363,22 @@ export default function EntityDocsViewer() {
                   )}
                   <VerifiedButton
                     verified={verified}
-                    verifyUrl={`/api/products/${productId}/${kind}/${artifactId}/verify`}
+                    verifyUrl={`/api/products/${productId}/${entityPath(kind)}/${artifactId}/verify`}
                     ownerId={product?.owner_id ?? null}
                     onVerified={(next) => {
                       setVerified(next.verified);
                       setVerifiedBy(next.verified_by ?? null);
                     }}
                   />
+                  <IconButton
+                    type="button"
+                    aria-label={t.delete ?? "Delete"}
+                    title={t.delete ?? "Delete"}
+                    onClick={remove}
+                    disabled={deleting}
+                  >
+                    {deleting ? <Spinner /> : <Trash size={14} weight="regular" />}
+                  </IconButton>
                 </div>
               </div>
             </Reveal>

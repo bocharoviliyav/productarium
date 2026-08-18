@@ -74,7 +74,11 @@ async def _run_expert_chat_collect(
         use_rlm_resolved,
     )
     return await _generate_answer(
-        prompt, resolved_model, base_url, api_key, use_rlm_resolved
+        prompt, resolved_model, base_url, api_key, use_rlm_resolved,
+        product_id=product_id,
+        product_name=_product_name_by_id(product_id),
+        query=query,
+        history=history,
     )
 
 
@@ -112,7 +116,11 @@ async def _run_expert_chat_stream(
     yield ExpertStreamEvent(EVENT_STATUS, EVENT_THINKING)
     content_started = False
     async for event in _stream_answer(
-        prompt, resolved_model, base_url, api_key, use_rlm_resolved
+        prompt, resolved_model, base_url, api_key, use_rlm_resolved,
+        product_id=product_id,
+        product_name=_product_name_by_id(product_id),
+        query=query,
+        history=history,
     ):
         # Emit the "answering" status just before the first content chunk
         # (after any reasoning events have been sent).
@@ -179,7 +187,11 @@ async def run_expert_doc(
         use_rlm_resolved,
     )
     doc = await _generate_answer(
-        prompt, resolved_model, base_url, api_key, use_rlm_resolved
+        prompt, resolved_model, base_url, api_key, use_rlm_resolved,
+        product_id=product_id,
+        product_name=_product_name_by_id(product_id),
+        query=query,
+        history="",
     )
     if not doc:
         doc = (

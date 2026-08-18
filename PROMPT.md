@@ -2,14 +2,14 @@
 
 ## Обзор проекта
 
-**Productarium** — продакто-центричная платформа документации, генерирующая структурированную, навигируемую документацию из кодовых баз, спецификаций и внешних источников знаний с использованием **полностью локальных LLM** (Ollama или любой OpenAI-совместимый сервер). Облачные API-ключи не требуются.
+**Productarium** — продакто-центричная платформа документации, генерирующая структурированную, навигируемую документацию из кодовых баз, спецификаций и внешних источников знаний с использованием **полностью локальных LLM** (любой OpenAI-совместимый сервер: LM Studio, llama.cpp, vLLM). Облачные API-ключи не требуются.
 
 **Продукт** (микросервис, монолит или databus-сервис) владеет **Артефактами** (codebase, spec, links, documentation, guides) и деревом **узлов знаний** (Knowledge Nodes). Каждый артефакт документируется, индексируется в графе знаний **cognee** (Postgres + pgvector) и становится доступным для запросов через экспертного чат-агента и RAG.
 
 ### Ключевые характеристики
 
 - **Продукто-центричная модель**: Продукты → Артефакты (codebase, spec, links, documentation, guides) + дерево знаний
-- **Локальные LLM**: Ollama (по умолчанию) или локальный OpenAI-совместимый API — без облачных ключей
+- **Локальные LLM**: локальный OpenAI-совместимый API (LM Studio, llama.cpp, vLLM) — без облачных ключей
 - **Граф знаний**: cognee + pgvector индексируют артефакты и узлы знаний для RAG
 - **Экспертный агент**: стриминг-чат (SSE) + генерация самодостаточного Markdown-документа
 - **fast-rlm**: Recursive Language Models для длинноконтекстной генерации (≥20k символов) и Deep Research
@@ -26,9 +26,9 @@
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Фронтенд      │     │   Бэкенд        │     │   Ollama /      │
+│   Фронтенд      │     │   Бэкенд        │     │   OpenAI-совм. /│
 │   (Next.js 15)  │◄───►│   (FastAPI)     │◄───►│   Локальный LLM │
-│   Порт: 3000    │     │   Порт: 8001    │     │   Порт: 11434   │
+│   Порт: 3000    │     │   Порт: 8001    │     │   Порт: 1234    │
 └─────────────────┘     └────────┬────────┘     └─────────────────┘
                                  │
                         ┌────────▼────────┐
@@ -129,7 +129,7 @@
 
 #### `api/cognee/`
 
-Интеграция cognee. `_runtime.py` настраивает локальный Ollama для LLM (`cognify` entity extraction) и эмбеддингов — без облачных ключей. `init_cognee()`, `add_and_index_document()`, `query_cognee()`, `reindex_product_knowledge_graph()` — все async, все non-fatal.
+Интеграция cognee. `_runtime.py` настраивает локальный OpenAI-совместимый сервер для LLM (`cognify` entity extraction) и эмбеддингов — без облачных ключей. `init_cognee()`, `add_and_index_document()`, `query_cognee()`, `reindex_product_knowledge_graph()` — все async, все non-fatal.
 
 #### `api/rlm/runner.py`
 
@@ -161,7 +161,7 @@ Persisted in Postgres via SQLAlchemy (`api/db.py`: `init_db()` on startup — `B
 
 #### `api/config/__init__.py`
 
-Центральная конфигурация. JSON из `api/config/`, `${ENV_VAR}` плейсхолдеры. Единый OpenAI-compatible путь (один клиент покрывает Ollama, LM Studio, llama.cpp, vLLM). Ключевые глобалы: `configs`, `OLLAMA_HOST`, `LOCAL_OPENAI_BASE_URL`.
+Центральная конфигурация. JSON из `api/config/`, `${ENV_VAR}` плейсхолдеры. Единый OpenAI-compatible путь (один клиент покрывает LM Studio, llama.cpp, vLLM). Ключевые глобалы: `configs`, `LOCAL_OPENAI_BASE_URL`.
 
 ---
 
@@ -248,7 +248,7 @@ src/
 
 JSON-файлы с поддержкой `${ENV_VAR}` плейсхолдеров (разрешаются при загрузке в `config.py`):
 
-1. **`generator.json`** — Провайдеры и модели LLM (`ollama`, `openai_local`).
+1. **`generator.json`** — Провайдеры и модели LLM (`openai`, `openai_local`).
 2. **`embedder.json`** — Модели эмбеддингов, retriever (`top_k: 20`), text splitter (350 слов, 100 overlap).
 3. **`repo.json`** — Фильтры файлов (исключаемые директории/файлы) и лимиты размера репозитория.
 
@@ -258,10 +258,9 @@ JSON-файлы с поддержкой `${ENV_VAR}` плейсхолдеров 
 
 Полный список — в `.env.example`. Ключевые группы:
 
-- **Ollama**: `OLLAMA_HOST` (по умолчанию `http://localhost:11434`).
 - **Postgres**: `DB_PROVIDER`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD`; `VECTOR_DB_PROVIDER=pgvector`.
-- **cognee LLM (local Ollama)**: `LLM_PROVIDER=ollama`, `LLM_ENDPOINT`, `LLM_MODEL`, `LLM_API_KEY=not-needed`.
-- **cognee embeddings**: `EMBEDDING_PROVIDER=ollama`, `EMBEDDING_MODEL=nomic-embed-text`, `EMBEDDING_ENDPOINT`, `EMBEDDING_DIMENSIONS=768`, `HUGGINGFACE_TOKENIZER`.
+- **cognee LLM (local OpenAI-compatible)**: `LLM_PROVIDER=openai`, `LLM_ENDPOINT`, `LLM_MODEL`, `LLM_API_KEY=not-needed`.
+- **cognee embeddings**: `EMBEDDING_PROVIDER=openai_compatible`, `EMBEDDING_MODEL=text-embedding-nomic-embed-text-v1.5`, `EMBEDDING_ENDPOINT`, `EMBEDDING_DIMENSIONS=768`, `HUGGINGFACE_TOKENIZER`.
 - **fast-rlm**: `RLM_MODEL_BASE_URL`, `RLM_MODEL_API_KEY=not-needed`, `RLM_MODEL_NAME`.
 - **Auth**: `AUTH_PROVIDER`, `BOOTSTRAP_ADMIN_USERNAME`, `BOOTSTRAP_ADMIN_PASSWORD`, `SETTINGS_SECRET_KEY`.
 - **Keycloak**: `KEYCLOAK_URL`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET`, `KEYCLOAK_REALM`.
@@ -315,11 +314,7 @@ Wiki генерируется последовательно в 7 этапов, 
 ### Предварительные требования
 
 - **Python 3.11+** и **Node.js** с **bun**
-- **Ollama** с моделями:
-  ```bash
-  ollama pull qwen3:8b           # или qwen3.5:9b, gemma3:12b, etc.
-  ollama pull nomic-embed-text   # обязательно для эмбеддингов
-  ```
+- **Локальный OpenAI-совместимый сервер** (LM Studio, llama.cpp, vLLM), запущенный с generation-моделью и embedding-моделью (например, `qwen/qwen3.6-27b` и `text-embedding-nomic-embed-text-v1.5`)
 - **PostgreSQL + pgvector** (опционально; `docker-compose up postgres`)
 
 ### Запуск

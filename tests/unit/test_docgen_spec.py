@@ -404,8 +404,8 @@ class TestGenerateSpecDoc:
 
     def test_indexing_called(self, fake_spec, fake_product, monkeypatch):
         indexing_calls = []
-        def track_indexing(content, dataset):
-            indexing_calls.append((content, dataset))
+        def track_indexing(content, dataset, *, source_type="codebase", source_id=None):
+            indexing_calls.append((content, dataset, source_type, source_id))
         monkeypatch.setattr(spec_mod, "_llm_or_none", lambda *a, **kw: _async_return(""))
         monkeypatch.setattr(spec_mod, "_make_repair_llm", lambda *a, **kw: None)
         monkeypatch.setattr(spec_mod, "_index_in_background", track_indexing)
@@ -414,6 +414,11 @@ class TestGenerateSpecDoc:
         asyncio.run(spec_mod.generate_openapi_docs(fake_spec, fake_product))
         assert len(indexing_calls) == 1
         assert indexing_calls[0][1] == "prod_prod_test"
+        # The rerouted caller now passes source_type=spec so the memory backend
+        # can scope the upsert (idempotent per source). source_id comes from
+        # spec.id; the FakeSpec fixture has no id, so it is None here.
+        assert indexing_calls[0][2] == "spec"
+        assert indexing_calls[0][3] is None
 
     def test_spec_content_write_failure_non_fatal(self, fake_product, monkeypatch):
         class WriteFailSpec:

@@ -240,7 +240,7 @@ _stream_globals = _stream_answer.__globals__
 
 class TestGenerateAnswer:
     def test_rlm_path_returns_text(self, monkeypatch):
-        async def _fake_rlm(prompt, model):
+        async def _fake_rlm(prompt, model, **kwargs):
             return "RLM answer"
 
         monkeypatch.setitem(_gen_globals, "_rlm_generate", _fake_rlm)
@@ -251,7 +251,7 @@ class TestGenerateAnswer:
         assert result == "RLM answer"
 
     def test_rlm_empty_falls_back_to_llm(self, monkeypatch):
-        async def _fake_rlm(prompt, model):
+        async def _fake_rlm(prompt, model, **kwargs):
             return ""
 
         monkeypatch.setitem(_gen_globals, "_rlm_generate", _fake_rlm)
@@ -267,7 +267,7 @@ class TestGenerateAnswer:
         assert result == "LLM answer"
 
     def test_rlm_path_and_llm_both_empty_returns_empty(self, monkeypatch):
-        async def _fake_rlm(prompt, model):
+        async def _fake_rlm(prompt, model, **kwargs):
             return ""
 
         monkeypatch.setitem(_gen_globals, "_rlm_generate", _fake_rlm)
@@ -313,7 +313,7 @@ class TestGenerateAnswer:
 # --------------------------------------------------------------------------- #
 class TestStreamAnswer:
     def test_rlm_path_yields_chunked_content(self, monkeypatch):
-        async def _fake_rlm(prompt, model):
+        async def _fake_rlm(prompt, model, **kwargs):
             return "RLM chunked answer text"
 
         monkeypatch.setitem(_stream_globals, "_rlm_generate", _fake_rlm)
@@ -331,7 +331,7 @@ class TestStreamAnswer:
         assert "RLM chunked answer text" in text
 
     def test_rlm_empty_falls_back_to_llm_stream(self, monkeypatch):
-        async def _fake_rlm(prompt, model):
+        async def _fake_rlm(prompt, model, **kwargs):
             return ""
 
         monkeypatch.setitem(_stream_globals, "_rlm_generate", _fake_rlm)
@@ -382,7 +382,7 @@ class TestStreamAnswer:
         assert events == []
 
     def test_rlm_empty_and_llm_none_yields_nothing(self, monkeypatch):
-        async def _fake_rlm(prompt, model):
+        async def _fake_rlm(prompt, model, **kwargs):
             return ""
 
         monkeypatch.setitem(_stream_globals, "_rlm_generate", _fake_rlm)

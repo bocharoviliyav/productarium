@@ -35,7 +35,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from api.auth.deps import get_current_user, require_admin
-from api.cognee import add_and_index_document
 from api.db import get_db
 from api.integrations.registry import get_connector, list_connectors
 from api.models import CodebaseORM, KnowledgeNodeORM, ProductORM
@@ -121,17 +120,32 @@ def _knowledge_node_pydantic(n: KnowledgeNodeORM) -> KnowledgeNode:
     )
 
 
-def _index_in_background(product_id: str, text: str) -> None:
-    """Fire-and-forget cognee indexing into the product-scoped dataset."""
+def _index_in_background(
+    product_id: str,
+    text: str,
+    *,
+    source_type: str = "integration",
+    source_id: Optional[str] = None,
+) -> None:
+    """Fire-and-forget memory-backend indexing into the product-scoped dataset.
+
+    Delegates to ``api.memory.index_document`` (active backend: pgvector by
+    default, cognee alt) so the admin ``memory.backend`` switch governs this
+    path too.
+    """
     if not text:
         return
     dataset = f"prod_{product_id}"
 
     async def _run() -> None:
         try:
-            await add_and_index_document(text, dataset_name=dataset)
+            from api.memory import index_document  # lazy: backend optional
+            await index_document(
+                text, product_id,
+                source_type=source_type, source_id=source_id,
+            )
         except Exception as e:  # pragma: no cover - non-fatal
-            logger.warning("Background cognee index for %s failed: %s", dataset, e)
+            logger.warning("Background memory index for %s failed: %s", dataset, e)
 
     try:
         loop = asyncio.get_running_loop()
@@ -140,7 +154,7 @@ def _index_in_background(product_id: str, text: str) -> None:
         try:
             asyncio.run(_run())
         except Exception as e:  # pragma: no cover - non-fatal
-            logger.warning("Inline cognee index for %s failed: %s", dataset, e)
+            logger.warning("Inline memory index for %s failed: %s", dataset, e)
 
 
 def _compose_content(pulled: Dict[str, Any]) -> str:
@@ -255,7 +269,7 @@ def codebase_from_integration(
 
     # Index any pulled markdown (rare for git, but some connectors attach docs).
     content = _compose_content(pulled)
-    _index_in_background(product_id, content)
+    _index_in_background(product_id, content, source_type="codebase", source_id=codebase.id)
     return _codebase_pydantic(codebase)
 
 
@@ -345,7 +359,11 @@ async def knowledge_from_integration(
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Persist failed")
 
         if indexed_texts:
-            _index_in_background(product_id, "\n\n".join(indexed_texts))
+            _index_in_background(
+                product_id, "\n\n".join(indexed_texts),
+                source_type="integration",
+                source_id=created_nodes[0].id if created_nodes else None,
+            )
         return _knowledge_node_pydantic(created_nodes[0])
 
     # Single page node.
@@ -368,7 +386,7 @@ async def knowledge_from_integration(
         db.rollback()
         logger.error("Failed to create KnowledgeNode from integration: %s", e)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Persist failed")
-    _index_in_background(product_id, content)
+    _index_in_background(product_id, content, source_type="integration", source_id=node.id)
     return _knowledge_node_pydantic(node)
 
 

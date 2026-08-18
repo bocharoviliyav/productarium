@@ -14,7 +14,7 @@ Decoupling notes (per the Wave 2 plan):
   panel can configure the summary model without touching this file.
 
 All LLM/cognee/DB dependencies are imported lazily so this module imports
-cleanly even when no live Ollama/Postgres is available.
+cleanly even when no live LLM/Postgres is available.
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ class _SummaryLLM:
         model_client_class = generator_config["model_client"]
         # Thread admin base_url/api_key through to the OpenAI-compatible client
         # so the summary LLM hits the configured endpoint (corporate AI gateway,
-        # LM Studio, Ollama :11434, ...) rather than a dead env-default. Mirrors
+        # LM Studio, ...) rather than a dead env-default. Mirrors
         # _StandardLLM/_ExpertLLM: every supported server exposes the
         # OpenAI-compatible /v1 API, so OpenAIClient covers all cases (SSL verify
         # wired via ssl_config).
@@ -116,7 +116,7 @@ def _safe_build_summary_llm(
 ) -> Optional[_SummaryLLM]:
     try:
         return _SummaryLLM(model, base_url=base_url, api_key=api_key)
-    except Exception as e:  # pragma: no cover - depends on live config/Ollama
+    except Exception as e:  # pragma: no cover - depends on live config/LLM
         logger.warning(
             "Could not initialise summary LLM (%s): %s. "
             "Falling back to a deterministic stub summary.",
@@ -235,7 +235,7 @@ async def generate_product_summary(
         return ""
     try:
         return _clean_text(await llm.generate(_build_summary_prompt(product_name, content)))
-    except Exception as e:  # pragma: no cover - depends on live Ollama
+    except Exception as e:  # pragma: no cover - depends on live LLM
         logger.warning("Summary LLM generation failed: %s", e)
         return ""
 

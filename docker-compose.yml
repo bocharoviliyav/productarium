@@ -61,17 +61,14 @@ services:
       # extra_hosts below maps host.docker.internal to the host gateway (Linux).
       # On Docker Desktop (macOS/Windows) host.docker.internal already resolves.
       # LM Studio exposes /v1/chat/completions, /v1/embeddings, /v1/models.
-      # We keep the OLLAMA_HOST var pointing at LM Studio too, because some
-      # code paths (api/cognee/, RAG fallback) still key off OLLAMA_HOST.
-      - OLLAMA_HOST=${LM_STUDIO_HOST:-http://host.docker.internal:1234}
       - LOCAL_OPENAI_BASE_URL=${LM_STUDIO_HOST:-http://host.docker.internal:1234}/v1
       - LOCAL_OPENAI_API_KEY=${LOCAL_OPENAI_API_KEY:-not-needed}
       - LOCAL_OPENAI_MODEL=${LOCAL_OPENAI_MODEL:-qwen/qwen3.6-27b}
       # --- cognee -> LM Studio (OpenAI-compatible; NO cloud API key) ---
       # cognee's LLM provider "openai" POSTs to {LLM_ENDPOINT}/chat/completions.
       # CRITICAL: embeddings provider MUST be "openai_compatible" (NOT "openai").
-      # cognee's create_embedding_engine routes only "openai_compatible" and
-      # "ollama" to safe engines; "openai" falls through to LiteLLMEmbeddingEngine,
+      # cognee's create_embedding_engine routes only "openai_compatible" to a
+      # safe engine; "openai" falls through to LiteLLMEmbeddingEngine,
       # which calls tiktoken.encoding_for_model(<nomic model>) and raises KeyError,
       # breaking every cognee.add()/cognify(). OpenAICompatibleEmbeddingEngine uses
       # the openai SDK directly and falls back to cl100k_base when transformers is
@@ -109,7 +106,7 @@ services:
       # --- fast-rlm (iterative reasoning) -> LM Studio (NO cloud key) ---
       # RLM talks to an OpenAI-compatible endpoint. Point it at LM Studio on the
       # host (host.docker.internal in Docker) with the "/v1" path. Without this,
-      # rlm_runner falls back to http://localhost:11434/v1, which inside the
+      # rlm_runner falls back to http://localhost:1234/v1, which inside the
       # container is the container itself -- nothing is there, so RLM fails
       # with "Connection error".
       - RLM_MODEL_BASE_URL=${LM_STUDIO_HOST:-http://host.docker.internal:1234}/v1
@@ -138,7 +135,7 @@ services:
       # Persist the Deno + fast-rlm (npm/jsr + Pyodide) cache so the one-time
       # first-run download happens only once, not on every container restart.
       - DENO_DIR=/root/.deno
-    # Allow the container to reach Ollama running on the host (Linux compatible).
+    # Allow the container to reach the host OpenAI-compatible server (Linux).
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

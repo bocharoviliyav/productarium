@@ -46,7 +46,7 @@ def rlm_deps(monkeypatch):
     run_mock = MagicMock(side_effect=_default_run)
     monkeypatch.setattr(runner, "run", run_mock)
 
-    admin_cfg = {"model": "test-model", "base_url": "http://localhost:11434/v1", "api_key": "not-needed"}
+    admin_cfg = {"model": "test-model", "base_url": "http://localhost:1234/v1", "api_key": "not-needed"}
     monkeypatch.setattr(
         "api.config.settings.get_model_for_task",
         lambda task: dict(admin_cfg),
@@ -160,7 +160,7 @@ class TestConfigResolution:
         monkeypatch.delenv("RLM_MODEL_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("LOCAL_OPENAI_API_KEY", raising=False)
-        rlm_deps.set_admin({"model": "m", "base_url": "http://localhost:11434/v1", "api_key": "real-key-123"})
+        rlm_deps.set_admin({"model": "m", "base_url": "http://localhost:1234/v1", "api_key": "real-key-123"})
 
         import os
         runner.run_rlm_task_sync("query", "m")

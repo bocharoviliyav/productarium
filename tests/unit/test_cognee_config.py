@@ -288,9 +288,9 @@ class TestApplyCogneeRuntimeConfig:
 
         def _fake_get_model(task):
             if task == "cognee":
-                return {"model": "qwen3:8b", "base_url": "http://localhost:11434/v1", "api_key": "test-key"}
+                return {"model": "qwen/qwen3.6-27b", "base_url": "http://localhost:1234/v1", "api_key": "test-key"}
             if task == "embedder":
-                return {"model": "nomic-embed-text", "base_url": "http://localhost:11434/v1", "api_key": "test-key"}
+                return {"model": "nomic-embed-text", "base_url": "http://localhost:1234/v1", "api_key": "test-key"}
             return {}
 
         monkeypatch.setattr("api.config.settings.get_model_for_task", _fake_get_model)
@@ -298,13 +298,13 @@ class TestApplyCogneeRuntimeConfig:
         apply_cognee_runtime_config()
 
         assert llm_calls.get("provider") == "openai"
-        assert "qwen3:8b" in llm_calls.get("model", "")
-        assert llm_calls.get("endpoint") == "http://localhost:11434/v1"
+        assert "qwen/qwen3.6-27b" in llm_calls.get("model", "")
+        assert llm_calls.get("endpoint") == "http://localhost:1234/v1"
         assert llm_calls.get("api_key") == "test-key"
 
         assert emb_calls.get("provider") == "openai_compatible"
         assert "nomic" in emb_calls.get("model", "")
-        assert emb_calls.get("endpoint") == "http://localhost:11434/v1"
+        assert emb_calls.get("endpoint") == "http://localhost:1234/v1"
 
     def test_env_fallback_when_settings_empty(self, monkeypatch, fake_cognee):
         """When settings store returns None, env defaults are used."""

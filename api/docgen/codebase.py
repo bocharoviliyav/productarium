@@ -6,9 +6,9 @@ wiki sections for a codebase artifact: the repo is cloned via
 long-context blob, and each section is generated from the matching
 ``refs/prompts/<section>.md`` template (variable mapping reused from
 ``api.docgen.wiki.WikiGenerator._format_prompt``). RLM (fast-rlm) is used for
-long context; the standard LLM (adalflow, local Ollama) is used when the
-codebase is small or RLM fails. The repo is indexed into cognee in the
-background after generation.
+long context; the standard LLM (adalflow, local OpenAI-compatible server) is
+used when the codebase is small or RLM fails. The repo is indexed into cognee
+in the background after generation.
 
 Shared LLM/persistence helpers live in ``api.docgen._common``.
 """
@@ -109,7 +109,7 @@ def _resolve_rlm_context_window() -> Optional[int]:
 
 
 # Token-counting is approximate by design: we need a budget estimate, not an
-# exact count. tiktoken cl100k_base (the Ollama path in data_pipeline.count_tokens)
+# exact count. tiktoken cl100k_base (the path in data_pipeline.count_tokens)
 # is a good fit for the local models used here; if tiktoken is unavailable we
 # fall back to a len//4 character ratio so chunking still works (just less
 # precise). The estimate is intentionally conservative (chunks end up slightly
@@ -120,7 +120,7 @@ _TIKTOKEN_ENC = None
 def _count_tokens(text: str) -> int:
     """Approximate token count for a chunk-budget estimate.
 
-    Uses tiktoken ``cl100k_base`` (matches the Ollama path in
+    Uses tiktoken ``cl100k_base`` (matches the path in
     ``api.data_pipeline.count_tokens``) when available; otherwise falls back to
     a 4-chars-per-token ratio. Never raises: on any error the fallback is used.
     """
@@ -417,6 +417,10 @@ async def _attempt_rlm(
     query: str,
     rlm_model: Optional[str],
     rlm_state: Optional[Dict[str, int]],
+    product_id: Optional[str] = None,
+    codebase_id: Optional[str] = None,
+    file_tree: Optional[str] = None,
+    repo_name: Optional[str] = None,
 ) -> Optional[str]:
     """Run one fast-rlm call. Returns cleaned text on success, ``None`` otherwise.
 
@@ -427,6 +431,18 @@ async def _attempt_rlm(
     wasting ~3 min/call on a model that consistently fails in the Pyodide REPL).
     On any non-success path a failure is recorded into ``rlm_state`` and the
     breaker trip is logged.
+
+    Two RLM paths:
+    - **Structured path** (when ``codebase_id`` is supplied): calls
+      ``run_rlm_structured`` with a dict query and the docgen retrieval tools.
+      The agent reads repo files ON DEMAND via ``read_codebase_file`` /
+      ``search_code`` so it can cover 100% of the repo regardless of size
+      (instead of a pre-chunked blob in the prompt). A per-codebase session
+      persists the agent's file index across the 7 sections (~2.6× cheaper per
+      the docs: the first section builds the index, later sections reuse it).
+      Falls back to the flat-string path on any structured failure.
+    - **Flat-string path** (no ``codebase_id``, or structured fallback): the
+      legacy ``run_rlm_task(query)`` with the codebase chunk already in the query.
     """
     rlm_failures = (rlm_state or {}).get("failures", 0)
     if rlm_failures >= RLM_MAX_FAILURES:
@@ -452,7 +468,58 @@ async def _attempt_rlm(
             query[:safe_query_chars] + "\n... (контекст обрезан для RLM)"
         )
 
-        from api.rlm.runner import run_rlm_task  # lazy: fast_rlm is optional
+        from api.rlm.runner import (  # lazy: fast_rlm is optional
+            run_rlm_structured,
+            run_rlm_task,
+            get_rlm_session_dir,
+        )
+
+        # Structured path: dict query + docgen tools + per-codebase session.
+        # The agent reads files on demand, so the dict carries the task + repo
+        # name + file tree (NOT the codebase blob). The first section builds the
+        # file index in the session; later sections reuse it.
+        if codebase_id:
+            try:
+                from api.rlm.tools import build_docgen_tools, resolve_env_variables
+
+                dict_query = {
+                    "task": query,
+                    "repo": repo_name or codebase_id,
+                    "file_tree": file_tree or "",
+                }
+                tools = build_docgen_tools()
+                env_vars = resolve_env_variables(product_id or "", codebase_id)
+                session_dir = get_rlm_session_dir(f"docgen_{codebase_id}")
+                res = await asyncio.wait_for(
+                    run_rlm_structured(
+                        dict_query,
+                        model_name=rlm_model,
+                        tools=tools,
+                        env_variables=env_vars,
+                        session_dir=session_dir,
+                        session_id=codebase_id,
+                        task="docgen",
+                    ),
+                    timeout=rlm_section_timeout,
+                )
+                if res.get("success") and res.get("results"):
+                    txt = _clean_llm_text(str(res["results"]))
+                    if txt:
+                        return txt
+                # Structured did not succeed -> fall through to flat-string path.
+                if not res.get("success"):
+                    logger.info(
+                        "RLM structured docgen path did not succeed (%s); "
+                        "trying flat-string path.",
+                        str(res.get("results"))[:120],
+                    )
+            except Exception as e:  # pragma: no cover - depends on live fast-rlm
+                logger.warning(
+                    "RLM structured docgen path failed (%s); falling back to flat-string.",
+                    e,
+                )
+
+        # Flat-string path (legacy, or structured fallback).
         res = await asyncio.wait_for(
             run_rlm_task(safe_query, rlm_model), timeout=rlm_section_timeout
         )
@@ -483,37 +550,67 @@ async def _generate_section_text(
     llm: Optional[_StandardLLM],
     rlm_model: Optional[str],
     rlm_state: Optional[Dict[str, int]] = None,
+    product_id: Optional[str] = None,
+    codebase_id: Optional[str] = None,
+    file_tree: Optional[str] = None,
+    repo_name: Optional[str] = None,
 ) -> str:
     """Generate a single section: RLM (long context) -> standard LLM fallback.
 
-    ``codebase_chunks`` is the codebase split into token-budget-sized pieces
-    (see ``_chunk_file_blocks``). A single chunk (or no chunk) takes the
-    original single-call path; multiple chunks take a map-reduce path:
-
-    - MAP: one RLM draft per chunk (RLM is the long-context engine). The shared
-      ``rlm_state`` circuit breaker short-circuits RLM for the remaining chunks
-      once ``RLM_MAX_FAILURES`` is hit this run.
-    - REDUCE: the standard LLM synthesizes the per-chunk drafts into one
-      coherent section. The drafts are small (a section's worth each), so the
-      reduce input always fits the standard LLM context.
+    Two RLM modes (selected automatically by ``codebase_id``):
+    - **Structured** (``codebase_id`` supplied): the agent reads repo files ON
+      DEMAND via the docgen tools, so it can cover 100% of the repo regardless
+      of size. The per-codebase session persists the file index across the 7
+      sections. Chunks are NOT used here — the agent fetches files itself.
+    - **Flat-string / map-reduce** (no ``codebase_id``): ``codebase_chunks``
+      is the codebase split into token-budget-sized pieces
+      (see ``_chunk_file_blocks``). A single chunk takes the single-call path;
+      multiple chunks take a map-reduce path:
+        - MAP: one RLM draft per chunk. The shared ``rlm_state`` breaker
+          short-circuits RLM once ``RLM_MAX_FAILURES`` is hit this run.
+        - REDUCE: the standard LLM synthesizes the per-chunk drafts.
 
     When ``use_rlm`` is False (small codebase, or admin forced LLM) the caller
     passes a single chunk and the standard LLM is used directly, with the
     codebase blob appended only if it is small enough (unchanged behaviour).
     """
     chunks = [c for c in (codebase_chunks or []) if c]
+    rlm_failures = (rlm_state or {}).get("failures", 0)
+    try_rlm = use_rlm and rlm_failures < RLM_MAX_FAILURES
 
+    # Structured RLM path: the agent reads files on demand, so chunks are
+    # irrelevant. One call per section (the session carries state across
+    # sections). Takes priority over the flat-string map-reduce path.
+    if try_rlm and codebase_id:
+        txt = await _attempt_rlm(
+            section_prompt, rlm_model, rlm_state,
+            product_id=product_id,
+            codebase_id=codebase_id,
+            file_tree=file_tree,
+            repo_name=repo_name,
+        )
+        if txt:
+            return txt
+        logger.warning(
+            "RLM structured path returned no usable result; falling back to "
+            "flat-string / standard LLM for this section."
+        )
+        # Fall through to the flat-string / standard-LLM path below.
+
+    # Flat-string map-reduce path (no codebase_id, or structured fallback).
     # Multi-chunk => map-reduce over RLM. Chunks are only produced for
     # large-codebase RLM runs, so ``use_rlm`` is True here.
     if use_rlm and len(chunks) > 1:
         return await _generate_section_mapreduce(
-            section_prompt, chunks, llm, rlm_model, rlm_state
+            section_prompt, chunks, llm, rlm_model, rlm_state,
+            product_id=product_id,
+            codebase_id=codebase_id,
+            file_tree=file_tree,
+            repo_name=repo_name,
         )
 
     # Single-chunk (or no-chunk / use_rlm False) => original single-call path.
     codebase_blob = chunks[0] if chunks else ""
-    rlm_failures = (rlm_state or {}).get("failures", 0)
-    try_rlm = use_rlm and rlm_failures < RLM_MAX_FAILURES
 
     if try_rlm:
         query = section_prompt + _CODEBASE_BLOCK_HEADER + codebase_blob
@@ -543,7 +640,7 @@ async def _generate_section_text(
             txt = _clean_llm_text(await llm.generate(prompt))
             if txt:
                 return txt
-        except Exception as e:  # pragma: no cover - depends on live Ollama
+        except Exception as e:  # pragma: no cover - depends on live LLM
             logger.warning("Standard LLM section generation failed: %s", e)
 
     return ""
@@ -555,6 +652,10 @@ async def _generate_section_mapreduce(
     llm: Optional[_StandardLLM],
     rlm_model: Optional[str],
     rlm_state: Optional[Dict[str, int]] = None,
+    product_id: Optional[str] = None,
+    codebase_id: Optional[str] = None,
+    file_tree: Optional[str] = None,
+    repo_name: Optional[str] = None,
 ) -> str:
     """Map-reduce a section over multiple codebase chunks.
 
@@ -573,7 +674,13 @@ async def _generate_section_mapreduce(
     drafts: List[str] = []
     for i, chunk in enumerate(chunks, 1):
         query = section_prompt + _CODEBASE_BLOCK_HEADER + chunk
-        draft = await _attempt_rlm(query, rlm_model, rlm_state)
+        draft = await _attempt_rlm(
+            query, rlm_model, rlm_state,
+            product_id=product_id,
+            codebase_id=codebase_id,
+            file_tree=file_tree,
+            repo_name=repo_name,
+        )
         if draft:
             drafts.append(draft)
         else:
@@ -599,7 +706,7 @@ async def _generate_section_mapreduce(
             txt = await _agentic_bottom_up_docgen(section_prompt, chunks, llm)
             if txt:
                 return txt
-        except Exception as e:  # pragma: no cover - depends on live Ollama
+        except Exception as e:  # pragma: no cover - depends on live LLM
             logger.warning("Agentic bottom-up section generation failed: %s", e)
     return ""
 
@@ -643,7 +750,7 @@ async def _reduce_section_drafts(
         txt = _clean_llm_text(await llm.generate(_with_verification_guard(reduce_prompt)))
         if txt:
             return txt
-    except Exception as e:  # pragma: no cover - depends on live Ollama
+    except Exception as e:  # pragma: no cover - depends on live LLM
         logger.warning("Section reduce LLM call failed: %s", e)
     return ""
 
@@ -781,6 +888,16 @@ async def generate_codebase_docs(
         raise ValueError("Codebase artifact has no repo_url; cannot generate docs.")
     repo_type = getattr(artifact, "repo_type", None) or "github"
     token = getattr(artifact, "token", None)
+    # Server-side credential resolution: the per-artifact token is no longer
+    # entered in the UI, so resolve the token from admin-configured git
+    # accounts by matching the repo URL host (public github.com / self-hosted).
+    try:
+        from api.config.settings import resolve_git_token
+        resolved_token = resolve_git_token(repo_url, repo_type)
+        if resolved_token:
+            token = resolved_token
+    except Exception as e:  # pragma: no cover - import-safe
+        logger.debug("resolve_git_token failed for %s: %s", repo_url, e)
 
     # Resolve the docgen LLM config from the admin store (models.docgen.*) so
     # codebase docgen reaches the corporate AI gateway when configured, instead
@@ -853,7 +970,7 @@ async def generate_codebase_docs(
     gen.set_context(context)
 
     llm = _safe_build_llm(model, base_url=resolved_base_url, api_key=resolved_api_key)
-    rlm_model = model  # run_rlm_task resolves local Ollama tags itself
+    rlm_model = model  # run_rlm_task resolves the local model id itself
     # Shared mutable state across sections: once RLM fails RLM_MAX_FAILURES
     # times within this run, remaining sections skip RLM and go straight to
     # the standard LLM.
@@ -869,6 +986,12 @@ async def generate_codebase_docs(
         _resolved_ctx_window or "unset (no clamp; relies on max_prompt_tokens)",
     )
 
+    # codebase_id enables the structured RLM path (agent reads files on demand
+    # via tools + per-codebase session). pid is the product id for the tools'
+    # env_variables. repo_name is derived from the URL for the dict query.
+    _codebase_id = getattr(artifact, "id", None)
+    _repo_name = context.repo_name or _repo_name_from_url(repo_url)
+
     sections: Dict[str, str] = {}
     repair_llm = _make_repair_llm(
         model, llm, base_url=resolved_base_url, api_key=resolved_api_key
@@ -876,7 +999,11 @@ async def generate_codebase_docs(
     for section_type in gen.SECTION_ORDER:
         prompt = gen._format_prompt(section_type, context)
         content = await _generate_section_text(
-            prompt, codebase_chunks, use_rlm, llm, rlm_model, rlm_state
+            prompt, codebase_chunks, use_rlm, llm, rlm_model, rlm_state,
+            product_id=pid,
+            codebase_id=_codebase_id,
+            file_tree=file_tree,
+            repo_name=_repo_name,
         )
         if not content:
             content = _SECTION_UNAVAILABLE_PLACEHOLDER
@@ -910,7 +1037,12 @@ async def generate_codebase_docs(
 
     pages = _section_pages(sections, language)
     _persist_artifact(artifact, markdown, pages)
-    # Index the cloned repo into cognee AFTER generation (non-blocking) into
-    # the product-scoped dataset (item 1 cognee-first).
-    _index_in_background(repo_dir, _cognee_dataset(product))
+    # Index the cloned repo into the active memory backend AFTER generation
+    # (non-blocking) into the product-scoped dataset. source_id = codebase id
+    # so the pgvector upsert can delete the previous chunks for this codebase
+    # before re-inserting (cognee ignores source_id).
+    _index_in_background(
+        repo_dir, _cognee_dataset(product),
+        source_type="codebase", source_id=getattr(artifact, "id", None),
+    )
     return markdown

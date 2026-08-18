@@ -163,7 +163,14 @@ class GitConnector:
         from api.clients.git import download_repo
 
         opts = opts or {}
-        token = opts.get("token") or self._token()
+        token = opts.get("token")
+        if not token:
+            try:
+                from api.config.settings import resolve_git_token
+                token = resolve_git_token(source_id, self.repo_type)
+            except Exception as e:  # pragma: no cover - import-safe
+                logger.debug("resolve_git_token failed for %s: %s", source_id, e)
+        token = token or self._token()
         local_path = self._clone_dir(source_id)
         # download_repo is idempotent: if the dir exists & is non-empty it reuses it.
         download_repo(source_id, local_path, repo_type=self.repo_type, access_token=token)

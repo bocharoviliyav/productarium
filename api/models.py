@@ -10,6 +10,7 @@ Defines the product-centric data model:
 - ``KnowledgeNodeORM`` — Confluence-like tree of knowledge pages per product
 - ``SettingORM``       — admin config key/value store (optionally encrypted)
 - ``ApiTokenORM``      — public API tokens for external integrations
+- ``KnowledgeChunkORM`` — embedded text chunks for the pgvector-direct memory
 
 String primary keys (``prod_..``, ``art_..``, ``user_..``, ``node_..``,
 ``tok_..``) keep frontend compatibility. All tables share the same
@@ -19,11 +20,64 @@ idempotent and non-fatal.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, Text, TypeDecorator
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+logger = logging.getLogger(__name__)
+
+# pgvector is a transitive dep (via cognee) but may be absent in minimal venvs.
+# Import guarded so the module always imports; the real Vector column type is
+# only used on Postgres (load_dialect_impl selects it by dialect).
+try:
+    from pgvector.sqlalchemy import Vector as _PgVector  # type: ignore
+    _PGVECTOR_AVAILABLE = True
+except Exception:  # pragma: no cover - dep missing in minimal venv
+    _PgVector = None  # type: ignore
+    _PGVECTOR_AVAILABLE = False
+
+
+class VectorType(TypeDecorator):
+    """Dialect-adaptive embedding column: pgvector ``Vector`` on Postgres, ``Text`` elsewhere.
+
+    Uses a dimensionless pgvector ``Vector()`` (no fixed dim) so a change of
+    embedder model / dimension does not require a migration. Cosine search
+    works as long as the query vector and stored vectors share a dimension;
+    otherwise the operator raises at query time (the caller returns "" on any
+    error). On SQLite (tests) the column degrades to ``Text`` and vector
+    operations are skipped by the pgvector backend.
+
+    ``process_bind_param`` serializes list/tuple embeddings to a
+    ``"[1.0,2.0,...]"`` string literal on the Text fallback dialect so the
+    column is writable on SQLite (tests) and when pgvector is absent. On
+    Postgres with pgvector the list is passed through to ``_PgVector`` which
+    binds it natively (and also accepts the string literal form).
+    """
+
+    impl = Text
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name in ("postgresql", "postgres") and _PGVECTOR_AVAILABLE:
+            return dialect.type_descriptor(_PgVector())
+        return dialect.type_descriptor(Text())
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        # On Postgres + pgvector, delegate to _PgVector's own bind processor
+        # (it accepts lists and string literals).
+        if dialect.name in ("postgresql", "postgres") and _PGVECTOR_AVAILABLE:
+            return value
+        # Text fallback (SQLite / pgvector absent): serialize lists to the
+        # "[1.0,2.0]" string literal so the column is writable. Non-list values
+        # (already a string) are stored as-is.
+        if isinstance(value, (list, tuple)):
+            return "[" + ",".join(str(float(x)) for x in value) + "]"
+        return value
 
 
 class Base(DeclarativeBase):
@@ -360,3 +414,47 @@ class ApiTokenORM(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
         return f"<ApiTokenORM id={self.id!r} name={self.name!r} user_id={self.user_id!r}>"
+
+
+class KnowledgeChunkORM(Base):
+    """ORM model for the ``knowledge_chunks`` table — a single embedded text
+    chunk scoped to a product, used by the pgvector-direct memory backend.
+
+    Each chunk is produced by chunking a source document (codebase generated
+    docs, spec content, knowledge node markdown, integration-pulled text) with
+    the shared ``TextSplitter`` config and embedding it via the configured
+    embedder. The ``embedding`` column is a pgvector ``Vector`` on Postgres
+    (dimensionless — any embedder dim) and degrades to ``Text`` on SQLite.
+
+    Product isolation is enforced by ``product_id`` filtering in every query;
+    the HNSW index on ``embedding`` (created in ``init_db``) accelerates the
+    cosine-distance ``ORDER BY`` within a product.
+    """
+
+    __tablename__ = "knowledge_chunks"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    product_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("products.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # codebase | spec | links | knowledge_node | integration
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False, default="codebase")
+    # The id of the codebase / spec / links / knowledge_node that produced this
+    # chunk (nullable: raw integration text has no owning entity row). Used by
+    # the upsert path to delete-and-reinsert chunks for a single source.
+    source_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    chunk_index: Mapped[int] = mapped_column(nullable=False, default=0)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[Optional[object]] = mapped_column(VectorType, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return (
+            f"<KnowledgeChunkORM id={self.id!r} product_id={self.product_id!r} "
+            f"source_type={self.source_type!r} chunk_index={self.chunk_index!r}>"
+        )

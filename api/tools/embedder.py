@@ -6,7 +6,7 @@ from api.config import configs
 def get_embedder(base_url: str = None, api_key: str = None) -> adal.Embedder:
     """Get embedder based on configuration or parameters.
 
-    Every supported local server (Ollama, LM Studio, llama.cpp, vLLM, ...)
+    Every supported local server (LM Studio, llama.cpp, vLLM, ...)
     exposes an OpenAI-compatible /v1/embeddings endpoint, so a single
     OpenAIClient-based embedder covers all cases.
 
@@ -44,8 +44,8 @@ def get_embedder(base_url: str = None, api_key: str = None) -> adal.Embedder:
     if "initialize_kwargs" in embedder_config:
         client_kwargs.update(embedder_config["initialize_kwargs"])
 
-    # Every supported server uses the OpenAI-compatible base_url=/api_key= shape
-    # (Ollama's /v1 endpoint accepts it too). SSL verify is wired via ssl_config.
+    # Every supported server uses the OpenAI-compatible base_url=/api_key= shape.
+    # SSL verify is wired via ssl_config.
     if base_url:
         client_kwargs["base_url"] = base_url
     if api_key:

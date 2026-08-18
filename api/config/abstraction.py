@@ -66,6 +66,15 @@ def sync_runtime_settings() -> None:
     except Exception as e:
         logger.debug("sync_runtime_settings: sync_timeout_env skipped: %s", e)
 
+    # Invalidate the cached memory backend instance so an admin switch of
+    # ``memory.backend`` (pgvector <-> cognee) takes effect on the next call
+    # without a process restart.
+    try:
+        from api.memory.resolver import reset_memory_backend_cache
+        reset_memory_backend_cache()
+    except Exception as e:
+        logger.debug("sync_runtime_settings: reset_memory_backend_cache skipped: %s", e)
+
     logger.info("Configuration Abstraction Layer: Synchronized runtime settings across process.")
 
 
@@ -74,7 +83,7 @@ def get_task_config(task: str) -> Dict[str, Optional[str]]:
 
     Precedence:
     1. DB SettingORM (`models.<task>.*`) — Admin UI saves.
-    2. Process Environment Variables (`LOCAL_OPENAI_BASE_URL`, `OLLAMA_HOST`, etc.).
+    2. Process Environment Variables (`LOCAL_OPENAI_BASE_URL`, etc.).
     3. Hardcoded defaults.
     """
     try:

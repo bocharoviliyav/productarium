@@ -1,8 +1,8 @@
 """Unit tests for ``api.expert.llm``.
 
 Covers:
-- ``_extract_chunk_fields`` for all chunk shapes: Ollama native message
-  (object + dict), Ollama /v1 choices/delta, OpenAI object .choices[0].delta,
+- ``_extract_chunk_fields`` for all chunk shapes: native message
+  (object + dict), OpenAI /v1 choices/delta, OpenAI object .choices[0].delta,
   adalflow .response/.data/.text, empty chunk -> (None, None).
 - ``_ThinkingStreamParser``: feed/flush (open+close across chunks, unclosed
   flush as reasoning, partial tag buffering, no-tag passthrough, empty feed).
@@ -157,22 +157,22 @@ class TestExtractChunkFields:
     def test_empty_chunk_returns_none_none(self):
         assert _extract_chunk_fields(SimpleNamespace()) == (None, None)
 
-    def test_ollama_native_object_message_content(self):
+    def test_native_object_message_content(self):
         msg = SimpleNamespace(content="hello", thinking=None)
         chunk = SimpleNamespace(message=msg)
         assert _extract_chunk_fields(chunk) == ("hello", None)
 
-    def test_ollama_native_object_message_thinking(self):
+    def test_native_object_message_thinking(self):
         msg = SimpleNamespace(content=None, thinking="reasoning text")
         chunk = SimpleNamespace(message=msg)
         content, reasoning = _extract_chunk_fields(chunk)
         assert reasoning == "reasoning text"
 
-    def test_ollama_native_dict_message_content(self):
+    def test_native_dict_message_content(self):
         chunk = SimpleNamespace(message={"content": "hi", "thinking": None})
         assert _extract_chunk_fields(chunk) == ("hi", None)
 
-    def test_ollama_native_dict_message_reasoning(self):
+    def test_native_dict_message_reasoning(self):
         chunk = SimpleNamespace(message={"content": "", "reasoning_content": "rc"})
         _, reasoning = _extract_chunk_fields(chunk)
         assert reasoning == "rc"
@@ -243,7 +243,7 @@ class TestExtractChunkFields:
         chunk = SimpleNamespace(data=123)
         assert _extract_chunk_fields(chunk) == (None, None)
 
-    def test_ollama_native_empty_content_skipped(self):
+    def test_native_empty_content_skipped(self):
         msg = SimpleNamespace(content="", thinking=None)
         chunk = SimpleNamespace(message=msg)
         assert _extract_chunk_fields(chunk) == (None, None)

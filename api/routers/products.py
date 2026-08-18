@@ -92,14 +92,27 @@ async def delete_product(product_id: str, db: Session = Depends(get_db)):
 
 
 # --- Codebases --------------------------------------------------------------
-def _reindex(product_id: str, indexed_text: Optional[str], entity_id: str) -> None:
-    """Re-index edited text into the per-product cognee dataset (fire-and-forget)."""
+def _reindex(
+    product_id: str,
+    indexed_text: Optional[str],
+    entity_id: str,
+    *,
+    source_type: str = "codebase",
+) -> None:
+    """Re-index edited text into the per-product memory backend (fire-and-forget).
+
+    ``source_id`` = entity id so the pgvector upsert deletes the previous chunks
+    for that entity before re-inserting (cognee ignores source_id).
+    """
     if indexed_text and indexed_text.strip():
         try:
             from api.docgen import _index_in_background
-            _index_in_background(indexed_text, f"prod_{product_id}")
+            _index_in_background(
+                indexed_text, f"prod_{product_id}",
+                source_type=source_type, source_id=entity_id,
+            )
         except Exception as e:  # pragma: no cover - defensive
-            logger.warning("Cognee re-index failed for entity %s: %s", entity_id, e)
+            logger.warning("Memory re-index failed for entity %s: %s", entity_id, e)
 
 
 @router.post("/{product_id}/codebases", response_model=Product)
@@ -140,7 +153,7 @@ async def update_codebase_docs(
         msg = str(e)
         status = 400 if "Provide one of" in msg else 404
         raise HTTPException(status_code=status, detail=msg)
-    _reindex(product_id, indexed_text, codebase_id)
+    _reindex(product_id, indexed_text, codebase_id, source_type="codebase")
     return product
 
 
@@ -173,9 +186,9 @@ async def update_spec(
         product, indexed_text = product_repo.update_spec_content(
             db, product_id, spec_id, body.content
         )
-    except ValueError:
+    except ValueError as e:
         raise HTTPException(status_code=404, detail="Product not found")
-    _reindex(product_id, indexed_text, spec_id)
+    _reindex(product_id, indexed_text, spec_id, source_type="spec")
     return product
 
 

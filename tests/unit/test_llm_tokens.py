@@ -2,7 +2,7 @@
 
 Covers:
 - ``get_model_context_window``:
-  * Env var override (``RLM_MODEL_CONTEXT_WINDOW`` / ``OLLAMA_NUM_CTX``).
+  * Env var override (``RLM_MODEL_CONTEXT_WINDOW``).
   * Admin setting override (``models.<task>.max_prompt_tokens``).
   * Cache hit (within TTL).
   * Live API query (OpenAI-compatible ``/v1/models`` with ``max_model_len``).
@@ -51,22 +51,10 @@ def _clear_cache():
 class TestEnvVarOverride:
     def test_rlm_model_context_window_env(self, monkeypatch):
         monkeypatch.setenv("RLM_MODEL_CONTEXT_WINDOW", "32768")
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
         assert get_model_context_window() == 32768
-
-    def test_ollama_num_ctx_env(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.setenv("OLLAMA_NUM_CTX", "16384")
-        assert get_model_context_window() == 16384
-
-    def test_rlm_takes_precedence_over_ollama(self, monkeypatch):
-        monkeypatch.setenv("RLM_MODEL_CONTEXT_WINDOW", "65536")
-        monkeypatch.setenv("OLLAMA_NUM_CTX", "4096")
-        assert get_model_context_window() == 65536
 
     def test_invalid_env_ignored(self, monkeypatch):
         monkeypatch.setenv("RLM_MODEL_CONTEXT_WINDOW", "not-a-number")
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
         # Falls through to live API query / default
         # With no live API (requests not mocked), returns default 8192
         monkeypatch.setattr("requests.get", lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("x")))
@@ -74,13 +62,11 @@ class TestEnvVarOverride:
 
     def test_zero_env_ignored(self, monkeypatch):
         monkeypatch.setenv("RLM_MODEL_CONTEXT_WINDOW", "0")
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
         monkeypatch.setattr("requests.get", lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("x")))
         assert get_model_context_window() == 8192
 
     def test_negative_env_ignored(self, monkeypatch):
-        monkeypatch.setenv("OLLAMA_NUM_CTX", "-100")
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
+        monkeypatch.setenv("RLM_MODEL_CONTEXT_WINDOW", "-100")
         monkeypatch.setattr("requests.get", lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("x")))
         assert get_model_context_window() == 8192
 
@@ -94,7 +80,6 @@ class TestAdminSettingOverride:
         from api.config import settings
 
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
         settings.set_setting("models.docgen.max_prompt_tokens", "16384", encrypt=False)
         assert get_model_context_window(task="docgen") == 16384
 
@@ -110,7 +95,6 @@ class TestAdminSettingOverride:
         from api.config import settings
 
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
         settings.set_setting("models.docgen.max_prompt_tokens", "garbage", encrypt=False)
         monkeypatch.setattr("requests.get", lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("x")))
         # Falls through to default
@@ -120,7 +104,6 @@ class TestAdminSettingOverride:
         from api.config import settings
 
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
         settings.set_setting("models.docgen.max_prompt_tokens", "0", encrypt=False)
         monkeypatch.setattr("requests.get", lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("x")))
         assert get_model_context_window(task="docgen") == 8192
@@ -138,7 +121,6 @@ class TestCache:
         cache_key = (url.rstrip("/"), model)
         _MODEL_CTX_CACHE[cache_key] = (time.time(), 99999)
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
         assert get_model_context_window(base_url=url, model_name=model) == 99999
 
     def test_cache_expired(self, monkeypatch):
@@ -148,7 +130,6 @@ class TestCache:
         # Set cache entry with old timestamp
         _MODEL_CTX_CACHE[cache_key] = (time.time() - _CACHE_TTL_SECONDS - 1, 99999)
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
         # Expired -> falls through to live API (mocked to fail) -> default
         monkeypatch.setattr("requests.get", lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("x")))
         assert get_model_context_window(base_url=url, model_name=model) == 8192
@@ -161,7 +142,6 @@ class TestCache:
 class TestLiveApiQuery:
     def test_max_model_len_key(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -180,7 +160,6 @@ class TestLiveApiQuery:
 
     def test_context_window_key(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -199,7 +178,6 @@ class TestLiveApiQuery:
 
     def test_max_tokens_key(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -218,7 +196,6 @@ class TestLiveApiQuery:
 
     def test_max_context_length_key(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -237,7 +214,6 @@ class TestLiveApiQuery:
 
     def test_n_ctx_key(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -256,7 +232,6 @@ class TestLiveApiQuery:
 
     def test_name_field_match(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -275,7 +250,6 @@ class TestLiveApiQuery:
 
     def test_non_200_returns_default(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
 
         fake_resp = types.SimpleNamespace(status_code=500, json=lambda: {})
         monkeypatch.setattr("requests.get", lambda *a, **kw: fake_resp)
@@ -287,7 +261,6 @@ class TestLiveApiQuery:
 
     def test_no_matching_model_returns_default(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -302,7 +275,6 @@ class TestLiveApiQuery:
 
     def test_connection_error_returns_default(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
 
         def boom(*a, **kw):
             raise ConnectionError("refused")
@@ -316,7 +288,6 @@ class TestLiveApiQuery:
 
     def test_result_cached_after_live_query(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
 
         call_count = {"n": 0}
 
@@ -340,7 +311,6 @@ class TestLiveApiQuery:
 
     def test_url_normalization_appends_v1(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
         captured = {}
 
         def fake_get(url, **kw):
@@ -353,7 +323,6 @@ class TestLiveApiQuery:
 
     def test_authorization_header_sent(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
         captured = {}
 
         def fake_get(url, **kw):
@@ -370,7 +339,6 @@ class TestLiveApiQuery:
 
     def test_no_auth_header_for_not_needed(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
         captured = {}
 
         def fake_get(url, **kw):
@@ -387,7 +355,6 @@ class TestLiveApiQuery:
 
     def test_float_context_value(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -406,7 +373,6 @@ class TestLiveApiQuery:
 
     def test_default_model_name(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
         captured = {}
 
         def fake_get(url, **kw):
