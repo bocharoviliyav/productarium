@@ -225,3 +225,55 @@ class TestAsyncWrapper:
         result = await runner.run_rlm_task("query", "m")
         assert result["success"] is True
         assert result["results"] == "async ok"
+
+
+# --------------------------------------------------------------------------- #
+# Prewarm — must resolve the admin-configured model, NOT a hardcoded default.
+# Regression for the startup ``qwen3.6`` requests: prewarm used to pass an
+# explicit model arg that took first precedence over admin config.
+# --------------------------------------------------------------------------- #
+class TestPrewarmModelResolution:
+    def test_prewarm_uses_admin_model_not_hardcoded(self, rlm_deps, monkeypatch):
+        """prewarm must pass model_name=None so admin config wins.
+
+        Previously prewarm passed ``os.environ.get("RLM_MODEL_NAME") or
+        "qwen/qwen3.6-27b"``, which took first precedence in
+        _resolve_rlm_config and overrode the admin-configured model — the
+        root cause of startup requests hitting qwen3.6 instead of qwen3.8.
+        """
+        rlm_deps.set_admin({
+            "model": "admin-configured-model",
+            "base_url": "http://localhost:1234/v1",
+            "api_key": "not-needed",
+        })
+        # Clear the RLM_MODEL_NAME env so the only possible source of the
+        # admin model is the settings store (not an env var).
+        monkeypatch.delenv("RLM_MODEL_NAME", raising=False)
+
+        def _capture(query, config=None, verbose=False):
+            rlm_deps.captured["model"] = config.primary_agent
+            rlm_deps.captured["query"] = query
+            return {"results": "ok", "usage": {}}
+        rlm_deps.set_run(_capture)
+
+        # Run prewarm's inner _warm synchronously. prewarm does
+        # ``import threading`` locally inside the function body, so we patch
+        # the global threading.Thread with a shim that runs the target
+        # immediately on the current thread instead of spawning a real one.
+        import threading
+
+        class _SyncThread:
+            def __init__(self, target=None, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        monkeypatch.setattr(threading, "Thread", _SyncThread)
+
+        runner.prewarm_rlm_background()
+
+        assert rlm_deps.captured["model"] == "admin-configured-model"
+        # Sanity: the hardcoded default must NOT have leaked through.
+        assert rlm_deps.captured["model"] != "qwen/qwen3.6-27b"
+        assert rlm_deps.captured.get("query") == "Reply with the single word: ok"

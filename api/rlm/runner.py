@@ -122,7 +122,12 @@ def _resolve_rlm_config(model_name: str = None):
             base_url = f"{_b}/v1"
     os.environ["RLM_MODEL_BASE_URL"] = base_url
 
-    # Resolve model. Admin models.docgen.model wins over the explicit arg / env.
+    # Resolve model. Precedence:
+    #   1. explicit model_name (callers pass the already-admin-resolved model;
+    #      prewarm passes None so admin config wins)
+    #   2. admin models.docgen.model (DB SettingORM, highest authority)
+    #   3. RLM_MODEL_NAME env var
+    #   4. "z-ai/glm-5" last-resort default
     # The endpoint is an OpenAI-compatible server (LM Studio, llama.cpp, vLLM,
     # corporate gateway); pass the model name through verbatim -- these servers
     # use their own model IDs.
@@ -480,10 +485,14 @@ def prewarm_rlm_background() -> None:
 
     def _warm() -> None:
         try:
-            res = run_rlm_task_sync(
-                "Reply with the single word: ok",
-                os.environ.get("RLM_MODEL_NAME") or "qwen/qwen3.6-27b",
-            )
+            # Pass model_name=None so _resolve_rlm_config resolves the
+            # admin-configured models.docgen.model (synced at startup by
+            # bootstrap_config -> sync_runtime_settings). Passing a hardcoded
+            # model here would take FIRST precedence in _resolve_rlm_config
+            # (``model_name or admin_model or ...``) and override the admin
+            # setting — that was the root cause of startup requests hitting
+            # qwen3.6 instead of the admin-configured qwen3.8.
+            res = run_rlm_task_sync("Reply with the single word: ok")
             # run_rlm_task_sync catches its own exceptions and returns
             # {"success": False}; only a truthy success flag means RLM is
             # actually usable. Reporting "completed" on failure hid the real
