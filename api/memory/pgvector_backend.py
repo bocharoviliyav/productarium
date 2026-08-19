@@ -104,14 +104,20 @@ async def _embed_batch(texts: List[str]) -> Optional[List[List[float]]]:
         embedder = get_embedder()
 
         def _do_embed() -> List[List[float]]:
-            # adalflow Embedder expects a list of strings and returns a list of
-            # embedding objects (numpy arrays). Coerce to plain float lists.
-            results = embedder.encode(input=texts) if hasattr(embedder, "encode") else None
-            if results is None:
-                # Fall back to the __call__ shape used elsewhere in adalflow.
-                results = embedder(texts)
+            # adalflow ``Embedder.__call__(input=list)`` returns an
+            # ``EmbedderOutput`` dataclass (NOT a list). The per-text vectors
+            # live on its ``.data`` field as a ``List[Embedding]``, each with
+            # ``.embedding: List[float]``. Iterating the dataclass directly or
+            # calling a nonexistent ``.encode()`` raises
+            # "'EmbedderOutput' object is not iterable".
+            results = embedder(input=texts)
+            err = getattr(results, "error", None)
+            if err:
+                logger.warning("pgvector memory: embedder returned error: %s", err)
+                return []
+            data = getattr(results, "data", None) or []
             out: List[List[float]] = []
-            for r in results:
+            for r in data:
                 vec = getattr(r, "embedding", None) or getattr(r, "vector", None) or r
                 if hasattr(vec, "tolist"):
                     vec = vec.tolist()

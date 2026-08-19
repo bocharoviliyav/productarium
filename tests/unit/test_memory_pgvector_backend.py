@@ -74,6 +74,84 @@ class TestSplitText:
 
 
 # --------------------------------------------------------------------------- #
+# _embed_batch — must read .data from the EmbedderOutput dataclass.
+# Regression for the "'EmbedderOutput' object is not iterable" crash: the old
+# code iterated the dataclass directly and called a nonexistent .encode().
+# --------------------------------------------------------------------------- #
+class TestEmbedBatch:
+    def _make_output(self, vectors, error=None):
+        """Build a real adalflow ``EmbedderOutput`` with ``Embedding`` rows."""
+        from adalflow.core.types import EmbedderOutput, Embedding
+
+        data = [Embedding(embedding=v, index=i) for i, v in enumerate(vectors)]
+        return EmbedderOutput(data=data, error=error)
+
+    def test_extracts_vectors_from_embedder_output_data(self, monkeypatch):
+        from api.memory import pgvector_backend as pb
+        import api.tools.embedder as emb_mod
+
+        output = self._make_output([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]])
+
+        class _FakeEmbedder:
+            def __call__(self, input=None, **kw):
+                assert input == ["a", "b", "c"]
+                return output
+
+        # get_embedder is imported INSIDE _embed_batch from
+        # api.tools.embedder, so patch it at its source module (not on pb).
+        monkeypatch.setattr(emb_mod, "get_embedder", lambda **kw: _FakeEmbedder())
+        # Stub the rate limiter so it just runs the to_thread coroutine.
+        from api.tools import rate_limiter as rl
+        monkeypatch.setattr(rl._embedder_rate_limiter, "execute", lambda func, *a, **kw: func(*a, **kw))
+
+        result = asyncio.run(pb._embed_batch(["a", "b", "c"]))
+        assert result == [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]
+
+    def test_embedder_error_returns_empty(self, monkeypatch):
+        from api.memory import pgvector_backend as pb
+        import api.tools.embedder as emb_mod
+
+        output = self._make_output([], error="boom")
+
+        class _FakeEmbedder:
+            def __call__(self, input=None, **kw):
+                return output
+
+        monkeypatch.setattr(emb_mod, "get_embedder", lambda **kw: _FakeEmbedder())
+        from api.tools import rate_limiter as rl
+        monkeypatch.setattr(rl._embedder_rate_limiter, "execute", lambda func, *a, **kw: func(*a, **kw))
+
+        result = asyncio.run(pb._embed_batch(["a"]))
+        assert result == []
+
+    def test_empty_input_returns_empty_list(self):
+        from api.memory.pgvector_backend import _embed_batch
+
+        assert asyncio.run(_embed_batch([])) == []
+
+    def test_numpy_array_vector_coerced_to_floats(self, monkeypatch):
+        from api.memory import pgvector_backend as pb
+        import api.tools.embedder as emb_mod
+
+        class _Arr:
+            def tolist(self):
+                return [0.1, 0.2]
+
+        output = self._make_output([_Arr()])
+
+        class _FakeEmbedder:
+            def __call__(self, input=None, **kw):
+                return output
+
+        monkeypatch.setattr(emb_mod, "get_embedder", lambda **kw: _FakeEmbedder())
+        from api.tools import rate_limiter as rl
+        monkeypatch.setattr(rl._embedder_rate_limiter, "execute", lambda func, *a, **kw: func(*a, **kw))
+
+        result = asyncio.run(pb._embed_batch(["a"]))
+        assert result == [[0.1, 0.2]]
+
+
+# --------------------------------------------------------------------------- #
 # _is_pgvector_capable
 # --------------------------------------------------------------------------- #
 class TestIsPgvectorCapable:
