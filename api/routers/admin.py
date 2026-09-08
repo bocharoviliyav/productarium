@@ -40,7 +40,7 @@ from api.auth.local import (
     hash_token,
 )
 from api.db import get_db
-from api.models import ApiTokenORM, UserORM
+from api.models import ApiTokenORM, ProductGrantORM, ProductORM, UserORM, USER_ROLES
 from api.schemas import (
     ApiTokenCreate,
     ApiTokenOut,
@@ -551,10 +551,10 @@ def put_group(
     if group == "users":
         user_id = body.get("user_id") if isinstance(body, dict) else None
         role = body.get("role") if isinstance(body, dict) else None
-        if not user_id or role not in ("user", "admin"):
+        if not user_id or role not in USER_ROLES:
             raise HTTPException(
                 status_code=400,
-                detail="Body must include {user_id, role} with role in (user, admin)",
+                detail=f"Body must include {{user_id, role}} with role in {USER_ROLES}",
             )
         u = db.get(UserORM, user_id)
         if u is None:
@@ -589,8 +589,10 @@ def create_user(
     username = body.username.strip()
     if not username:
         raise HTTPException(status_code=400, detail="Username is required.")
-    if body.role not in ("user", "admin"):
-        raise HTTPException(status_code=400, detail="role must be 'user' or 'admin'.")
+    if body.role not in USER_ROLES:
+        raise HTTPException(
+            status_code=400, detail=f"role must be one of {USER_ROLES}."
+        )
     if db.query(UserORM).filter(UserORM.username == username).first() is not None:
         raise HTTPException(status_code=409, detail="Username already taken.")
     temp_password = body.password or secrets.token_urlsafe(12)
@@ -615,6 +617,102 @@ def create_user(
         temp_password=temp_password,
         reset_token=reset_token,
     )
+
+
+# --- Per-product access grants (P0-2) -----------------------------------------
+_GRANT_LEVELS = ("ro", "rw")
+
+
+class GrantUpdate(BaseModel):
+    product_id: str
+    user_id: str
+    level: str  # ro | rw
+
+
+@router.get("/grants")
+def list_grants(
+    admin: UserORM = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> List[Dict[str, Any]]:
+    """List all per-product access grants (admin UI).
+
+    Each row carries the product/user display names so the admin panel can
+    render the matrix without extra lookups.
+    """
+    grants = db.query(ProductGrantORM).all()
+    products = {p.id: p.name for p in db.query(ProductORM.id, ProductORM.name).all()}
+    users = {u.id: u.username for u in db.query(UserORM.id, UserORM.username).all()}
+    return [
+        {
+            "product_id": g.product_id,
+            "user_id": g.user_id,
+            "level": g.level,
+            "granted_by": g.granted_by,
+            "created_at": g.created_at,
+            "product_name": products.get(g.product_id),
+            "username": users.get(g.user_id),
+        }
+        for g in grants
+    ]
+
+
+@router.put("/grants")
+def upsert_grant(
+    body: GrantUpdate,
+    admin: UserORM = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Create or update a per-product grant (level ro|rw)."""
+    if body.level not in _GRANT_LEVELS:
+        raise HTTPException(status_code=400, detail="level must be 'ro' or 'rw'.")
+    if db.get(ProductORM, body.product_id) is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    user = db.get(UserORM, body.user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.role == "admin":
+        raise HTTPException(
+            status_code=400,
+            detail="Admins already have full access; grants are redundant.",
+        )
+    grant = db.get(ProductGrantORM, {"product_id": body.product_id, "user_id": body.user_id})
+    if grant is None:
+        grant = ProductGrantORM(
+            product_id=body.product_id,
+            user_id=body.user_id,
+            level=body.level,
+            granted_by=admin.id,
+        )
+        db.add(grant)
+    else:
+        grant.level = body.level
+        grant.granted_by = admin.id
+    db.commit()
+    logger.info(
+        "Admin %r set grant %s -> %s (%s).",
+        admin.username, body.product_id, user.username, body.level,
+    )
+    return {
+        "product_id": grant.product_id,
+        "user_id": grant.user_id,
+        "level": grant.level,
+        "granted_by": grant.granted_by,
+    }
+
+
+@router.delete("/grants")
+def delete_grant(
+    product_id: str,
+    user_id: str,
+    admin: UserORM = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> Dict[str, str]:
+    """Remove a per-product grant."""
+    grant = db.get(ProductGrantORM, {"product_id": product_id, "user_id": user_id})
+    if grant is not None:
+        db.delete(grant)
+        db.commit()
+    return {"message": "Grant removed"}
 
 
 @router.post("/users/{user_id}/reset-token")

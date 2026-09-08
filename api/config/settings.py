@@ -210,6 +210,48 @@ def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     return get_setting(key, default=default)
 
 
+# --- Standalone secret crypto (P0-2: git tokens on codebases) ----------------
+def encrypt_secret(plaintext: str) -> Optional[str]:
+    """Encrypt a standalone secret (e.g. a per-codebase git token).
+
+    Returns the Fernet ciphertext string, or None when crypto is unavailable —
+    callers decide whether to fall back to plaintext storage (never crash).
+    """
+    f = _fernet()
+    if f is None:
+        return None
+    try:
+        return f.encrypt(plaintext.encode("utf-8")).decode("utf-8")
+    except Exception as e:
+        logger.warning("encrypt_secret failed: %s", e)
+        return None
+
+
+def decrypt_secret(ciphertext: str) -> Optional[str]:
+    """Decrypt a secret produced by ``encrypt_secret``.
+
+    Returns the plaintext, or None when decryption fails (wrong key, corrupt
+    data, crypto unavailable) — never raises.
+    """
+    f = _fernet()
+    if f is None:
+        return None
+    try:
+        return f.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
+    except Exception as e:
+        logger.warning("decrypt_secret failed: %s", e)
+        return None
+
+
+def is_encrypted_secret(value: Optional[str]) -> bool:
+    """Heuristic: Fernet tokens always start with the versioned prefix 'gAAAA'.
+
+    Used by the lazy plaintext->ciphertext migration for codebase git tokens:
+    anything else is treated as legacy plaintext.
+    """
+    return bool(value) and value.startswith("gAAAA")
+
+
 def delete_setting(key: str) -> bool:
     """Delete a setting by key. Returns True if a row was deleted."""
     try:

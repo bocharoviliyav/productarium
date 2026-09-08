@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 import tiktoken
 
 from api.config import configs, DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES
+from api.utils.repo_url import validate_repo_url
 
 logger = logging.getLogger(__name__)
 
@@ -454,6 +455,11 @@ class DatabaseManager:
                     force_refresh=force_refresh,
                 )
             else:  # local path
+                # P0-1: a non-URL value is only allowed when it points inside
+                # the managed state dir AND the operator explicitly opted in
+                # (PRODUCTARIUM_ALLOW_LOCAL_CLONES). Arbitrary filesystem
+                # reads (e.g. /etc) are rejected before anything is read.
+                validate_repo_url(repo_url_or_path)
                 repo_name = os.path.basename(repo_url_or_path)
                 save_repo_dir = repo_url_or_path
 

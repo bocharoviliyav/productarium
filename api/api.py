@@ -54,6 +54,15 @@ async def _startup() -> None:
     await get_checkpointer()
     logger.info("Agent checkpointer initialized (postgres).")
 
+    # P0-2: one-shot migration of any legacy plaintext codebase tokens to
+    # Fernet-encrypted form (non-fatal — per-row lazy migration also runs on
+    # access, so a failure here never blocks startup).
+    try:
+        from api.repositories import product_repo
+        product_repo.migrate_plaintext_tokens()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Plaintext token migration skipped (non-fatal): %s", e)
+
     # Bootstrap configuration abstraction layer (highest precedence to DB settings)
     try:
         from api.config.abstraction import bootstrap_config

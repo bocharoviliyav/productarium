@@ -30,6 +30,8 @@ from urllib.parse import urlparse, urlunparse, quote
 import requests
 from requests.exceptions import RequestException
 
+from api.utils.repo_url import validate_repo_url
+
 logger = logging.getLogger(__name__)
 
 
@@ -111,7 +113,15 @@ def download_repo(
 
     Returns:
         str: The output message from the `git` command.
+
+    Raises:
+        ValueError: when ``repo_url`` is not an http(s) URL (or an allowed
+        managed local path) — checked BEFORE any git invocation (P0-1).
     """
+    # P0-1: defense in depth — the same shared validator used at the CRUD
+    # boundary. Rejects ext::/file:///ssh:// and arbitrary local paths before
+    # any subprocess runs. (Placed before the try so the real message surfaces.)
+    validate_repo_url(repo_url)
     try:
         # Check if Git is installed
         logger.info(f"Preparing to clone repository to {local_path}")

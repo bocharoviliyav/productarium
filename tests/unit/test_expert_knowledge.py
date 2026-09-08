@@ -359,7 +359,10 @@ class TestRetrieveProductKnowledge:
         monkeypatch.setattr(reg_mod, "get_connector", lambda name: fake_connector if name == "confluence" else None)
 
         result = asyncio.run(_retrieve_product_knowledge("prod_missing", "query"))
-        assert result == "confluence content"
+        # P0-8: untrusted Confluence content is wrapped as data, never raw.
+        assert "confluence content" in result
+        assert "<untrusted_content>" in result and "</untrusted_content>" in result
+        assert "UNTRUSTED DATA" in result
 
     def test_confluence_fallback_not_configured(self, monkeypatch, isolated_db):
         async def _fake_query_memory(query, product_id, top_k=20):
@@ -459,5 +462,6 @@ class TestRetrieveProductKnowledge:
         monkeypatch.setattr(reg_mod, "get_connector", lambda name: _FakeConnector())
 
         result = asyncio.run(_retrieve_product_knowledge("prod_missing", "query"))
-        assert result == "content from id-keyed space"
+        assert "content from id-keyed space" in result
+        assert "<untrusted_content>" in result  # P0-8 data framing
         assert captured["sp_id"] == "SPACE123"

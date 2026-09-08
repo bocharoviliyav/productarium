@@ -18,22 +18,28 @@ Endpoints (prefix ``/api/products``, tags ``products``):
 
 Thin layer: request parsing + memory re-index handoff; all DB access lives in
 ``api.repositories.product_repo``.
+
+Authorization (P0-2): reads require visible access (owner / grant /
+viewer_global / manager / admin); writes require 'rw' (owner / rw-grant /
+manager / admin). Product creation is restricted to admin|manager; the creator
+becomes the owner when the payload has none.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from api.db import get_db
+from api.models import ProductGrantORM, ProductORM, UserORM
 from api.repositories import product_repo
 from api.schemas import Codebase, Links, Product, Spec
-from api.auth.deps import get_current_user
-from api.models import UserORM
+from api.auth.deps import get_current_user, require_product_access
+from api.utils.repo_url import validate_repo_url
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +73,36 @@ class ContentUpdate(BaseModel):
 
 
 @router.get("", response_model=list[Product])
-async def list_products(db: Session = Depends(get_db)):
-    return product_repo.list_products(db)
+async def list_products(
+    db: Session = Depends(get_db),
+    user: UserORM = Depends(get_current_user),
+):
+    """List the products visible to the current user (P0-2).
+
+    admin / manager / viewer_global see everything; a plain ``user`` sees own
+    products + products with an explicit grant.
+    """
+    visible = _visible_product_ids(db, user)
+    return product_repo.list_products(db, product_ids=visible)
+
+
+def _visible_product_ids(db: Session, user: UserORM) -> Optional[Set[str]]:
+    """None = no restriction; otherwise the set of product ids the user sees."""
+    if user.role in ("admin", "manager", "viewer_global"):
+        return None
+    owned = {
+        row[0]
+        for row in db.query(ProductORM.id)
+        .filter(ProductORM.owner_id == user.id)
+        .all()
+    }
+    granted = {
+        row[0]
+        for row in db.query(ProductGrantORM.product_id)
+        .filter(ProductGrantORM.user_id == user.id)
+        .all()
+    }
+    return owned | granted
 
 
 def _guard_no_raw_dsn(result: Product, request: Product) -> None:
@@ -105,7 +139,22 @@ def _guard_no_raw_dsn(result: Product, request: Product) -> None:
 
 
 @router.post("", response_model=Product)
-async def create_product(product: Product, db: Session = Depends(get_db)):
+async def create_product(
+    product: Product,
+    db: Session = Depends(get_db),
+    user: UserORM = Depends(get_current_user),
+):
+    """Create a product (admin|manager only, P0-2).
+
+    When the payload carries no ``owner_id`` the creator becomes the owner.
+    """
+    if user.role not in ("admin", "manager"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins and managers can create products",
+        )
+    if not product.owner_id:
+        product = product.model_copy(update={"owner_id": user.id})
     p_orm = product_repo.upsert_product(db, product)
     result = product_repo.orm_to_product(p_orm)
     _guard_no_raw_dsn(result, product)
@@ -113,7 +162,11 @@ async def create_product(product: Product, db: Session = Depends(get_db)):
 
 
 @router.get("/{product_id}", response_model=Product)
-async def get_product(product_id: str, db: Session = Depends(get_db)):
+async def get_product(
+    product_id: str,
+    db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("ro")),
+):
     p_orm = product_repo.load_product_orm(db, product_id)
     if p_orm is None:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -121,8 +174,15 @@ async def get_product(product_id: str, db: Session = Depends(get_db)):
 
 
 @router.put("/{product_id}", response_model=Product)
-async def update_product(product_id: str, product: Product, db: Session = Depends(get_db)):
+async def update_product(
+    product_id: str,
+    product: Product,
+    db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
+):
     # Preserve previous overwrite semantics: the body Product is saved as-is.
+    # (Server-owned verified flags and stored tokens survive the replace —
+    # see product_repo.upsert_product.)
     p_orm = product_repo.upsert_product(db, product)
     result = product_repo.orm_to_product(p_orm)
     _guard_no_raw_dsn(result, product)
@@ -130,7 +190,11 @@ async def update_product(product_id: str, product: Product, db: Session = Depend
 
 
 @router.delete("/{product_id}")
-async def delete_product(product_id: str, db: Session = Depends(get_db)):
+async def delete_product(
+    product_id: str,
+    db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
+):
     product_repo.delete_product(db, product_id)
     return {"message": "Product deleted successfully"}
 
@@ -160,7 +224,19 @@ def _reindex(
 
 
 @router.post("/{product_id}/codebases", response_model=Product)
-async def add_codebase(product_id: str, codebase: Codebase, db: Session = Depends(get_db)):
+async def add_codebase(
+    product_id: str,
+    codebase: Codebase,
+    db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
+):
+    # P0-1: reject dangerous clone sources at the CRUD boundary, before any
+    # git invocation (ext::, file://, ssh://, arbitrary local paths, ...).
+    if codebase.repo_url:
+        try:
+            validate_repo_url(codebase.repo_url)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
         return product_repo.add_codebase(db, product_id, codebase)
     except ValueError:
@@ -168,7 +244,12 @@ async def add_codebase(product_id: str, codebase: Codebase, db: Session = Depend
 
 
 @router.delete("/{product_id}/codebases/{codebase_id}", response_model=Product)
-async def delete_codebase(product_id: str, codebase_id: str, db: Session = Depends(get_db)):
+async def delete_codebase(
+    product_id: str,
+    codebase_id: str,
+    db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
+):
     try:
         return product_repo.delete_codebase(db, product_id, codebase_id)
     except ValueError:
@@ -181,6 +262,7 @@ async def update_codebase_docs(
     codebase_id: str,
     body: CodebaseDocUpdate,
     db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
 ):
     """Edit a codebase's generated documentation (WYSIWYG editor saves)."""
     try:
@@ -203,7 +285,12 @@ async def update_codebase_docs(
 
 # --- Specs ------------------------------------------------------------------
 @router.post("/{product_id}/specs", response_model=Product)
-async def add_spec(product_id: str, spec: Spec, db: Session = Depends(get_db)):
+async def add_spec(
+    product_id: str,
+    spec: Spec,
+    db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
+):
     try:
         return product_repo.add_spec(db, product_id, spec)
     except ValueError:
@@ -211,7 +298,12 @@ async def add_spec(product_id: str, spec: Spec, db: Session = Depends(get_db)):
 
 
 @router.delete("/{product_id}/specs/{spec_id}", response_model=Product)
-async def delete_spec(product_id: str, spec_id: str, db: Session = Depends(get_db)):
+async def delete_spec(
+    product_id: str,
+    spec_id: str,
+    db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
+):
     try:
         return product_repo.delete_spec(db, product_id, spec_id)
     except ValueError:
@@ -224,6 +316,7 @@ async def update_spec(
     spec_id: str,
     body: ContentUpdate,
     db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
 ):
     """Replace a spec's raw content (authored directly, no generation)."""
     try:
@@ -238,7 +331,12 @@ async def update_spec(
 
 # --- Links ------------------------------------------------------------------
 @router.post("/{product_id}/links", response_model=Product)
-async def add_links(product_id: str, links: Links, db: Session = Depends(get_db)):
+async def add_links(
+    product_id: str,
+    links: Links,
+    db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
+):
     try:
         return product_repo.add_links(db, product_id, links)
     except ValueError:
@@ -246,7 +344,12 @@ async def add_links(product_id: str, links: Links, db: Session = Depends(get_db)
 
 
 @router.delete("/{product_id}/links/{links_id}", response_model=Product)
-async def delete_links(product_id: str, links_id: str, db: Session = Depends(get_db)):
+async def delete_links(
+    product_id: str,
+    links_id: str,
+    db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
+):
     try:
         return product_repo.delete_links(db, product_id, links_id)
     except ValueError:
@@ -259,6 +362,7 @@ async def update_links(
     links_id: str,
     body: ContentUpdate,
     db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
 ):
     """Replace a links collection's raw content."""
     try:

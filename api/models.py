@@ -2,7 +2,8 @@
 
 Defines the product-centric data model:
 
-- ``UserORM``          — local + Keycloak users (admin/user roles)
+- ``UserORM``          — local + Keycloak users (admin/manager/viewer_global/user roles)
+- ``ProductGrantORM``  — per-product access grants (ro/rw) for non-admin users
 - ``ProductORM``       — top-level product (no ``type``; +summary, +owner_id)
 - ``CodebaseORM``      — git repository artifact (repo clone, page tree, generated docs)
 - ``SpecORM``          — OpenAPI/AsyncAPI spec artifact (single yaml/json)
@@ -93,6 +94,9 @@ class Base(DeclarativeBase):
 # The spec subtype enum (openapi|asyncapi) carried on SpecORM.kind.
 SPEC_KINDS: tuple[str, ...] = ("openapi", "asyncapi")
 
+# Valid user roles (P0-2 role model) — see UserORM.role.
+USER_ROLES: tuple[str, ...] = ("user", "admin", "manager", "viewer_global")
+
 
 class UserORM(Base):
     """ORM model for the ``users`` table (local + Keycloak users)."""
@@ -104,7 +108,11 @@ class UserORM(Base):
     email: Mapped[Optional[str]] = mapped_column(String(256), nullable=True, unique=True)
     # Null for Keycloak users (no local password).
     password_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # 'user' | 'admin'
+    # 'user' | 'admin' | 'manager' | 'viewer_global' (P0-2 role model):
+    #   admin         — full access incl. the admin UI
+    #   manager       — create + fill products (no admin UI)
+    #   viewer_global — read-only on all products
+    #   user          — own products + per-product grants only
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
     # 'local' | 'keycloak'
     provider: Mapped[str] = mapped_column(String(16), nullable=False, default="local")
@@ -448,6 +456,41 @@ class KnowledgeNodeORM(Base):
         return (
             f"<KnowledgeNodeORM id={self.id!r} title={self.title!r} "
             f"node_type={self.node_type!r}>"
+        )
+
+
+class ProductGrantORM(Base):
+    """Per-product access grant (P0-2): user -> product at level ``ro`` | ``rw``.
+
+    Grants complement ownership: a plain ``user`` (or ``manager``) gets read or
+    write access to products they do not own. Composite PK (product_id,
+    user_id) so a user has at most one grant per product. Both FKs cascade:
+    deleting the product or the user removes the grant.
+    """
+
+    __tablename__ = "product_grants"
+
+    product_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("products.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("productarium_users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # 'ro' | 'rw'
+    level: Mapped[str] = mapped_column(String(8), nullable=False, default="ro")
+    granted_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return (
+            f"<ProductGrantORM product={self.product_id!r} user={self.user_id!r} "
+            f"level={self.level!r}>"
         )
 
 

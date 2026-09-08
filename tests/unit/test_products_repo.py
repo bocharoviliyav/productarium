@@ -129,10 +129,18 @@ class TestFromPydanticMappers:
         assert orm.name == "Repo A"
         assert orm.repo_url == "https://github.com/example/repo"
         assert orm.repo_type == "github"
-        assert orm.token == "tok"
+        # P0-2: the payload token is WRITE-ONLY — the mapper persists only the
+        # caller-resolved stored (encrypted) value; a raw "tok" never lands.
+        assert orm.token is None
+        stored = pr._resolved_stored_token(c.token, None)
+        assert stored is not None and stored != "tok"  # Fernet ciphertext
+        orm2 = pr._codebase_orm_from_pydantic(c, stored_token=stored)
+        assert orm2.token == stored
+        assert pr.get_codebase_token(orm2) == "tok"
         assert orm.generated_docs is None
         assert orm.pages is None
-        assert orm.verified is False
+        # P0-5: verified is server-owned — not copied from the payload.
+        assert orm.verified is None
         assert orm.source == "manual"
 
     def test_codebase_orm_from_pydantic_source_defaults_to_manual(self):
@@ -152,7 +160,9 @@ class TestFromPydanticMappers:
         assert orm.name == "OpenAPI"
         assert orm.kind == "openapi"
         assert orm.content == "openapi: 3.0.0"
-        assert orm.verified is False
+        # P0-5: verified is server-owned — not copied from the payload
+        # (column default applies at flush, so it is None on the fresh ORM).
+        assert orm.verified is None
         assert orm.source == "manual"
 
     def test_spec_orm_from_pydantic_kind_defaults_to_openapi(self):
@@ -172,7 +182,8 @@ class TestFromPydanticMappers:
         assert orm.id == "links_1"
         assert orm.name == "Links A"
         assert orm.content is not None and "url" in orm.content
-        assert orm.verified is False
+        # P0-5: verified is server-owned — not copied from the payload.
+        assert orm.verified is None
         assert orm.source == "manual"
 
     def test_links_orm_from_pydantic_source_defaults_to_manual(self):

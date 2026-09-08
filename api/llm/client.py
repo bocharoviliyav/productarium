@@ -82,11 +82,27 @@ _CHAT_FIELDS = frozenset(
 
 
 def is_local_endpoint(base_url: Optional[str]) -> bool:
-    """True when the base URL points at a local/loopback endpoint."""
+    """True when the base URL points at a local/loopback endpoint.
+
+    Exact hostname comparison (P0-10): the previous substring check let
+    ``http://localhost.attacker.com`` pass as "local" and inherit the
+    keyless-endpoint policy. Parse the URL and compare the hostname EXACTLY
+    against ``_LOCAL_HOSTS`` (IPv6 literals unbracketed; ``urlsplit`` returns
+    them bare, the tuple keeps bracketed entries for readability); anything
+    unparseable or host-less is not local.
+    """
     if not base_url:
         return False
-    lowered = base_url.lower()
-    return any(host in lowered for host in _LOCAL_HOSTS)
+    try:
+        from urllib.parse import urlsplit
+
+        hostname = urlsplit(base_url).hostname
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+    host = hostname.lower()
+    return host in _LOCAL_HOSTS or f"[{host}]" in _LOCAL_HOSTS
 
 
 def is_no_auth_placeholder(api_key: Optional[str]) -> bool:

@@ -6,6 +6,7 @@ import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { tomorrow } from 'react-syntax-highlighter/dist/cjs/styles/prism';
 import Mermaid from './Mermaid';
+import { safeExternalHref } from '@/lib/links';
 
 interface MarkdownProps {
   content: string;
@@ -75,13 +76,14 @@ const Markdown: React.FC<MarkdownProps> = ({ content }) => {
       return <li className="mb-2 text-sm leading-relaxed dark:text-white" {...props}>{children}</li>;
     },
     a({ children, href, ...props }: { children?: React.ReactNode; href?: string }) {
-      // Scheme whitelist (defense in depth on top of rehype-sanitize): only
-      // absolute web/mailto links and in-page anchors become clickable —
-      // anything else (javascript:, data:, unknown schemes) renders inert.
-      const safeHref =
-        typeof href === 'string' && /^(https?:|mailto:|#)/i.test(href.trim())
-          ? href.trim()
-          : undefined;
+      // P0-4: markdown (generated docs, specs) is untrusted — only allowlisted
+      // schemes (http/https/mailto) and same-page #anchors become links
+      // (defense in depth on top of rehype-sanitize); javascript:/data: and
+      // other targets render as plain text.
+      const safeHref = safeExternalHref(href);
+      if (!safeHref) {
+        return <span className="font-medium" {...props}>{children}</span>;
+      }
       return (
         <a
           href={safeHref}

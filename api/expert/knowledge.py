@@ -130,7 +130,11 @@ async def _retrieve_product_knowledge(product_id: str, query: str) -> str:
                 if sp_id:
                     pulled = c_connector.pull(sp_id, opts={"recursive": False})
                     if pulled and pulled.get("markdown"):
-                        return pulled["markdown"]
+                        # P0-8: third-party wiki content is untrusted — frame it
+                        # as data before it reaches the LLM prompt.
+                        from api.utils.llm_helpers import wrap_untrusted
+
+                        return wrap_untrusted(pulled["markdown"])
     except Exception as e:
         logger.debug("Expert live Confluence fallback skipped for %s: %s", product_id, e)
 

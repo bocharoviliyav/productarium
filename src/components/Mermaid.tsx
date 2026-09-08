@@ -4,16 +4,20 @@ import mermaid from 'mermaid';
 import { useLanguage } from '@/contexts/LanguageContext';
 
 // Initialize mermaid with defaults - Japanese aesthetic
+// P0-3: diagrams are rendered from model/user-generated markdown, so mermaid
+// must run at securityLevel 'strict' (escapes HTML in labels, disables click
+// callbacks and links) with htmlLabels disabled (labels become SVG <text>,
+// not foreignObject HTML). 'loose' allowed arbitrary HTML/script injection.
 mermaid.initialize({
   startOnLoad: true,
   theme: 'neutral',
-  securityLevel: 'loose',
+  securityLevel: 'strict',
   suppressErrorRendering: true,
   logLevel: 'error',
   maxTextSize: 100000, // Increase text size limit
-  htmlLabels: true,
+  htmlLabels: false,
   flowchart: {
-    htmlLabels: true,
+    htmlLabels: false,
     curve: 'basis',
     nodeSpacing: 60,
     rankSpacing: 60,
@@ -395,10 +399,18 @@ const Mermaid: React.FC<MermaidProps> = ({ chart, className = '', zoomingEnabled
           setError(`${t.renderError ?? 'Diagram rendering error'}: ${errorMessage}`);
 
           if (mermaidRef.current) {
-            mermaidRef.current.innerHTML = `
-              <div class="text-red-500 dark:text-red-400 text-xs mb-1">${t.syntaxError ?? 'Syntax error in diagram'}</div>
-              <pre class="text-xs overflow-auto p-2 bg-gray-100 dark:bg-gray-800 rounded">${chart}</pre>
-            `;
+            // P0-3: never interpolate the (untrusted) chart source into
+            // innerHTML — build the error view via textContent so any markup
+            // in the diagram source is displayed, not executed.
+            mermaidRef.current.replaceChildren();
+            const label = document.createElement('div');
+            label.className = 'text-red-500 dark:text-red-400 text-xs mb-1';
+            label.textContent = t.syntaxError ?? 'Syntax error in diagram';
+            const pre = document.createElement('pre');
+            pre.className =
+              'text-xs overflow-auto p-2 bg-gray-100 dark:bg-gray-800 rounded';
+            pre.textContent = chart;
+            mermaidRef.current.append(label, pre);
           }
         }
       }
@@ -458,6 +470,9 @@ const Mermaid: React.FC<MermaidProps> = ({ chart, className = '', zoomingEnabled
         <div
           className={`relative group ${zoomingEnabled ? "h-full rounded-lg border-2 border-black" : ""}`}
         >
+          {/* Safe with mermaid securityLevel 'strict': the rendered SVG has
+              labels escaped as text, click callbacks disabled, and links
+              stripped — diagram source cannot inject markup or scripts. */}
           <div
             className={`flex justify-center overflow-auto text-center my-2 cursor-pointer hover:shadow-md transition-shadow duration-200 rounded-md ${className} ${zoomingEnabled ? "h-full" : ""}`}
             dangerouslySetInnerHTML={{ __html: svg }}

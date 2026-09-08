@@ -71,6 +71,33 @@ def _setup_db():
     return db
 
 
+def _register_overrides(app, db_mod, _get_test_db):
+    """Register DB + auth overrides on the real api.api app.
+
+    P0-2: the generate/status endpoints now authenticate + enforce product
+    access. Override the auth dependency with a system admin (same semantics as
+    AUTH_PROVIDER=none) and cover every captured get_db object: tests reload
+    api.db, so api.api's re-export, the docgen router's import, and
+    api.auth.deps' import may each be distinct function objects.
+    """
+    from datetime import datetime
+
+    import api.api as api_mod
+    import api.routers.docgen as docgen_router
+    from api.auth import deps as auth_deps
+    from api.models import UserORM
+
+    def _system_user():
+        return UserORM(
+            id="system", username="system", role="admin",
+            provider="local", created_at=datetime.utcnow(),
+        )
+
+    for get_db in (api_mod.get_db, docgen_router.get_db, auth_deps.get_db):
+        app.dependency_overrides[get_db] = _get_test_db
+    app.dependency_overrides[auth_deps.get_current_user] = _system_user
+
+
 def _build_app(db_mod, monkeypatch):
     """Return the real api.api app + client with get_db overridden and the
     worker-thread SessionLocal rebound to the test engine."""
@@ -87,22 +114,7 @@ def _build_app(db_mod, monkeypatch):
         finally:
             s.close()
 
-    api_mod.app.dependency_overrides[api_mod.get_db] = _get_test_db
-
-    # The real app now enforces router-level auth on the products-scoped
-    # routers (products/docgen/databases) — authenticate as a fixed admin.
-    from datetime import datetime
-
-    from api.models import UserORM
-
-    _admin = UserORM(
-        id="user_admin1",
-        username="admin",
-        role="admin",
-        provider="local",
-        created_at=datetime.utcnow(),
-    )
-    api_mod.app.dependency_overrides[api_mod.get_current_user] = lambda: _admin
+    _register_overrides(api_mod.app, db_mod, _get_test_db)
     return api_mod.app, TestClient(api_mod.app)
 
 
@@ -302,27 +314,15 @@ class TestAsyncDocgen:
         # set_main_event_loop — so _index_in_background hands off to the main
         # loop instead of scheduling on the worker loop (production behavior).
         client = TestClient(api_mod.app)
-        # Override get_db so the request-scoped session uses the test DB.
+        # Override get_db + auth so the request-scoped session uses the test DB
+        # and the (now authenticated) generate endpoints accept the request.
         def _get_test_db():
             s = db_mod.SessionLocal()
             try:
                 yield s
             finally:
                 s.close()
-        api_mod.app.dependency_overrides[api_mod.get_db] = _get_test_db
-        # Router-level auth (Wave F): authenticate as a fixed admin.
-        from datetime import datetime
-
-        from api.models import UserORM
-
-        _admin = UserORM(
-            id="user_admin1",
-            username="admin",
-            role="admin",
-            provider="local",
-            created_at=datetime.utcnow(),
-        )
-        api_mod.app.dependency_overrides[api_mod.get_current_user] = lambda: _admin
+        _register_overrides(api_mod.app, db_mod, _get_test_db)
         # The worker thread reads SessionLocal from api.docgen.jobs (its
         # import site), not api.api.
         monkeypatch.setattr(dj, "SessionLocal", db_mod.SessionLocal, raising=True)

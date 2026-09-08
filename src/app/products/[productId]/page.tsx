@@ -51,6 +51,7 @@ import {
   parseLinksContent,
   serializeLinksContent,
 } from "@/lib/types";
+import { safeExternalHref } from "@/lib/links";
 import { useNotifications } from "@/contexts/NotificationContext";
 
 type DeleteType = "codebase" | "spec" | "links" | "database";
@@ -94,6 +95,9 @@ export default function ProductDetailPage() {
   const [cbName, setCbName] = useState("");
   const [cbRepoUrl, setCbRepoUrl] = useState("");
   const [cbRepoType, setCbRepoType] = useState("github");
+  // Write-only access token (P0-2): sent once on create, never read back —
+  // the API excludes tokens from responses and exposes `has_token` instead.
+  const [cbToken, setCbToken] = useState("");
   const [isSaving, setIsSaving] = useState(false);
 
   // In-place link add form (inside the Links spoiler).
@@ -293,6 +297,7 @@ export default function ProductDetailPage() {
     setCbName("");
     setCbRepoUrl("");
     setCbRepoType("github");
+    setCbToken("");
   };
 
   const resetLinkForm = () => {
@@ -377,6 +382,9 @@ export default function ProductDetailPage() {
         name: cbName.trim(),
         repo_url: cbRepoUrl.trim() || null,
         repo_type: cbRepoType,
+        // Empty string would clear a stored token; omit the field entirely
+        // when the user left it blank (write-only semantics).
+        ...(cbToken.trim() ? { token: cbToken.trim() } : {}),
         source: "manual" as const,
       };
       const res = await fetch(`/api/products/${product.id}/codebases`, {
@@ -622,6 +630,8 @@ export default function ProductDetailPage() {
                         {links.map((l) => {
                           const items = parseLinksContent(l.content);
                           const firstUrl = items.find((it) => it.url?.trim())?.url;
+                          // P0-4: only allowlisted schemes become anchors.
+                          const firstHref = safeExternalHref(firstUrl);
                           const isDeleting = deletingId === l.id;
                           return (
                             <li
@@ -629,9 +639,9 @@ export default function ProductDetailPage() {
                               className="rounded-md border border-divider bg-surface-2 p-3"
                             >
                               <div className="flex items-center justify-between gap-2">
-                                {firstUrl ? (
+                                {firstHref ? (
                                   <a
-                                    href={firstUrl}
+                                    href={firstHref}
                                     target="_blank"
                                     rel="noopener noreferrer"
                                     className="truncate text-sm font-medium text-ink underline-offset-2 hover:underline"
@@ -665,23 +675,32 @@ export default function ProductDetailPage() {
                               </div>
                               {items.length > 0 && (
                                 <ul className="mt-2 flex flex-col gap-1.5">
-                                  {items.map((it, i) => (
-                                    <li key={i} className="flex flex-col gap-0.5 text-sm">
-                                      {it.url ? (
-                                        <a
-                                          href={it.url}
-                                          target="_blank"
-                                          rel="noopener noreferrer"
-                                          className="font-mono text-xs text-ink underline-offset-2 hover:underline"
-                                        >
-                                          {it.url}
-                                        </a>
-                                      ) : null}
-                                      {it.description && (
-                                        <span className="text-muted">{it.description}</span>
-                                      )}
-                                    </li>
-                                  ))}
+                                  {items.map((it, i) => {
+                                    const itemHref = safeExternalHref(it.url);
+                                    return (
+                                      <li key={i} className="flex flex-col gap-0.5 text-sm">
+                                        {it.url ? (
+                                          itemHref ? (
+                                            <a
+                                              href={itemHref}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="font-mono text-xs text-ink underline-offset-2 hover:underline"
+                                            >
+                                              {it.url}
+                                            </a>
+                                          ) : (
+                                            <span className="font-mono text-xs text-ink">
+                                              {it.url}
+                                            </span>
+                                          )
+                                        ) : null}
+                                        {it.description && (
+                                          <span className="text-muted">{it.description}</span>
+                                        )}
+                                      </li>
+                                    );
+                                  })}
                                 </ul>
                               )}
                             </li>
@@ -769,6 +788,19 @@ export default function ProductDetailPage() {
                       <option value="gitlab">{t.gitlab ?? "GitLab"}</option>
                     </Select>
                   </div>
+                </div>
+                <div>
+                  <Label>{t.gitToken ?? "Access token (optional)"}</Label>
+                  <Input
+                    type="password"
+                    value={cbToken}
+                    onChange={(e) => setCbToken(e.target.value)}
+                    placeholder={
+                      t.gitTokenPlaceholder ??
+                      "Personal access token — stored encrypted, never shown again"
+                    }
+                    autoComplete="off"
+                  />
                 </div>
                 <div className="flex items-center justify-end gap-2">
                   <Button type="button" variant="ghost" onClick={() => setShowCodebaseModal(false)}>
@@ -964,6 +996,9 @@ export default function ProductDetailPage() {
                                         <Tag tone="blue">{tArt?.codebase?.label ?? "Codebase"}</Tag>
                                         {hasDocs && (
                                           <Tag tone="green">{t.docsReady ?? "Docs ready"}</Tag>
+                                        )}
+                                        {c.has_token && (
+                                          <Tag tone="neutral">{t.tokenSaved ?? "Token saved"}</Tag>
                                         )}
                                         {c.verified && (
                                           <Tag tone="green">{t.verified ?? "Verified"}</Tag>

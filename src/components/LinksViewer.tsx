@@ -9,6 +9,7 @@
  */
 
 import { ArrowSquareOut, LinkSimple } from "@phosphor-icons/react";
+import { safeExternalHref } from "@/lib/links";
 import { parseLinksContent } from "@/lib/types";
 
 export function LinksViewer({ content }: { content: string }) {
@@ -38,7 +39,9 @@ export function LinksViewer({ content }: { content: string }) {
           {items.map((item, idx) => {
             const url = item.url.trim();
             const desc = (item.description ?? "").trim();
-            const isUrl = /^https?:\/\//i.test(url);
+            // P0-4: link targets are user-authored — only allowlisted schemes
+            // (http/https/mailto) become anchors, anything else renders as text.
+            const href = safeExternalHref(url);
             return (
               <tr
                 key={idx}
@@ -46,9 +49,9 @@ export function LinksViewer({ content }: { content: string }) {
               >
                 <td className="px-4 py-3">
                   {url ? (
-                    isUrl ? (
+                    href ? (
                       <a
-                        href={url}
+                        href={href}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="inline-flex items-center gap-1.5 font-mono text-xs text-ink underline-offset-2 hover:underline"

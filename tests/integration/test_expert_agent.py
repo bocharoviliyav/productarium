@@ -322,6 +322,8 @@ class TestRunExpertChat:
         captured: dict = {}
 
         async def _fake_generate_answer(prompt, model, base_url, api_key, **kwargs):
+            # **kwargs: the real call site also passes product_id/product_name/
+            # query/history for logging + verification plumbing.
             captured["prompt"] = prompt
             captured["kwargs"] = kwargs
             return "ok"

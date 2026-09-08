@@ -2,6 +2,15 @@
 
 All Product + child-entity DB access (load, upsert, add/remove, content update)
 lives here. No FastAPI dependencies — pure SQLAlchemy.
+
+Security invariants (P0):
+
+- Codebase git tokens are WRITE-ONLY: a plaintext token from a client payload
+  is encrypted (Fernet) before storage and never serialized back — responses
+  expose only ``has_token``. An empty token on update keeps the stored one.
+- The verified triple (verified/verified_by/verified_at) is SERVER-OWNED: it is
+  never copied from client payloads; full-replace upserts preserve it by id,
+  and only the verify endpoints (owner/admin) mutate it.
 """
 
 from __future__ import annotations
@@ -13,6 +22,7 @@ from typing import Any, List, Optional, Tuple
 
 from sqlalchemy.orm import Session, selectinload
 
+from api.config.settings import decrypt_secret, encrypt_secret, is_encrypted_secret
 from api.db import get_db  # re-exported so routers import it from the repo
 from api.models import (
     CodebaseORM,
@@ -26,44 +36,125 @@ from api.schemas import Codebase, Database, Links, Product, Spec
 logger = logging.getLogger(__name__)
 
 
+# --- Git token helpers (P0-2) -----------------------------------------------
+def _encrypt_stored_token(plaintext: Optional[str]) -> Optional[str]:
+    """Encrypt a git token for storage; None/empty stays None.
+
+    Falls back to storing the plaintext (with a warning) only when Fernet is
+    unavailable — same policy as the settings store.
+    """
+    if not plaintext:
+        return None
+    encrypted = encrypt_secret(plaintext)
+    if encrypted is None:
+        logger.warning(
+            "Fernet unavailable; storing a codebase git token in plaintext"
+        )
+        return plaintext
+    return encrypted
+
+
+def get_codebase_token(c: Any) -> Optional[str]:
+    """Plaintext git token for a codebase (ORM row or object with ``.token``).
+
+    Decrypts Fernet ciphertext; legacy plaintext values (pre-migration rows)
+    pass through unchanged. Never raises, never logs the value.
+    """
+    stored = getattr(c, "token", None)
+    if not stored:
+        return None
+    if is_encrypted_secret(stored):
+        return decrypt_secret(stored)
+    return stored
+
+
+def migrate_plaintext_tokens(db: Optional[Session] = None) -> int:
+    """Lazy migration (P0-2): encrypt any legacy plaintext codebase tokens.
+
+    Called once at startup (non-fatal). Rows already storing Fernet ciphertext
+    (``gAAAA…``) are skipped. Returns the number of migrated rows.
+    """
+    try:
+        if db is None:
+            from api.db import SessionLocal
+
+            with SessionLocal() as session:
+                return migrate_plaintext_tokens(session)
+        migrated = 0
+        rows = (
+            db.query(CodebaseORM)
+            .filter(CodebaseORM.token.isnot(None), CodebaseORM.token != "")
+            .all()
+        )
+        for row in rows:
+            if row.token and not is_encrypted_secret(row.token):
+                encrypted = encrypt_secret(row.token)
+                if encrypted is not None:
+                    row.token = encrypted
+                    migrated += 1
+        if migrated:
+            db.commit()
+            logger.info("Encrypted %d legacy plaintext codebase token(s).", migrated)
+        return migrated
+    except Exception as e:  # non-fatal by contract
+        logger.warning("Codebase token migration failed: %s", e)
+        return 0
+
+
 # --- ORM<->Pydantic mapping -------------------------------------------------
-def _codebase_orm_from_pydantic(c: Codebase) -> CodebaseORM:
+def _codebase_orm_from_pydantic(
+    c: Codebase, *, stored_token: Optional[str] = None
+) -> CodebaseORM:
+    """Build a CodebaseORM from a client payload.
+
+    ``stored_token`` is the already-encrypted value to persist — callers
+    resolve it via :func:`_resolved_stored_token` (empty payload token = keep
+    the existing stored value). The verified triple is intentionally NOT
+    copied from the payload (P0-5: server-owned).
+    """
     return CodebaseORM(
         id=c.id,
         name=c.name,
         repo_url=c.repo_url,
         repo_type=c.repo_type,
-        token=c.token,
+        token=stored_token,
         generated_docs=c.generated_docs,
         pages=c.pages,
-        verified=c.verified,
-        verified_by=c.verified_by,
-        verified_at=c.verified_at,
         source=c.source or "manual",
     )
 
 
+def _resolved_stored_token(
+    payload_token: Optional[str], existing_token: Optional[str]
+) -> Optional[str]:
+    """Merge rule for the write-only token (P0-2):
+
+    non-empty payload token → its ciphertext; empty/None → keep the existing
+    stored value (also None for brand-new entities).
+    """
+    raw = (payload_token or "").strip() if payload_token is not None else ""
+    if raw:
+        return _encrypt_stored_token(raw)
+    return existing_token or None
+
+
 def _spec_orm_from_pydantic(s: Spec) -> SpecORM:
+    # verified triple is server-owned (P0-5) — not copied from the payload
     return SpecORM(
         id=s.id,
         name=s.name,
         kind=s.kind or "openapi",
         content=s.content,
-        verified=s.verified,
-        verified_by=s.verified_by,
-        verified_at=s.verified_at,
         source=s.source or "manual",
     )
 
 
 def _links_orm_from_pydantic(l: Links) -> LinksORM:
+    # verified triple is server-owned (P0-5) — not copied from the payload
     return LinksORM(
         id=l.id,
         name=l.name,
         content=l.content,
-        verified=l.verified,
-        verified_by=l.verified_by,
-        verified_at=l.verified_at,
         source=l.source or "manual",
     )
 
@@ -108,7 +199,9 @@ def orm_to_product(p_orm: ProductORM) -> Product:
                 name=c.name,
                 repo_url=c.repo_url,
                 repo_type=c.repo_type,
-                token=c.token,
+                # P0-2: the stored token (ciphertext) is NEVER exposed; only
+                # the boolean fact that one exists.
+                has_token=bool(c.token),
                 generated_docs=c.generated_docs,
                 pages=c.pages,
                 verified=c.verified,
@@ -179,9 +272,22 @@ def load_product_orm(db: Session, product_id: str) -> Optional[ProductORM]:
     return q.first()
 
 
-def list_products(db: Session) -> List[Product]:
-    """List all products with children eagerly loaded, as Pydantic models."""
+def list_products(
+    db: Session, product_ids: Optional[Any] = None
+) -> List[Product]:
+    """List products with children eagerly loaded, as Pydantic models.
+
+    ``product_ids`` (optional iterable of ids) restricts the listing to the
+    products visible to the current user (P0-2). An empty iterable yields an
+    empty list without querying.
+    """
+    if product_ids is not None:
+        ids = list(product_ids)
+        if not ids:
+            return []
     q = db.query(ProductORM)
+    if product_ids is not None:
+        q = q.filter(ProductORM.id.in_(ids))
     for opt in _load_options():
         q = q.options(opt)
     return [orm_to_product(p) for p in q.all()]
@@ -191,7 +297,9 @@ def upsert_product(db: Session, product: Product) -> ProductORM:
     """Insert or update a Product and fully replace its codebases/specs/links.
 
     Mirrors the previous JSON overwrite semantics (full replace of the child
-    lists) so POST/PUT stay drop-in compatible.
+    lists) so POST/PUT stay drop-in compatible — but server-owned state
+    survives the replace (P0-5): the verified triple is preserved per child
+    id, and codebase tokens follow the write-only merge rule (P0-2).
     """
     p_orm = db.get(ProductORM, product.id)
     if p_orm is None:
@@ -209,6 +317,25 @@ def upsert_product(db: Session, product: Product) -> ProductORM:
         p_orm.summary = product.summary
         p_orm.owner_id = product.owner_id
 
+    # Snapshot server-owned state per (collection, id) before the full replace
+    # (plain values — the rows themselves are deleted below). P0-5: the
+    # verified triple is server-owned; P0-2: codebase tokens follow the
+    # write-only merge rule.
+    saved: dict = {}
+    for model, coll in (
+        (CodebaseORM, "codebases"),
+        (SpecORM, "specs"),
+        (LinksORM, "links"),
+    ):
+        for row in db.query(model).filter(model.product_id == product.id).all():
+            saved[(coll, row.id)] = {
+                "verified": row.verified,
+                "verified_by": row.verified_by,
+                "verified_at": row.verified_at,
+                # Only CodebaseORM carries a git token column.
+                "token": row.token if model is CodebaseORM else None,
+            }
+
     # Verified state is server-owned (review #4): capture the STORED
     # verification triple per database id BEFORE the child replace, so the
     # re-insert below preserves it for existing artifacts and forces False
@@ -225,15 +352,26 @@ def upsert_product(db: Session, product: Product) -> ProductORM:
         )
     db.flush()
     for c in product.codebases:
-        orm = _codebase_orm_from_pydantic(c)
+        prev = saved.get(("codebases", c.id))
+        orm = _codebase_orm_from_pydantic(
+            c,
+            stored_token=_resolved_stored_token(
+                c.token, prev.get("token") if prev else None
+            ),
+        )
+        _restore_server_state(orm, prev)
         orm.product_id = product.id
         db.add(orm)
     for s in product.specs:
+        prev = saved.get(("specs", s.id))
         orm = _spec_orm_from_pydantic(s)
+        _restore_server_state(orm, prev)
         orm.product_id = product.id
         db.add(orm)
     for l in product.links:
+        prev = saved.get(("links", l.id))
         orm = _links_orm_from_pydantic(l)
+        _restore_server_state(orm, prev)
         orm.product_id = product.id
         db.add(orm)
     for d in product.databases:
@@ -260,6 +398,26 @@ def delete_product(db: Session, product_id: str) -> None:
         db.commit()
 
 
+def _restore_server_state(orm, prev) -> None:
+    """Restore server-owned fields from the previous state with the same id.
+
+    ``prev`` is either a plain-value snapshot dict (upsert full replace) or a
+    live ORM row (_add_child replace). P0-5: verified/verified_by/verified_at
+    are owned by the verify endpoints — a client re-sending an entity cannot
+    reset or forge them.
+    """
+    if prev is None:
+        return
+    if isinstance(prev, dict):
+        orm.verified = prev.get("verified") or False
+        orm.verified_by = prev.get("verified_by")
+        orm.verified_at = prev.get("verified_at")
+    else:
+        orm.verified = prev.verified
+        orm.verified_by = prev.verified_by
+        orm.verified_at = prev.verified_at
+
+
 # --- Per-type add / delete --------------------------------------------------
 def _add_child(db: Session, product_id: str, orm, collection: str) -> Product:
     p_orm = load_product_orm(db, product_id)
@@ -267,6 +425,10 @@ def _add_child(db: Session, product_id: str, orm, collection: str) -> Product:
         raise ValueError("Product not found")
     existing = next((x for x in getattr(p_orm, collection) if x.id == orm.id), None)
     if existing is not None:
+        _restore_server_state(orm, existing)
+        if isinstance(orm, CodebaseORM) and not orm.token:
+            # write-only token merge: empty payload token keeps the stored one
+            orm.token = existing.token
         getattr(p_orm, collection).remove(existing)
         db.flush()
     getattr(p_orm, collection).append(orm)
@@ -288,7 +450,15 @@ def _delete_child(db: Session, product_id: str, entity_id: str, model, collectio
 
 
 def add_codebase(db: Session, product_id: str, codebase: Codebase) -> Product:
-    orm = _codebase_orm_from_pydantic(codebase)
+    existing_token = (
+        db.query(CodebaseORM.token)
+        .filter(CodebaseORM.product_id == product_id, CodebaseORM.id == codebase.id)
+        .scalar()
+    )
+    orm = _codebase_orm_from_pydantic(
+        codebase,
+        stored_token=_resolved_stored_token(codebase.token, existing_token),
+    )
     orm.product_id = product_id
     return _add_child(db, product_id, orm, "codebases")
 

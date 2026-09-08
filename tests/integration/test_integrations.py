@@ -453,7 +453,11 @@ class TestIntegrationsRouter:
         # is imported fresh here, but other tests reload api.db (creating a new
         # get_db) after the router was pre-imported via api.api — overriding both
         # keeps this test robust to that, matching test_admin_public's pattern.
+        # require_product_access (api.auth.deps) holds yet another captured copy;
+        # override it as well so the product-access dependency sees this engine.
         app.dependency_overrides[router_mod.get_db] = _override_get_db
+        import api.auth.deps as deps_mod
+        app.dependency_overrides[deps_mod.get_db] = _override_get_db
         app.dependency_overrides[get_current_user] = lambda: _admin
         app.include_router(router_mod.router)
         client = TestClient(app)

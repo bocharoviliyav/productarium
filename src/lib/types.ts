@@ -59,7 +59,14 @@ export interface Codebase {
   name: string;
   repo_url?: string | null;
   repo_type?: string | null;
+  /**
+   * Write-only field: the backend accepts a token on create/update but never
+   * returns it (Pydantic `exclude`). Responses carry `has_token` instead —
+   * the token itself is resolved server-side from encrypted storage.
+   */
   token?: string | null;
+  /** True when the backend has a stored (encrypted) access token. */
+  has_token?: boolean;
   generated_docs?: string | null;
   pages?: ArtifactPages;
   verified?: boolean;
@@ -162,7 +169,7 @@ export interface KnowledgeNode {
 /* Auth + admin (contract J)                                           */
 /* ------------------------------------------------------------------ */
 
-export type UserRole = "user" | "admin";
+export type UserRole = "user" | "admin" | "manager" | "viewer_global";
 export type AuthProvider = "local" | "keycloak";
 
 export interface User {
@@ -415,7 +422,9 @@ export function codebaseToRepoInfo(
     owner,
     repo,
     type,
-    token: codebase.token ?? null,
+    // The API no longer returns tokens (write-only): the backend resolves the
+    // stored encrypted token itself when cloning/pulling.
+    token: null,
     localPath: null,
     repoUrl: codebase.repo_url,
   };

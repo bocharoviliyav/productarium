@@ -175,6 +175,11 @@ class GitConnector:
         the configured token (e.g. a per-request token from the caller).
         """
         from api.clients.git import download_repo
+        from api.utils.repo_url import validate_repo_url
+
+        # P0-1: reject dangerous clone sources (ext::, file://, ssh://, local
+        # paths outside the managed dir) before any git invocation.
+        validate_repo_url(source_id)
 
         opts = opts or {}
         token = opts.get("token")

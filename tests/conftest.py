@@ -190,10 +190,16 @@ def build_test_client(
         finally:
             s.close()
 
-    # Override every captured get_db reference the routers hold.
+    # Override every captured get_db reference the routers hold. Tests reload
+    # api.db (per-test isolation), so a router imported at a different time can
+    # hold a different get_db object than api.auth.deps — override deps' copy
+    # too so dependencies like require_product_access see the same test DB.
+    import api.auth.deps as auth_deps
+
     seen = set()
-    for mod in routers:
-        get_db = getattr(mod, "get_db", None)
+    for get_db in [auth_deps.get_db] + [
+        getattr(mod, "get_db", None) for mod in routers
+    ]:
         if get_db is not None and id(get_db) not in seen:
             app.dependency_overrides[get_db] = _get_test_db
             seen.add(id(get_db))

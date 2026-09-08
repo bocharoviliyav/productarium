@@ -28,7 +28,11 @@ class Codebase(BaseModel):
     name: str
     repo_url: Optional[str] = None
     repo_type: Optional[str] = None
-    token: Optional[str] = None
+    # Write-only (P0-2): accepted on input, never serialized into responses.
+    # Empty/None on update = keep the stored token.
+    token: Optional[str] = Field(default=None, exclude=True)
+    # True when an (encrypted) access token is stored for this repo.
+    has_token: bool = False
     generated_docs: Optional[str] = None
     pages: Optional[Dict[str, Any]] = None
     verified: bool = False
@@ -95,7 +99,8 @@ class Product(BaseModel):
 class UserBase(BaseModel):
     username: str
     email: Optional[str] = None
-    role: str = "user"  # user|admin
+    # user|admin|manager|viewer_global (P0-2 role model)
+    role: str = "user"
     provider: str = "local"  # local|keycloak
 
 
@@ -145,7 +150,8 @@ class UserCreateAdmin(BaseModel):
     """Admin creates a local user (optionally with a temp password)."""
     username: str
     email: Optional[str] = None
-    role: str = "user"  # user|admin
+    # user|admin|manager|viewer_global (P0-2 role model)
+    role: str = "user"
     # Optional temp password; if omitted a random one is generated and returned.
     password: Optional[str] = None
     must_change_password: bool = True

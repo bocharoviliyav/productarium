@@ -16,6 +16,21 @@ from api.models import ApiTokenORM, UserORM
 # --------------------------------------------------------------------------- #
 # Helper: build a TestClient for the auth router with the isolated DB
 # --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True)
+def _reset_login_rate_limits():
+    """Clear the in-process login rate limiter before each test.
+
+    The limiter is keyed per client IP and TestClient always presents the same
+    one, so without a reset the 10/min default trips mid-module (429 instead of
+    the expected 200/401). Per-test isolation is the intended test semantics.
+    """
+    from api.utils.rate_limit import reset_rate_limits
+
+    reset_rate_limits()
+    yield
+    reset_rate_limits()
+
+
 def _build_client(isolated_db, monkeypatch, auth_provider="local"):
     import api.auth as auth_pkg
     import api.auth.router as router_mod
@@ -620,13 +635,14 @@ class TestGetCurrentUserDeps:
         finally:
             db.close()
 
-    def test_transient_user_from_claims(self, isolated_db, monkeypatch):
-        """When the token is valid but the user_id is not in the DB, a transient
-        user is built from the token claims."""
+    def test_stale_token_for_missing_user_401(self, isolated_db, monkeypatch):
+        """P0-9: a valid-signature token for a user that is NOT in the DB must be
+        rejected with 401 — no transient user is built from token claims (the
+        claims are attacker-controllable; a deleted user must lose access)."""
         import api.auth.deps as deps_mod
         from api.auth.deps import get_current_user
         from api.auth.tokens import create_session_token
-        from fastapi import Request
+        from fastapi import HTTPException, Request
 
         monkeypatch.setattr(deps_mod, "AUTH_PROVIDER", "local")
         from api.models import UserORM
@@ -638,10 +654,9 @@ class TestGetCurrentUserDeps:
         })
         db = isolated_db.SessionLocal()
         try:
-            user = get_current_user(request, db)
-            assert user.id == "user_transient"
-            assert user.username == "transient"
-            assert user.role == "admin"
+            with pytest.raises(HTTPException) as exc_info:
+                get_current_user(request, db)
+            assert exc_info.value.status_code == 401
         finally:
             db.close()
 

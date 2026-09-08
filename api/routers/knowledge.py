@@ -38,10 +38,10 @@ import importlib
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session, selectinload
 
-from api.auth.deps import get_current_user
+from api.auth.deps import get_current_user, require_product_access
 from api.db import get_db
 from api.docgen.summary import generate_product_summary
 from api.models import KnowledgeNodeORM, ProductORM
@@ -145,6 +145,26 @@ def _load_product(db: Session, product_id: str) -> ProductORM:
     return p
 
 
+# Upload size limit (P0-11): admin setting > env > 50 MiB default.
+_DEFAULT_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _upload_max_bytes() -> int:
+    """Resolve the upload size limit for markitdown uploads."""
+    try:
+        from api.config.settings import get_setting
+
+        raw = get_setting("limits.upload_max_bytes")
+        if raw and str(raw).strip().isdigit():
+            return int(str(raw).strip())
+    except Exception:  # pragma: no cover - settings store down
+        pass
+    raw_env = os.environ.get("UPLOAD_MAX_BYTES", "")
+    if raw_env.strip().isdigit():
+        return int(raw_env.strip())
+    return _DEFAULT_UPLOAD_MAX_BYTES
+
+
 def _load_node(db: Session, product_id: str, node_id: str) -> KnowledgeNodeORM:
     n = db.get(KnowledgeNodeORM, node_id)
     if n is None or n.product_id != product_id:
@@ -169,10 +189,9 @@ def _is_owner(product: ProductORM, node: Optional[KnowledgeNodeORM], user: UserO
 def get_knowledge_tree(
     product_id: str,
     db: Session = Depends(get_db),
-    _user: UserORM = Depends(get_current_user),
+    _product: ProductORM = Depends(require_product_access("ro")),
 ) -> List[Dict[str, Any]]:
     """Return the nested knowledge tree for a product (list of root nodes)."""
-    _load_product(db, product_id)
     nodes = (
         db.query(KnowledgeNodeORM)
         .filter(KnowledgeNodeORM.product_id == product_id)
@@ -191,9 +210,10 @@ def create_node(
     body: KnowledgeNodeCreate,
     db: Session = Depends(get_db),
     user: UserORM = Depends(get_current_user),
+    _product: ProductORM = Depends(require_product_access("rw")),
 ) -> KnowledgeNode:
     """Create a knowledge node. Validates parent belongs to the same product."""
-    _load_product(db, product_id)
+    # (visibility/rw was enforced by require_product_access above)
     if body.parent_id:
         parent = db.get(KnowledgeNodeORM, body.parent_id)
         if parent is None or parent.product_id != product_id:
@@ -227,7 +247,7 @@ def get_node(
     product_id: str,
     node_id: str,
     db: Session = Depends(get_db),
-    _user: UserORM = Depends(get_current_user),
+    _product: ProductORM = Depends(require_product_access("ro")),
 ) -> KnowledgeNode:
     """Return a single knowledge node (full content_md)."""
     node = _load_node(db, product_id, node_id)
@@ -285,7 +305,7 @@ def update_node(
     node_id: str,
     body: KnowledgeNodeUpdate,
     db: Session = Depends(get_db),
-    _user: UserORM = Depends(get_current_user),
+    _product: ProductORM = Depends(require_product_access("rw")),
 ) -> KnowledgeNode:
     """Update a node's title/slug/content_md/node_type/parent_id.
 
@@ -331,7 +351,7 @@ def delete_node(
     product_id: str,
     node_id: str,
     db: Session = Depends(get_db),
-    _user: UserORM = Depends(get_current_user),
+    _product: ProductORM = Depends(require_product_access("rw")),
 ) -> Dict[str, str]:
     """Delete a node; its subtree is removed by the DB ON DELETE CASCADE."""
     node = _load_node(db, product_id, node_id)
@@ -394,13 +414,33 @@ def _convert_via_markitdown(data: bytes, filename: str) -> tuple:
 async def upload_node_content(
     product_id: str,
     node_id: str,
+    request: Request,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    _user: UserORM = Depends(get_current_user),
+    _product: ProductORM = Depends(require_product_access("rw")),
 ) -> KnowledgeNode:
-    """Convert an uploaded file to Markdown via markitdown and store as content_md."""
+    """Convert an uploaded file to Markdown via markitdown and store as content_md.
+
+    Uploads are size-capped (P0-11): ``limits.upload_max_bytes`` admin setting
+    > ``UPLOAD_MAX_BYTES`` env > 50 MiB. Both a Content-Length pre-check and a
+    bounded read enforce the cap (a lying/missing Content-Length is caught by
+    the read), returning 413 immediately.
+    """
     node = _load_node(db, product_id, node_id)
-    data = await file.read()
+    limit = _upload_max_bytes()
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.strip().isdigit():
+        if int(content_length.strip()) > limit:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Upload exceeds the {limit // (1024 * 1024)} MiB limit",
+            )
+    data = await file.read(limit + 1)
+    if len(data) > limit:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Upload exceeds the {limit // (1024 * 1024)} MiB limit",
+        )
     if not data:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
     filename = file.filename or ""
@@ -463,7 +503,7 @@ def verify_node(
 async def generate_summary(
     product_id: str,
     db: Session = Depends(get_db),
-    _user: UserORM = Depends(get_current_user),
+    _product: ProductORM = Depends(require_product_access("rw")),
 ) -> Dict[str, Any]:
     """Generate an AI summary over the product's artifacts + knowledge nodes.
 

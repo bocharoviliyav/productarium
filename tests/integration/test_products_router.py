@@ -279,12 +279,13 @@ class TestUpdateProduct:
         assert r.status_code == 200
         assert r.json()["name"] == "Updated"
 
-    def test_update_upserts_missing(self, isolated_db):
-        # PUT uses upsert, so a non-existent product is created.
+    def test_update_missing_product_404(self, isolated_db):
+        # P0-2: PUT is guarded by require_product_access("rw") — a missing
+        # product is indistinguishable from an invisible one (404, no existence
+        # leak, no create-by-PUT). Creation is POST-only.
         app, client = _make_client(isolated_db)
         r = client.put("/api/products/prod_new", json=_product_payload("prod_new"))
-        assert r.status_code == 200
-        assert r.json()["id"] == "prod_new"
+        assert r.status_code == 404
 
 
 # --------------------------------------------------------------------------- #
@@ -300,10 +301,12 @@ class TestDeleteProduct:
         # Confirm gone.
         assert client.get("/api/products/prod_1").status_code == 404
 
-    def test_delete_missing_is_noop(self, isolated_db):
+    def test_delete_missing_is_404(self, isolated_db):
+        # P0-2: DELETE on a missing product returns 404 (no existence leak);
+        # it no longer returns a no-op 200.
         app, client = _make_client(isolated_db)
         r = client.delete("/api/products/missing")
-        assert r.status_code == 200
+        assert r.status_code == 404
 
 
 # --------------------------------------------------------------------------- #

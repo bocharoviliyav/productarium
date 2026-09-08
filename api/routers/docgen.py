@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from api.auth.deps import get_current_user
+from api.auth.deps import get_current_user, require_product_access
 from api.db import get_db
 from api.docgen.jobs import (
     _progress_snapshot,
@@ -29,6 +29,7 @@ from api.docgen.jobs import (
     get_job,
     submit_job,
 )
+from api.models import ProductORM
 from api.repositories import product_repo
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ def _start_generate(
     db: Session, product_id: str, entity_type: str, entity_id: str,
     request_data: GenerateDocRequest,
 ) -> JSONResponse:
+    # Access (rw) is enforced by the endpoint's require_product_access dep.
     p_orm = product_repo.load_product_orm(db, product_id)
     if p_orm is None:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -86,6 +88,7 @@ def _start_generate(
 async def generate_codebase_docs(
     product_id: str, codebase_id: str,
     request_data: GenerateDocRequest, db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
 ):
     return _start_generate(db, product_id, "codebase", codebase_id, request_data)
 
@@ -94,6 +97,7 @@ async def generate_codebase_docs(
 async def get_codebase_docgen_status(
     product_id: str, codebase_id: str,
     job_id: str = Query(..., description="Docgen job id returned by the generate endpoint"),
+    _product: ProductORM = Depends(require_product_access("ro")),
 ):
     return _get_status(product_id, "codebase", codebase_id, job_id)
 
@@ -102,6 +106,7 @@ async def get_codebase_docgen_status(
 async def generate_spec_docs(
     product_id: str, spec_id: str,
     request_data: GenerateDocRequest, db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
 ):
     return _start_generate(db, product_id, "spec", spec_id, request_data)
 
@@ -110,6 +115,7 @@ async def generate_spec_docs(
 async def get_spec_docgen_status(
     product_id: str, spec_id: str,
     job_id: str = Query(..., description="Docgen job id returned by the generate endpoint"),
+    _product: ProductORM = Depends(require_product_access("ro")),
 ):
     return _get_status(product_id, "spec", spec_id, job_id)
 

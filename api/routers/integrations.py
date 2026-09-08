@@ -34,7 +34,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from api.auth.deps import get_current_user, require_admin
+from api.auth.deps import get_current_user, require_admin, require_product_access
 from api.db import get_db
 from api.integrations.registry import get_connector, list_connectors
 from api.models import CodebaseORM, KnowledgeNodeORM, ProductORM
@@ -85,12 +85,13 @@ def _slugify(title: str) -> str:
 
 
 def _codebase_pydantic(c: CodebaseORM) -> Codebase:
+    # P0-2: the stored (encrypted) token is never exposed — only has_token.
     return Codebase(
         id=c.id,
         name=c.name,
         repo_url=c.repo_url,
         repo_type=c.repo_type,
-        token=c.token,
+        has_token=bool(c.token),
         generated_docs=c.generated_docs,
         pages=c.pages,
         verified=c.verified,
@@ -223,8 +224,9 @@ def codebase_from_integration(
     body: FromCodebaseRequest,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
+    _product: ProductORM = Depends(require_product_access("rw")),
 ):
-    """Pull a repo from a git connector and create a Codebase.
+    """Pull a repo from a git connector and create a Codebase (rw required).
 
     Only git connectors (github/gitlab) are supported here; they set
     ``repo_url``/``repo_type`` on the created CodebaseORM.
@@ -235,8 +237,6 @@ def codebase_from_integration(
             detail=f"Connector '{body.connector}' does not produce a codebase; "
             f"use the knowledge pull endpoint instead.",
         )
-    if db.get(ProductORM, product_id) is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
     connector = get_connector(body.connector)
     if connector is None:
@@ -291,15 +291,14 @@ async def knowledge_from_integration(
     body: FromNodeRequest,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
+    _product: ProductORM = Depends(require_product_access("rw")),
 ):
-    """Pull a space/page from any connector and create KnowledgeNode(s).
+    """Pull a space/page from any connector and create KnowledgeNode(s) (rw).
 
     Multi-page Confluence trees become a root node + children (parent links
     preserved). The pulled markdown (+ converted attachments) is indexed into
     the product-scoped pgvector memory in the background (non-fatal).
     """
-    if db.get(ProductORM, product_id) is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     connector = get_connector(body.connector)
     if connector is None:
         raise HTTPException(
