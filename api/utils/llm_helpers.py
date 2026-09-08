@@ -14,8 +14,11 @@ prompt-substitution helper is defined once, not three times.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def safe_replace(template: str, variables: Dict[str, Any]) -> str:
@@ -39,6 +42,25 @@ def cap(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "\n... (обрезано для контекста LLM)\n"
+
+
+async def aclose_llm(llm: Any) -> None:
+    """Close ``llm`` via its optional ``aclose()`` (P1-14). Duck-typed; never raises.
+
+    Accepts any LLM-like object (a wrapper such as ``_StandardLLM`` or a raw
+    model client). Objects without ``aclose`` (e.g. lightweight test doubles
+    injected via the ``_safe_build_*`` factories) are skipped silently; a real
+    close failure is logged at debug level so teardown can never mask a
+    generation result.
+    """
+    if llm is None:
+        return
+    try:
+        aclose = getattr(llm, "aclose", None)
+        if aclose is not None:
+            await aclose()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("LLM aclose failed: %s", e)
 
 
 # --- Untrusted-content framing (P0-8) ----------------------------------------

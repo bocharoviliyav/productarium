@@ -47,6 +47,9 @@ _DEFAULT_TOP_K = 20
 # Soft cap on chunks per source to bound a runaway embedder bill on a giant
 # repo blob; the expert recall only needs the most relevant top_k anyway.
 _MAX_CHUNKS_PER_SOURCE = 2000
+# P1-20: reindex iterates products in keyset pages of this size so memory
+# stays bounded on large deployments (no full-table product+children load).
+_REINDEX_PRODUCT_PAGE_SIZE = 25
 # Candidate cap for the lexical-boost ILIKE scan (3.2): SQL filters by
 # ILIKE ANY, then the Python stage re-ranks and keeps top_k. The cap bounds
 # the scan on products with thousands of chunks.
@@ -358,6 +361,50 @@ def _is_pgvector_capable() -> bool:
         return (DB_PROVIDER or "").lower() in ("postgres", "postgresql") and bool(_PGVECTOR_AVAILABLE)
     except Exception:
         return False
+
+
+def _extract_index_items(p_orm) -> List[Tuple[str, str, Optional[str]]]:
+    """Collect (content, source_type, source_id) triples from a product's
+    children (codebases + specs + links + knowledge nodes).
+
+    Codebases: when ``generated_docs`` is present the pages are section
+    slices of it — indexing both would duplicate the content, so only the
+    docs blob is indexed. Legacy artifacts without docs fall back to pages,
+    each under a DISTINCT source id — reusing the codebase id would make
+    every page's upsert delete the previous page's chunks.
+    """
+    items: List[Tuple[str, str, Optional[str]]] = []
+    for c in p_orm.codebases:
+        docs = getattr(c, "generated_docs", None) or ""
+        if docs and docs.strip():
+            items.append((docs.strip(), "codebase", c.id))
+            continue
+        pages = getattr(c, "pages", None) or {}
+        if isinstance(pages, dict):
+            for page_id, page in pages.items():
+                pc = ""
+                if isinstance(page, dict):
+                    pc = page.get("content") or ""
+                elif isinstance(page, str):
+                    pc = page
+                if pc and pc.strip():
+                    items.append((
+                        pc.strip(), "codebase",
+                        f"{c.id}::page::{page_id}",
+                    ))
+    for s in p_orm.specs:
+        c = getattr(s, "content", None) or ""
+        if c and c.strip():
+            items.append((c.strip(), "spec", s.id))
+    for l in p_orm.links:
+        c = getattr(l, "content", None) or ""
+        if c and c.strip():
+            items.append((c.strip(), "links", l.id))
+    for n in p_orm.knowledge_nodes:
+        md = getattr(n, "content_md", None) or ""
+        if md and md.strip():
+            items.append((md.strip(), "knowledge_node", n.id))
+    return items
 
 
 class PgVectorMemoryBackend(MemoryBackend):
@@ -720,78 +767,62 @@ class PgVectorMemoryBackend(MemoryBackend):
             return False
 
     async def reindex_product(self, product_id: Optional[str] = None) -> Dict[str, Any]:
-        """Rebuild the index from source artifacts for one or all products."""
+        """Rebuild the index from source artifacts for one or all products.
+
+        P1-20: products are iterated in keyset pages (bounded memory) and each
+        product is swapped in a SINGLE transaction — delete its old chunks and
+        insert the new ones atomically — so there is never a window where a
+        product has empty or partial recall data. Embedding failures on an
+        item skip that item; if NOTHING could be embedded the swap is skipped
+        entirely (the previous chunks survive).
+        """
         try:
             from api.db import SessionLocal
-            from api.models import ProductORM
+            from api.models import ProductORM, KnowledgeChunkORM
             from sqlalchemy.orm import selectinload
 
-            def _load() -> List[Tuple[str, List[Tuple[str, str, Optional[str]]]]]:
-                """Return [(product_id, [(content, source_type, source_id), ...])]."""
+            def _product_ids_page(after_id: Optional[str], limit: int) -> List[str]:
+                """Keyset page of product ids (ordered, so pages never skip)."""
                 with SessionLocal() as db:
-                    q = db.query(ProductORM).options(
-                        selectinload(ProductORM.codebases),
-                        selectinload(ProductORM.specs),
-                        selectinload(ProductORM.links),
-                        selectinload(ProductORM.knowledge_nodes),
-                    )
+                    q = db.query(ProductORM.id).order_by(ProductORM.id)
                     if product_id:
                         q = q.filter(ProductORM.id == product_id)
-                    products = q.all()
-                    out = []
-                    for p in products:
-                        items: List[Tuple[str, str, Optional[str]]] = []
-                        for c in p.codebases:
-                            docs = getattr(c, "generated_docs", None) or ""
-                            if docs and docs.strip():
-                                # Pages are section slices of generated_docs —
-                                # indexing both would duplicate the content.
-                                items.append((docs.strip(), "codebase", c.id))
-                                continue
-                            # Legacy artifact WITHOUT generated_docs: fall
-                            # back to pages, each under a DISTINCT source id —
-                            # reusing the codebase id would make every page's
-                            # upsert delete the previous page's chunks.
-                            pages = getattr(c, "pages", None) or {}
-                            if isinstance(pages, dict):
-                                for page_id, page in pages.items():
-                                    pc = ""
-                                    if isinstance(page, dict):
-                                        pc = page.get("content") or ""
-                                    elif isinstance(page, str):
-                                        pc = page
-                                    if pc and pc.strip():
-                                        items.append((
-                                            pc.strip(), "codebase",
-                                            f"{c.id}::page::{page_id}",
-                                        ))
-                        for s in p.specs:
-                            c = getattr(s, "content", None) or ""
-                            if c and c.strip():
-                                items.append((c.strip(), "spec", s.id))
-                        for l in p.links:
-                            c = getattr(l, "content", None) or ""
-                            if c and c.strip():
-                                items.append((c.strip(), "links", l.id))
-                        for n in p.knowledge_nodes:
-                            md = getattr(n, "content_md", None) or ""
-                            if md and md.strip():
-                                items.append((md.strip(), "knowledge_node", n.id))
-                        out.append((p.id, items))
-                    return out
+                    elif after_id is not None:
+                        q = q.filter(ProductORM.id > after_id)
+                    return [r[0] for r in q.limit(limit).all()]
 
-            batches = await asyncio.to_thread(_load)
-            if not batches:
-                return {"success": True, "message": "No products found to reindex.", "reindexed_count": 0}
+            def _load_products_page(ids: List[str]) -> List[Tuple[str, List[Tuple[str, str, Optional[str]]]]]:
+                """Load one page of products with their children attached."""
+                with SessionLocal() as db:
+                    q = (
+                        db.query(ProductORM)
+                        .options(
+                            selectinload(ProductORM.codebases),
+                            selectinload(ProductORM.specs),
+                            selectinload(ProductORM.links),
+                            selectinload(ProductORM.knowledge_nodes),
+                        )
+                        .filter(ProductORM.id.in_(ids))
+                        .order_by(ProductORM.id)
+                    )
+                    return [(p.id, _extract_index_items(p)) for p in q]
 
+            page_size = _REINDEX_PRODUCT_PAGE_SIZE
+            after_id: Optional[str] = None
             reindexed = 0
-            for pid, items in batches:
-                if not items:
-                    continue
-                await self.clear_product(pid)
-                for content, source_type, source_id in items:
-                    await self.index(content, pid, source_type=source_type, source_id=source_id)
-                reindexed += 1
+            while True:
+                ids = await asyncio.to_thread(_product_ids_page, after_id, page_size)
+                if not ids:
+                    break
+                after_id = ids[-1]
+                batches = await asyncio.to_thread(_load_products_page, ids)
+                for pid, items in batches:
+                    if not items:
+                        continue
+                    if await self._reindex_one_product(pid, items):
+                        reindexed += 1
+                if product_id:
+                    break  # single-product mode: exactly one page
             return {
                 "success": True,
                 "message": f"Reindexed {reindexed} product(s) into pgvector memory.",
@@ -800,6 +831,76 @@ class PgVectorMemoryBackend(MemoryBackend):
         except Exception as e:
             logger.error("pgvector memory: reindex failed: %s", e, exc_info=True)
             return {"success": False, "message": f"Reindex error: {e}", "reindexed_count": 0}
+
+    async def _reindex_one_product(
+        self,
+        product_id: str,
+        items: List[Tuple[str, str, Optional[str]]],
+    ) -> bool:
+        """Embed all items of one product, then swap its chunks atomically.
+
+        Reuses the per-item pipeline (split + capped + rate-limited embed) but
+        defers the DB write to ONE delete+insert transaction per product
+        (the `_upsert_chunks` pattern at product granularity).
+        """
+        from api.db import SessionLocal
+        from api.models import KnowledgeChunkORM
+
+        rows = []
+        for content, source_type, source_id in items:
+            try:
+                chunks = await asyncio.to_thread(_split_text, content)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "pgvector memory: chunking failed for product %s source %s: %s",
+                    product_id, source_id, e,
+                )
+                continue
+            if not chunks:
+                continue
+            if len(chunks) > _MAX_CHUNKS_PER_SOURCE:
+                chunks = chunks[:_MAX_CHUNKS_PER_SOURCE]
+            embeddings = await _embed_batch(chunks)
+            if not embeddings or len(embeddings) != len(chunks):
+                logger.warning(
+                    "pgvector memory: embedder returned %d vectors for %d chunks "
+                    "(product %s source %s); skipping source.",
+                    len(embeddings) if embeddings else 0, len(chunks), product_id, source_id,
+                )
+                continue
+            for i, (text, vec) in enumerate(zip(chunks, embeddings)):
+                rows.append(KnowledgeChunkORM(
+                    id=_new_chunk_id(),
+                    product_id=product_id,
+                    source_type=source_type,
+                    source_id=source_id,
+                    chunk_index=i,
+                    content=text,
+                    embedding=vec,
+                ))
+        if not rows:
+            logger.warning(
+                "pgvector memory: nothing embeddable for product %s; keeping "
+                "previous chunks (no swap).", product_id,
+            )
+            return False
+
+        def _do() -> int:
+            with SessionLocal() as db:
+                # Single transaction: old chunks for the product disappear
+                # exactly when the new ones appear.
+                db.query(KnowledgeChunkORM).filter(
+                    KnowledgeChunkORM.product_id == product_id
+                ).delete(synchronize_session=False)
+                db.add_all(rows)
+                db.commit()
+                return len(rows)
+
+        count = await asyncio.to_thread(_do)
+        logger.info(
+            "pgvector memory: reindexed %d chunks for product %s.", count, product_id
+        )
+        return True
 
     def status(self) -> Dict[str, Any]:
         """Chunk + product counts for the admin UI (non-fatal on DB down)."""

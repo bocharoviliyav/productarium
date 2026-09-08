@@ -17,7 +17,8 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 from sqlalchemy.orm import selectinload
 
@@ -42,32 +43,10 @@ _docgen_executor = ThreadPoolExecutor(
 # across different models/languages.
 _JOBS_LOCK = threading.Lock()
 
-_ENTITY_LOCKS: Dict[Tuple[str, str, str], threading.Lock] = {}
-_ENTITY_LOCKS_GUARD = threading.Lock()
-
 
 def job_key(product_id: str, entity_type: str, entity_id: str) -> Tuple[str, str, str]:
     """Canonical dedup/serialization key: one active job per product entity."""
     return (product_id, entity_type, entity_id)
-
-
-def lock_for_entity(
-    product_id: str, entity_type: str, entity_id: str
-) -> threading.Lock:
-    """One lock per (product, entity_type, entity_id).
-
-    Serializes generation writes to the same entity even if a duplicate job
-    ever slips past the registry dedup (defense-in-depth). Public on purpose:
-    the 2.3 introspection disk cache takes the same lock so a cached payload
-    write can never race a live generation for the entity.
-    """
-    key = job_key(product_id, entity_type, entity_id)
-    with _ENTITY_LOCKS_GUARD:
-        lock = _ENTITY_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _ENTITY_LOCKS[key] = lock
-        return lock
 
 
 # --- Progress model -----------------------------------------------------------
@@ -214,6 +193,89 @@ def _progress_reporter(job_id: str):
     return report
 
 
+# --- Per-entity locks (P1-19/P1-22) -------------------------------------------
+class EntityBusyError(RuntimeError):
+    """The entity is currently locked by a running docgen job (HTTP 409)."""
+
+
+# Refcounted registry: an entry lives while at least one holder/waiter is in
+# the ``lock_for_entity`` context. The LAST release removes the entry from the
+# dict (P1-22) — no periodic cleanup needed because the refcount drops to zero
+# exactly when the holder and every waiter have left the context.
+_ENTITY_LOCKS: Dict[str, threading.RLock] = {}
+_ENTITY_REFCOUNTS: Dict[str, int] = {}
+_entity_locks_guard = threading.Lock()
+
+# Short by design: API writes never block a whole docgen job's duration —
+# they fail fast with 409 Conflict instead (jobs themselves wait a bit to
+# absorb quick back-to-back generations for the same entity).
+_ENTITY_LOCK_TIMEOUT = float(os.environ.get("ENTITY_LOCK_TIMEOUT_SECONDS", "5"))
+
+
+def _entity_key(entity_type: str, entity_id: str) -> str:
+    return f"{entity_type}:{entity_id}"
+
+
+@contextmanager
+def lock_for_entity(
+    entity_type: str,
+    entity_id: str,
+    *,
+    timeout: Optional[float] = None,
+) -> Iterator[None]:
+    """Serialize API writes with running docgen jobs on the same entity.
+
+    Raises :class:`EntityBusyError` when the lock cannot be taken within
+    ``timeout`` seconds (default ``ENTITY_LOCK_TIMEOUT_SECONDS`` / 5s). The
+    registry entry is dropped once the last holder/waiter leaves the context
+    (refcount reaches zero), so the dict cannot grow unboundedly.
+    """
+    if timeout is None:
+        timeout = _ENTITY_LOCK_TIMEOUT
+    key = _entity_key(entity_type, entity_id)
+    with _entity_locks_guard:
+        lock = _ENTITY_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _ENTITY_LOCKS[key] = lock
+        _ENTITY_REFCOUNTS[key] = _ENTITY_REFCOUNTS.get(key, 0) + 1
+    try:
+        if not lock.acquire(timeout=max(0.0, timeout)):
+            raise EntityBusyError(
+                f"{entity_type} {entity_id!r} is busy: a docgen job is "
+                "already running for this entity. Retry when it completes."
+            )
+        try:
+            yield
+        finally:
+            lock.release()
+    finally:
+        with _entity_locks_guard:
+            remaining = _ENTITY_REFCOUNTS.get(key, 0) - 1
+            if remaining <= 0:
+                # Last holder AND all waiters are out — safe to drop the entry.
+                _ENTITY_REFCOUNTS.pop(key, None)
+                _ENTITY_LOCKS.pop(key, None)
+            else:
+                _ENTITY_REFCOUNTS[key] = remaining
+
+
+def _fail_job_with_busy(job_id: str, entity_type: str, entity_id: str) -> None:
+    job = _docgen_jobs.get(job_id)
+    if job is None or job.get("finished_at"):
+        return
+    msg = (
+        f"{entity_type} {entity_id!r} is busy: another docgen job is already "
+        "running for this entity. Retry when it completes."
+    )
+    job["status"] = "failed"
+    job["indexing_status"] = "failed"
+    job["indexing_message"] = f"Ошибка: {msg}"
+    job["error"] = msg
+    job["finished_at"] = time.time()
+    logger.warning("Docgen job %s not started: %s", job_id, msg)
+
+
 def _docgen_prune_old_jobs(max_age_seconds: int = 3600) -> None:
     """Drop finished jobs older than ``max_age_seconds`` to bound memory.
 
@@ -352,7 +414,6 @@ async def _run_docgen_job_async(
     # First phase transition is emitted by the generate_* pipeline itself
     # (cloning for codebase, planning for spec/database).
     progress_cb = _progress_reporter(job_id)
-    entity_lock = lock_for_entity(product_id, entity_type, entity_id)
     db = SessionLocal()
     try:
         # 2.2 embedder preflight: one short probe BEFORE the (potentially
@@ -374,68 +435,65 @@ async def _run_docgen_job_async(
             raise ValueError(f"{EMBEDDER_ERROR_PREFIX}{e}") from None
         except Exception as e:  # pragma: no cover - preflight plumbing
             logger.warning("Embedder preflight skipped (unexpected error): %s", e)
-        # Fork H4: per-entity lock. The registry dedup above already prevents
-        # two ACTIVE jobs for one entity; this lock is the belt-and-braces
-        # guarantee that generation for the same entity row / state-dir clone
-        # is serialized even if a duplicate job ever reaches the worker (and
-        # it is the same lock the 2.3 introspection cache will take).
-        with entity_lock:
-            p_orm = (
-                db.query(ProductORM)
-                .options(
-                    selectinload(ProductORM.codebases),
-                    selectinload(ProductORM.specs),
-                    selectinload(ProductORM.databases),
-                )
-                .filter(ProductORM.id == product_id)
-                .first()
+        # Fork H4: the worker entry point (_run_docgen_job) already holds the
+        # per-entity lock (refcounted lock_for_entity context manager) for the
+        # whole job, so this async body runs serialized — no inner lock here.
+        p_orm = (
+            db.query(ProductORM)
+            .options(
+                selectinload(ProductORM.codebases),
+                selectinload(ProductORM.specs),
+                selectinload(ProductORM.databases),
             )
-            if p_orm is None:
-                raise ValueError("Product not found")
+            .filter(ProductORM.id == product_id)
+            .first()
+        )
+        if p_orm is None:
+            raise ValueError("Product not found")
 
-            if entity_type == "codebase":
-                entity = next((c for c in p_orm.codebases if c.id == entity_id), None)
-                if entity is None:
-                    raise ValueError("Codebase not found")
-                from api.docgen.codebase import generate_codebase_docs
-                docs = await generate_codebase_docs(
-                    entity, p_orm, model=model,
-                    language=language or "ru",
-                    progress=progress_cb,
-                )
-            elif entity_type == "spec":
-                entity = next((s for s in p_orm.specs if s.id == entity_id), None)
-                if entity is None:
-                    raise ValueError("Spec not found")
-                # SpecORM.kind is the real column ("openapi" | "asyncapi").
-                spec_kind = (getattr(entity, "kind", None) or "openapi").lower()
-                from api.docgen.spec import generate_openapi_docs, generate_asyncapi_docs
-                if spec_kind == "asyncapi":
-                    docs = await generate_asyncapi_docs(
-                        entity, p_orm, model=model,
-                        language=language or "ru",
-                        progress=progress_cb,
-                    )
-                else:
-                    docs = await generate_openapi_docs(
-                        entity, p_orm, model=model,
-                        language=language or "ru",
-                        progress=progress_cb,
-                    )
-            elif entity_type == "database":
-                entity = next((d for d in p_orm.databases if d.id == entity_id), None)
-                if entity is None:
-                    raise ValueError("Database not found")
-                from api.docgen.database import generate_database_docs
-                docs = await generate_database_docs(
+        if entity_type == "codebase":
+            entity = next((c for c in p_orm.codebases if c.id == entity_id), None)
+            if entity is None:
+                raise ValueError("Codebase not found")
+            from api.docgen.codebase import generate_codebase_docs
+            docs = await generate_codebase_docs(
+                entity, p_orm, model=model,
+                language=language or "ru",
+                progress=progress_cb,
+            )
+        elif entity_type == "spec":
+            entity = next((s for s in p_orm.specs if s.id == entity_id), None)
+            if entity is None:
+                raise ValueError("Spec not found")
+            # SpecORM.kind is the real column ("openapi" | "asyncapi").
+            spec_kind = (getattr(entity, "kind", None) or "openapi").lower()
+            from api.docgen.spec import generate_openapi_docs, generate_asyncapi_docs
+            if spec_kind == "asyncapi":
+                docs = await generate_asyncapi_docs(
                     entity, p_orm, model=model,
                     language=language or "ru",
                     progress=progress_cb,
                 )
             else:
-                raise ValueError(f"Unsupported docgen entity_type: {entity_type}")
+                docs = await generate_openapi_docs(
+                    entity, p_orm, model=model,
+                    language=language or "ru",
+                    progress=progress_cb,
+                )
+        elif entity_type == "database":
+            entity = next((d for d in p_orm.databases if d.id == entity_id), None)
+            if entity is None:
+                raise ValueError("Database not found")
+            from api.docgen.database import generate_database_docs
+            docs = await generate_database_docs(
+                entity, p_orm, model=model,
+                language=language or "ru",
+                progress=progress_cb,
+            )
+        else:
+            raise ValueError(f"Unsupported docgen entity_type: {entity_type}")
 
-            db.commit()
+        db.commit()
         job["status"] = "succeeded"
         # Display is decoupled from memory indexing: docs are already committed,
         # so the job is a success regardless of how long background indexing
@@ -507,9 +565,17 @@ def _run_docgen_job(
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(
-            _run_docgen_job_async(job_id, product_id, entity_type, entity_id, model, language)
-        )
+        # P1-19: hold the entity lock for the whole job so API writes to the
+        # same entity fail fast (409) instead of racing the final commit.
+        try:
+            with lock_for_entity(entity_type, entity_id):
+                loop.run_until_complete(
+                    _run_docgen_job_async(
+                        job_id, product_id, entity_type, entity_id, model, language
+                    )
+                )
+        except EntityBusyError:
+            _fail_job_with_busy(job_id, entity_type, entity_id)
 
         async def _drain() -> None:
             pending = [

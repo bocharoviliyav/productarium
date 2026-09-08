@@ -59,18 +59,42 @@ class TestCountTokens:
         result = cb._count_tokens("hello world")
         assert result > 0
 
-    def test_fallback_ratio(self, monkeypatch):
-        # Force tiktoken import to fail so the len//4 fallback is used
-        import builtins
-        real_import = builtins.__import__
-        def mock_import(name, *args, **kwargs):
-            if name == "tiktoken":
-                raise ImportError("no tiktoken")
-            return real_import(name, *args, **kwargs)
-        monkeypatch.setattr(builtins, "__import__", mock_import)
-        monkeypatch.setattr(cb, "_TIKTOKEN_ENC", None)
+    def test_default_is_len_div_4_heuristic(self, monkeypatch):
+        # P1-23: precise counting is OPT-IN; default is the cheap heuristic.
+        monkeypatch.delenv("LLM_PRECISE_TOKENS", raising=False)
+        import api.utils.llm_tokens as lt
+
+        monkeypatch.setattr(lt, "_ENCODER", None)
+        monkeypatch.setattr(lt, "_ENCODER_LOADED", False)
         result = cb._count_tokens("hello world test")
         assert result == len("hello world test") // 4
+
+    def test_delegates_to_shared_counter(self, monkeypatch):
+        seen = {}
+
+        def _spy(text, precise=None):
+            seen["text"] = text
+            seen["precise"] = precise
+            return 42
+
+        import api.utils.llm_tokens as lt
+
+        monkeypatch.setattr(lt, "count_tokens", _spy)
+        assert cb._count_tokens("abc") == 42
+        assert seen == {"text": "abc", "precise": None}
+
+    def test_precise_opt_in_via_env(self, monkeypatch):
+        """LLM_PRECISE_TOKENS=1 switches the shared counter to tiktoken."""
+        monkeypatch.setenv("LLM_PRECISE_TOKENS", "1")
+        import api.utils.llm_tokens as lt
+
+        class _FakeEnc:
+            def encode(self, text, disallowed_special=()):
+                return [0] * 7  # deterministic "exact" count
+
+        monkeypatch.setattr(lt, "_ENCODER", _FakeEnc())
+        monkeypatch.setattr(lt, "_ENCODER_LOADED", True)
+        assert cb._count_tokens("anything") == 7
 
 
 # ============================================================================
@@ -595,6 +619,64 @@ class TestAgenticBottomUpDocgen:
                 return "direct result"
         result = asyncio.run(cb._agentic_bottom_up_docgen("p", ["c1"], FakeLLM()))
         assert "direct result" in result
+
+    # --- P1-24: bounded parallel MAP phase ----------------------------------- #
+    def test_map_phase_bounded_parallel_and_ordered(self, monkeypatch):
+        """Phase 1 runs chunk summaries with bounded parallelism (semaphore)
+        and gather preserves the part i/N order regardless of completion."""
+        import re
+
+        import api.config.timeout as timeout_mod
+
+        monkeypatch.setattr(timeout_mod, "resolve_docgen_map_concurrency", lambda: 2)
+        peak = {"cur": 0, "max": 0}
+
+        class FakeLLM:
+            async def generate(self, prompt):
+                if "<codebase_chunk>" not in prompt:
+                    return "joined"
+                peak["cur"] += 1
+                peak["max"] = max(peak["max"], peak["cur"])
+                await asyncio.sleep(0.03)
+                peak["cur"] -= 1
+                return "file summary"
+
+        async def _fake_reduce(section_prompt, drafts, llm):
+            return "\n\n".join(drafts)
+
+        monkeypatch.setattr(cb, "_reduce_section_drafts", _fake_reduce)
+
+        chunks = [f"chunk-{i}" for i in range(6)]
+        result = asyncio.run(cb._agentic_bottom_up_docgen("p", chunks, FakeLLM()))
+        assert 2 <= peak["max"] <= 2  # parallelism used AND bounded at 2
+        labels = re.findall(r"часть (\d+)/6", result)
+        assert labels == [str(i) for i in range(1, 7)]  # order preserved
+
+    def test_map_phase_concurrency_one_is_sequential(self, monkeypatch):
+        import api.config.timeout as timeout_mod
+
+        monkeypatch.setattr(timeout_mod, "resolve_docgen_map_concurrency", lambda: 1)
+        peak = {"cur": 0, "max": 0}
+
+        class FakeLLM:
+            async def generate(self, prompt):
+                if "<codebase_chunk>" not in prompt:
+                    return "joined"
+                peak["cur"] += 1
+                peak["max"] = max(peak["max"], peak["cur"])
+                await asyncio.sleep(0.01)
+                peak["cur"] -= 1
+                return "file summary"
+
+        async def _fake_reduce(section_prompt, drafts, llm):
+            return "\n\n".join(drafts)
+
+        monkeypatch.setattr(cb, "_reduce_section_drafts", _fake_reduce)
+
+        chunks = [f"chunk-{i}" for i in range(4)]
+        result = asyncio.run(cb._agentic_bottom_up_docgen("p", chunks, FakeLLM()))
+        assert peak["max"] == 1  # strictly sequential
+        assert result.count("file summary") == 4
 
 
 # ============================================================================

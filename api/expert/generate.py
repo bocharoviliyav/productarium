@@ -18,6 +18,7 @@ import logging
 from typing import AsyncIterator, Optional
 
 from api.utils import setup_logging
+from api.utils.llm_helpers import aclose_llm as _aclose_llm
 from api.expert.llm import _safe_build_llm
 from api.expert.prompt import _clean_llm_text
 from api.expert.types import ExpertStreamEvent
@@ -45,6 +46,10 @@ async def _generate_answer(
     except Exception as e:  # pragma: no cover - depends on live LLM
         logger.warning("Expert standard LLM generate failed: %s", e)
         return ""
+    finally:
+        # P1-14: release httpx pools. Duck-typed close — ``_safe_build_llm`` is
+        # a patch point and may return objects without ``aclose``.
+        await _aclose_llm(llm)
 
 
 async def _stream_answer(
@@ -67,5 +72,11 @@ async def _stream_answer(
     llm = _safe_build_llm(model, base_url=base_url, api_key=api_key)
     if llm is None:
         return
-    async for event in llm.stream(prompt):
-        yield event
+    try:
+        async for event in llm.stream(prompt):
+            yield event
+    finally:
+        # P1-14: release httpx pools (also on early SSE disconnect). Duck-typed
+        # close — ``_safe_build_llm`` is a patch point; never raise from a
+        # generator's finally (it would mask the generation result).
+        await _aclose_llm(llm)

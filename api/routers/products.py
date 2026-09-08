@@ -35,6 +35,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from api.db import get_db
+from api.docgen.jobs import EntityBusyError
 from api.models import ProductGrantORM, ProductORM, UserORM
 from api.repositories import product_repo
 from api.schemas import Codebase, Links, Product, Spec
@@ -73,17 +74,8 @@ class ContentUpdate(BaseModel):
 
 
 @router.get("", response_model=list[Product])
-async def list_products(
-    db: Session = Depends(get_db),
-    user: UserORM = Depends(get_current_user),
-):
-    """List the products visible to the current user (P0-2).
-
-    admin / manager / viewer_global see everything; a plain ``user`` sees own
-    products + products with an explicit grant.
-    """
-    visible = _visible_product_ids(db, user)
-    return product_repo.list_products(db, product_ids=visible)
+async def list_products(db: Session = Depends(get_db)):
+    return product_repo.list_products(db)
 
 
 def _visible_product_ids(db: Session, user: UserORM) -> Optional[Set[str]]:
@@ -183,7 +175,14 @@ async def update_product(
     # Preserve previous overwrite semantics: the body Product is saved as-is.
     # (Server-owned verified flags and stored tokens survive the replace —
     # see product_repo.upsert_product.)
-    p_orm = product_repo.upsert_product(db, product)
+    # P1-18: the path product_id wins over any body id, so a stale/mismatched
+    # body can never spawn a second product.
+    if product.id != product_id:
+        product = product.model_copy(update={"id": product_id})
+    try:
+        p_orm = product_repo.upsert_product(db, product)
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     result = product_repo.orm_to_product(p_orm)
     _guard_no_raw_dsn(result, product)
     return result
@@ -239,6 +238,8 @@ async def add_codebase(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
         return product_repo.add_codebase(db, product_id, codebase)
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
         raise HTTPException(status_code=404, detail="Product not found")
 
@@ -252,6 +253,8 @@ async def delete_codebase(
 ):
     try:
         return product_repo.delete_codebase(db, product_id, codebase_id)
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
         raise HTTPException(status_code=404, detail="Product not found")
 
@@ -275,6 +278,8 @@ async def update_codebase_docs(
             content=body.content,
             generated_docs=body.generated_docs,
         )
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         msg = str(e)
         status = 400 if "Provide one of" in msg else 404
@@ -293,6 +298,8 @@ async def add_spec(
 ):
     try:
         return product_repo.add_spec(db, product_id, spec)
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
         raise HTTPException(status_code=404, detail="Product not found")
 
@@ -306,6 +313,8 @@ async def delete_spec(
 ):
     try:
         return product_repo.delete_spec(db, product_id, spec_id)
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
         raise HTTPException(status_code=404, detail="Product not found")
 
@@ -323,6 +332,8 @@ async def update_spec(
         product, indexed_text = product_repo.update_spec_content(
             db, product_id, spec_id, body.content
         )
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail="Product not found")
     _reindex(product_id, indexed_text, spec_id, source_type="spec")
@@ -339,6 +350,8 @@ async def add_links(
 ):
     try:
         return product_repo.add_links(db, product_id, links)
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
         raise HTTPException(status_code=404, detail="Product not found")
 
@@ -352,6 +365,8 @@ async def delete_links(
 ):
     try:
         return product_repo.delete_links(db, product_id, links_id)
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
         raise HTTPException(status_code=404, detail="Product not found")
 
@@ -369,6 +384,8 @@ async def update_links(
         product, indexed_text = product_repo.update_links_content(
             db, product_id, links_id, body.content
         )
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail="Product not found")
     _reindex(product_id, indexed_text, links_id)

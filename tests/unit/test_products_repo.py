@@ -4,7 +4,7 @@ Covers:
 - ORM<->Pydantic mappers: ``orm_to_product``, ``_codebase_orm_from_pydantic``,
   ``_spec_orm_from_pydantic``, ``_links_orm_from_pydantic``.
 - ``load_product_orm`` (found / not found).
-- ``list_products`` (empty / with children).
+- ``list_products_light`` (empty / counters / visibility / pagination).
 - ``upsert_product`` (insert, update, full child replace).
 - ``delete_product`` (existing / missing no-op).
 - Per-type add/delete for codebase/spec/links (including replace-on-duplicate).
@@ -34,7 +34,7 @@ from api.models import (
     SpecORM,
 )
 from api.repositories import product_repo as pr
-from api.schemas import Codebase, Database, Links, Product, Spec
+from api.schemas import Codebase, Database, Links, Product, ProductListItem, Spec
 
 
 # --------------------------------------------------------------------------- #
@@ -269,24 +269,74 @@ class TestLoadProductOrm:
 
 
 # --------------------------------------------------------------------------- #
-# list_products
+# list_products_light
 # --------------------------------------------------------------------------- #
-class TestListProducts:
+class TestListProductsLight:
     def test_empty(self, session):
-        assert pr.list_products(session) == []
+        assert pr.list_products_light(session) == ([], 0)
 
     def test_with_products(self, session):
         _seed_product(session, "prod_1")
         _seed_product(session, "prod_2")
-        result = pr.list_products(session)
-        assert len(result) == 2
-        ids = {p.id for p in result}
-        assert ids == {"prod_1", "prod_2"}
+        items, total = pr.list_products_light(session)
+        assert total == 2
+        assert {p.id for p in items} == {"prod_1", "prod_2"}
 
-    def test_returns_pydantic_models(self, session):
+    def test_returns_light_pydantic_models(self, session):
         _seed_product(session)
-        result = pr.list_products(session)
-        assert isinstance(result[0], Product)
+        items, _ = pr.list_products_light(session)
+        assert isinstance(items[0], ProductListItem)
+        assert items[0].id == "prod_1"
+
+    def test_counters_verified_vs_total(self, session):
+        _seed_product(session)
+        session.add(CodebaseORM(
+            id="cb_v", product_id="prod_1", name="V", source="manual",
+            verified=True, verified_by="admin",
+        ))
+        session.add(CodebaseORM(id="cb_u", product_id="prod_1", name="U", source="manual"))
+        session.add(SpecORM(id="spec_1", product_id="prod_1", name="S", kind="openapi", source="manual"))
+        session.add(LinksORM(id="links_1", product_id="prod_1", name="L", source="manual"))
+        session.commit()
+        items, total = pr.list_products_light(session)
+        assert total == 1
+        it = items[0]
+        assert it.codebases_count == 2
+        assert it.verified_codebases == 1
+        assert it.specs_count == 1
+        assert it.verified_specs == 0
+        assert it.links_count == 1
+        assert it.verified_links == 0
+
+    def test_visibility_filter(self, session):
+        _seed_product(session, "prod_1")
+        _seed_product(session, "prod_2")
+        items, total = pr.list_products_light(session, product_ids=["prod_2"])
+        assert total == 1
+        assert [i.id for i in items] == ["prod_2"]
+        # Empty visibility -> no query at all.
+        assert pr.list_products_light(session, product_ids=[]) == ([], 0)
+
+    def test_pagination_and_ordering(self, session):
+        for i in range(3):
+            session.add(ProductORM(
+                id=f"prod_{i}", name=f"W{i}", description="d",
+                created_at=datetime(2024, 1, 1, 0, 0, i),
+            ))
+        session.commit()
+
+        items, total = pr.list_products_light(session, limit=2)
+        assert total == 3
+        assert [i.id for i in items] == ["prod_0", "prod_1"]
+
+        items, total = pr.list_products_light(session, limit=2, offset=2)
+        assert total == 3
+        assert [i.id for i in items] == ["prod_2"]
+
+        # Offset beyond the end: empty page, total unchanged.
+        items, total = pr.list_products_light(session, limit=2, offset=10)
+        assert items == []
+        assert total == 3
 
 
 # --------------------------------------------------------------------------- #

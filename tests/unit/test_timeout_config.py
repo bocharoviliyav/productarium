@@ -26,6 +26,7 @@ from api.config.timeout import (
     _resolve_with_key,
     get_timeout_resolved_view,
     resolve_docgen_indexing_drain_seconds,
+    resolve_docgen_map_concurrency,
     resolve_timeout,
     resolve_timeout_int,
     sync_timeout_env,
@@ -39,6 +40,7 @@ WRAPPER_TO_KEY = {
     "resolve_llm_request_timeout": "llm_request",
     "resolve_llm_retry_max_time": "llm_retry_max_time",
     "resolve_docgen_indexing_drain_seconds": "docgen_indexing_drain",
+    "resolve_docgen_map_concurrency": "docgen_map_concurrency",
     "resolve_memory_query_timeout": "memory_query",
     "resolve_model_list_timeout": "model_list",
     "resolve_integration_http_timeout": "integration_http",
@@ -47,6 +49,7 @@ WRAPPER_TO_KEY = {
     "resolve_mermaid_verify_timeout": "mermaid_verify",
     "resolve_mermaid_repair_timeout": "mermaid_repair",
     "resolve_mermaid_max_repair_attempts": "mermaid_max_repair_attempts",
+    "resolve_mermaid_repair_deadline": "mermaid_repair_deadline",
     "resolve_provider_test_timeout": "provider_test",
 }
 
@@ -203,6 +206,30 @@ class TestTimeoutConfig(unittest.TestCase):
         with _EnvGuard(env_vars, []):
             os.environ["DOCGEN_INDEXING_DRAIN_SECONDS"] = "120"
             self.assertEqual(resolve_docgen_indexing_drain_seconds(), 120.0)
+
+    # ------------------------------------------------------------------
+    # docgen_map_concurrency (P1-24): bounded MAP-phase parallelism
+    # ------------------------------------------------------------------
+    def test_docgen_map_concurrency_default(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            self.assertEqual(resolve_docgen_map_concurrency(), 3)
+
+    def test_docgen_map_concurrency_env_override(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["DOCGEN_MAP_CONCURRENCY"] = "8"
+            self.assertEqual(resolve_docgen_map_concurrency(), 8)
+
+    def test_docgen_map_concurrency_floor_one(self):
+        # 0 / negative / garbage all clamp/fall back to at least 1
+        # (sequential), never to unlimited or zero.
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["DOCGEN_MAP_CONCURRENCY"] = "0"
+            self.assertEqual(resolve_docgen_map_concurrency(), 1)
+            os.environ["DOCGEN_MAP_CONCURRENCY"] = "garbage"
+            self.assertEqual(resolve_docgen_map_concurrency(), 3)
 
     def test_docgen_drain_explicit_override_below_floor_is_clamped(self):
         # An explicit DOCGEN_INDEXING_DRAIN_SECONDS below the drain floor (5)

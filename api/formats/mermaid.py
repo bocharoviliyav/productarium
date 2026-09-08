@@ -43,11 +43,13 @@ import logging
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from api.config.timeout import (
     resolve_mermaid_max_repair_attempts,
+    resolve_mermaid_repair_deadline,
     resolve_mermaid_repair_timeout,
     resolve_mermaid_verify_timeout,
 )
@@ -431,6 +433,20 @@ async def run_repair_loop(
     # budget stays consistent across the drain (admin edits take effect on the
     # next run_repair_loop call, not mid-drain).
     max_attempts = resolve_mermaid_max_repair_attempts()
+    # P1-15: global budget guards. A mutating LLM that returns a NEW broken
+    # body on every call used to earn a fresh per-body budget for each new
+    # body hash, so the loop could spin indefinitely. Two hard caps close
+    # that: a per-block TOTAL iteration cap (max_attempts * 3) and a
+    # wall-clock deadline for the whole drain (timeout-registry key
+    # ``mermaid_repair_deadline``, default 600s).
+    deadline = time.monotonic() + resolve_mermaid_repair_deadline()
+    block_iterations: Dict[int, int] = {}
+    total_iter_cap = max(1, max_attempts * 3)
+
+    def _budget_left(block_index: int) -> bool:
+        if time.monotonic() > deadline:
+            return False
+        return block_iterations.get(block_index, 0) < total_iter_cap
 
     blocks = extract_mermaid_blocks(page_markdown)
     if not blocks:
@@ -453,7 +469,7 @@ async def run_repair_loop(
         stats["broken"] += 1
         h = _body_hash(block.body)
         attempt_counts[h] = attempt_counts.get(h, 0)
-        if attempt_counts[h] < max_attempts:
+        if attempt_counts[h] < max_attempts and _budget_left(block.index):
             queue.append(
                 RepairJob(
                     block_index=block.index,
@@ -493,12 +509,19 @@ async def run_repair_loop(
             stats["failed"] += 1
             continue
 
+        # P1-15: per-block total-iteration cap + wall-clock deadline.
+        if not _budget_left(job.block_index):
+            marked.add(job.block_index)
+            stats["failed"] += 1
+            continue
+
         attempt_counts[h] += 1
         job.attempt = attempt_counts[h]
+        block_iterations[job.block_index] = block_iterations.get(job.block_index, 0) + 1
         repaired = await repair_diagram(job, llm)
         if not repaired:
             # LLM gave nothing usable; re-enqueue if budget remains.
-            if attempt_counts[h] < max_attempts:
+            if attempt_counts[h] < max_attempts and _budget_left(job.block_index):
                 queue.append(job)
             else:
                 marked.add(job.block_index)
@@ -520,10 +543,11 @@ async def run_repair_loop(
             stats["fixed"] += 1
             continue
         # Repaired body is still broken. Re-enqueue under the NEW body's hash so
-        # a different broken variant also gets its own budget.
+        # a different broken variant also gets its own budget — but only while
+        # the P1-15 global per-block/wall-clock budget lasts.
         new_h = _body_hash(repaired)
         attempt_counts[new_h] = attempt_counts.get(new_h, 0)
-        if attempt_counts[new_h] < max_attempts:
+        if attempt_counts[new_h] < max_attempts and _budget_left(job.block_index):
             queue.append(
                 RepairJob(
                     block_index=job.block_index,

@@ -22,6 +22,7 @@ from api.utils import setup_logging
 from api.utils.llm_helpers import (  # noqa: E402
     safe_replace as _safe_replace,
     cap as _cap,
+    aclose_llm as _aclose_llm,
     strip_inline_line_numbers as _strip_inline_line_numbers,
     strip_number_prefixes_from_block as _strip_number_prefixes_from_block,
     LINE_NUM_PREFIX_RE as _LINE_NUM_PREFIX_RE,
@@ -235,6 +236,8 @@ async def _llm_or_none(
         logger.warning("Standard LLM generation failed: %s", e)
         return ""
     finally:
+        # P1-14: release httpx pools. Duck-typed close — the factory is a
+        # patch point and may return objects without ``aclose``.
         await _safe_aclose(llm)
 
 
@@ -253,20 +256,32 @@ def _make_repair_llm(
     ``_close_owned_llm`` (spec flow). Returns None if no LLM could be built
     (repairs are then skipped and broken diagrams are surfaced with a marker).
     """
+    def _build() -> Optional[_StandardLLM]:
+        return existing if existing is not None else _safe_build_llm(
+            model, base_url=base_url, api_key=api_key
+        )
+
     owns_llm = existing is None
-    if existing is not None:
-        llm = existing
-    else:
-        llm = _safe_build_llm(model, base_url=base_url, api_key=api_key)
+    llm = _build()
     if llm is None:
         return None
 
     async def _call(prompt: str) -> str:
+        # P1-14: when this closure owns the LLM (no ``existing`` passed), build
+        # per call and close it in ``finally`` so no httpx pool leaks. When an
+        # ``existing`` LLM is reused, its owner is responsible for closing.
+        owned = existing is None
+        llm = _build()
+        if llm is None:
+            return ""
         try:
             return await llm.generate(prompt)
         except Exception as e:  # pragma: no cover - depends on live LLM
             logger.warning("Mermaid repair LLM call failed: %s", e)
             return ""
+        finally:
+            if owned:
+                await _aclose_llm(llm)  # P1-14 (duck-typed; see _llm_or_none)
 
     _call._owned_llm = llm if owns_llm else None  # type: ignore[attr-defined]
     return _call

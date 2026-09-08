@@ -83,6 +83,7 @@ from api.docgen._common import (
     _checkpoint_partial_docs,
     _clean_llm_text,
     _with_verification_guard,
+    _aclose_llm,
     _StandardLLM,
     _resolve_docgen_model,
     _safe_aclose,
@@ -146,33 +147,31 @@ def _resolve_docgen_context_window() -> Optional[int]:
         return 8192
 
 
+async def _resolve_rlm_context_window_async() -> Optional[int]:
+    """P1-13: off-loop wrapper — the resolver may hit live API metadata
+    (/api/show or /v1/models); calling it on the event loop stalls every
+    concurrent request. Used at all async call sites in this module."""
+    return await asyncio.to_thread(_resolve_rlm_context_window)
+
+
 # Token-counting is approximate by design: we need a budget estimate, not an
-# exact count. tiktoken cl100k_base (the path in data_pipeline.count_tokens)
-# is a good fit for the local models used here; if tiktoken is unavailable we
-# fall back to a len//4 character ratio so chunking still works (just less
-# precise). The estimate is intentionally conservative (chunks end up slightly
-# smaller than the budget, which is the safe direction).
-_TIKTOKEN_ENC = None
-
-
+# exact count. P1-23: the local tiktoken counter was replaced by the shared
+# hybrid in ``api.utils.llm_tokens`` — a cheap len//4 heuristic by default
+# (encoding a whole codebase chunk-by-chunk was the CPU hot spot) with exact
+# tiktoken cl100k_base counting OPT-IN via the admin setting
+# ``llm.precise_tokens`` / env ``LLM_PRECISE_TOKENS`` (one singleton encoder
+# per process). The estimate stays conservative in the safe direction.
 def _count_tokens(text: str) -> int:
-    """Approximate token count for a chunk-budget estimate.
+    """Approximate token count for a chunk-budget estimate (P1-23).
 
-    Uses tiktoken ``cl100k_base`` (matches the path in
-    ``api.data_pipeline.count_tokens``) when available; otherwise falls back to
-    a 4-chars-per-token ratio. Never raises: on any error the fallback is used.
+    Delegates to :func:`api.utils.llm_tokens.count_tokens`: len//4 heuristic
+    by default; exact tiktoken cl100k_base when precise counting is opted in.
     """
     if not text:
         return 0
-    global _TIKTOKEN_ENC
-    try:
-        if _TIKTOKEN_ENC is None:
-            import tiktoken  # type: ignore
-            _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
-        return len(_TIKTOKEN_ENC.encode(text, disallowed_special=()))
-    except Exception:
-        # Conservative ratio so chunks err on the small side.
-        return max(1, len(text) // 4)
+    from api.utils.llm_tokens import count_tokens  # lazy: keeps module import light
+
+    return count_tokens(text)
 
 
 def _resolve_codebase_chunk_budget() -> int:
@@ -2130,12 +2129,26 @@ async def _agentic_bottom_up_docgen(
     ctx_win = _resolve_docgen_context_window() or 8192
     max_p_tokens = max(1024, ctx_win - 2048)
 
-    # Phase 1: Map all file chunks to technical file summaries
-    file_summaries: List[str] = []
-    for i, chunk in enumerate(chunks, 1):
-        summary = await _agentic_file_map_summary(chunk, llm, max_p_tokens)
+    # Phase 1: Map all file chunks to technical file summaries.
+    # P1-24: chunks are independent LLM calls — run them with bounded
+    # parallelism (asyncio.Semaphore + gather, admin/env knob
+    # DOCGEN_MAP_CONCURRENCY, default 3) instead of strictly sequential
+    # awaits. gather preserves input order, so the "часть i/N" labels stay
+    # stable regardless of completion order.
+    from api.config.timeout import resolve_docgen_map_concurrency
+
+    concurrency = max(1, resolve_docgen_map_concurrency())
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _map_one(i: int, chunk: str) -> str:
+        async with sem:
+            summary = await _agentic_file_map_summary(chunk, llm, max_p_tokens)
         if summary:
-            file_summaries.append(f"### Сводка файлов (часть {i}/{len(chunks)}):\n{summary}")
+            return f"### Сводка файлов (часть {i}/{len(chunks)}):\n{summary}"
+        return ""
+
+    mapped = await asyncio.gather(*(_map_one(i, c) for i, c in enumerate(chunks, 1)))
+    file_summaries = [m for m in mapped if m]
 
     if not file_summaries:
         # Fallback to direct prompt if map produced nothing
@@ -2460,7 +2473,9 @@ async def generate_codebase_docs(
     # FALLBACK standard-LLM path (single call / map-reduce) when the agent
     # path cannot run.
     codebase_chunks: List[str] = [codebase_blob]
-    chunk_budget = _resolve_codebase_chunk_budget()
+    # P1-13: the budget resolver reads settings + may hit live API metadata —
+    # run it off the event loop.
+    chunk_budget = await asyncio.to_thread(_resolve_codebase_chunk_budget)
     if codebase_blob:
         chunked = _chunk_file_blocks(_build_file_blocks(documents), chunk_budget)
         if chunked:

@@ -143,7 +143,20 @@ def enforce_ip_rate_limit(request, *, setting_key: str, env_name: str, default_p
     _enforce(f"ip:{client_ip(request)}", limit, 60.0, "ip")
 
 
-def enforce_user_rate_limit(user_key: str, *, setting_key: str, env_name: str, default_per_minute: int) -> None:
-    """Per-user limit for an expensive operation (docgen/expert/public ask)."""
+def enforce_user_rate_limit(
+    user_key: str,
+    *,
+    setting_key: str,
+    env_name: str,
+    default_per_minute: int,
+    window_seconds: float = 60.0,
+) -> None:
+    """Per-user limit for an expensive operation (docgen/expert/public ask).
+
+    ``window_seconds`` sizes the refill window: 60 (default) = per-minute
+    buckets; 3600 = hourly buckets (docgen generate). The ``*_per_minute``
+    naming of the settings/env keys is historical — for hourly buckets the
+    value means "requests per hour".
+    """
     limit = _setting_int(setting_key, env_name, default_per_minute)
-    _enforce(f"user:{user_key}", limit, 60.0, "user")
+    _enforce(f"user:{user_key}", limit, float(window_seconds), "user")

@@ -170,7 +170,10 @@ def download_repo(
                     logger.info("Repository refreshed to latest remote tip.")
                     return f"Refreshed existing repository at {local_path}"
                 except subprocess.CalledProcessError as e:
-                    err = _sanitize_git_stderr(e.stderr.decode('utf-8'), access_token)
+                    # e.stderr can be None (e.g. spawn failures); decode defensively.
+                    err = _sanitize_git_stderr(
+                        (e.stderr or b"").decode("utf-8", errors="replace"), access_token
+                    )
                     logger.warning(
                         "force_refresh fetch/reset failed for %s (%s); removing and "
                         "re-cloning fresh.", local_path, err,
@@ -223,7 +226,10 @@ def download_repo(
         return result.stdout.decode("utf-8")
 
     except subprocess.CalledProcessError as e:
-        error_msg = _sanitize_git_stderr(e.stderr.decode('utf-8'), access_token)
+        # e.stderr can be None; decode defensively (pattern from :81).
+        error_msg = _sanitize_git_stderr(
+            (e.stderr or b"").decode("utf-8", errors="replace"), access_token
+        )
         raise ValueError(f"Error during cloning: {error_msg}")
     except Exception as e:
         raise ValueError(f"An unexpected error occurred: {str(e)}")

@@ -864,16 +864,21 @@ class TestReindexProduct:
 
         indexed_sources: list = []
 
-        async def _spy_index(self, content, pid, source_type="codebase", source_id=None, **kw):
-            indexed_sources.append(source_id)
-            return 1
+        async def _spy_reindex_one(self, pid, items):
+            # P1-20 keyset reindex: per-product swap seam (index() is no
+            # longer called item-by-item from reindex_product).
+            indexed_sources.extend(source_id for _, _, source_id in items)
+            return True
 
-        monkeypatch.setattr(pb.PgVectorMemoryBackend, "index", _spy_index)
+        monkeypatch.setattr(
+            pb.PgVectorMemoryBackend, "_reindex_one_product", _spy_reindex_one
+        )
 
         be = pb.PgVectorMemoryBackend()
         result = asyncio.run(be.reindex_product("prod_1"))
         assert result["success"] is True
-        # Exactly ONE index call for the codebase (docs, not docs+pages).
+        assert result["reindexed_count"] == 1
+        # Exactly ONE item for the codebase (docs, not docs+pages).
         assert indexed_sources == ["cb_1"]
 
     def test_legacy_pages_get_distinct_source_ids(self, monkeypatch, isolated_db):
@@ -937,6 +942,135 @@ class TestReindexProduct:
         assert result["success"] is False
         assert result["reindexed_count"] == 0
 
+    # --- P1-20: pagination + atomic per-product swap -------------------------- #
+    def test_pagination_reindexes_all_products(self, monkeypatch, isolated_db):
+        """Keyset pages of 1 product each still cover every product (no skips,
+        no infinite loop) and only ONE load happens per page."""
+        from api.memory import pgvector_backend as pb
+        from api.models import CodebaseORM, ProductORM
+
+        db = isolated_db.SessionLocal()
+        try:
+            for i in range(3):
+                db.add(ProductORM(id=f"prod_{i}", name=f"P{i}", description=""))
+                db.add(CodebaseORM(
+                    id=f"cb_{i}", product_id=f"prod_{i}", name="repo",
+                    generated_docs=f"content for product {i} " * 8,
+                ))
+            db.commit()
+        finally:
+            db.close()
+
+        async def _fake_embed(texts):
+            return [[float(len(t))] * 4 for t in texts]
+
+        monkeypatch.setattr(pb, "_embed_batch", _fake_embed)
+        monkeypatch.setattr(pb, "_REINDEX_PRODUCT_PAGE_SIZE", 1)
+
+        be = pb.PgVectorMemoryBackend()
+        result = asyncio.run(be.reindex_product())
+        assert result["success"] is True
+        assert result["reindexed_count"] == 3
+
+        from api.models import KnowledgeChunkORM
+        db = isolated_db.SessionLocal()
+        try:
+            for i in range(3):
+                assert db.query(KnowledgeChunkORM).filter(
+                    KnowledgeChunkORM.product_id == f"prod_{i}"
+                ).count() > 0
+        finally:
+            db.close()
+
+    def test_swap_is_atomic_old_chunks_replaced(self, monkeypatch, isolated_db):
+        """A product with stale chunks gets exactly one atomic swap: old ids
+        gone, new chunks present in a single pass."""
+        from api.memory import pgvector_backend as pb
+        from api.models import CodebaseORM, KnowledgeChunkORM, ProductORM
+
+        db = isolated_db.SessionLocal()
+        try:
+            db.add(ProductORM(id="prod_1", name="P1", description=""))
+            db.add(CodebaseORM(
+                id="cb_1", product_id="prod_1", name="repo",
+                generated_docs="fresh wiki content " * 10,
+            ))
+            # Stale chunk from a previous index run.
+            db.add(KnowledgeChunkORM(
+                id="chunk_stale", product_id="prod_1", chunk_index=0,
+                content="stale",
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        async def _fake_embed(texts):
+            return [[float(len(t))] * 4 for t in texts]
+
+        monkeypatch.setattr(pb, "_embed_batch", _fake_embed)
+
+        be = pb.PgVectorMemoryBackend()
+        result = asyncio.run(be.reindex_product("prod_1"))
+        assert result["success"] is True
+        assert result["reindexed_count"] == 1
+
+        db = isolated_db.SessionLocal()
+        try:
+            assert db.query(KnowledgeChunkORM).filter(
+                KnowledgeChunkORM.id == "chunk_stale"
+            ).count() == 0
+            fresh = db.query(KnowledgeChunkORM).filter(
+                KnowledgeChunkORM.product_id == "prod_1"
+            ).count()
+            assert fresh > 0
+            # Every fresh row carries its source, so future per-source
+            # upserts still work after the swap.
+            for row in db.query(KnowledgeChunkORM).filter(
+                KnowledgeChunkORM.product_id == "prod_1"
+            ).all():
+                assert row.source_type == "codebase"
+                assert row.source_id == "cb_1"
+        finally:
+            db.close()
+
+    def test_embedder_failure_keeps_previous_chunks(self, monkeypatch, isolated_db):
+        """If nothing can be embedded the swap is skipped entirely — the
+        product keeps its previous chunks instead of ending up empty."""
+        from api.memory import pgvector_backend as pb
+        from api.models import CodebaseORM, KnowledgeChunkORM, ProductORM
+
+        db = isolated_db.SessionLocal()
+        try:
+            db.add(ProductORM(id="prod_1", name="P1", description=""))
+            db.add(CodebaseORM(
+                id="cb_1", product_id="prod_1", name="repo",
+                generated_docs="wiki content " * 10,
+            ))
+            db.add(KnowledgeChunkORM(
+                id="chunk_keep", product_id="prod_1", chunk_index=0,
+                content="previous index data",
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        async def _broken_embed(texts):
+            return None  # total embedder failure
+
+        monkeypatch.setattr(pb, "_embed_batch", _broken_embed)
+
+        be = pb.PgVectorMemoryBackend()
+        result = asyncio.run(be.reindex_product("prod_1"))
+        assert result["success"] is True  # non-fatal
+        assert result["reindexed_count"] == 0  # product not swapped
+
+        db = isolated_db.SessionLocal()
+        try:
+            assert db.query(KnowledgeChunkORM).filter(
+                KnowledgeChunkORM.id == "chunk_keep"
+            ).count() == 1
+        finally:
+            db.close()
 
 # --------------------------------------------------------------------------- #
 # Wave D: _compute_char_spans (best-effort chunk offsets within the source)

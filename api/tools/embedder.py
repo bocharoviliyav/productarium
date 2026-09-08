@@ -13,11 +13,23 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Optional
 
 from api.config import configs
 
 logger = logging.getLogger(__name__)
+
+# P1-25: process-level embedder cache. Building an embedder constructs a new
+# model client (connection pool, SSL context) on every call; the pgvector
+# memory backend embeds one batch per source, so indexing/reindexing a
+# product with many sources previously built hundreds of throwaway clients.
+# Instances are cached keyed by the EFFECTIVE (base_url, api_key, model) so an
+# admin config change yields a fresh client while unchanged configs reuse the
+# cached one. Bounded FIFO so stale configs can't accumulate.
+_EMBEDDER_CACHE: dict = {}
+_EMBEDDER_CACHE_LOCK = threading.Lock()
+_MAX_CACHED_EMBEDDERS = 8
 
 # Default embedding model (matches .env.example / nomic-embed-text-v1.5, 768d).
 _DEFAULT_EMBEDDING_MODEL = "text-embedding-nomic-embed-text-v1.5"
@@ -64,6 +76,14 @@ def get_embedder(base_url: Optional[str] = None, api_key: Optional[str] = None):
         base_url = emb_cfg.get("base_url")
     if not api_key:
         api_key = emb_cfg.get("api_key")
+
+    # P1-25: reuse the client for unchanged effective configs (the key covers
+    # everything that feeds the model client + model_kwargs below).
+    cache_key = (base_url or "", api_key or "", model)
+    with _EMBEDDER_CACHE_LOCK:
+        cached = _EMBEDDER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     resolved_base_url = (
         base_url
@@ -125,4 +145,10 @@ def get_embedder(base_url: Optional[str] = None, api_key: Optional[str] = None):
     if isinstance(batch_size, int) and batch_size > 0:
         kwargs["chunk_size"] = batch_size
 
-    return OpenAIEmbeddings(**kwargs)
+    embedder = OpenAIEmbeddings(**kwargs)
+    with _EMBEDDER_CACHE_LOCK:
+        if len(_EMBEDDER_CACHE) >= _MAX_CACHED_EMBEDDERS:
+            # FIFO-evict the oldest entry (dicts preserve insertion order).
+            _EMBEDDER_CACHE.pop(next(iter(_EMBEDDER_CACHE)), None)
+        _EMBEDDER_CACHE[cache_key] = embedder
+    return embedder

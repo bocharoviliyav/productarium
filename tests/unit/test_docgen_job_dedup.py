@@ -108,16 +108,43 @@ class TestCreateOrGetJob:
 # lock_for_entity
 # ============================================================================
 class TestLockForEntity:
-    def test_same_key_same_lock_object(self):
-        l1 = jobs_mod.lock_for_entity("p1", "codebase", "c1")
-        l2 = jobs_mod.lock_for_entity("p1", "codebase", "c1")
-        assert l1 is l2
+    """The refcounted per-entity lock context manager (2-arg API).
+
+    Same (entity_type, entity_id) key => one RLock: a second taker from
+    ANOTHER thread times out with EntityBusyError (RLock is reentrant
+    per-thread, so same-thread nesting is legal by design).
+    """
+
+    def test_same_key_is_serialized_across_threads(self):
+        acquired = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with jobs_mod.lock_for_entity("codebase", "c1", timeout=0.05):
+                acquired.set()
+                release.wait(timeout=5)
+
+        t = threading.Thread(target=hold)
+        t.start()
+        assert acquired.wait(timeout=5)
+        try:
+            with pytest.raises(jobs_mod.EntityBusyError):
+                with jobs_mod.lock_for_entity("codebase", "c1", timeout=0.05):
+                    pass
+        finally:
+            release.set()
+            t.join(timeout=5)
 
     def test_different_keys_distinct_locks(self):
-        l1 = jobs_mod.lock_for_entity("p1", "codebase", "c1")
-        l2 = jobs_mod.lock_for_entity("p1", "codebase", "c2")
-        l3 = jobs_mod.lock_for_entity("p1", "spec", "c1")
-        assert l1 is not l2 and l1 is not l3 and l2 is not l3
+        with jobs_mod.lock_for_entity("codebase", "c1", timeout=0.05):
+            with jobs_mod.lock_for_entity("codebase", "c2", timeout=0.05):
+                with jobs_mod.lock_for_entity("spec", "c1", timeout=0.05):
+                    pass  # distinct keys — all acquired, no interference
+
+    def test_registry_entry_dropped_after_release(self):
+        with jobs_mod.lock_for_entity("codebase", "c_drop", timeout=0.05):
+            assert "codebase:c_drop" in jobs_mod._ENTITY_LOCKS
+        assert "codebase:c_drop" not in jobs_mod._ENTITY_LOCKS
 
 
 # ============================================================================
@@ -319,7 +346,8 @@ class TestWorkerEntityLockSerializes:
         jobs_mod._run_docgen_job(j1, "prod_rel", "codebase", "cb_rel", None, "ru")
         assert jobs_mod.get_job(j1)["status"] == "succeeded"
 
-        lock = jobs_mod.lock_for_entity("prod_rel", "codebase", "cb_rel")
-        acquired = lock.acquire(timeout=0.5)
-        assert acquired, "entity lock was not released after the run"
-        lock.release()
+        # The refcounted per-entity lock must be free again after the run:
+        # a fresh CM entry acquires immediately and drops its registry entry.
+        with jobs_mod.lock_for_entity("codebase", "cb_rel", timeout=0.5):
+            pass
+        assert "codebase:cb_rel" not in jobs_mod._ENTITY_LOCKS

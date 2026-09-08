@@ -158,6 +158,12 @@ class TestListProducts:
         assert len(data) == 1
         assert data[0]["id"] == "prod_1"
 
+# P2 note: the light-row list (counters in SQL, pagination, visibility)
+# was reverted to the baseline list[Product] contract while rebasing onto
+# 4845658 — the baseline test suite pins the old shape. The light listing
+# (product_repo.list_products_light + ProductListResponse) is kept in the
+# repo layer and ships with the P2 frontend adaptation.
+
 
 # --------------------------------------------------------------------------- #
 # POST /api/products

@@ -17,7 +17,9 @@ from api.utils.logging import (
 from api.utils.llm_tokens import (
     _MODEL_CTX_CACHE,
     _count_tokens,
+    count_tokens,
     get_model_context_window,
+    get_model_context_window_async,
 )
 
 __all__ = [
@@ -28,5 +30,7 @@ __all__ = [
     # llm_tokens
     "_MODEL_CTX_CACHE",
     "_count_tokens",
+    "count_tokens",
     "get_model_context_window",
+    "get_model_context_window_async",
 ]

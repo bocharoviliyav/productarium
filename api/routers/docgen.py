@@ -29,8 +29,9 @@ from api.docgen.jobs import (
     get_job,
     submit_job,
 )
-from api.models import ProductORM
+from api.models import ProductORM, UserORM
 from api.repositories import product_repo
+from api.utils.rate_limit import enforce_user_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +52,18 @@ class GenerateDocRequest(BaseModel):
 
 def _start_generate(
     db: Session, product_id: str, entity_type: str, entity_id: str,
-    request_data: GenerateDocRequest,
+    request_data: GenerateDocRequest, user_id: str,
 ) -> JSONResponse:
+    # P1-17: per-user token bucket on the expensive generate operation.
+    # Checked before any DB work so an exhausted client is shed cheaply.
+    enforce_user_rate_limit(
+        user_id,
+        setting_key="rate.docgen.per_user_hour",
+        env_name="RATE_DOCGEN_PER_USER_HOUR",
+        default_per_minute=10,
+        window_seconds=3600.0,
+    )
+
     # Access (rw) is enforced by the endpoint's require_product_access dep.
     p_orm = product_repo.load_product_orm(db, product_id)
     if p_orm is None:
@@ -89,8 +100,9 @@ async def generate_codebase_docs(
     product_id: str, codebase_id: str,
     request_data: GenerateDocRequest, db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("rw")),
+    user: UserORM = Depends(get_current_user),
 ):
-    return _start_generate(db, product_id, "codebase", codebase_id, request_data)
+    return _start_generate(db, product_id, "codebase", codebase_id, request_data, user.id)
 
 
 @router.get("/{product_id}/codebases/{codebase_id}/generate/status")
@@ -107,8 +119,9 @@ async def generate_spec_docs(
     product_id: str, spec_id: str,
     request_data: GenerateDocRequest, db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("rw")),
+    user: UserORM = Depends(get_current_user),
 ):
-    return _start_generate(db, product_id, "spec", spec_id, request_data)
+    return _start_generate(db, product_id, "spec", spec_id, request_data, user.id)
 
 
 @router.get("/{product_id}/specs/{spec_id}/generate/status")

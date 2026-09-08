@@ -20,7 +20,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Optional, List, Dict, Any
+import threading
+import time
+from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -147,24 +149,90 @@ def _fernet() -> Optional["Fernet"]:
 
 
 # --- Core CRUD --------------------------------------------------------------
+# P1-13: short in-process TTL cache so hot read paths (per-request timeout
+# resolution via api.config.timeout, rate limits, embedder settings) stop doing
+# a synchronous DB round-trip on every call. Writes invalidate immediately;
+# stale reads are bounded by the TTL (default 5s, env-tunable).
+_SETTINGS_CACHE: Dict[str, Tuple[float, Any]] = {}
+_SETTINGS_CACHE_LOCK = threading.Lock()
+_SETTINGS_CACHE_MISS = object()  # sentinel: key present in cache as "not set"
+_SETTINGS_CACHE_TTL_SECONDS = 5.0
+
+
+def _settings_cache_ttl() -> float:
+    raw = os.environ.get("SETTINGS_CACHE_TTL_SECONDS")
+    if raw:
+        try:
+            val = float(str(raw).strip())
+            if val >= 0:
+                return val
+        except ValueError:
+            pass
+    return _SETTINGS_CACHE_TTL_SECONDS
+
+
+def clear_settings_cache() -> None:
+    """Drop all cached setting values (tests, admin "apply now" paths)."""
+    with _SETTINGS_CACHE_LOCK:
+        _SETTINGS_CACHE.clear()
+
+
+def _cache_get(key: str) -> Tuple[bool, Any]:
+    """Return (hit, value) from the TTL cache. value may be _SETTINGS_CACHE_MISS."""
+    now = time.monotonic()
+    with _SETTINGS_CACHE_LOCK:
+        entry = _SETTINGS_CACHE.get(key)
+        if entry is None:
+            return False, None
+        ts, value = entry
+        if now - ts > _settings_cache_ttl():
+            _SETTINGS_CACHE.pop(key, None)
+            return False, None
+        return True, value
+
+
+def _cache_put(key: str, value: Any) -> None:
+    with _SETTINGS_CACHE_LOCK:
+        _SETTINGS_CACHE[key] = (time.monotonic(), value)
+
+
+def _cache_drop(key: str) -> None:
+    with _SETTINGS_CACHE_LOCK:
+        _SETTINGS_CACHE.pop(key, None)
+
+
 def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
-    """Read a setting by key. Decrypts if the row is marked encrypted."""
+    """Read a setting by key. Decrypts if the row is marked encrypted.
+
+    Serves from a short TTL cache (P1-13): a hit (including a cached "key is
+    not set") skips the DB round-trip; ``set_setting`` / ``delete_setting``
+    invalidate the key immediately.
+    """
+    hit, cached = _cache_get(key)
+    if hit:
+        return default if cached is _SETTINGS_CACHE_MISS else cached
     try:
         from api.db import SessionLocal
         from api.models import SettingORM
         with SessionLocal() as db:
             row = db.get(SettingORM, key)
             if row is None:
+                _cache_put(key, _SETTINGS_CACHE_MISS)
                 return default
             if row.encrypted:
                 f = _fernet()
                 if f is None or not row.value:
+                    _cache_put(key, _SETTINGS_CACHE_MISS)
                     return default
                 try:
-                    return f.decrypt(row.value.encode("utf-8")).decode("utf-8")
+                    value = f.decrypt(row.value.encode("utf-8")).decode("utf-8")
+                    _cache_put(key, value)
+                    return value
                 except Exception as e:
                     logger.warning("Failed to decrypt setting %r: %s", key, e)
+                    _cache_put(key, _SETTINGS_CACHE_MISS)
                     return default
+            _cache_put(key, row.value)
             return row.value
     except Exception as e:
         logger.debug("get_setting(%r) failed (DB down?): %s", key, e)
@@ -201,8 +269,10 @@ def set_setting(key: str, value: Optional[str], encrypt: bool = False) -> None:
                 row.value = stored
                 row.encrypted = encrypted
             db.commit()
+        _cache_drop(key)  # P1-13: writes invalidate immediately
     except Exception as e:
         logger.warning("set_setting(%r) failed (DB down?): %s", key, e)
+        _cache_drop(key)
 
 
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -267,6 +337,8 @@ def delete_setting(key: str) -> bool:
     except Exception as e:
         logger.warning("delete_setting(%r) failed (DB down?): %s", key, e)
         return False
+    finally:
+        _cache_drop(key)  # P1-13: deletes invalidate immediately
 
 
 def list_settings(prefix: Optional[str] = None) -> List[Dict[str, Any]]:

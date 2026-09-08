@@ -307,7 +307,9 @@ async def knowledge_from_integration(
         )
 
     try:
-        pulled = connector.pull(body.source_id, body.opts)
+        # P1-13: connector.pull does sync network I/O (Confluence API, git) —
+        # run it off the event loop in a worker thread.
+        pulled = await asyncio.to_thread(connector.pull, body.source_id, body.opts)
     except ValueError as e:
         # Controlled validation messages from our own connector layer.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))

@@ -128,12 +128,29 @@ DATABASE_URL = _build_database_url()
 
 # ``pool_pre_ping`` avoids stale-connection errors after DB restarts.
 # ``future=True`` enables SQLAlchemy 2.0-style behavior.
-engine: Engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    future=True,
-    connect_args=_engine_connect_args(DATABASE_URL),
-)
+_engine_kwargs: Dict[str, Any] = {
+    "pool_pre_ping": True,
+    "future": True,
+    "connect_args": _engine_connect_args(DATABASE_URL),
+}
+if DATABASE_URL == "sqlite:///:memory:":
+    # In-memory SQLite is PER-CONNECTION: the default SingletonThreadPool
+    # hands every thread its own EMPTY database, so P1-13's off-loop
+    # ``asyncio.to_thread`` DB reads would silently see no tables in the
+    # no-Postgres fallback config. Share one connection across threads
+    # instead (same StaticPool + check_same_thread=False setup as the test
+    # suite's isolated_db fixture). Postgres connections are pooled and
+    # thread-safe, so this branch never affects the real deployment path.
+    from sqlalchemy.pool import StaticPool
+
+    _engine_kwargs.update(
+        poolclass=StaticPool,
+        connect_args={
+            **_engine_kwargs["connect_args"],
+            "check_same_thread": False,
+        },
+    )
+engine: Engine = create_engine(DATABASE_URL, **_engine_kwargs)
 
 
 def _harden_sqlite_connection(dbapi_conn: Any) -> None:

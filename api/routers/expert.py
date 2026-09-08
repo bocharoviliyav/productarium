@@ -74,6 +74,7 @@ from api.expert.types import (
     ExpertStreamEvent,
 )
 from api.models import ChatMessageORM, ChatSessionORM, ProductORM, UserORM
+from api.utils.rate_limit import enforce_user_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -446,6 +447,15 @@ async def expert_ask(
     still streams (legacy behavior: no 404) but runs statelessly with no
     session and no persistence.
     """
+    # P1-17: per-user token bucket (30/min default) on the expert chat —
+    # checked before any prompt/cognee work.
+    enforce_user_rate_limit(
+        user.id,
+        setting_key="rate.expert.per_user_min",
+        env_name="RATE_EXPERT_PER_USER_MINUTE",
+        default_per_minute=30,
+    )
+
     if not body.query.strip():
         raise HTTPException(status_code=400, detail="query is required")
 
@@ -501,6 +511,15 @@ async def expert_ask_doc(
     attachment`` header. ``messages`` is accepted but ignored (doc generation
     is one-shot, not conversational).
     """
+    # P1-17: same per-user bucket as /ask (doc generation is the same cost
+    # class as a chat turn with deep research).
+    enforce_user_rate_limit(
+        user.id,
+        setting_key="rate.expert.per_user_min",
+        env_name="RATE_EXPERT_PER_USER_MINUTE",
+        default_per_minute=30,
+    )
+
     if not body.query.strip():
         raise HTTPException(status_code=400, detail="query is required")
 

@@ -21,6 +21,7 @@ import re
 from typing import Any, AsyncIterator, List, Optional, Tuple
 
 from api.utils import setup_logging
+from api.utils.llm_helpers import aclose_llm as _aclose_llm
 from api.expert.types import (
     EVENT_CONTENT,
     EVENT_REASONING,
@@ -63,6 +64,15 @@ generation, and on ``api.llm.stream_chat_fields`` for async streaming
         self._base_url = base_url
         self._api_key = api_key
         self._llm = GenerateLLM(model=model, base_url=base_url, api_key=api_key)
+
+    async def aclose(self) -> None:
+        """Close the underlying model client's httpx connection pools (P1-14).
+
+        Each ``_ExpertLLM`` is built per expert request/answer; without an
+        explicit close every one of them leaked an open ``httpx.Client`` + a
+        lazily-built ``httpx.AsyncClient``. Never raises.
+        """
+        await _aclose_llm(self.model_client)
 
     async def generate(self, prompt: str) -> str:
         """Non-streaming generation. Returns the raw response text."""

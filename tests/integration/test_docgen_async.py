@@ -41,10 +41,15 @@ def _clear_app_overrides():
     Also clear the module-level docgen job registry: with job dedup
     (create_or_get_job) a still-running job from a previous test would make
     the next POST for the same (product, codebase) re-attach to it instead
-    of starting a fresh run."""
+    of starting a fresh run. Also resets the rate-limit buckets (P1-17):
+    every generate POST draws from a small hourly per-user bucket and tests
+    would otherwise couple through it."""
     import api.docgen.jobs as _dj
     _dj._docgen_jobs.clear()
     _dj._ENTITY_LOCKS.clear()
+    from api.utils.rate_limit import reset_rate_limits
+
+    reset_rate_limits()
     yield
     _dj._docgen_jobs.clear()
     _dj._ENTITY_LOCKS.clear()
@@ -53,6 +58,7 @@ def _clear_app_overrides():
         api_mod.app.dependency_overrides.clear()
     except Exception:
         pass
+    reset_rate_limits()
 
 
 def _setup_db():

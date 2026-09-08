@@ -57,7 +57,21 @@ def _isolated_env(tmp_path_factory, monkeypatch):
     from cryptography.fernet import Fernet
 
     monkeypatch.setenv("SETTINGS_SECRET_KEY", Fernet.generate_key().decode())
+    # P1-13: the settings store now caches reads for ~5s; tests reload api.db
+    # per-test, so stale cached values must never leak across test boundaries.
+    try:
+        from api.config import settings as _settings_mod
+
+        _settings_mod.clear_settings_cache()
+    except Exception:
+        pass
     yield
+    try:
+        from api.config import settings as _settings_mod
+
+        _settings_mod.clear_settings_cache()
+    except Exception:
+        pass
 
 
 # --- Isolated DB -------------------------------------------------------------

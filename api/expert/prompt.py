@@ -142,6 +142,7 @@ def _build_prompt(
     base_url: Optional[str] = None,
     model: Optional[str] = None,
     api_key: Optional[str] = None,
+    ctx_win: Optional[int] = None,
 ) -> str:
     """Assemble the full expert prompt from a loaded template body.
 
@@ -172,12 +173,15 @@ def _build_prompt(
     # Resolve the model's context window so the standard-LLM path stays in
     # budget. RLM is a long-context engine and ignores this cap (it receives
     # the full prompt); the cap only protects the standard-LLM fallback.
-    try:
-        from api.utils import get_model_context_window, _count_tokens
-        ctx_win = get_model_context_window(base_url=base_url, model_name=model, api_key=api_key, task="expert")
-    except Exception:
-        ctx_win = 8192
-        from api.utils import _count_tokens
+    # P1-13: async callers resolve ctx_win off-loop (to_thread) and pass it
+    # in; the sync resolution here is only a fallback for sync callers.
+    if ctx_win is None:
+        try:
+            from api.utils import get_model_context_window, _count_tokens
+            ctx_win = get_model_context_window(base_url=base_url, model_name=model, api_key=api_key, task="expert")
+        except Exception:
+            ctx_win = 8192
+            from api.utils import _count_tokens
 
     # Reserve tokens for system instructions, query, and LLM output completion.
     avail_tokens = max(1024, ctx_win - 2048)

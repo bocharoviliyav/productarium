@@ -21,6 +21,7 @@ import) so ``api.prompts.reload_prompt_file`` can hot-reload them by reloading
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -60,9 +61,17 @@ async def _run_expert_chat_collect(
     resolved_model, base_url, api_key = _resolve_expert_model(model)
     knowledge = await _retrieve_product_knowledge(product_id, query)
     history = _format_history(messages)
+    # P1-13: resolve ctx window off-loop (may query live API metadata).
+    try:
+        from api.utils import get_model_context_window_async
+        ctx_win = await get_model_context_window_async(
+            base_url=base_url, model_name=resolved_model, api_key=api_key, task="expert"
+        )
+    except Exception:
+        ctx_win = 8192
     prompt = _build_prompt(
         _expert_prompt.EXPERT_SYSTEM_PROMPT, _product_name_by_id(product_id), knowledge, history, query,
-        base_url=base_url, model=resolved_model, api_key=api_key,
+        base_url=base_url, model=resolved_model, api_key=api_key, ctx_win=ctx_win,
     )
     logger.info(
         "Expert chat (collect) product=%s prompt_chars=%d",
@@ -97,9 +106,17 @@ async def _run_expert_chat_stream(
     resolved_model, base_url, api_key = _resolve_expert_model(model)
     knowledge = await _retrieve_product_knowledge(product_id, query)
     history = _format_history(messages)
+    # P1-13: resolve ctx window off-loop (may query live API metadata).
+    try:
+        from api.utils import get_model_context_window_async
+        ctx_win = await get_model_context_window_async(
+            base_url=base_url, model_name=resolved_model, api_key=api_key, task="expert"
+        )
+    except Exception:
+        ctx_win = 8192
     prompt = _build_prompt(
         _expert_prompt.EXPERT_SYSTEM_PROMPT, _product_name_by_id(product_id), knowledge, history, query,
-        base_url=base_url, model=resolved_model, api_key=api_key,
+        base_url=base_url, model=resolved_model, api_key=api_key, ctx_win=ctx_win,
     )
     logger.info(
         "Expert chat (stream) product=%s prompt_chars=%d",
@@ -163,9 +180,17 @@ async def run_expert_doc(
     """
     resolved_model, base_url, api_key = _resolve_expert_model(model)
     knowledge = await _retrieve_product_knowledge(product_id, query)
+    # P1-13: resolve ctx window off-loop (may query live API metadata).
+    try:
+        from api.utils import get_model_context_window_async
+        ctx_win = await get_model_context_window_async(
+            base_url=base_url, model_name=resolved_model, api_key=api_key, task="expert"
+        )
+    except Exception:
+        ctx_win = 8192
     prompt = _build_prompt(
         _expert_prompt.EXPERT_DOC_PROMPT, _product_name_by_id(product_id), knowledge, "", query,
-        base_url=base_url, model=resolved_model, api_key=api_key,
+        base_url=base_url, model=resolved_model, api_key=api_key, ctx_win=ctx_win,
     )
     logger.info(
         "Expert doc product=%s prompt_chars=%d",

@@ -237,29 +237,8 @@ class TestCreateProductRoles:
         assert r.json()["owner_id"] == "user_manager"
 
 
-class TestListVisibility:
-    def test_plain_user_sees_owned_and_granted_only(self, isolated_db):
-        from api.routers import products as products_mod
-
-        _seed(isolated_db)
-        # user_owner owns prod_1 and has NO grant on prod_2.
-        app, client = _build_client(isolated_db, products_mod, user=_user("user_owner", "user"))
-        ids = {p["id"] for p in client.get("/api/products").json()}
-        assert ids == {"prod_1"}
-
-        # grantee_rw holds a grant on prod_1 only.
-        app, client = _build_client(isolated_db, products_mod, user=_user("user_grantee_rw", "user"))
-        ids = {p["id"] for p in client.get("/api/products").json()}
-        assert ids == {"prod_1"}
-
-        # stranger sees nothing (empty visibility -> no query at all).
-        app, client = _build_client(isolated_db, products_mod, user=_user("user_stranger", "user"))
-        assert client.get("/api/products").json() == []
-
-    def test_admin_sees_all(self, isolated_db):
-        from api.routers import products as products_mod
-
-        _seed(isolated_db)
-        app, client = _build_client(isolated_db, products_mod, user=_user("user_admin", "admin"))
-        ids = {p["id"] for p in client.get("/api/products").json()}
-        assert ids == {"prod_1", "prod_2"}
+# TestListVisibility (P1-16 list visibility) removed while rebasing onto
+# 4845658: the baseline GET /api/products contract (list[Product], no
+# per-user visibility filter) is pinned by the user's tests and was
+# restored. The visibility-filtered listing ships with the P2 frontend
+# adaptation (product_repo.list_products_light + _visible_product_ids).

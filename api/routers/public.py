@@ -18,6 +18,8 @@ leaves the server.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
 from datetime import datetime
@@ -30,6 +32,7 @@ from sqlalchemy.orm import Session
 
 from api.auth.deps import require_api_token
 from api.db import get_db
+from api.utils.rate_limit import enforce_user_rate_limit
 from api.models import (
     ApiTokenORM, CodebaseORM, DatabaseORM, KnowledgeNodeORM, LinksORM,
     ProductORM, SpecORM,
@@ -276,6 +279,14 @@ async def ask(
     db: Session = Depends(get_db),
 ):
     """Reuse the expert agent to answer a query over a product (SSE stream)."""
+    # P1-17: per-user (token owner) bucket; tokens without a linked user are
+    # keyed by the token id itself.
+    enforce_user_rate_limit(
+        tok.user_id or tok.id,
+        setting_key="rate.public.per_user_min",
+        env_name="RATE_PUBLIC_PER_USER_MINUTE",
+        default_per_minute=30,
+    )
     product = db.get(ProductORM, product_id)
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -367,9 +378,15 @@ async def push(
         "user_id": tok.user_id,
     }
     try:
-        result = push_fn(payload)
-        if hasattr(result, "__await__"):
-            result = await result
+        # P1-13: sync push functions (Confluence/git connectors do blocking
+        # network I/O) must not run on the event loop; native async ones are
+        # awaited directly.
+        if inspect.iscoroutinefunction(push_fn):
+            result = await push_fn(payload)
+        else:
+            result = await asyncio.to_thread(push_fn, payload)
+            if inspect.isawaitable(result):
+                result = await result
     except Exception as e:
         # Push exceptions (Confluence/git HTTP stacks) can embed authenticated
         # URLs — log the details, keep the client message generic.

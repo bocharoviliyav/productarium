@@ -20,6 +20,7 @@ import logging
 from datetime import datetime
 from typing import Any, List, Optional, Tuple
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session, selectinload
 
 from api.config.settings import decrypt_secret, encrypt_secret, is_encrypted_secret
@@ -31,7 +32,7 @@ from api.models import (
     ProductORM,
     SpecORM,
 )
-from api.schemas import Codebase, Database, Links, Product, Spec
+from api.schemas import Codebase, Database, Links, Product, ProductListItem, Spec
 
 logger = logging.getLogger(__name__)
 
@@ -272,35 +273,164 @@ def load_product_orm(db: Session, product_id: str) -> Optional[ProductORM]:
     return q.first()
 
 
-def list_products(
-    db: Session, product_ids: Optional[Any] = None
-) -> List[Product]:
-    """List products with children eagerly loaded, as Pydantic models.
+def _count_subquery(model, *, verified: bool = False):
+    """Correlated ``SELECT count(*)`` subquery over a child table (P1-16).
 
-    ``product_ids`` (optional iterable of ids) restricts the listing to the
-    products visible to the current user (P0-2). An empty iterable yields an
-    empty list without querying.
+    Counted in SQL — child rows (and their Text payloads) are never loaded.
     """
-    if product_ids is not None:
-        ids = list(product_ids)
-        if not ids:
-            return []
+    from sqlalchemy import select as _select
+
+    sq = _select(func.count()).select_from(model).where(
+        model.product_id == ProductORM.id
+    )
+    if verified:
+        sq = sq.where(model.verified.is_(True))
+    return sq.scalar_subquery()
+
+
+def list_products(db: Session) -> List[Product]:
+    """Full product listing with children eagerly loaded (baseline contract)."""
     q = db.query(ProductORM)
-    if product_ids is not None:
-        q = q.filter(ProductORM.id.in_(ids))
     for opt in _load_options():
         q = q.options(opt)
     return [orm_to_product(p) for p in q.all()]
 
 
-def upsert_product(db: Session, product: Product) -> ProductORM:
-    """Insert or update a Product and fully replace its codebases/specs/links.
+def list_products_light(
+    db: Session,
+    product_ids: Optional[Any] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> Tuple[List[ProductListItem], int]:
+    """Light paginated product listing (P1-16): counters in SQL, no Text fields.
 
-    Mirrors the previous JSON overwrite semantics (full replace of the child
-    lists) so POST/PUT stay drop-in compatible — but server-owned state
-    survives the replace (P0-5): the verified triple is preserved per child
-    id, and codebase tokens follow the write-only merge rule (P0-2).
+    Returns ``(items, total)`` where ``total`` is the filtered count BEFORE
+    pagination. ``product_ids`` restricts the listing to visible products
+    (None = no restriction; empty iterable -> ([], 0) without querying).
     """
+    base = db.query(ProductORM)
+    if product_ids is not None:
+        ids = list(product_ids)
+        if not ids:
+            return [], 0
+        base = base.filter(ProductORM.id.in_(ids))
+    total = base.count()
+    rows = (
+        base.with_entities(
+            ProductORM.id,
+            ProductORM.name,
+            ProductORM.summary,
+            ProductORM.owner_id,
+            ProductORM.created_at,
+            ProductORM.updated_at,
+            _count_subquery(CodebaseORM).label("codebases_count"),
+            _count_subquery(CodebaseORM, verified=True).label("verified_codebases"),
+            _count_subquery(SpecORM).label("specs_count"),
+            _count_subquery(SpecORM, verified=True).label("verified_specs"),
+            _count_subquery(LinksORM).label("links_count"),
+            _count_subquery(LinksORM, verified=True).label("verified_links"),
+        )
+        .order_by(ProductORM.created_at, ProductORM.id)
+        .offset(max(0, offset))
+        .limit(max(1, limit))
+        .all()
+    )
+    items = [
+        ProductListItem(
+            id=r.id,
+            name=r.name,
+            summary=r.summary,
+            owner_id=r.owner_id,
+            created_at=r.created_at,
+            updated_at=r.updated_at,
+            codebases_count=r.codebases_count or 0,
+            verified_codebases=r.verified_codebases or 0,
+            specs_count=r.specs_count or 0,
+            verified_specs=r.verified_specs or 0,
+            links_count=r.links_count or 0,
+            verified_links=r.verified_links or 0,
+        )
+        for r in rows
+    ]
+    return items, total
+
+
+def _entity_lock(entity_type: str, entity_id: str):
+    """Context manager serializing API writes with running docgen jobs.
+
+    Lazy import so ``product_repo`` stays free of docgen-package imports at
+    module load (the docgen package lazily imports this module at runtime).
+    Raises ``EntityBusyError`` (mapped to HTTP 409 by the routers) when a
+    docgen job holds the lock for this entity.
+    """
+    from api.docgen.jobs import lock_for_entity  # lazy: avoid import cycle weight
+
+    return lock_for_entity(entity_type, entity_id)
+
+
+_ENTITY_TYPE_BY_COLLECTION = {
+    "codebases": "codebase",
+    "specs": "spec",
+    "links": "links",
+    "databases": "database",
+}
+
+
+def upsert_product(db: Session, product: Product) -> ProductORM:
+    """Insert or update a Product with PER-ID child upserts (P1-19).
+
+    Children in the payload are updated in place when a row with the same id
+    exists, inserted when new, and rows absent from the payload are deleted
+    (same end state as the old delete-all+reinsert, but rows are never deleted
+    and re-created under their id, so a concurrent docgen commit to the same
+    row cannot be wiped). Server-owned state survives: the verified triple
+    stays untouched on existing rows (P0-5) and codebase tokens follow the
+    write-only merge rule (P0-2).
+
+    The whole operation runs under the entity locks of every touched child
+    (existing ∪ payload ids, acquired in sorted order — deadlock-free) so a
+    concurrently running docgen job for any of these entities either finishes
+    first or we fail fast with ``EntityBusyError`` (HTTP 409 at the router).
+    """
+    import contextlib
+
+    existing_ids = {
+        "codebase": {
+            row[0] for row in db.query(CodebaseORM.id).filter(
+                CodebaseORM.product_id == product.id
+            )
+        },
+        "spec": {
+            row[0] for row in db.query(SpecORM.id).filter(
+                SpecORM.product_id == product.id
+            )
+        },
+        "links": {
+            row[0] for row in db.query(LinksORM.id).filter(
+                LinksORM.product_id == product.id
+            )
+        },
+    }
+    payload_ids = {
+        "codebase": {c.id for c in product.codebases},
+        "spec": {s.id for s in product.specs},
+        "links": {l.id for l in product.links},
+    }
+    # Fixed sorted order keeps concurrent multi-lock acquisitions deadlock-free.
+    keys = sorted(
+        f"{etype}:{eid}"
+        for etype in ("codebase", "spec", "links")
+        for eid in existing_ids[etype] | payload_ids[etype]
+    )
+    with contextlib.ExitStack() as stack:
+        for key in keys:
+            etype, _, eid = key.partition(":")
+            stack.enter_context(_entity_lock(etype, eid))
+        return _upsert_product_locked(db, product)
+
+
+def _upsert_product_locked(db: Session, product: Product) -> ProductORM:
+    """Per-id child upsert — caller must already hold the entity locks."""
     p_orm = db.get(ProductORM, product.id)
     if p_orm is None:
         p_orm = ProductORM(
@@ -420,33 +550,35 @@ def _restore_server_state(orm, prev) -> None:
 
 # --- Per-type add / delete --------------------------------------------------
 def _add_child(db: Session, product_id: str, orm, collection: str) -> Product:
-    p_orm = load_product_orm(db, product_id)
-    if p_orm is None:
-        raise ValueError("Product not found")
-    existing = next((x for x in getattr(p_orm, collection) if x.id == orm.id), None)
-    if existing is not None:
-        _restore_server_state(orm, existing)
-        if isinstance(orm, CodebaseORM) and not orm.token:
-            # write-only token merge: empty payload token keeps the stored one
-            orm.token = existing.token
-        getattr(p_orm, collection).remove(existing)
-        db.flush()
-    getattr(p_orm, collection).append(orm)
-    db.commit()
-    db.refresh(p_orm)
-    return orm_to_product(p_orm)
+    with _entity_lock(_ENTITY_TYPE_BY_COLLECTION[collection], orm.id):
+        p_orm = load_product_orm(db, product_id)
+        if p_orm is None:
+            raise ValueError("Product not found")
+        existing = next((x for x in getattr(p_orm, collection) if x.id == orm.id), None)
+        if existing is not None:
+            _restore_server_state(orm, existing)
+            if isinstance(orm, CodebaseORM) and not orm.token:
+                # write-only token merge: empty payload token keeps the stored one
+                orm.token = existing.token
+            getattr(p_orm, collection).remove(existing)
+            db.flush()
+        getattr(p_orm, collection).append(orm)
+        db.commit()
+        db.refresh(p_orm)
+        return orm_to_product(p_orm)
 
 
 def _delete_child(db: Session, product_id: str, entity_id: str, model, collection: str) -> Product:
-    p_orm = load_product_orm(db, product_id)
-    if p_orm is None:
-        raise ValueError("Product not found")
-    existing = next((x for x in getattr(p_orm, collection) if x.id == entity_id), None)
-    if existing is not None:
-        getattr(p_orm, collection).remove(existing)
-        db.commit()
-    db.refresh(p_orm)
-    return orm_to_product(p_orm)
+    with _entity_lock(_ENTITY_TYPE_BY_COLLECTION[collection], entity_id):
+        p_orm = load_product_orm(db, product_id)
+        if p_orm is None:
+            raise ValueError("Product not found")
+        existing = next((x for x in getattr(p_orm, collection) if x.id == entity_id), None)
+        if existing is not None:
+            getattr(p_orm, collection).remove(existing)
+            db.commit()
+        db.refresh(p_orm)
+        return orm_to_product(p_orm)
 
 
 def add_codebase(db: Session, product_id: str, codebase: Codebase) -> Product:
@@ -578,80 +710,83 @@ def update_codebase_content(
     re-indexed into the memory backend (may be None). Raises ValueError if
     product or codebase is missing, or if no edit shape was provided.
     """
-    p_orm = load_product_orm(db, product_id)
-    if p_orm is None:
-        raise ValueError("Product not found")
-    codebase = next((c for c in p_orm.codebases if c.id == codebase_id), None)
-    if codebase is None:
-        raise ValueError("Codebase not found")
+    with _entity_lock("codebase", codebase_id):
+        p_orm = load_product_orm(db, product_id)
+        if p_orm is None:
+            raise ValueError("Product not found")
+        codebase = next((c for c in p_orm.codebases if c.id == codebase_id), None)
+        if codebase is None:
+            raise ValueError("Codebase not found")
 
-    indexed_text: Optional[str] = None
+        indexed_text: Optional[str] = None
 
-    if pages is not None:
-        codebase.pages = pages
-        indexed_text = json.dumps(pages, ensure_ascii=False)
-    elif page_id is not None and content is not None:
-        # Copy-on-write (same as update_database_content): in-place mutation
-        # of the loaded JSON dict would silently persist nothing.
-        current = dict(codebase.pages) if isinstance(codebase.pages, dict) else {}
-        page = dict(current.get(page_id) or {})
-        if page:
-            page["content"] = content
+        if pages is not None:
+            codebase.pages = pages
+            indexed_text = json.dumps(pages, ensure_ascii=False)
+        elif page_id is not None and content is not None:
+            # Copy-on-write (same as update_database_content): in-place mutation
+            # of the loaded JSON dict would silently persist nothing.
+            current = dict(codebase.pages) if isinstance(codebase.pages, dict) else {}
+            page = dict(current.get(page_id) or {})
+            if page:
+                page["content"] = content
+            else:
+                page = {
+                    "id": page_id,
+                    "title": page_id,
+                    "content": content,
+                    "filePaths": [],
+                    "importance": "medium",
+                    "relatedPages": [],
+                }
+            current[page_id] = page
+            codebase.pages = current
+            indexed_text = content
+        elif generated_docs is not None:
+            codebase.generated_docs = generated_docs
+            indexed_text = generated_docs
         else:
-            page = {
-                "id": page_id,
-                "title": page_id,
-                "content": content,
-                "filePaths": [],
-                "importance": "medium",
-                "relatedPages": [],
-            }
-        current[page_id] = page
-        codebase.pages = current
-        indexed_text = content
-    elif generated_docs is not None:
-        codebase.generated_docs = generated_docs
-        indexed_text = generated_docs
-    else:
-        raise ValueError(
-            "Provide one of: pages, (page_id + content), or generated_docs"
-        )
+            raise ValueError(
+                "Provide one of: pages, (page_id + content), or generated_docs"
+            )
 
-    db.commit()
-    db.refresh(p_orm)
-    return orm_to_product(p_orm), indexed_text
+        db.commit()
+        db.refresh(p_orm)
+        return orm_to_product(p_orm), indexed_text
 
 
 def update_spec_content(
     db: Session, product_id: str, spec_id: str, content: Optional[str]
 ) -> Tuple[Product, Optional[str]]:
     """Replace a spec's raw content (authored directly, no generation)."""
-    p_orm = load_product_orm(db, product_id)
-    if p_orm is None:
-        raise ValueError("Product not found")
-    spec = next((s for s in p_orm.specs if s.id == spec_id), None)
-    if spec is None:
-        raise ValueError("Spec not found")
-    spec.content = content
-    db.commit()
-    db.refresh(p_orm)
-    return orm_to_product(p_orm), content
+    with _entity_lock("spec", spec_id):
+        p_orm = load_product_orm(db, product_id)
+        if p_orm is None:
+            raise ValueError("Product not found")
+        spec = next((s for s in p_orm.specs if s.id == spec_id), None)
+        if spec is None:
+            raise ValueError("Spec not found")
+        spec.content = content
+        db.commit()
+        db.refresh(p_orm)
+        return orm_to_product(p_orm), content
 
 
 def update_links_content(
     db: Session, product_id: str, links_id: str, content: Optional[str]
 ) -> Tuple[Product, Optional[str]]:
     """Replace a links collection's raw content (JSON array of {url, description})."""
-    p_orm = load_product_orm(db, product_id)
-    if p_orm is None:
-        raise ValueError("Product not found")
-    links = next((l for l in p_orm.links if l.id == links_id), None)
-    if links is None:
-        raise ValueError("Links not found")
-    links.content = content
-    db.commit()
-    db.refresh(p_orm)
-    return orm_to_product(p_orm), content
+    with _entity_lock("links", links_id):
+        p_orm = load_product_orm(db, product_id)
+        if p_orm is None:
+            raise ValueError("Product not found")
+        links = next((l for l in p_orm.links if l.id == links_id), None)
+        if links is None:
+            raise ValueError("Links not found")
+        links.content = content
+        db.commit()
+        db.refresh(p_orm)
+        return orm_to_product(p_orm), content
 
 
 def update_database_meta(

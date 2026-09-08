@@ -97,6 +97,18 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         label="Docgen indexing drain",
         group="LLM",
     ),
+    # Not a timeout but a tunable knob that shares the registry's precedence
+    # (admin store > env > default) + floor machinery: max parallel LLM calls
+    # in the agentic docgen MAP phase (P1-24).
+    TimeoutKey(
+        key="docgen_map_concurrency",
+        env_var="DOCGEN_MAP_CONCURRENCY",
+        default=3.0,
+        floor=1.0,
+        label="Docgen map-phase parallel LLM calls",
+        unit="parallel calls",
+        group="LLM",
+    ),
     # --- Memory backend (pgvector recall) -------------------------------
     TimeoutKey(
         key="memory_query",
@@ -162,6 +174,14 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         default=3.0,
         floor=1.0,
         label="Mermaid max repair attempts",
+        group="Mermaid",
+    ),
+    TimeoutKey(
+        key="mermaid_repair_deadline",
+        env_var="MERMAID_REPAIR_DEADLINE_SECONDS",
+        default=600.0,
+        floor=10.0,
+        label="Mermaid repair loop wall-clock budget",
         group="Mermaid",
     ),
     # --- Provider connection test (admin panel "Test" button) ----------
@@ -274,6 +294,18 @@ def resolve_docgen_indexing_drain_seconds() -> float:
     return resolve_timeout("docgen_indexing_drain")
 
 
+def resolve_docgen_map_concurrency() -> int:
+    """Max parallel LLM calls in the agentic docgen MAP phase (P1-24).
+
+    The Phase-1 map loop (``_agentic_bottom_up_docgen``) issues one independent
+    LLM call per codebase chunk; awaiting them strictly sequentially wastes wall
+    clock on a local model. This knob bounds the parallelism (asyncio.Semaphore
+    + gather) so the local server is not flooded. The RLM map loop stays
+    sequential (shared REPL session). Floor 1 = sequential fallback.
+    """
+    return resolve_timeout_int("docgen_map_concurrency")
+
+
 def resolve_memory_query_timeout() -> float:
     """pgvector cosine-recall query timeout (seconds).
 
@@ -318,6 +350,17 @@ def resolve_mermaid_repair_timeout() -> float:
 def resolve_mermaid_max_repair_attempts() -> int:
     """Max LLM repair attempts per unique mermaid diagram body."""
     return resolve_timeout_int("mermaid_max_repair_attempts")
+
+
+def resolve_mermaid_repair_deadline() -> float:
+    """Wall-clock budget for the whole mermaid repair drain (seconds).
+
+    P1-15: caps the TOTAL time run_repair_loop may spend draining repairs for
+    one page, so a mutating LLM that produces a fresh broken body on every
+    call cannot spin the loop indefinitely (each new body hash previously
+    earned its own per-body budget).
+    """
+    return resolve_timeout("mermaid_repair_deadline")
 
 
 def resolve_provider_test_timeout() -> float:
@@ -382,6 +425,7 @@ __all__ = [
     "resolve_llm_request_timeout",
     "resolve_llm_retry_max_time",
     "resolve_docgen_indexing_drain_seconds",
+    "resolve_docgen_map_concurrency",
     "resolve_memory_query_timeout",
     "resolve_model_list_timeout",
     "resolve_integration_http_timeout",
@@ -390,6 +434,7 @@ __all__ = [
     "resolve_mermaid_verify_timeout",
     "resolve_mermaid_repair_timeout",
     "resolve_mermaid_max_repair_attempts",
+    "resolve_mermaid_repair_deadline",
     "resolve_provider_test_timeout",
     "sync_timeout_env",
     "get_timeout_resolved_view",

@@ -12,6 +12,7 @@ Split out of the former ``api/expert_agent.py`` (Step 6). Owns:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List
 
@@ -115,7 +116,8 @@ async def _retrieve_product_knowledge(product_id: str, query: str) -> str:
             "Expert: memory recall failed for product %r: %s", product_id, e
         )
 
-    fallback_docs = _fallback_artifact_docs(product_id)
+    # P1-13: sync DB reads / connector HTTP must not block the event loop.
+    fallback_docs = await asyncio.to_thread(_fallback_artifact_docs, product_id)
     if fallback_docs:
         return fallback_docs
 
@@ -124,11 +126,13 @@ async def _retrieve_product_knowledge(product_id: str, query: str) -> str:
         from api.integrations.registry import get_connector
         c_connector = get_connector("confluence")
         if c_connector and c_connector.is_configured():
-            spaces = c_connector.list_spaces()
+            spaces = await asyncio.to_thread(c_connector.list_spaces)
             if spaces:
                 sp_id = spaces[0].get("key") or spaces[0].get("id")
                 if sp_id:
-                    pulled = c_connector.pull(sp_id, opts={"recursive": False})
+                    pulled = await asyncio.to_thread(
+                        c_connector.pull, sp_id, opts={"recursive": False}
+                    )
                     if pulled and pulled.get("markdown"):
                         # P0-8: third-party wiki content is untrusted — frame it
                         # as data before it reaches the LLM prompt.

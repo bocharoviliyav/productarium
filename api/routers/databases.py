@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 from api.auth.deps import get_current_user
 from api.db import get_db
 from api.docgen.jobs import (
+    EntityBusyError,
     _progress_snapshot,
     create_or_get_job,
     get_job,
@@ -145,6 +146,8 @@ async def add_database(
     )
     try:
         product = product_repo.add_database(db, product_id, fresh)
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
         raise HTTPException(status_code=404, detail="Product not found")
     # Defensive: the raw DSN must never appear in the serialized response.
@@ -158,6 +161,8 @@ async def delete_database(
 ):
     try:
         return product_repo.delete_database(db, product_id, database_id)
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
         raise HTTPException(status_code=404, detail="Product not found")
 
@@ -188,6 +193,8 @@ async def update_database(
                 content=body.content,
                 generated_docs=body.generated_docs,
             )
+        except EntityBusyError as e:
+            raise HTTPException(status_code=409, detail=str(e))
         except ValueError as e:
             msg = str(e)
             status = 400 if "Provide one of" in msg else 404
@@ -206,6 +213,8 @@ async def update_database(
             dsn=body.dsn,
             mcp_server_id=body.mcp_server_id,
         )
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
         raise HTTPException(status_code=404, detail="Database not found")
     _assert_no_raw_dsn(product, body.dsn)

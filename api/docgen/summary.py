@@ -185,8 +185,11 @@ async def generate_product_summary(
             logger.debug("settings_store summary task lookup failed: %s", e)
 
     try:
-        from api.utils import get_model_context_window
-        ctx_win = get_model_context_window(base_url=base_url, model_name=model, api_key=api_key, task="summary")
+        # P1-13: the resolver may hit live API metadata — keep it off the loop.
+        from api.utils import get_model_context_window_async
+        ctx_win = await get_model_context_window_async(
+            base_url=base_url, model_name=model, api_key=api_key, task="summary"
+        )
     except Exception:
         ctx_win = 8192
 
@@ -209,6 +212,9 @@ async def generate_product_summary(
         logger.warning("Summary LLM generation failed: %s", e)
         return ""
     finally:
+        # P1-14: release httpx pools. Duck-typed close — tests (and future
+        # callers) may swap ``_safe_build_summary_llm`` for objects without
+        # ``aclose``.
         await _safe_aclose(llm)
     # Deterministic secret guard: the summary lands in ProductORM.summary and
     # the products API — the same masked-text contract as the docgen flows.

@@ -373,3 +373,63 @@ class TestGetEmbedder:
         )
         embedder = get_embedder()
         assert embedder.model == "text-embedding-nomic-embed-text-v1.5"
+
+    # --- P1-25: instance reuse across batches ---------------------------------- #
+    def test_same_params_reuse_cached_instance(self, monkeypatch):
+        import api.tools.embedder as emb_mod
+        from api.tools.embedder import get_embedder
+
+        emb_mod._EMBEDDER_CACHE.clear()
+        e1 = get_embedder(base_url="http://cache-test:1/v1", api_key="not-needed")
+        e2 = get_embedder(base_url="http://cache-test:1/v1", api_key="not-needed")
+        assert e1 is e2  # same effective (base_url, api_key, model) -> reused
+        emb_mod._EMBEDDER_CACHE.clear()
+
+    def test_different_base_url_new_instance(self, monkeypatch):
+        import api.tools.embedder as emb_mod
+        from api.tools.embedder import get_embedder
+
+        emb_mod._EMBEDDER_CACHE.clear()
+        e1 = get_embedder(base_url="http://cache-test:1/v1", api_key="k")
+        e2 = get_embedder(base_url="http://cache-test:2/v1", api_key="k")
+        assert e1 is not e2
+        assert e1.openai_api_base == "http://cache-test:1/v1"
+        assert e2.openai_api_base == "http://cache-test:2/v1"
+        emb_mod._EMBEDDER_CACHE.clear()
+
+    def test_admin_model_change_new_instance(self, monkeypatch):
+        """The cache key includes the effective model, so an admin model
+        change builds a fresh client instead of returning the stale one."""
+        import api.tools.embedder as emb_mod
+        from api.tools.embedder import get_embedder
+
+        emb_mod._EMBEDDER_CACHE.clear()
+        monkeypatch.setattr(
+            "api.config.settings.get_setting",
+            lambda key, default=None: "emb-a" if key == "models.embedder.model" else default,
+        )
+        e1 = get_embedder(base_url="http://cache-test:1/v1", api_key="k")
+        assert e1.model == "emb-a"
+        monkeypatch.setattr(
+            "api.config.settings.get_setting",
+            lambda key, default=None: "emb-b" if key == "models.embedder.model" else default,
+        )
+        e2 = get_embedder(base_url="http://cache-test:1/v1", api_key="k")
+        assert e2.model == "emb-b"
+        assert e1 is not e2
+        emb_mod._EMBEDDER_CACHE.clear()
+
+    def test_cache_is_bounded_fifo(self, monkeypatch):
+        import api.tools.embedder as emb_mod
+        from api.tools.embedder import get_embedder
+
+        emb_mod._EMBEDDER_CACHE.clear()
+        monkeypatch.setattr(emb_mod, "_MAX_CACHED_EMBEDDERS", 2)
+        e1 = get_embedder(base_url="http://f:1/v1", api_key="k")
+        get_embedder(base_url="http://f:2/v1", api_key="k")
+        get_embedder(base_url="http://f:3/v1", api_key="k")  # evicts f:1
+        assert len(emb_mod._EMBEDDER_CACHE) == 2
+        assert all(k[0] != "http://f:1/v1" for k in emb_mod._EMBEDDER_CACHE)
+        e1_again = get_embedder(base_url="http://f:1/v1", api_key="k")
+        assert e1_again is not e1  # rebuilt after eviction
+        emb_mod._EMBEDDER_CACHE.clear()

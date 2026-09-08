@@ -488,9 +488,14 @@ class TestExpertRouter:
         from fastapi.testclient import TestClient
         import api.routers.expert as expert_router
 
+        # P1-17: fresh rate-limit budget per test (ask endpoints are limited).
+        from api.utils.rate_limit import reset_rate_limits
+
+        reset_rate_limits()
         app = FastAPI()
         app.include_router(expert_router.router)
-        return app, TestClient(app)
+        yield app, TestClient(app)
+        reset_rate_limits()
 
     def test_ask_streams_sse_reasoning_events(self, app_and_client, monkeypatch):
         """The router emits typed SSE frames for reasoning + content events."""
