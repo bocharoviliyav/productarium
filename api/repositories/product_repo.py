@@ -288,14 +288,6 @@ def _count_subquery(model, *, verified: bool = False):
     return sq.scalar_subquery()
 
 
-def list_products(db: Session) -> List[Product]:
-    """Full product listing with children eagerly loaded (baseline contract)."""
-    q = db.query(ProductORM)
-    for opt in _load_options():
-        q = q.options(opt)
-    return [orm_to_product(p) for p in q.all()]
-
-
 def list_products_light(
     db: Session,
     product_ids: Optional[Any] = None,
@@ -304,9 +296,11 @@ def list_products_light(
 ) -> Tuple[List[ProductListItem], int]:
     """Light paginated product listing (P1-16): counters in SQL, no Text fields.
 
-    Returns ``(items, total)`` where ``total`` is the filtered count BEFORE
-    pagination. ``product_ids`` restricts the listing to visible products
-    (None = no restriction; empty iterable -> ([], 0) without querying).
+    Serves the bare-list contract: the caller returns these rows as a plain
+    JSON array and carries ``total`` out-of-band (``X-Total-Count`` header).
+    ``total`` is the filtered count BEFORE pagination. ``product_ids``
+    restricts the listing to visible products (None = no restriction;
+    empty iterable -> ([], 0) without querying).
     """
     base = db.query(ProductORM)
     if product_ids is not None:
@@ -319,6 +313,7 @@ def list_products_light(
         base.with_entities(
             ProductORM.id,
             ProductORM.name,
+            ProductORM.description,
             ProductORM.summary,
             ProductORM.owner_id,
             ProductORM.created_at,
@@ -329,6 +324,8 @@ def list_products_light(
             _count_subquery(SpecORM, verified=True).label("verified_specs"),
             _count_subquery(LinksORM).label("links_count"),
             _count_subquery(LinksORM, verified=True).label("verified_links"),
+            _count_subquery(DatabaseORM).label("databases_count"),
+            _count_subquery(DatabaseORM, verified=True).label("verified_databases"),
         )
         .order_by(ProductORM.created_at, ProductORM.id)
         .offset(max(0, offset))
@@ -339,6 +336,7 @@ def list_products_light(
         ProductListItem(
             id=r.id,
             name=r.name,
+            description=r.description or "",
             summary=r.summary,
             owner_id=r.owner_id,
             created_at=r.created_at,
@@ -349,6 +347,8 @@ def list_products_light(
             verified_specs=r.verified_specs or 0,
             links_count=r.links_count or 0,
             verified_links=r.verified_links or 0,
+            databases_count=r.databases_count or 0,
+            verified_databases=r.verified_databases or 0,
         )
         for r in rows
     ]

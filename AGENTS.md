@@ -49,7 +49,7 @@ Productarium is a **product-centric** documentation platform. The top-level enti
 
 ### Product-Centric Data Model
 No polymorphic artifact entity — separate typed ORM models (all in `api/models.py`):
-- **Product** (`products`): `id, name, summary, owner_id, created_at, updated_at`. Owns `codebases`, `specs`, `links`, `databases` (each `cascade="all, delete-orphan"`).
+- **Product** (`products`): `id, name, description, summary, owner_id, created_at, updated_at`. Owns `codebases`, `specs`, `links`, `databases` (each `cascade="all, delete-orphan"`).
 - **Codebase** (`codebases`): `id, product_id (FK CASCADE), name, repo_url, repo_type, token, generated_docs (Text), pages (JSON tree), verified, verified_by, verified_at, source, timestamps`.
 - **Spec** (`specs`): `id, product_id, name, kind (openapi|asyncapi), content (Text — yaml/json), verified/…, source, timestamps`.
 - **Links** (`links`): `id, product_id, name, content (Text — JSON array of {url, description}), verified/…, source, timestamps`.
@@ -61,7 +61,7 @@ No polymorphic artifact entity — separate typed ORM models (all in `api/models
 - **ProductMcpServer** (`product_mcp_servers`) — per-product binding with optional `allowed_tools` allowlist.
 - **KnowledgeChunk** (`knowledge_chunks`) — pgvector memory chunks (`product_id, source_type, source_id, content, embedding` + HNSW).
 - Persisted via SQLAlchemy 2.0 (`api/db.py`: `init_db()` = `create_all` + pgvector extension/index; idempotent, non-fatal; no migrations). `get_db()` is the FastAPI dependency.
-- REST: `GET/POST /api/products`, `GET/PUT/DELETE /api/products/{id}`, `POST/DELETE/PUT /api/products/{id}/codebases|specs|links|databases/{id}`, `POST .../codebases|specs|databases/{id}/generate` + status (202 + job_id), `POST /api/products/{id}/ask` (SSE) + `/ask/doc`, chat sessions CRUD, `/api/admin/mcp/servers`, `/api/products/{id}/mcp` (bindings), inbound MCP at `/api/mcp`.
+- REST: `GET/POST /api/products` (GET serves **light rows in a bare JSON array** — SQL-counted child totals only, `limit`/`offset` query params, filtered total in the `X-Total-Count` header, per-user visibility filter; the full object only via `GET /{id}`), `GET/PUT/DELETE /api/products/{id}`, `POST/DELETE/PUT /api/products/{id}/codebases|specs|links|databases/{id}`, `POST .../codebases|specs|databases/{id}/generate` + status (202 + job_id), `POST /api/products/{id}/ask` (SSE) + `/ask/doc`, chat sessions CRUD, `/api/admin/mcp/servers`, `/api/products/{id}/mcp` (bindings), inbound MCP at `/api/mcp`.
 
 ### Two-Process Architecture
 - **Frontend**: Next.js on port 3000. Proxies API calls to the backend via rewrites in `next.config.ts` (`/api/*` → `SERVER_BASE_URL`, default `http://localhost:8001`).
@@ -120,6 +120,7 @@ Warm monochrome, Geist font + system serif headings, Phosphor icons, bento grids
 - **Write-only secrets in API responses**: `Codebase.token` is Fernet-encrypted at rest and never returned — responses expose `has_token: bool`; raw DB DSNs are masked on acceptance (`dsn_masked`).
 - **Rate limits**: per-user token buckets on docgen generate / expert ask / public ask; per-IP on `/login` and `/reset-password` (`api/utils/rate_limit.py`; 429 + `Retry-After`, configurable in admin settings).
 - **Entity locks**: API entity writes serialize with running docgen jobs via the refcounted per-entity lock (`api/docgen/jobs.py:lock_for_entity`); contention maps to HTTP 409 `EntityBusyError`.
+- **Light product list, bare-list contract**: `GET /api/products` returns a plain JSON array of light rows (counters via correlated SQL subqueries in `product_repo.list_products_light` — no Text payloads loaded); pagination via `limit`/`offset`, filtered total via the `X-Total-Count` header. The response shape stays a bare list (no `{items,total}` envelope) for backward compatibility.
 
 ## Environment Variables
 

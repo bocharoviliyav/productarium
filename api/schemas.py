@@ -96,14 +96,20 @@ class Product(BaseModel):
 
 
 class ProductListItem(BaseModel):
-    """Light product row for GET /api/products (P1-16).
+    """Light product row for GET /api/products (P1-16, bare-list contract).
 
-    No heavy payloads (no child entities, no generated_docs/pages/content):
-    children are represented by SQL-counted totals + verified counts only.
-    The full object is served exclusively by GET /api/products/{id}.
+    The listing endpoint keeps the baseline bare-JSON-array response shape
+    (backward compatibility: clients — and pinned tests — expect a plain
+    list). Rows are light: no child entities, no generated_docs/pages/
+    content payloads — children appear only as SQL-counted totals +
+    verified counts. Pagination travels in the ``limit``/``offset`` query
+    params; the filtered total is returned in the ``X-Total-Count`` header
+    (no envelope). The full object is served exclusively by
+    GET /api/products/{id}.
     """
     id: str
     name: str
+    description: str = ""
     summary: Optional[str] = None
     owner_id: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -111,17 +117,11 @@ class ProductListItem(BaseModel):
     codebases_count: int = 0
     specs_count: int = 0
     links_count: int = 0
+    databases_count: int = 0
     verified_codebases: int = 0
     verified_specs: int = 0
     verified_links: int = 0
-
-
-class ProductListResponse(BaseModel):
-    """Paginated light product list (P1-16): items + total + paging echo."""
-    items: List[ProductListItem] = []
-    total: int = 0
-    limit: int = 50
-    offset: int = 0
+    verified_databases: int = 0
 
 
 # --- User -------------------------------------------------------------------

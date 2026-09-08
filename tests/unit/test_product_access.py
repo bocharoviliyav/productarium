@@ -237,8 +237,54 @@ class TestCreateProductRoles:
         assert r.json()["owner_id"] == "user_manager"
 
 
-# TestListVisibility (P1-16 list visibility) removed while rebasing onto
-# 4845658: the baseline GET /api/products contract (list[Product], no
-# per-user visibility filter) is pinned by the user's tests and was
-# restored. The visibility-filtered listing ships with the P2 frontend
-# adaptation (product_repo.list_products_light + _visible_product_ids).
+# --- List visibility (P1-16, bare-list shape) --------------------------------
+class TestListVisibility:
+    """GET /api/products is visibility-filtered per user; the response stays
+    a bare JSON array with the filtered total in the X-Total-Count header."""
+
+    def test_plain_user_sees_owned_and_granted_only(self, isolated_db):
+        from api.routers import products as products_mod
+
+        _seed(isolated_db)
+        # stranger: no products owned, no grants -> empty list
+        app, client = _build_client(
+            isolated_db, products_mod, user=_user("user_stranger", "user")
+        )
+        r = client.get("/api/products")
+        assert r.status_code == 200
+        assert r.json() == []
+        assert r.headers["X-Total-Count"] == "0"
+
+        # rw grantee: sees exactly the granted product
+        app, client = _build_client(
+            isolated_db, products_mod, user=_user("user_grantee_rw", "user")
+        )
+        r = client.get("/api/products")
+        assert r.status_code == 200
+        assert [p["id"] for p in r.json()] == ["prod_1"]
+        assert r.headers["X-Total-Count"] == "1"
+
+        # owner: sees the owned product
+        app, client = _build_client(
+            isolated_db, products_mod, user=_user("user_owner", "user")
+        )
+        r = client.get("/api/products")
+        assert [p["id"] for p in r.json()] == ["prod_1"]
+        assert r.headers["X-Total-Count"] == "1"
+
+    def test_privileged_roles_see_all(self, isolated_db):
+        from api.routers import products as products_mod
+
+        _seed(isolated_db)
+        for uid, role in (
+            ("user_admin", "admin"),
+            ("user_viewer", "viewer_global"),
+            ("user_manager", "manager"),
+        ):
+            app, client = _build_client(
+                isolated_db, products_mod, user=_user(uid, role)
+            )
+            r = client.get("/api/products")
+            assert r.status_code == 200
+            assert sorted(p["id"] for p in r.json()) == ["prod_1", "prod_2"]
+            assert r.headers["X-Total-Count"] == "2"

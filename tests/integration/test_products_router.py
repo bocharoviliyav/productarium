@@ -31,7 +31,14 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from api.models import CodebaseORM, LinksORM, ProductORM, SpecORM, UserORM
+from api.models import (
+    CodebaseORM,
+    DatabaseORM,
+    LinksORM,
+    ProductORM,
+    SpecORM,
+    UserORM,
+)
 from api.schemas import Codebase, Links, Product, Spec
 from api.routers import products as products_router_module
 from tests.conftest import build_test_client
@@ -130,6 +137,15 @@ def _seed_links(db_mod, pid: str = "prod_1", lid: str = "links_1") -> None:
         s.close()
 
 
+def _seed_database(db_mod, pid: str = "prod_1", dbid: str = "db_1") -> None:
+    s = db_mod.SessionLocal()
+    try:
+        s.add(DatabaseORM(id=dbid, product_id=pid, name="Main DB", source="manual"))
+        s.commit()
+    finally:
+        s.close()
+
+
 def _make_client(db_mod):
     return build_test_client(db_mod, [products_router_module], auth_none=True)
 
@@ -140,14 +156,19 @@ def _disable_reindex(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# GET /api/products
+# GET /api/products — light rows in the bare-list shape (P1-16 reworked)
 # --------------------------------------------------------------------------- #
 class TestListProducts:
+    """The response body stays a bare JSON array (backward-compatible
+    contract pinned by user tests); rows are light with SQL-counted totals,
+    the filtered total rides in the X-Total-Count header."""
+
     def test_empty(self, isolated_db):
         app, client = _make_client(isolated_db)
         r = client.get("/api/products")
         assert r.status_code == 200
         assert r.json() == []
+        assert r.headers["X-Total-Count"] == "0"
 
     def test_with_product(self, isolated_db):
         _seed_product(isolated_db)
@@ -157,12 +178,82 @@ class TestListProducts:
         data = r.json()
         assert len(data) == 1
         assert data[0]["id"] == "prod_1"
+        assert r.headers["X-Total-Count"] == "1"
 
-# P2 note: the light-row list (counters in SQL, pagination, visibility)
-# was reverted to the baseline list[Product] contract while rebasing onto
-# 4845658 — the baseline test suite pins the old shape. The light listing
-# (product_repo.list_products_light + ProductListResponse) is kept in the
-# repo layer and ships with the P2 frontend adaptation.
+    def test_light_row_shape(self, isolated_db):
+        """Exactly the light field set — heavy child payloads never appear."""
+        _seed_product(isolated_db)
+        _seed_codebase(isolated_db)
+        _seed_spec(isolated_db)
+        _seed_links(isolated_db)
+        _seed_database(isolated_db)
+        app, client = _make_client(isolated_db)
+        r = client.get("/api/products")
+        assert r.status_code == 200
+        item = r.json()[0]
+        assert set(item.keys()) == {
+            "id", "name", "description", "summary", "owner_id",
+            "created_at", "updated_at",
+            "codebases_count", "specs_count", "links_count", "databases_count",
+            "verified_codebases", "verified_specs", "verified_links",
+            "verified_databases",
+        }
+        assert item["description"] == "desc"
+        assert item["codebases_count"] == 1
+        assert item["specs_count"] == 1
+        assert item["links_count"] == 1
+        assert item["databases_count"] == 1
+        # manual seeds are unverified -> all verified counters are 0
+        assert item["verified_codebases"] == 0
+        assert item["verified_specs"] == 0
+        assert item["verified_links"] == 0
+        assert item["verified_databases"] == 0
+
+    def test_verified_counters(self, isolated_db):
+        _seed_product(isolated_db)
+        s = isolated_db.SessionLocal()
+        try:
+            s.add(CodebaseORM(
+                id="cb_1", product_id="prod_1", name="Repo A",
+                source="manual", verified=True,
+            ))
+            s.add(CodebaseORM(
+                id="cb_2", product_id="prod_1", name="Repo B",
+                source="manual", verified=False,
+            ))
+            s.add(DatabaseORM(
+                id="db_1", product_id="prod_1", name="Main DB",
+                source="manual", verified=True,
+            ))
+            s.commit()
+        finally:
+            s.close()
+        app, client = _make_client(isolated_db)
+        r = client.get("/api/products")
+        item = r.json()[0]
+        assert item["codebases_count"] == 2
+        assert item["verified_codebases"] == 1
+        assert item["databases_count"] == 1
+        assert item["verified_databases"] == 1
+
+    def test_pagination_and_total_header(self, isolated_db):
+        for i in range(3):
+            _seed_product(isolated_db, pid=f"prod_{i}")
+        app, client = _make_client(isolated_db)
+        r = client.get("/api/products?limit=2&offset=0")
+        assert r.status_code == 200
+        assert [p["id"] for p in r.json()] == ["prod_0", "prod_1"]
+        assert r.headers["X-Total-Count"] == "3"
+        r2 = client.get("/api/products?limit=2&offset=2")
+        assert [p["id"] for p in r2.json()] == ["prod_2"]
+        assert r2.headers["X-Total-Count"] == "3"
+
+    @pytest.mark.parametrize(
+        "qs", ["?limit=0", "?limit=-1", "?limit=501", "?offset=-1"]
+    )
+    def test_bad_pagination_params_422(self, isolated_db, qs):
+        app, client = _make_client(isolated_db)
+        assert client.get(f"/api/products{qs}").status_code == 422
 
 
 # --------------------------------------------------------------------------- #

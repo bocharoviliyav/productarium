@@ -1,7 +1,8 @@
 """Product / Codebase / Spec / Links CRUD router.
 
 Endpoints (prefix ``/api/products``, tags ``products``):
-- ``GET    /api/products``                                    — list products
+- ``GET    /api/products``                                    — list products (light rows, bare
+  list + ``X-Total-Count``; the full object lives at GET /{id})
 - ``POST   /api/products``                                    — create product
 - ``GET    /api/products/{product_id}``                       — get product
 - ``PUT    /api/products/{product_id}``                       — update product
@@ -30,7 +31,7 @@ from __future__ import annotations
 import logging
 from typing import Optional, Dict, Any, Set
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -38,7 +39,7 @@ from api.db import get_db
 from api.docgen.jobs import EntityBusyError
 from api.models import ProductGrantORM, ProductORM, UserORM
 from api.repositories import product_repo
-from api.schemas import Codebase, Links, Product, Spec
+from api.schemas import Codebase, Links, Product, ProductListItem, Spec
 from api.auth.deps import get_current_user, require_product_access
 from api.utils.repo_url import validate_repo_url
 
@@ -73,9 +74,28 @@ class ContentUpdate(BaseModel):
     content: Optional[str] = None
 
 
-@router.get("", response_model=list[Product])
-async def list_products(db: Session = Depends(get_db)):
-    return product_repo.list_products(db)
+@router.get("", response_model=list[ProductListItem])
+async def list_products(
+    response: Response,
+    db: Session = Depends(get_db),
+    user: UserORM = Depends(get_current_user),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """Light product listing (P1-16) in the baseline bare-list shape.
+
+    Rows carry SQL-counted child totals only — no child entities, no
+    generated_docs/pages/content (the full object is served by GET /{id}).
+    Pagination via ``limit``/``offset`` query params; the visibility-
+    filtered total rides in the ``X-Total-Count`` header so the body stays
+    a plain JSON array (backward-compatible contract — no envelope).
+    """
+    visible = _visible_product_ids(db, user)
+    items, total = product_repo.list_products_light(
+        db, product_ids=visible, limit=limit, offset=offset
+    )
+    response.headers["X-Total-Count"] = str(total)
+    return items
 
 
 def _visible_product_ids(db: Session, user: UserORM) -> Optional[Set[str]]:

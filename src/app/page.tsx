@@ -26,7 +26,7 @@ import {
   Textarea,
   cn,
 } from "@/components/ui";
-import { type Product, generateId } from "@/lib/types";
+import { type Product, type ProductListItem, generateId } from "@/lib/types";
 
 export default function ProductsDashboard() {
   const router = useRouter();
@@ -34,7 +34,12 @@ export default function ProductsDashboard() {
   const { messages, fmt } = useLanguage();
   const t = messages?.home ?? {};
   const tc = messages?.common ?? {};
-  const [products, setProducts] = useState<Product[]>([]);
+  // P1-16: GET /api/products serves light rows (counters only); a freshly
+  // created full Product (POST response) is structurally assignable too —
+  // hence the Partial<Product> widening (child arrays for the fallbacks).
+  const [products, setProducts] = useState<
+    (ProductListItem & Partial<Product>)[]
+  >([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -58,7 +63,8 @@ export default function ProductsDashboard() {
         return;
       }
       if (!res.ok) throw new Error(`Failed to load products (${res.status})`);
-      const data = (await res.json()) as Product[];
+      const data = (await res.json()) as (ProductListItem &
+        Partial<Product>)[];
       setProducts(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load products.");
@@ -239,12 +245,14 @@ export default function ProductsDashboard() {
             <div className="grid grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-3">
               {products.map((p, i) => {
                 // P2-33: databases are artifacts too — include them in the
-                // dashboard counter.
+                // dashboard counter. P1-16: list rows carry SQL-counted
+                // totals; a full Product (POST-create prepend) carries child
+                // arrays instead — hence the ?? fallbacks.
                 const count =
-                  p.codebases.length +
-                  p.specs.length +
-                  p.links.length +
-                  (p.databases?.length ?? 0);
+                  (p.codebases_count ?? p.codebases?.length ?? 0) +
+                  (p.specs_count ?? p.specs?.length ?? 0) +
+                  (p.links_count ?? p.links?.length ?? 0) +
+                  (p.databases_count ?? p.databases?.length ?? 0);
                 const isDeleting = deletingId === p.id;
                 return (
                   <Reveal key={p.id} delayMs={Math.min(i, 6) * 80}>

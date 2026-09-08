@@ -139,6 +139,34 @@ export interface Product {
   databases?: Database[];
 }
 
+/**
+ * Light product row served by GET /api/products (P1-16): children appear
+ * only as SQL-counted totals — no child payloads. The endpoint keeps the
+ * bare JSON-array response shape (no envelope): pagination goes via
+ * `limit`/`offset` query params and the filtered total rides in the
+ * `X-Total-Count` response header. The full object is served only by
+ * GET /api/products/{id}. Counter fields are optional so a full `Product`
+ * (e.g. the POST create response prepended to a list) is assignable to
+ * this type — read counters via `?? child?.length ?? 0` fallbacks.
+ */
+export interface ProductListItem {
+  id: string;
+  name: string;
+  description: string;
+  summary?: string | null;
+  owner_id?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  codebases_count?: number;
+  specs_count?: number;
+  links_count?: number;
+  databases_count?: number;
+  verified_codebases?: number;
+  verified_specs?: number;
+  verified_links?: number;
+  verified_databases?: number;
+}
+
 /* ------------------------------------------------------------------ */
 /* Knowledge tree (Confluence-like, item 2)                            */
 /* ------------------------------------------------------------------ */
