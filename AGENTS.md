@@ -83,7 +83,7 @@ No polymorphic artifact entity — separate typed ORM models (all in `api/models
 - **`integrations/`** — auto-discovered via `pkgutil`; connectors implement `test()`/`list_spaces()`/`pull()`: `github`, `gitlab` (+`_git_base`), `confluence`, `mcp`. Git pulls create Codebases; non-git pulls create knowledge nodes.
 - **`config/`** — `__init__.py` (JSON loader, `${ENV_VAR}` placeholders), `settings.py` (Fernet-encrypted admin store), `timeout.py` (**the authoritative timeout registry** — every key: env var + default + floor), `ssl.py`, `abstraction.py`.
 - **`prompts.py`** — prompt registry + loader; bodies in `refs/prompts/*.md`; `load_prompt_file()` wraps via `_wrap_prompt(content, language)`.
-- **`clients/openai_client.py`** — low-level OpenAI-compatible client.
+- **`llm/client.py`** — low-level OpenAI-compatible client + `is_local_endpoint` guard (exact-hostname localhost check; no suffix matching).
 - **`tools/rate_limiter.py`** — embedder rate limiting (semaphore + spacing + 429 retry).
 - **`utils/`** — `logging.py` (console-only; logfmt/json), `fs.py` (`open_read_nofollow` — O_NOFOLLOW), `llm_helpers.py` (`cap`), `llm_tokens.py` (context window via `RLM_MODEL_CONTEXT_WINDOW`, token counting).
 - **`formats/mermaid.py`** — Node-based Mermaid verification + bounded LLM repair (`MERMAID_VERIFY` master switch).
@@ -116,6 +116,10 @@ Warm monochrome, Geist font + system serif headings, Phosphor icons, bento grids
 - **Symlink-safe file tools**: `api/utils/fs.py:open_read_nofollow` (O_NOFOLLOW) + realpath confinement on every agent/docgen file read.
 - **Non-fatal initialization**: DB down, memory backend down, dead MCP server → warnings + fallbacks; the app always starts.
 - **Auto-discovery**: routers (module-level `router`), integrations (`pkgutil`).
+- **RBAC + grants**: global roles (`admin|manager|viewer_global|user`) on `productarium_users.role` plus per-product `ro|rw` grants (`product_grants`); enforced via `api/auth/deps.py:require_product_access` / `require_role`. Keycloak role mapping configurable (`KEYCLOAK_ROLE_MAPPING` / admin panel).
+- **Write-only secrets in API responses**: `Codebase.token` is Fernet-encrypted at rest and never returned — responses expose `has_token: bool`; raw DB DSNs are masked on acceptance (`dsn_masked`).
+- **Rate limits**: per-user token buckets on docgen generate / expert ask / public ask; per-IP on `/login` and `/reset-password` (`api/utils/rate_limit.py`; 429 + `Retry-After`, configurable in admin settings).
+- **Entity locks**: API entity writes serialize with running docgen jobs via the refcounted per-entity lock (`api/docgen/jobs.py:lock_for_entity`); contention maps to HTTP 409 `EntityBusyError`.
 
 ## Environment Variables
 

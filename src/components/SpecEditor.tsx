@@ -17,7 +17,7 @@
  * Verify: POST /api/products/{id}/specs/{specId}/verify (owner/admin only).
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -87,6 +87,9 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
   const [deleting, setDeleting] = useState(false);
   const [verified, setVerified] = useState(false);
   const [verifiedBy, setVerifiedBy] = useState<string | null>(null);
+  // P2-28: latest dirty flag for fetch guards (refetch must not clobber a
+  // draft just because the language bundle finished loading).
+  const dirtyRef = useRef(false);
 
   // New specs edit immediately; existing specs open in preview-only view and
   // switch to editing (split) when the user clicks Edit.
@@ -118,8 +121,11 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
         return;
       }
       setSpec(found);
-      setContent(found.content ?? "");
-      setDirty(false);
+      // P2-28: don't clobber an unsaved draft on refetch.
+      if (!dirtyRef.current) {
+        setContent(found.content ?? "");
+        setDirty(false);
+      }
       setVerified(Boolean(found.verified));
       setVerifiedBy(found.verified_by ?? null);
     } catch (e) {
@@ -129,7 +135,14 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
     } finally {
       setLoading(false);
     }
-  }, [isNew, productId, specId, router, notify, t, messages]);
+  // P2-28: t/messages only label error toasts; depending on them would
+  // refetch (and clobber the draft) whenever the language bundle loads.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isNew, productId, specId, router, notify]);
+
+  useEffect(() => {
+    dirtyRef.current = dirty;
+  }, [dirty]);
 
   useEffect(() => {
     if (isNew) return;

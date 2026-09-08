@@ -189,7 +189,18 @@ const FullScreenModal: React.FC<{
   const { messages } = useLanguage();
   const t = messages?.mermaid ?? {};
   const modalRef = useRef<HTMLDivElement>(null);
+  const prevFocusRef = useRef<HTMLElement | null>(null);
   const [zoom, setZoom] = useState(1);
+
+  // P2-30: move focus into the dialog on open, restore it on close.
+  useEffect(() => {
+    if (!isOpen) return;
+    prevFocusRef.current = document.activeElement as HTMLElement | null;
+    modalRef.current?.focus();
+    return () => {
+      prevFocusRef.current?.focus?.();
+    };
+  }, [isOpen]);
 
   // Close on Escape key
   useEffect(() => {
@@ -238,7 +249,11 @@ const FullScreenModal: React.FC<{
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-75 p-4">
       <div
         ref={modalRef}
-        className="bg-[var(--card-bg)] rounded-lg shadow-custom max-w-5xl max-h-[90vh] w-full overflow-hidden flex flex-col card-japanese"
+        role="dialog"
+        aria-modal="true"
+        aria-label={t.diagramView ?? 'Diagram view'}
+        tabIndex={-1}
+        className="bg-[var(--card-bg)] rounded-lg shadow-custom max-w-5xl max-h-[90vh] w-full overflow-hidden flex flex-col card-japanese outline-none"
       >
         {/* Modal header with controls */}
         <div className="flex items-center justify-between p-4 border-b border-[var(--border-color)]">

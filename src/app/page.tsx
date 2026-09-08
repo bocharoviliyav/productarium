@@ -238,7 +238,13 @@ export default function ProductsDashboard() {
           ) : (
             <div className="grid grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-3">
               {products.map((p, i) => {
-                const count = p.codebases.length + p.specs.length + p.links.length;
+                // P2-33: databases are artifacts too — include them in the
+                // dashboard counter.
+                const count =
+                  p.codebases.length +
+                  p.specs.length +
+                  p.links.length +
+                  (p.databases?.length ?? 0);
                 const isDeleting = deletingId === p.id;
                 return (
                   <Reveal key={p.id} delayMs={Math.min(i, 6) * 80}>

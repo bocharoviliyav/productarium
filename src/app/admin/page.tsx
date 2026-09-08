@@ -2167,7 +2167,13 @@ function PromptsSection() {
       );
       const list = Array.isArray(data) ? data : data?.files ?? [];
       setFiles(list);
-      if (list.length > 0 && !selected) setSelected(list[0].filename);
+      // P2-32: functional update — `selected` must NOT be a dep of loadList,
+      // otherwise every selection re-fetches the whole list (double fetch).
+      setSelected((prev) =>
+        prev && list.some((f) => f.filename === prev)
+          ? prev
+          : (list[0]?.filename ?? null),
+      );
     } catch (e) {
       notify({
         tone: "error",
@@ -2177,7 +2183,9 @@ function PromptsSection() {
     } finally {
       setLoadingList(false);
     }
-  }, [selected, getJson, notify, t]);
+  // P2-32: the list loads once on mount (or explicit refresh); t only labels toasts.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [getJson, notify]);
 
   useEffect(() => {
     void loadList();

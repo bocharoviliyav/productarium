@@ -177,11 +177,10 @@ def _build_prompt(
     # in; the sync resolution here is only a fallback for sync callers.
     if ctx_win is None:
         try:
-            from api.utils import get_model_context_window, _count_tokens
+            from api.utils import get_model_context_window
             ctx_win = get_model_context_window(base_url=base_url, model_name=model, api_key=api_key, task="expert")
         except Exception:
             ctx_win = 8192
-            from api.utils import _count_tokens
 
     # Reserve tokens for system instructions, query, and LLM output completion.
     avail_tokens = max(1024, ctx_win - 2048)

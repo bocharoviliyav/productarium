@@ -436,6 +436,18 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
         router.replace(`/login?next=/products/${productId}`);
         return;
       }
+      if (res.status === 429) {
+        // Per-user rate limit (P1-17): human message + Retry-After.
+        const detail = await res.json().catch(() => ({}));
+        const ra = res.headers.get("Retry-After");
+        const wait = ra && /^\d+$/.test(ra) ? Number(ra) : null;
+        throw new Error(
+          `${
+            (detail as { detail?: string })?.detail ||
+            "Too many requests — please wait a moment and try again."
+          }${wait ? ` (retry in ~${wait}s)` : ""}`,
+        );
+      }
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(
@@ -550,6 +562,18 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
       if (res.status === 401) {
         router.replace(`/login?next=/products/${productId}`);
         return;
+      }
+      if (res.status === 429) {
+        // Per-user rate limit (P1-17): human message + Retry-After.
+        const detail = await res.json().catch(() => ({}));
+        const ra = res.headers.get("Retry-After");
+        const wait = ra && /^\d+$/.test(ra) ? Number(ra) : null;
+        throw new Error(
+          `${
+            (detail as { detail?: string })?.detail ||
+            "Too many requests — please wait a moment and try again."
+          }${wait ? ` (retry in ~${wait}s)` : ""}`,
+        );
       }
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
