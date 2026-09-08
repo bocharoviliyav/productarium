@@ -151,6 +151,48 @@ class TestRouterLevelAuthz:
         # Bonus invariant (Wave E): the raw DSN never round-trips.
         assert "secretpw" not in r.text
 
+    def test_deleted_user_session_rejected_401(self, isolated_db, monkeypatch):
+        """P0-9: a cryptographically valid session cookie for a user with NO
+        DB row (deleted after login, or minted for a phantom sub) must 401 —
+        never a transient in-memory user built from token claims."""
+        from api.auth.tokens import SESSION_COOKIE_NAME, create_session_token
+        from api.models import UserORM
+
+        app, client, auth_deps = self._build_client(isolated_db, monkeypatch)
+
+        # A live user: session works.
+        live = UserORM(
+            id="user_live",
+            username="live",
+            role="user",
+            provider="local",
+            created_at=datetime.utcnow(),
+        )
+        with isolated_db.SessionLocal() as db:
+            db.add(live)
+            db.commit()
+            # Mint inside the session — create_session_token reads user attrs.
+            live_token = create_session_token(live)
+        r = client.get(
+            "/api/products",
+            cookies={SESSION_COOKIE_NAME: live_token},
+        )
+        assert r.status_code == 200
+
+        # Same token shape but the user does not exist in the DB → 401.
+        ghost = UserORM(
+            id="user_ghost",
+            username="ghost",
+            role="admin",  # privileged claims must not matter
+            provider="local",
+            created_at=datetime.utcnow(),
+        )
+        r = client.get(
+            "/api/products",
+            cookies={SESSION_COOKIE_NAME: create_session_token(ghost)},
+        )
+        assert r.status_code == 401
+
 
 # --- B. CORS_ORIGINS env parsing ----------------------------------------------
 class TestCorsConfig:
