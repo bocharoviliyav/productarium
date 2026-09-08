@@ -17,6 +17,24 @@ from api.llm.client import build_chat_model
 logger = logging.getLogger(__name__)
 
 
+async def _aclose_chat(chat: Any) -> None:
+    """Close the per-call httpx client behind a streamed chat model (P1-14).
+
+    ``build_chat_model`` opens a dedicated ``httpx.AsyncClient`` per call and
+    the OpenAI SDK never closes a client it was handed, so the generator that
+    built the model must close it once the stream finishes — including on
+    early SSE disconnect (``GeneratorExit``). Duck-typed and never raises so a
+    cleanup failure can never mask the streamed result.
+    """
+    client = getattr(chat, "http_async_client", None)
+    if client is None:
+        return
+    try:
+        await client.aclose()
+    except Exception:
+        logger.debug("could not close the streaming httpx client", exc_info=True)
+
+
 async def stream_chat(
     prompt: str,
     model: Optional[str] = None,
@@ -34,10 +52,13 @@ async def stream_chat(
     from langchain_core.messages import HumanMessage
 
     chat = build_chat_model(model=model, base_url=base_url, api_key=api_key)
-    async for chunk in chat.astream([HumanMessage(content=prompt)]):
-        text = _chunk_text(chunk)
-        if text:
-            yield text
+    try:
+        async for chunk in chat.astream([HumanMessage(content=prompt)]):
+            text = _chunk_text(chunk)
+            if text:
+                yield text
+    finally:
+        await _aclose_chat(chat)
 
 
 def _chunk_text(chunk: Any) -> str:
@@ -77,10 +98,13 @@ async def stream_chat_fields(
     from langchain_core.messages import HumanMessage
 
     chat = build_chat_model(model=model, base_url=base_url, api_key=api_key)
-    async for chunk in chat.astream([HumanMessage(content=prompt)]):
-        content, reasoning = _chunk_fields(chunk)
-        if content or reasoning:
-            yield content, reasoning
+    try:
+        async for chunk in chat.astream([HumanMessage(content=prompt)]):
+            content, reasoning = _chunk_fields(chunk)
+            if content or reasoning:
+                yield content, reasoning
+    finally:
+        await _aclose_chat(chat)
 
 
 def _chunk_fields(chunk: Any) -> Tuple[str, str]:
