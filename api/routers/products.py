@@ -16,7 +16,7 @@ Endpoints (prefix ``/api/products``, tags ``products``):
 - ``DELETE /api/products/{product_id}/links/{links_id}``      — delete links
 - ``PUT    /api/products/{product_id}/links/{links_id}``      — update links content
 
-Thin layer: request parsing + cognee re-index handoff; all DB access lives in
+Thin layer: request parsing + memory re-index handoff; all DB access lives in
 ``api.repositories.product_repo``.
 """
 
@@ -37,7 +37,14 @@ from api.models import UserORM
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/products", tags=["products"])
+# All product CRUD endpoints require an authenticated user (a no-op when
+# AUTH_PROVIDER=none). Object-level checks (owner/admin) apply on top where
+# they matter — e.g. the ``verify`` endpoints below.
+router = APIRouter(
+    prefix="/api/products",
+    tags=["products"],
+    dependencies=[Depends(get_current_user)],
+)
 
 
 class CodebaseDocUpdate(BaseModel):
@@ -64,10 +71,45 @@ async def list_products(db: Session = Depends(get_db)):
     return product_repo.list_products(db)
 
 
+def _guard_no_raw_dsn(result: Product, request: Product) -> None:
+    """Refuse to return a product payload containing a RAW database DSN.
+
+    Same semantics as the databases router's ``_assert_no_raw_dsn`` (kept
+    local per the repo's router-isolation convention): the full-product
+    POST/PUT accepts ``databases[].dsn`` and ``_database_orm_from_pydantic``
+    masks it on persistence — this guard is the defense-in-depth check on
+    the RESPONSE (review #4 HIGH). Password-less DSNs legitimately mask to
+    themselves and never trip the guard.
+    """
+    from api.docgen.verification import mask_dsn
+
+    raw_dsns = [
+        (d.dsn or "").strip() for d in (request.databases or []) if (d.dsn or "").strip()
+    ]
+    if not raw_dsns:
+        return
+    leaking = [raw for raw in raw_dsns if mask_dsn(raw) != raw]
+    if not leaking:
+        return
+    try:
+        payload = repr(result.model_dump())
+    except Exception:  # pragma: no cover - defensive
+        return
+    for raw in leaking:
+        if raw in payload:
+            logger.error(
+                "products router: raw DSN leaked into the product payload; "
+                "refusing to return it"
+            )
+            raise HTTPException(status_code=500, detail="Internal masking error")
+
+
 @router.post("", response_model=Product)
 async def create_product(product: Product, db: Session = Depends(get_db)):
     p_orm = product_repo.upsert_product(db, product)
-    return product_repo.orm_to_product(p_orm)
+    result = product_repo.orm_to_product(p_orm)
+    _guard_no_raw_dsn(result, product)
+    return result
 
 
 @router.get("/{product_id}", response_model=Product)
@@ -82,7 +124,9 @@ async def get_product(product_id: str, db: Session = Depends(get_db)):
 async def update_product(product_id: str, product: Product, db: Session = Depends(get_db)):
     # Preserve previous overwrite semantics: the body Product is saved as-is.
     p_orm = product_repo.upsert_product(db, product)
-    return product_repo.orm_to_product(p_orm)
+    result = product_repo.orm_to_product(p_orm)
+    _guard_no_raw_dsn(result, product)
+    return result
 
 
 @router.delete("/{product_id}")
@@ -102,7 +146,7 @@ def _reindex(
     """Re-index edited text into the per-product memory backend (fire-and-forget).
 
     ``source_id`` = entity id so the pgvector upsert deletes the previous chunks
-    for that entity before re-inserting (cognee ignores source_id).
+    for that entity before re-inserting.
     """
     if indexed_text and indexed_text.strip():
         try:

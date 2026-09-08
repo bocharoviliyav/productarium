@@ -6,12 +6,13 @@ Backend API for Productarium — a product-centric documentation platform powere
 
 - **Product-Centric Model**: Products own typed Codebase, Spec, and Links entities plus a Knowledge Node tree (no polymorphic artifact entity).
 - **Local LLM**: single OpenAI-compatible path (LM Studio, llama.cpp, vLLM) — no cloud keys.
-- **Knowledge Graph**: cognee + pgvector index every entity and knowledge node for RAG.
+- **Semantic Memory**: pgvector indexes generated docs per product for RAG recall (no external KG service).
 - **Expert Agent**: streaming chat (SSE) + document generation over indexed knowledge.
-- **fast-rlm**: Recursive Language Models for long-context doc generation (≥20k chars) and Deep Research.
+- **Deep Research**: bounded multi-iteration research loop over product knowledge.
 - **Authentication**: local (passlib bcrypt + JWT) and/or Keycloak OIDC.
-- **Admin Panel**: models, git-credentials, Confluence, integrations, rlm, ssl, cognee, timeouts, users, API tokens, prompts.
-- **Integrations**: GitHub, GitLab, Confluence, MCP (stdio/http) — auto-discovered.
+- **Admin Panel**: models, git-credentials, Confluence, integrations, ssl, embedder, memory, timeouts, users, API tokens, prompts.
+- **Integrations**: GitHub, GitLab, Confluence — auto-discovered.
+- **MCP Platform**: outbound tool integrations via langchain-mcp-adapters (tools auto-appended to the expert agent) + Productarium itself exposed as an MCP server (FastMCP at `/api/mcp`).
 
 ## Quick Start
 
@@ -42,9 +43,7 @@ All configuration is local. See `.env.example` in the project root for the full,
 | `LOCAL_OPENAI_BASE_URL` | Local OpenAI-compatible API URL | `http://localhost:1234/v1` |
 | `LOCAL_OPENAI_API_KEY` | API key for local OpenAI API | `not-needed` |
 | `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USERNAME` / `DB_PASSWORD` | Postgres connection | `localhost` / `5432` / `cognee_db` / `cognee` / `cognee` |
-| `LLM_PROVIDER` / `LLM_ENDPOINT` / `LLM_MODEL` / `LLM_API_KEY` | cognee LLM (local OpenAI-compatible) | `openai` / `…/v1` / `qwen/qwen3.6-27b` / `not-needed` |
-| `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | cognee embeddings (local OpenAI-compatible) | `openai_compatible` / `text-embedding-nomic-embed-text-v1.5` / `768` |
-| `RLM_MODEL_BASE_URL` / `RLM_MODEL_NAME` | fast-rlm | `…/v1` / `qwen/qwen3.6-27b` |
+| `RLM_MODEL_CONTEXT_WINDOW` | Context-window override (tokens) for prompt budgeting | (from live API metadata / model name) |
 | `PORT` | API server port | `8001` |
 | `AUTH_PROVIDER` | Auth mode: `local` / `keycloak` / `both` / `none` | `local` |
 | `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD` | One-shot bootstrap admin | `admin` / `change-me` |
@@ -67,18 +66,20 @@ Custom config directory via `DEEPWIKI_CONFIG_DIR`.
 ### Entry Point
 
 - **`main.py`** — Loads `.env`, configures logging, starts uvicorn on `PORT` (8001).
-- **`api.py`** — Main FastAPI app. Connects all routers via `include_all_routers(app)`. `startup_event()` calls `init_db()` then `init_cognee()`. Both non-fatal.
+- **`api.py`** — Main FastAPI app. Connects all routers via `include_all_routers(app)`, mounts the inbound MCP server at `/api/mcp` (best-effort — degrades with a warning if `mcp` is missing). Lifespan calls `init_db()` then memory init; both non-fatal.
 
 ### Routers (`api/routers/`)
 
 Auto-discovered: add `api/routers/<name>.py` with a module-level `router = APIRouter(...)` — it connects automatically.
 
-- **`admin.py`** — Admin-protected CRUD + connectivity tests for `models`, `git`, `confluence`, `integrations`, `rlm`, `ssl`, `cognee`, `timeouts`, `users`, `apitokens`, `prompts`. Secrets encrypted on save, masked on read.
+- **`admin.py`** — Admin-protected CRUD + connectivity tests for `models`, `git`, `confluence`, `integrations`, `ssl`, `embedder`, `memory`, `timeouts`, `users`, `apitokens`, `prompts`. Secrets encrypted on save, masked on read.
 - **`auth/`** (in `api/auth/`) — Local login/me/logout, first-run setup, password change/reset, Keycloak OIDC login/callback.
 - **`docgen.py`** — Per-type generate endpoints: `POST .../codebases/{id}/generate` + status, `POST .../specs/{id}/generate` + status. Links do not generate.
 - **`expert.py`** — Expert agent: SSE chat (`POST /api/products/{id}/ask`) + document generation (`POST /api/products/{id}/ask/doc`).
 - **`integrations.py`** — List/test/pull from integration connectors; git connectors create `CodebaseORM`, non-git pulls create knowledge nodes only.
 - **`knowledge.py`** — Knowledge tree CRUD, markitdown upload, verified toggle, AI product summary (`generate_product_summary(product, codebases, specs, nodes)`).
+- **`mcp_admin.py`** — Admin MCP server registry: CRUD + `POST .../test` (bounded health-check; persists status) + `GET .../tools` (cached discovery) under `/api/admin/mcp/servers`.
+- **`product_mcp.py`** — Per-product MCP bindings CRUD under `/api/products/{product_id}/mcp` (enable a server, optional `allowed_tools` allowlist).
 - **`products.py`** — Per-type create/delete/update: `POST/DELETE/PUT .../codebases|specs|links/{id}`.
 - **`public.py`** — API-token-authenticated endpoints: export verified knowledge (markdown/json with `codebases`/`specs`/`links`/`nodes` keys), ask, push to Confluence/git.
 
@@ -98,30 +99,34 @@ Scalable connector framework. Auto-discovered via `pkgutil`. Each connector impl
 
 - **`github.py`** / **`gitlab.py`** — List repos, clone + document as `CodebaseORM` (`repo_url`/`repo_type`).
 - **`confluence.py`** — List spaces, pull pages (recursively, attachments via markitdown) as knowledge nodes.
-- **`mcp.py`** — Model Context Protocol. Supports `http` transport (JSON-RPC `initialize` + `tools/call`) and `stdio` transport.
 - **`base.py`** / **`registry.py`** — Base class `IntegrationConnector` + auto-discovery registry.
 - **`_git_base.py`** — Shared git connector logic.
 
-Add new `api/integrations/<name>.py` subclassing `IntegrationConnector` — no core changes needed.
+### MCP Platform (`api/mcp/`)
+
+Model Context Protocol in two directions:
+- **`manager.py`** — Outbound tool manager over langchain-mcp-adapters `MultiServerMCPClient`. Per-server clients + `tools/list` discovery results cached by config fingerprint (transport/url/command/args/headers/env ciphertext/updated_at); every connect is bounded by `MCP_DISCOVERY_TIMEOUT_SECONDS` (default 10 s). Applies the per-binding `allowed_tools` allowlist and dedupes tool names. `get_tools_for_product()` is best-effort: a failing server is skipped, never fatal to the expert agent.
+- **`secrets.py`** — Fernet encrypt/decrypt + masking for server `headers`/`env` (stored encrypted in `mcp_servers`, masked on every read).
+- **`inbound.py`** — Inbound MCP server (`mcp.server.fastmcp.FastMCP`, streamable HTTP) mounted at `/api/mcp`. Auth: Bearer API tokens (sha256 lookup in `api_tokens`, updates `last_used_at`). Tools: `list_products`, `get_product_knowledge`, `search_knowledge`, `ask_expert` (bounded by `MCP_ASK_TIMEOUT_SECONDS`, default 120 s).
+
+Expert agent integration: `build_expert_agent` receives the bound enabled servers' tools (after allowlist) as `extra_tools` — no separate endpoint.
 
 ### Core Modules
 
-- **`rag.py`** — RAG implementation. Custom `Memory`/`CustomConversation`/`DialogTurn` (adalflow workaround). `RAG` class manages retriever, FAISS indices, queries. Parameters: text splitter (350 words, 100 overlap), retriever top_k=20.
-- **`data_pipeline.py`** — Repository cloning (GitHub/GitLab, shallow `--depth=1`), file reading with include/exclude filters, `DatabaseManager` (FAISS indices).
-- **`docgen/`** — Documentation generation package. **No dispatcher** — each generate endpoint calls its generator directly. `codebase.py:generate_codebase_docs` (RLM for long-context ≥20k chars else standard LLM, 7 sections from refs), `spec.py:generate_openapi_docs`/`generate_asyncapi_docs` (stdlib parse + skeleton + LLM enrichment). `jobs.py` (async 202+poll worker, takes `entity_type`). `_common.py` (shared `_index_in_background`). All paths index into cognee and persist `generated_docs` + `pages`.
-- **`expert/`** — Expert agent package. `chat.py` (cognee-recall + RLM routing + LLM streaming), `generate.py` (standalone doc). Prompt bodies in `refs/prompts/expert_agent_*.md`.
-- **`cognee/`** — cognee integration (`_runtime.py` configures a local OpenAI-compatible server for LLM + embeddings; no cloud key). `init_cognee()`, `add_and_index_document()`, `query_cognee()`, `reindex_product_knowledge_graph()` — all async, all non-fatal.
-- **`rlm/runner.py`** — fast-rlm wrapper (Deno + Pyodide) for long-context reasoning. Single path: admin config → `LOCAL_OPENAI_BASE_URL` → default.
+- **`memory/`** — Semantic memory: `pgvector_backend.py` (chunks + embeddings in `knowledge_chunks`, HNSW cosine recall), `resolver.py` (`memory.backend` admin setting; pgvector only), backend-agnostic facade (`index_document` / `query_memory` / `reindex_product_memory`).
+- **`repositories/`** — `product_repo.py` (Product/Codebase/Spec/Links/Database ORM↔Pydantic + persistence), `documents.py` (repo clone orchestration via `api.clients.git` + symlink-safe file reading).
+- **`docgen/`** — Documentation generation package. **No dispatcher** — each generate endpoint calls its generator directly. `codebase.py:generate_codebase_docs` (deepagents orchestrator with parallel section subagents + standard-LLM fallback, 7 sections from refs), `spec.py:generate_openapi_docs`/`generate_asyncapi_docs` (stdlib parse + skeleton + agent/LLM enrichment), `database.py` (MCP introspection reverse-engineering). `jobs.py` (async 202+poll worker, takes `entity_type`). `_common.py` (shared `_index_in_background`). All paths index into the pgvector memory backend and persist `generated_docs` + `pages`.
+- **`expert/`** — Expert agent package. `chat.py` (SSE chat + sessions), `deep_research.py` (bounded multi-iteration loop), `generate.py` (standalone doc). Prompt bodies in `refs/prompts/expert_agent_*.md`.
 - **`config/`** — Central configuration package. `__init__.py` (JSON loader, `${ENV_VAR}` placeholders), `settings.py` (encrypted key/value store, Fernet via `SETTINGS_SECRET_KEY`), `timeout.py` (per-key timeout overrides), `ssl.py` (TLS patch for corporate gateways).
-- **`clients/`** — `openai_client.py` (custom OpenAI-compatible client for local LLM servers). Single client.
+- **`clients/`** — `git.py` (GitHub/GitLab shallow clone + remote file content APIs).
 - **`utils/`** — `logging.py` (console-only, `LOG_FORMAT` env: `logfmt`/`json`), `llm_helpers.py` (`cap(text, limit)` char-based), `llm_tokens.py` (`get_model_context_window`, `_count_tokens`).
-- **`models.py`** — SQLAlchemy 2.0 ORM: `UserORM`, `ProductORM`, `CodebaseORM`, `SpecORM`, `LinksORM`, `KnowledgeNodeORM`, `SettingORM`, `ApiTokenORM`.
+- **`models.py`** — SQLAlchemy 2.0 ORM: `UserORM`, `ProductORM`, `CodebaseORM`, `SpecORM`, `LinksORM`, `KnowledgeNodeORM`, `SettingORM`, `ApiTokenORM`, `McpServerORM`, `ProductMcpServerORM`.
 - **`db.py`** — SQLAlchemy engine + `SessionLocal` + `get_db()` + `init_db()` (`Base.metadata.create_all`, idempotent, non-fatal).
 - **`prompts.py`** — Prompt registry + loader. `load_prompt_file()` applies `_wrap_prompt(content, language)` after loading. Bodies in `refs/prompts/*.md` (externalized).
 
 ### System Prompts
 
-All prompt bodies are externalized to `refs/prompts/*.md` (7 wiki sections, spec doc, expert agent, deep research iterations, RAG/simple-chat system prompts). Edit directly — no code changes needed. `load_prompt_file()` applies `_wrap_prompt(content, language)` after loading.
+All prompt bodies are externalized to `refs/prompts/*.md` (7 wiki section contracts in `docgen_sections.md`, subpage contracts in `docgen_subpages.md`, decomposer plan in `docgen_decomposer.md`, spec doc, expert agent, deep research iterations). Edit directly — no code changes needed. `load_prompt_file()` applies `_wrap_prompt(content, language)` after loading.
 
 ## API Endpoints
 
@@ -169,6 +174,18 @@ All prompt bodies are externalized to `refs/prompts/*.md` (7 wiki sections, spec
 | `/api/integrations/{name}/spaces` | GET | List spaces/repos |
 | `/api/integrations/{name}/pull` | POST | Pull content as codebase/knowledge node |
 
+### MCP
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/admin/mcp/servers` | GET/POST | List/create MCP servers (secrets masked) |
+| `/api/admin/mcp/servers/{id}` | PUT/DELETE | Update/delete a server (cascades bindings) |
+| `/api/admin/mcp/servers/{id}/test` | POST | Bounded health-check + tool discovery; persists status |
+| `/api/admin/mcp/servers/{id}/tools` | GET | Cached tool list (no reconnect) |
+| `/api/products/{id}/mcp` | GET/POST | List/create product bindings |
+| `/api/products/{id}/mcp/{binding_id}` | PUT/DELETE | Update/delete a binding |
+| `/api/mcp` | POST (JSON-RPC) | Inbound MCP server (streamable HTTP; Bearer API token) |
+
 ### Admin
 
 | Endpoint | Method | Description |
@@ -198,26 +215,19 @@ All prompt bodies are externalized to `refs/prompts/*.md` (7 wiki sections, spec
 | `/api/public/products/{id}/ask` | POST | Ask expert agent |
 | `/api/public/products/{id}/push` | POST | Push to Confluence/git |
 
-### RLM
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/rlm/run` | POST | Run fast-rlm task |
-
 ## Storage
 
 All data is stored locally:
-- Cloned repositories: `~/.adalflow/repos/`
-- FAISS indices: `~/.adalflow/databases/`
-- Products/Codebases/Specs/Links/Knowledge Nodes: Postgres (`products`, `codebases`, `specs`, `links`, `knowledge_nodes` tables)
-- cognee knowledge graph: Postgres + pgvector
+- Cloned repositories: managed state dir (`PRODUCTARIUM_STATE_DIR`, `~/.adalflow` legacy compat)
+- Products/Codebases/Specs/Links/Databases/Knowledge Nodes: Postgres (`products`, `codebases`, `specs`, `links`, `databases`, `knowledge_nodes` tables)
+- Semantic memory chunks: Postgres + pgvector (`knowledge_chunks` + HNSW index)
 
 ## Data Flow (Product → Codebase/Spec → Docs)
 
 1. Create a **Product** and add a **Codebase** (via repo URL), **Spec** (yaml/json content), or **Links** (JSON array).
 2. **Generate** docs (per-type endpoint):
-   - **codebase**: clone repo (shallow), read files, build long-context → **fast-rlm** (if ≥20k chars) or standard LLM generates 7 wiki sections → `generated_docs` + `pages` persisted → indexed in cognee (background, async 202+poll).
-   - **spec**: parse (stdlib json/yaml) → markdown skeleton + LLM enrichment → indexed in cognee.
+   - **codebase**: clone repo (shallow) → **deepagents** pipeline (standard-LLM fallback) generates 7 wiki sections with per-capability/per-API/per-store subpages → `generated_docs` + `pages` persisted → indexed into the pgvector memory backend (background, async 202+poll).
+   - **spec**: parse (stdlib json/yaml) → markdown skeleton + agent/LLM enrichment → indexed into the pgvector memory backend.
    - **links**: no generation (content storage only).
-3. Frontend viewer renders `codebase.pages` (nav tree) + markdown/Mermaid; Ask panel uses RAG (FAISS, top_k=20) augmented with cognee recall over the codebase's dataset.
+3. Frontend viewer renders `codebase.pages` (nav tree) + markdown/Mermaid; Ask panel uses semantic recall (pgvector, top_k=20) over the product's indexed chunks.
 4. **Expert Agent** streams SSE chat over all indexed knowledge (codebases + specs + links + knowledge nodes); `ask/doc` generates a standalone Markdown document.

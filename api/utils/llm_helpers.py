@@ -22,8 +22,8 @@ def safe_replace(template: str, variables: Dict[str, Any]) -> str:
     """Substitute ``{var}`` placeholders in ``template`` using exact replacement.
 
     Unmatched placeholders are left intact (so they remain visible rather than
-    silently disappearing), matching the behaviour of
-    ``WikiGenerator._format_prompt``.
+    silently disappearing) — the same str.replace semantics the docgen
+    scaffolding uses for its prompt slots.
     """
     if not template:
         return ""

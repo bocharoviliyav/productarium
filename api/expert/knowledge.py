@@ -1,11 +1,11 @@
 """Expert knowledge retrieval + fallback + product-name lookup + history rendering.
 
 Split out of the former ``api/expert_agent.py`` (Step 6). Owns:
-- ``_retrieve_product_knowledge``: cognee recall over the product-scoped dataset
-  ``prod_{product_id}`` with artifact-docs + live-Confluence fallbacks. Never
-  raises; returns "" when nothing is available.
+- ``_retrieve_product_knowledge``: semantic recall over the product-scoped
+  memory chunks with artifact-docs + live-Confluence fallbacks. Never raises;
+  returns "" when nothing is available.
 - ``_fallback_artifact_docs``: concatenates artifact ``generated_docs`` / page
-  content when cognee is empty (own short-lived DB session, non-fatal).
+  content when memory recall is empty (own short-lived DB session, non-fatal).
 - ``_product_name_by_id``: DB product-name lookup with id fallback (non-fatal).
 - ``_format_history``: render prior conversation turns as a history block.
 """
@@ -37,7 +37,7 @@ def _product_name_by_id(product_id: str) -> str:
 
 
 def _fallback_artifact_docs(product_id: str) -> str:
-    """Concatenate codebase generated_docs + spec content when cognee is empty.
+    """Concatenate codebase generated_docs + spec content when memory recall is empty.
 
     Opens its own short-lived session (non-fatal: returns "" on any error or
     when the product/codebases/specs are missing).
@@ -92,9 +92,9 @@ def _fallback_artifact_docs(product_id: str) -> str:
 
 
 async def _retrieve_product_knowledge(product_id: str, query: str) -> str:
-    """Retrieve product knowledge via the active memory backend (pgvector default,
-    cognee alt); fall back to concatenated artifact docs or live Confluence.
-    Never raises; returns "" if nothing available.
+    """Retrieve product knowledge via the active memory backend (pgvector);
+    fall back to concatenated artifact docs or live Confluence. Never raises;
+    returns "" if nothing available.
     """
     try:
         from api.memory import query_memory

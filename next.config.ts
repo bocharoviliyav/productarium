@@ -36,8 +36,9 @@ const nextConfig: NextConfig = {
   },
   async rewrites() {
     return [
-      // Product/Artifact CRUD + RLM endpoints (product-centric routing).
-      // These have no Next.js route handler; proxy straight to the FastAPI backend.
+      // Product/Artifact CRUD endpoints (product-centric routing), including
+      // the expert chat + chat sessions. These have no Next.js route handler;
+      // proxy straight to the FastAPI backend.
       {
         source: "/api/products",
         destination: `${TARGET_SERVER_BASE_URL}/api/products`,
@@ -45,10 +46,6 @@ const nextConfig: NextConfig = {
       {
         source: "/api/products/:path*",
         destination: `${TARGET_SERVER_BASE_URL}/api/products/:path*`,
-      },
-      {
-        source: "/api/rlm/run",
-        destination: `${TARGET_SERVER_BASE_URL}/api/rlm/run`,
       },
       // Auth (contract J): local login / me / logout / keycloak. Generic
       // catch-all after the legacy specific routes below.

@@ -12,7 +12,7 @@ Covers:
 - Router endpoint integration (create/get/tree/put/delete/verify) over an
   isolated SQLite DB via FastAPI TestClient with dependency overrides.
 
-No live LLM/Postgres/cognee is required: LLM and cognee indexing are mocked.
+No live LLM/Postgres/memory backend is required: LLM and memory indexing are mocked.
 """
 
 from __future__ import annotations

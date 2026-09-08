@@ -1,19 +1,18 @@
 """Rate limiter for the shared embedder (OpenAI-compatible /v1/embeddings).
 
-Mirrors ``api.cognee.rate_limiter.CogneeRateLimiter`` (async semaphore + request
-spacing + 429 retry) but is scoped to the embedder used by the pgvector memory
-backend. Settings live under the ``embedder.*`` prefix, resolved with the same
-precedence as cognee's (admin settings store > env var > default):
+Async semaphore + request spacing + 429 retry, scoped to the embedder used by
+the pgvector memory backend. Settings live under the ``embedder.*`` prefix,
+resolved with admin settings store > env var > default precedence:
 
 - ``embedder.max_concurrency`` (int, default 4)
 - ``embedder.delay_seconds`` (float, default 0.1)
 - ``embedder.rate_limit_rps`` (float, default 10.0 -> 0.1s spacing)
 
-The adalflow ``Embedder`` is synchronous, so callers wrap their
-``asyncio.to_thread(...)`` call in :meth:`execute` to throttle concurrent and
-bursty embedding requests without blocking the event loop. Settings are read
-through on every call (no caching), so an admin save takes effect immediately
-without a restart.
+The langchain ``OpenAIEmbeddings`` client exposes synchronous embed calls, so
+callers wrap their ``asyncio.to_thread(...)`` call in :meth:`execute` to
+throttle concurrent and bursty embedding requests without blocking the event
+loop. Settings are read through on every call (no caching), so an admin save
+takes effect immediately without a restart.
 """
 
 from __future__ import annotations

@@ -2,6 +2,7 @@ import React from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { tomorrow } from 'react-syntax-highlighter/dist/cjs/styles/prism';
 import Mermaid from './Mermaid';
@@ -9,6 +10,22 @@ import Mermaid from './Mermaid';
 interface MarkdownProps {
   content: string;
 }
+
+// Sanitize schema: the default (GitHub-style) allow-list extended with the
+// attributes our renderers rely on (className for syntax highlighting and
+// mermaid code blocks; anchor target/rel). Applied AFTER rehype-raw so raw
+// HTML in LLM output is reduced to a safe subset — no scripts, no event
+// handlers, no javascript:/data: URLs.
+const sanitizeSchema = {
+  ...defaultSchema,
+  attributes: {
+    ...defaultSchema.attributes,
+    '*': [...(defaultSchema.attributes?.['*'] ?? []), 'className'],
+    a: [...(defaultSchema.attributes?.['a'] ?? []), 'target', 'rel'],
+    code: [...(defaultSchema.attributes?.['code'] ?? []), 'className'],
+    span: [...(defaultSchema.attributes?.['span'] ?? []), 'className'],
+  },
+};
 
 const Markdown: React.FC<MarkdownProps> = ({ content }) => {
   // Define markdown components
@@ -58,9 +75,16 @@ const Markdown: React.FC<MarkdownProps> = ({ content }) => {
       return <li className="mb-2 text-sm leading-relaxed dark:text-white" {...props}>{children}</li>;
     },
     a({ children, href, ...props }: { children?: React.ReactNode; href?: string }) {
+      // Scheme whitelist (defense in depth on top of rehype-sanitize): only
+      // absolute web/mailto links and in-page anchors become clickable —
+      // anything else (javascript:, data:, unknown schemes) renders inert.
+      const safeHref =
+        typeof href === 'string' && /^(https?:|mailto:|#)/i.test(href.trim())
+          ? href.trim()
+          : undefined;
       return (
         <a
-          href={href}
+          href={safeHref}
           className="text-purple-600 dark:text-purple-400 hover:underline font-medium"
           target="_blank"
           rel="noopener noreferrer"
@@ -196,7 +220,7 @@ const Markdown: React.FC<MarkdownProps> = ({ content }) => {
     <div className="prose prose-base dark:prose-invert max-w-none px-2 py-4">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeRaw]}
+        rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema]]}
         components={MarkdownComponents}
       >
         {content}

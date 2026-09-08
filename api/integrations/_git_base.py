@@ -87,27 +87,41 @@ class GitConnector:
         return parts[-1].replace(".git", "")
 
     def _clone_dir(self, repo_url: str) -> str:
-        """The local clone path under ~/.adalflow/repos (mirrors data_pipeline)."""
-        try:
-            from adalflow.utils import get_adalflow_default_root_path
+        """The local clone path under ~/.adalflow/repos (mirrors documents.py)."""
+        from api.repositories.documents import DEFAULT_REPO_ROOT
 
-            root = get_adalflow_default_root_path()
-        except Exception:
-            root = os.path.expanduser("~/.adalflow")
+        root = DEFAULT_REPO_ROOT
         repo_name = self.extract_repo_name(repo_url, self.repo_type)
         return os.path.join(root, "repos", repo_name)
 
     # ---- markdown building from a clone ----------------------------------
     @staticmethod
     def _find_readme(repo_dir: str) -> Optional[str]:
+        """README text from the clone root (capped), symlink-safe + confined.
+
+        Pulls document untrusted repos; a planted README symlink must never
+        read outside the clone (review #5). Symlinked candidates are skipped
+        entirely; the realpath must stay under the clone root and the final
+        open goes through ``open_read_nofollow``.
+        """
+        from api.utils.fs import open_read_nofollow
+
+        try:
+            root = os.path.realpath(repo_dir)
+        except OSError:
+            return None
         for cand in ("README.md", "README.rst", "README.txt", "README", "readme.md"):
             p = os.path.join(repo_dir, cand)
-            if os.path.isfile(p):
-                try:
-                    with open(p, "r", encoding="utf-8", errors="replace") as f:
-                        return f.read()
-                except Exception:
+            try:
+                if os.path.islink(p):
                     continue
+                real = os.path.realpath(p)
+                if os.path.commonpath([root, real]) != root:
+                    continue
+                with open_read_nofollow(real, errors="replace") as f:
+                    return f.read(64_000)
+            except (OSError, ValueError):
+                continue
         return None
 
     @staticmethod

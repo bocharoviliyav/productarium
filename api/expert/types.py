@@ -20,6 +20,8 @@ EVENT_STATUS = "status"
 EVENT_REASONING = "reasoning"
 EVENT_CONTENT = "content"
 EVENT_ERROR = "error"
+EVENT_TOOL_CALL = "tool_call"
+EVENT_TOOL_RESULT = "tool_result"
 
 #: Status phase values (the ``content`` of an ``EVENT_STATUS`` event).
 EVENT_RETRIEVING = "retrieving"
@@ -60,6 +62,8 @@ __all__ = [
     "EVENT_REASONING",
     "EVENT_CONTENT",
     "EVENT_ERROR",
+    "EVENT_TOOL_CALL",
+    "EVENT_TOOL_RESULT",
     "EVENT_RETRIEVING",
     "EVENT_THINKING",
     "EVENT_ANSWERING",

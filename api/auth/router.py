@@ -16,6 +16,7 @@ they return 501 with a clear message (Keycloak is configured separately).
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta
 
@@ -60,9 +61,20 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
-# Cookies are httpOnly + SameSite=Lax. Set secure=True behind HTTPS in prod via
-# an env flag if needed.
-_COOKIE_KWARGS = {"httponly": True, "samesite": "lax", "secure": False, "path": "/"}
+# Cookies are httpOnly + SameSite=Lax. Set COOKIE_SECURE=true when serving
+# behind HTTPS (adds the Secure attribute to every session/OAuth cookie).
+_COOKIE_SECURE = (os.environ.get("COOKIE_SECURE") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_COOKIE_KWARGS = {
+    "httponly": True,
+    "samesite": "lax",
+    "secure": _COOKIE_SECURE,
+    "path": "/",
+}
 
 
 def _user_out(user: UserORM) -> UserOut:
@@ -284,9 +296,10 @@ def keycloak_callback(
         raise HTTPException(status_code=400, detail=f"Keycloak error: {error}")
     if not code:
         raise HTTPException(status_code=400, detail="Missing authorization code")
-    # Validate state round-trip (defensive; mismatch -> 400).
+    # Validate state round-trip (CSRF): both sides must be PRESENT and equal.
+    # An omitted state parameter must never skip the check (review #5).
     cookie_state = request.cookies.get("productarium_oauth_state")
-    if cookie_state and state and cookie_state != state:
+    if not state or not cookie_state or cookie_state != state:
         raise HTTPException(status_code=400, detail="OAuth state mismatch")
     code_verifier = request.cookies.get("productarium_pkce_verifier")
     redirect_uri = str(request.url_for("keycloak_callback"))

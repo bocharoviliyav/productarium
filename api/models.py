@@ -7,15 +7,20 @@ Defines the product-centric data model:
 - ``CodebaseORM``      — git repository artifact (repo clone, page tree, generated docs)
 - ``SpecORM``          — OpenAPI/AsyncAPI spec artifact (single yaml/json)
 - ``LinksORM``         — curated external links (kv pairs)
+- ``DatabaseORM``      — reverse-engineered database artifact (masked DSN, MCP)
 - ``KnowledgeNodeORM`` — Confluence-like tree of knowledge pages per product
 - ``SettingORM``       — admin config key/value store (optionally encrypted)
 - ``ApiTokenORM``      — public API tokens for external integrations
+- ``ChatSessionORM``   — expert-agent chat session per product (Wave B)
+- ``ChatMessageORM``   — one transcript message of a chat session
 - ``KnowledgeChunkORM`` — embedded text chunks for the pgvector-direct memory
+- ``McpServerORM``       — admin registry of external MCP servers (Wave C)
+- ``ProductMcpServerORM`` — per-product binding to an MCP server (Wave C)
 
 String primary keys (``prod_..``, ``art_..``, ``user_..``, ``node_..``,
 ``tok_..``) keep frontend compatibility. All tables share the same
-Postgres+pgvector database used by cognee (see ``api/db.py``). ``init_db`` is
-idempotent and non-fatal.
+Postgres+pgvector database (see ``api/db.py``). ``init_db`` is idempotent and
+non-fatal.
 """
 
 from __future__ import annotations
@@ -29,9 +34,9 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 logger = logging.getLogger(__name__)
 
-# pgvector is a transitive dep (via cognee) but may be absent in minimal venvs.
-# Import guarded so the module always imports; the real Vector column type is
-# only used on Postgres (load_dialect_impl selects it by dialect).
+# pgvector may be absent in minimal venvs. Import guarded so the module
+# always imports; the real Vector column type is only used on Postgres
+# (load_dialect_impl selects it by dialect).
 try:
     from pgvector.sqlalchemy import Vector as _PgVector  # type: ignore
     _PGVECTOR_AVAILABLE = True
@@ -159,7 +164,15 @@ class ProductORM(Base):
         back_populates="product",
         cascade="all, delete-orphan",
     )
+    databases: Mapped[list["DatabaseORM"]] = relationship(
+        back_populates="product",
+        cascade="all, delete-orphan",
+    )
     knowledge_nodes: Mapped[list["KnowledgeNodeORM"]] = relationship(
+        back_populates="product",
+        cascade="all, delete-orphan",
+    )
+    mcp_bindings: Mapped[list["ProductMcpServerORM"]] = relationship(
         back_populates="product",
         cascade="all, delete-orphan",
     )
@@ -299,6 +312,70 @@ class LinksORM(Base):
         return f"<LinksORM id={self.id!r} name={self.name!r}>"
 
 
+class DatabaseORM(Base):
+    """ORM model for the ``databases`` table — a database documented via MCP
+    reverse-engineering (Wave E).
+
+    Mirrors :class:`CodebaseORM`: the reverse-engineering flow (MCP
+    introspection tools → deterministic schema skeleton → LLM enrichment →
+    verification) writes ``generated_docs`` (the full markdown blob) and
+    ``pages`` (the JSON page tree rendered by the viewer).
+
+    Secrets: the connection DSN is accepted from the client, masked via
+    ``api.docgen.verification.mask_dsn`` and ONLY the masked form
+    (``dsn_masked``) is persisted — the raw DSN is never stored, logged, or
+    returned. ``mcp_server_id`` optionally pins the registry MCP server whose
+    introspection tools the flow uses (NULL = all of the product's bound
+    enabled servers); the FK is SET NULL so deleting the server row does not
+    cascade into the documented database.
+    """
+
+    __tablename__ = "databases"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    product_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("products.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    # Masked connection DSN (secret part replaced with ***REDACTED***).
+    dsn_masked: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Optional pin to a registered MCP server (introspection source).
+    mcp_server_id: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey("mcp_servers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    generated_docs: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # JSON tree of generated pages, keyed by page id (viewer contract).
+    pages: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    verified_by: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey("productarium_users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    product: Mapped["ProductORM"] = relationship(back_populates="databases")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return f"<DatabaseORM id={self.id!r} name={self.name!r}>"
+
+
 class KnowledgeNodeORM(Base):
     """Confluence-like tree node of knowledge pages scoped to a product."""
 
@@ -416,6 +493,194 @@ class ApiTokenORM(Base):
         return f"<ApiTokenORM id={self.id!r} name={self.name!r} user_id={self.user_id!r}>"
 
 
+class ChatSessionORM(Base):
+    """ORM model for the ``chat_sessions`` table — a persistent expert-agent
+    chat conversation scoped to a product (Wave B).
+
+    Each session owns an ordered list of :class:`ChatMessageORM` rows and is
+    the stable key for the LangGraph checkpointer thread
+    (``thread_id = session.id``), so the agent's internal message state and the
+    user-visible transcript persist together.
+    """
+
+    __tablename__ = "chat_sessions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    product_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("products.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # The user who owns the conversation (auth ``get_current_user``).
+    user_id: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey("productarium_users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    title: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    messages: Mapped[list["ChatMessageORM"]] = relationship(
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="ChatMessageORM.created_at",
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return (
+            f"<ChatSessionORM id={self.id!r} product_id={self.product_id!r}>"
+        )
+
+
+class ChatMessageORM(Base):
+    """ORM model for the ``chat_messages`` table — one turn in a chat session.
+
+    Stores the user-visible transcript (user queries + assistant answers + a
+    short summary of each tool call) so the UI history endpoints can render
+    the conversation without replaying the LangGraph checkpoint state.
+    """
+
+    __tablename__ = "chat_messages"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    session_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # user | assistant | tool
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Tool-call metadata for role='tool': tool name + args/result summary.
+    tool_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    tool_args: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+
+    session: Mapped["ChatSessionORM"] = relationship(back_populates="messages")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return (
+            f"<ChatMessageORM id={self.id!r} session_id={self.session_id!r} "
+            f"role={self.role!r}>"
+        )
+
+
+class McpServerORM(Base):
+    """ORM model for the ``mcp_servers`` table — admin registry of external
+    MCP (Model Context Protocol) servers whose tools can be attached to
+    products (Wave C).
+
+    ``transport`` is either ``http`` (streamable HTTP endpoint at ``url``) or
+    ``stdio`` (subprocess launched from ``command`` + ``args``).
+
+    Secrets: ``headers`` (http) and ``env`` (stdio) hold Fernet-ENCRYPTED JSON
+    ciphertext (see ``api/mcp/secrets.py``) — never plaintext, never returned
+    to API clients (responses expose masked key-only views).
+
+    ``status`` is the outcome of the last admin health-check
+    (``ok`` | ``error`` | ``unknown``), stamped by ``status_checked_at`` and
+    detailed (short, sanitized) in ``status_error``.
+    """
+
+    __tablename__ = "mcp_servers"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    # 'http' | 'stdio'
+    transport: Mapped[str] = mapped_column(String(16), nullable=False)
+    url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    command: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    args: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    # Encrypted JSON dicts (ciphertext strings inside the JSON column).
+    headers: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    env: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # 'ok' | 'error' | 'unknown' (last health-check outcome)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
+    status_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    status_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    bindings: Mapped[list["ProductMcpServerORM"]] = relationship(
+        back_populates="server",
+        cascade="all, delete-orphan",
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return (
+            f"<McpServerORM id={self.id!r} name={self.name!r} "
+            f"transport={self.transport!r}>"
+        )
+
+
+class ProductMcpServerORM(Base):
+    """ORM model for the ``product_mcp_servers`` table — a binding between a
+    product and a registered MCP server (Wave C).
+
+    ``allowed_tools`` is a JSON list of tool names exposed to the product's
+    expert agent; ``None`` means ALL tools of the server are allowed.
+    Both sides cascade: deleting the product or the server removes bindings.
+    """
+
+    __tablename__ = "product_mcp_servers"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    product_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("products.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    mcp_server_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("mcp_servers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # JSON list[str] | None — None means all tools of the server are allowed.
+    allowed_tools: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    product: Mapped["ProductORM"] = relationship(back_populates="mcp_bindings")
+    server: Mapped["McpServerORM"] = relationship(back_populates="bindings")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return (
+            f"<ProductMcpServerORM id={self.id!r} product_id={self.product_id!r} "
+            f"mcp_server_id={self.mcp_server_id!r}>"
+        )
+
+
 class KnowledgeChunkORM(Base):
     """ORM model for the ``knowledge_chunks`` table — a single embedded text
     chunk scoped to a product, used by the pgvector-direct memory backend.
@@ -427,7 +692,9 @@ class KnowledgeChunkORM(Base):
     (dimensionless — any embedder dim) and degrades to ``Text`` on SQLite.
 
     Product isolation is enforced by ``product_id`` filtering in every query;
-    the HNSW index on ``embedding`` (created in ``init_db``) accelerates the
+    the HNSW index on ``embedding`` (dimension pinned + index created lazily
+    by ``api.db.ensure_embedding_dimension_and_hnsw`` once the first real
+    embedding batch reveals the embedder dimension) accelerates the
     cosine-distance ``ORDER BY`` within a product.
     """
 
@@ -447,6 +714,18 @@ class KnowledgeChunkORM(Base):
     # the upsert path to delete-and-reinsert chunks for a single source.
     source_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     chunk_index: Mapped[int] = mapped_column(nullable=False, default=0)
+    # Citation/provenance columns (Wave D). All nullable so pre-existing rows
+    # and pre-existing DATABASES (create_all adds them only to fresh tables)
+    # stay valid: the pgvector backend writes them only when the columns are
+    # actually present in the live schema (see
+    # ``api.memory.pgvector_backend._citation_columns_available``).
+    # Stable citation id resolvable back to the chunk ("c:<source_id>:<idx>").
+    chunk_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    # Repo-relative path of the file the chunk was produced from (when known).
+    source_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    # [start, end] character offsets of the chunk within the source document
+    # (JSON; None when the offsets could not be located).
+    char_span: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[Optional[object]] = mapped_column(VectorType, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

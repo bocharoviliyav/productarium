@@ -28,12 +28,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from api.models import (
     CodebaseORM,
+    DatabaseORM,
     LinksORM,
     ProductORM,
     SpecORM,
 )
 from api.repositories import product_repo as pr
-from api.schemas import Codebase, Links, Product, Spec
+from api.schemas import Codebase, Database, Links, Product, Spec
 
 
 # --------------------------------------------------------------------------- #
@@ -644,3 +645,44 @@ class TestVerifyChild:
         _seed_product(session)
         with pytest.raises(ValueError, match="Entity not found"):
             pr.verify_child(session, "prod_1", "nope", "codebases", "user_1")
+
+
+# --------------------------------------------------------------------------- #
+# upsert_product — database verified state is server-owned (review #4)
+# --------------------------------------------------------------------------- #
+class TestUpsertDatabaseVerifiedOwnership:
+    def test_upsert_preserves_stored_verified_forces_false_for_new(self, session):
+        _seed_product(session)
+        verified_at = datetime(2026, 1, 1)
+        session.add(DatabaseORM(
+            id="db_1", product_id="prod_1", name="DB1", source="manual",
+            verified=True, verified_by="user_owner", verified_at=verified_at,
+        ))
+        session.commit()
+
+        product = _make_product()
+        product.databases = [
+            # Existing id: the client payload's verified triple is IGNORED,
+            # the stored one survives (round-trip PUT cannot re-grant or
+            # tamper with verification).
+            Database(
+                id="db_1", name="DB1 renamed",
+                verified=True, verified_by="user_evil",
+                verified_at=datetime(2026, 6, 6), source="manual",
+            ),
+            # New id: verified claims are forced off.
+            Database(
+                id="db_2", name="DB2",
+                verified=True, verified_by="user_evil", source="manual",
+            ),
+        ]
+        pr.upsert_product(session, product)
+
+        row1 = session.get(DatabaseORM, "db_1")
+        assert row1.verified is True
+        assert row1.verified_by == "user_owner"
+        assert row1.verified_at == verified_at
+        row2 = session.get(DatabaseORM, "db_2")
+        assert row2.verified is False
+        assert row2.verified_by is None
+        assert row2.verified_at is None

@@ -1,8 +1,8 @@
 """Async documentation generation (202 + poll) job registry.
 
-Long-running doc generation (git clone, file read, RLM bootstrap) is offloaded
-to a dedicated ThreadPoolExecutor. The POST returns 202 + job_id immediately so
-the Next.js proxy never holds a long connection (which caused ECONNRESET). Each
+Long-running doc generation (git clone, file read, LLM calls) is offloaded to a
+dedicated ThreadPoolExecutor. The POST returns 202 + job_id immediately so the
+Next.js proxy never holds a long connection (which caused ECONNRESET). Each
 worker thread runs its OWN event loop (the docgen pipeline is async) with its
 OWN SQLAlchemy session, so the main FastAPI event loop is never blocked and
 request-scoped sessions are not shared across threads.
@@ -13,10 +13,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from sqlalchemy.orm import selectinload
 
@@ -32,9 +33,194 @@ _docgen_executor = ThreadPoolExecutor(
     max_workers=_DocgenMaxWorkers, thread_name_prefix="docgen"
 )
 
+# --- Dedup + serialization (port of the fork's wiki_generation H3/H4) --------
+# The whole check-then-act (prune + scan-for-active + insert) runs under one
+# lock, so two concurrent identical POSTs cannot both create a job for the
+# same entity. A per-entity lock additionally serializes the generation
+# itself: the entity row, the state-dir clone and (from 2.3 on) the
+# introspection disk cache are shared mutable state for the same entity even
+# across different models/languages.
+_JOBS_LOCK = threading.Lock()
+
+_ENTITY_LOCKS: Dict[Tuple[str, str, str], threading.Lock] = {}
+_ENTITY_LOCKS_GUARD = threading.Lock()
+
+
+def job_key(product_id: str, entity_type: str, entity_id: str) -> Tuple[str, str, str]:
+    """Canonical dedup/serialization key: one active job per product entity."""
+    return (product_id, entity_type, entity_id)
+
+
+def lock_for_entity(
+    product_id: str, entity_type: str, entity_id: str
+) -> threading.Lock:
+    """One lock per (product, entity_type, entity_id).
+
+    Serializes generation writes to the same entity even if a duplicate job
+    ever slips past the registry dedup (defense-in-depth). Public on purpose:
+    the 2.3 introspection disk cache takes the same lock so a cached payload
+    write can never race a live generation for the entity.
+    """
+    key = job_key(product_id, entity_type, entity_id)
+    with _ENTITY_LOCKS_GUARD:
+        lock = _ENTITY_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _ENTITY_LOCKS[key] = lock
+        return lock
+
+
+# --- Progress model -----------------------------------------------------------
+# Phase lifecycle: queued -> cloning -> planning -> sections -> verifying ->
+# indexing -> done. spec/database flows map onto the same vocabulary (planning
+# for parse/resolve, sections for the single enrichment/introspection unit).
+DOCGEN_PHASES = (
+    "queued", "cloning", "planning", "sections", "verifying", "indexing", "done",
+)
+
+
+def _new_progress() -> Dict[str, Any]:
+    return {
+        "phase": "queued",
+        "sections_total": None,
+        "sections_done": 0,
+        "current_section": None,
+        "section_durations": {},
+    }
+
+
+def _progress_snapshot(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Reader-side copy of the progress block (poll endpoints / UI restore)."""
+    prog = dict(job.get("progress") or _new_progress())
+    prog["section_durations"] = dict(prog.get("section_durations") or {})
+    return prog
+
+
+def _fmt_duration(seconds: Optional[float]) -> str:
+    """tqdm-readable duration: ``42.1s`` under a minute, else ``2m10s``."""
+    s = max(0.0, float(seconds or 0.0))
+    if s < 60:
+        return f"{s:.1f}s"
+    m, sec = divmod(int(s), 60)
+    return f"{m}m{sec:02d}s"
+
+
+def _tqdm_bar(job: Dict[str, Any]) -> Optional[Any]:
+    """Lazily create the worker-thread progress bar (TTY-only via disable=None)."""
+    bar = job.get("_tqdm")
+    if bar is not None:
+        return bar
+    try:
+        from tqdm.auto import tqdm  # optional dep guard
+    except Exception:
+        return None
+    bar = tqdm(total=None, dynamic_ncols=True, disable=None, unit="section", desc="docgen")
+    job["_tqdm"] = bar
+    return bar
+
+
+def _tqdm_sync(job: Dict[str, Any], prog: Dict[str, Any]) -> None:
+    """Reflect the progress state onto the tqdm bar (never raises)."""
+    try:
+        bar = _tqdm_bar(job)
+        if bar is None:
+            return
+        total = prog.get("sections_total")
+        if total and bar.total != total:
+            bar.reset(total=total)
+        target = prog.get("sections_done") or 0
+        if target > bar.n:
+            bar.update(target - bar.n)
+        else:
+            bar.refresh()
+        label = prog.get("current_section") or prog.get("phase") or "docgen"
+        bar.set_description(f"docgen: {label}")
+    except Exception:  # pragma: no cover - progress UI must never break a job
+        pass
+
+
+def _close_progress_bar(job_id: str) -> None:
+    """Close the job's tqdm bar (worker-thread teardown)."""
+    job = _docgen_jobs.get(job_id)
+    if not job:
+        return
+    bar = job.pop("_tqdm", None)
+    if bar is not None:
+        try:
+            bar.close()
+        except Exception:  # pragma: no cover
+            pass
+
+
+def report_progress(job_id: str, **fields: Any) -> None:
+    """Merge a progress update into the job (called from the worker thread).
+
+    Accepted fields: ``phase``, ``sections_total``, ``sections_done``,
+    ``current_section``, plus the section-completion pair ``section_done`` /
+    ``section_seconds``. Emits the tqdm-style INFO lines (phase transitions and
+    ``docgen progress [3/7] architecture done in 42.1s (total 2m10s)``) and
+    drives the TTY bar. Never raises — broken progress plumbing must not fail
+    a generation run.
+    """
+    job = _docgen_jobs.get(job_id)
+    if job is None:
+        return
+    try:
+        prog = job.setdefault("progress", _new_progress())
+        old_phase = prog.get("phase")
+
+        done_sid = fields.pop("section_done", None)
+        done_seconds = fields.pop("section_seconds", None)
+
+        if done_sid:
+            durations = prog.setdefault("section_durations", {})
+            try:
+                durations[done_sid] = float(done_seconds) if done_seconds is not None else 0.0
+            except (TypeError, ValueError):
+                durations[done_sid] = 0.0
+            if "sections_done" not in fields:
+                fields["sections_done"] = len(durations)
+            if prog.get("current_section") == done_sid:
+                fields["current_section"] = None
+
+        prog.update(fields)
+
+        if done_sid:
+            total = prog.get("sections_total")
+            started = job.get("started_at")
+            elapsed = (time.time() - started) if started else 0.0
+            logger.info(
+                "docgen progress [%s/%s] %s done in %s (total %s)",
+                prog.get("sections_done", "?"),
+                total if total else "?",
+                done_sid,
+                _fmt_duration(done_seconds),
+                _fmt_duration(elapsed),
+            )
+
+        new_phase = fields.get("phase")
+        if new_phase and new_phase != old_phase:
+            logger.info("docgen job %s: phase %s -> %s", job_id, old_phase, new_phase)
+
+        _tqdm_sync(job, prog)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("docgen progress update failed for %s", job_id, exc_info=True)
+
+
+def _progress_reporter(job_id: str):
+    """Closure passed to generate_* as the optional ``progress`` callback."""
+    def report(**fields: Any) -> None:
+        report_progress(job_id, **fields)
+    return report
+
 
 def _docgen_prune_old_jobs(max_age_seconds: int = 3600) -> None:
-    """Drop finished jobs older than ``max_age_seconds`` to bound memory."""
+    """Drop finished jobs older than ``max_age_seconds`` to bound memory.
+
+    Precondition: the caller holds ``_JOBS_LOCK`` (``threading.Lock`` is
+    non-reentrant, so this helper never acquires it itself — it iterates a
+    snapshot and mutates ``_docgen_jobs`` directly).
+    """
     cutoff = time.time() - max_age_seconds
     stale = [
         jid for jid, j in _docgen_jobs.items()
@@ -44,16 +230,17 @@ def _docgen_prune_old_jobs(max_age_seconds: int = 3600) -> None:
         _docgen_jobs.pop(jid, None)
 
 
-def create_job(product_id: str, entity_type: str, entity_id: str) -> str:
-    """Register a new queued job and return its id."""
-    _docgen_prune_old_jobs()
+def _register_job(key: Tuple[str, str, str]) -> str:
+    """Insert a fresh queued job. Precondition: caller holds ``_JOBS_LOCK``."""
     job_id = uuid.uuid4().hex
     _docgen_jobs[job_id] = {
         "job_id": job_id,
-        "product_id": product_id,
-        "entity_type": entity_type,
-        "entity_id": entity_id,
+        "product_id": key[0],
+        "entity_type": key[1],
+        "entity_id": key[2],
+        "key": key,
         "status": "queued",
+        "progress": _new_progress(),
         "created_at": time.time(),
         "started_at": None,
         "finished_at": None,
@@ -61,6 +248,40 @@ def create_job(product_id: str, entity_type: str, entity_id: str) -> str:
         "docs_chars": None,
     }
     return job_id
+
+
+def create_job(product_id: str, entity_type: str, entity_id: str) -> str:
+    """Register a NEW queued job unconditionally (no dedup) and return its id.
+
+    Request paths must prefer ``create_or_get_job`` — this entry point exists
+    for tests and internal callers that explicitly want a fresh job.
+    """
+    with _JOBS_LOCK:
+        _docgen_prune_old_jobs()
+        return _register_job(job_key(product_id, entity_type, entity_id))
+
+
+def create_or_get_job(
+    product_id: str, entity_type: str, entity_id: str
+) -> Tuple[str, bool]:
+    """Atomic check-then-act job creation with in-flight dedup (fork H3/H4).
+
+    Returns ``(job_id, is_new)``. While a job for the same (product, entity)
+    is queued or running, the SAME job id is returned with ``is_new=False``
+    and the caller MUST NOT dispatch a second generation run for it — a
+    repeated POST just re-attaches to the in-flight job.
+    """
+    key = job_key(product_id, entity_type, entity_id)
+    with _JOBS_LOCK:
+        _docgen_prune_old_jobs()
+        for job in _docgen_jobs.values():
+            if job.get("key") == key and job.get("status") in ("queued", "running"):
+                logger.info(
+                    "Reusing in-flight docgen job %s for %s %s (duplicate POST)",
+                    job["job_id"], entity_type, entity_id,
+                )
+                return job["job_id"], False
+        return _register_job(key), True
 
 
 def submit_job(
@@ -84,6 +305,31 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     return _docgen_jobs.get(job_id)
 
 
+def active_jobs_for_product(product_id: str) -> list:
+    """Snapshot of the product's QUEUED/RUNNING jobs for the UI restore flow.
+
+    Single-process in-memory registry: a backend restart kills the jobs
+    anyway, so there is nothing durable to restore FROM — this answers "what
+    is running right now" for ``GET /api/products/{id}/docgen/active`` after a
+    page reload/navigation.
+    """
+    out = []
+    with _JOBS_LOCK:
+        for job in _docgen_jobs.values():
+            if job.get("product_id") != product_id:
+                continue
+            if job.get("status") not in ("queued", "running"):
+                continue
+            out.append({
+                "job_id": job["job_id"],
+                "entity_type": job["entity_type"],
+                "entity_id": job["entity_id"],
+                "status": job["status"],
+                "progress": _progress_snapshot(job),
+            })
+    return out
+
+
 # --- Worker-thread docgen pipeline -------------------------------------------
 
 async def _run_docgen_job_async(
@@ -103,59 +349,118 @@ async def _run_docgen_job_async(
     job["indexing_status"] = "idle"
     job["indexing_message"] = "Генерация документации..."
     job["started_at"] = time.time()
+    # First phase transition is emitted by the generate_* pipeline itself
+    # (cloning for codebase, planning for spec/database).
+    progress_cb = _progress_reporter(job_id)
+    entity_lock = lock_for_entity(product_id, entity_type, entity_id)
     db = SessionLocal()
     try:
-        p_orm = (
-            db.query(ProductORM)
-            .options(
-                selectinload(ProductORM.codebases),
-                selectinload(ProductORM.specs),
+        # 2.2 embedder preflight: one short probe BEFORE the (potentially
+        # hours-long) pipeline — a run whose output could never be indexed
+        # (embedder down / model missing / dimension changed) must fail in
+        # seconds with a readable EMBEDDER_ERROR reason, not lose recall
+        # silently at the very end. Skipped automatically on non-pgvector
+        # installs (SQLite fallback, hermetic tests); internal preflight
+        # errors never kill the job — only the classified diagnosis does.
+        try:
+            from api.memory.preflight import (
+                EMBEDDER_ERROR_PREFIX,
+                EmbedderUnavailable,
+                preflight_embedder,
             )
-            .filter(ProductORM.id == product_id)
-            .first()
-        )
-        if p_orm is None:
-            raise ValueError("Product not found")
 
-        if entity_type == "codebase":
-            entity = next((c for c in p_orm.codebases if c.id == entity_id), None)
-            if entity is None:
-                raise ValueError("Codebase not found")
-            from api.docgen.codebase import generate_codebase_docs
-            docs = await generate_codebase_docs(
-                entity, p_orm, model=model,
-                language=language or "ru",
+            await preflight_embedder(product_id)
+        except EmbedderUnavailable as e:
+            raise ValueError(f"{EMBEDDER_ERROR_PREFIX}{e}") from None
+        except Exception as e:  # pragma: no cover - preflight plumbing
+            logger.warning("Embedder preflight skipped (unexpected error): %s", e)
+        # Fork H4: per-entity lock. The registry dedup above already prevents
+        # two ACTIVE jobs for one entity; this lock is the belt-and-braces
+        # guarantee that generation for the same entity row / state-dir clone
+        # is serialized even if a duplicate job ever reaches the worker (and
+        # it is the same lock the 2.3 introspection cache will take).
+        with entity_lock:
+            p_orm = (
+                db.query(ProductORM)
+                .options(
+                    selectinload(ProductORM.codebases),
+                    selectinload(ProductORM.specs),
+                    selectinload(ProductORM.databases),
+                )
+                .filter(ProductORM.id == product_id)
+                .first()
             )
-        elif entity_type == "spec":
-            entity = next((s for s in p_orm.specs if s.id == entity_id), None)
-            if entity is None:
-                raise ValueError("Spec not found")
-            spec_kind = (getattr(entity, "spec_kind", "") or "").lower()
-            from api.docgen.spec import generate_openapi_docs, generate_asyncapi_docs
-            if spec_kind == "asyncapi":
-                docs = await generate_asyncapi_docs(
+            if p_orm is None:
+                raise ValueError("Product not found")
+
+            if entity_type == "codebase":
+                entity = next((c for c in p_orm.codebases if c.id == entity_id), None)
+                if entity is None:
+                    raise ValueError("Codebase not found")
+                from api.docgen.codebase import generate_codebase_docs
+                docs = await generate_codebase_docs(
                     entity, p_orm, model=model,
                     language=language or "ru",
+                    progress=progress_cb,
+                )
+            elif entity_type == "spec":
+                entity = next((s for s in p_orm.specs if s.id == entity_id), None)
+                if entity is None:
+                    raise ValueError("Spec not found")
+                # SpecORM.kind is the real column ("openapi" | "asyncapi").
+                spec_kind = (getattr(entity, "kind", None) or "openapi").lower()
+                from api.docgen.spec import generate_openapi_docs, generate_asyncapi_docs
+                if spec_kind == "asyncapi":
+                    docs = await generate_asyncapi_docs(
+                        entity, p_orm, model=model,
+                        language=language or "ru",
+                        progress=progress_cb,
+                    )
+                else:
+                    docs = await generate_openapi_docs(
+                        entity, p_orm, model=model,
+                        language=language or "ru",
+                        progress=progress_cb,
+                    )
+            elif entity_type == "database":
+                entity = next((d for d in p_orm.databases if d.id == entity_id), None)
+                if entity is None:
+                    raise ValueError("Database not found")
+                from api.docgen.database import generate_database_docs
+                docs = await generate_database_docs(
+                    entity, p_orm, model=model,
+                    language=language or "ru",
+                    progress=progress_cb,
                 )
             else:
-                docs = await generate_openapi_docs(
-                    entity, p_orm, model=model,
-                    language=language or "ru",
-                )
-        else:
-            raise ValueError(f"Unsupported docgen entity_type: {entity_type}")
+                raise ValueError(f"Unsupported docgen entity_type: {entity_type}")
 
-        db.commit()
+            db.commit()
         job["status"] = "succeeded"
-        # Display is decoupled from the knowledge graph: docs are already
-        # committed, so the job is a success regardless of how long cognee
-        # cognify takes (it can run 20-30 min and is handed off to the main
-        # event loop, NOT gated on the worker thread).
+        # Display is decoupled from memory indexing: docs are already committed,
+        # so the job is a success regardless of how long background indexing
+        # takes (it is handed off to the main event loop, NOT gated on the
+        # worker thread).
         job["indexing_status"] = "succeeded"
-        job["indexing_message"] = "Документы сгенерированы. Граф знаний обновляется в фоне."
+        job["indexing_message"] = "Документы сгенерированы. Индексация обновляется в фоне."
         job["finished_at"] = time.time()
         job["docs_chars"] = len(docs or "")
+        report_progress(job_id, phase="done")
         logger.info("Docgen job %s succeeded for %s %s", job_id, entity_type, entity_id)
+    except ValueError as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        job["status"] = "failed"
+        job["indexing_status"] = "failed"
+        # Controlled validation messages from our own docgen layer (entity
+        # not found, unusable MCP surface, LLM fully unavailable) — safe to
+        # surface to the polling client.
+        job["indexing_message"] = f"Ошибка генерации документации: {e}"
+        job["error"] = str(e)
+        job["finished_at"] = time.time()
+        logger.warning("Docgen job %s failed: %s", job_id, e)
     except Exception as e:
         try:
             db.rollback()
@@ -163,8 +468,13 @@ async def _run_docgen_job_async(
             pass
         job["status"] = "failed"
         job["indexing_status"] = "failed"
-        job["indexing_message"] = f"Ошибка генерации документации: {e}"
-        job["error"] = str(e)
+        # Unexpected exceptions may embed local FS paths / clone stderr /
+        # upstream details — generic client message, full context in the
+        # server log only (review #5).
+        job["indexing_message"] = (
+            "Ошибка генерации документации (подробности в логах сервера)"
+        )
+        job["error"] = f"Generation failed ({type(e).__name__}); see server logs"
         job["finished_at"] = time.time()
         logger.error("Docgen job %s failed: %s", job_id, e, exc_info=True)
     finally:
@@ -189,11 +499,11 @@ def _run_docgen_job(
     language: str,
 ) -> None:
     """Worker-thread entry point: runs the async job in a brand-new event loop
-    so the heavy sync work (git clone, file read, RLM) never touches the main
-    loop. Cognee indexing is normally handed off to the MAIN event loop via
-    ``_index_in_background``; any leftover tasks on the worker loop are drained
-    best-effort and NON-FATAL — a drain timeout never marks the job as failed
-    because the docs are already committed."""
+    so the heavy sync work (git clone, file read, LLM calls) never touches the
+    main loop. Memory indexing is normally handed off to the MAIN event loop
+    via ``_index_in_background``; any leftover tasks on the worker loop are
+    drained best-effort and NON-FATAL — a drain timeout never marks the job as
+    failed because the docs are already committed."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -222,6 +532,7 @@ def _run_docgen_job(
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("Docgen background drain error for job %s: %s", job_id, e)
     finally:
+        _close_progress_bar(job_id)
         try:
             loop.close()
         except Exception:

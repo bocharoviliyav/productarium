@@ -291,7 +291,7 @@ def update_node(
 
     WYSIWYG saves ``content_md``; drag-and-drop saves ``parent_id``. When
     ``content_md`` changes, the new text is re-indexed into the product's
-    cognee dataset in the background (fire-and-forget, non-fatal) so expert
+    pgvector memory in the background (fire-and-forget, non-fatal) so expert
     Ask/summary stay in sync with manual page edits (and future MCP/Confluence/
     webhook-pulled content).
     """
@@ -311,7 +311,7 @@ def update_node(
     db.commit()
     db.refresh(node)
 
-    # Re-index edited page content into the per-product cognee dataset so the
+    # Re-index edited page content into the per-product pgvector memory so the
     # expert agent / Ask recall user edits. Fire-and-forget; never fatal.
     if content_changed and node.content_md and node.content_md.strip():
         try:

@@ -1,7 +1,6 @@
 """Unit tests for ``api.tools.rate_limiter`` (EmbedderRateLimiter).
 
-Mirrors ``test_cognee_rate_limiter.py`` but targets the embedder limiter used
-by the pgvector memory backend:
+Targets the embedder limiter used by the pgvector memory backend:
 
 - ``EmbedderRateLimiter.get_rate_settings``: defaults (4, 0.1), admin-store
   overrides (embedder.max_concurrency, embedder.delay_seconds,

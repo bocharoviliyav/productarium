@@ -6,13 +6,13 @@ Focuses on the lines NOT already covered by tests/integration/test_admin_public.
 - _ping_model_endpoint branches (success, auth-rejected, probe failure, non-200)
 - _lazy_connector / _connector_test_result helper branches
 - prompts list/get/put (including invalid filename + path traversal + missing file)
-- cognee reindex endpoint (success + failure)
-- settings group GETs with ``resolved`` views (git, confluence, integrations, rlm,
-  ssl, cognee, timeouts)
+- memory endpoints (GET/PUT /api/admin/memory, POST /api/admin/memory/reindex)
+- settings group GETs with ``resolved`` views (git, confluence, integrations,
+  ssl, embedder, memory, timeouts)
 - users: POST create (with + without password), POST reset-token, duplicate 409,
   invalid role 400, non-local user reset 400
 - api tokens: non-admin delete 403, delete nonexistent 404
-- settings PUT validation (rlm invalid mode, models max_prompt_tokens invalid/neg,
+- settings PUT validation (models max_prompt_tokens invalid/neg,
   timeouts invalid/neg/float, non-dict body 400)
 """
 
@@ -517,7 +517,7 @@ class TestPrompts:
         assert resp.status_code == 200
         body = resp.json()
         assert isinstance(body, list)
-        # refs/prompts/ should have at least overview.md
+        # refs/prompts/ holds the registered prompt files (docgen_sections.md etc.)
         filenames = [p["filename"] for p in body]
         assert any(f.endswith(".md") for f in filenames)
 
@@ -525,10 +525,10 @@ class TestPrompts:
         from api.routers import admin as admin_mod
 
         app, client = _build_client(isolated_db, admin_mod)
-        resp = client.get("/api/admin/prompts/overview.md")
+        resp = client.get("/api/admin/prompts/docgen_sections.md")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["filename"] == "overview.md"
+        assert body["filename"] == "docgen_sections.md"
         assert "content" in body
         assert len(body["content"]) > 0
 
@@ -554,8 +554,9 @@ class TestPrompts:
         assert _safe_prompt_filename("overview.txt") is None
         # Unknown registered file rejected.
         assert _safe_prompt_filename("nonexistent_prompt.md") is None
+        assert _safe_prompt_filename("overview.md") is None  # deleted dead prompt
         # Known registered file accepted.
-        assert _safe_prompt_filename("overview.md") == "overview.md"
+        assert _safe_prompt_filename("docgen_sections.md") == "docgen_sections.md"
 
     def test_get_prompt_unknown_registered_file(self, isolated_db):
         from api.routers import admin as admin_mod
@@ -567,10 +568,12 @@ class TestPrompts:
 
     def test_put_prompt(self, isolated_db):
         from api.routers import admin as admin_mod
-        from api.prompts import PROMPTS_DIR
+        from api.prompts import PROMPTS_DIR, reload_prompt_file
         import os
 
-        fname = "overview.md"
+        # A registered prompt file (the PUT hot-reloads it in memory, so the
+        # finally block must restore BOTH the file and the loaded constant).
+        fname = "mermaid_repair.md"
         fpath = os.path.join(PROMPTS_DIR, fname)
         original = open(fpath, "r", encoding="utf-8").read()
         try:
@@ -589,6 +592,7 @@ class TestPrompts:
         finally:
             with open(fpath, "w", encoding="utf-8") as f:
                 f.write(original)
+            reload_prompt_file(fname)
 
     def test_put_prompt_invalid_filename(self, isolated_db):
         from api.routers import admin as admin_mod
@@ -599,58 +603,6 @@ class TestPrompts:
             json={"content": "x"},
         )
         assert resp.status_code == 400
-
-
-# --- Cognee reindex (alias → api.memory) ------------------------------------
-# The legacy POST /api/admin/cognee/reindex endpoint now delegates to
-# ``api.memory.reindex_product_memory`` (the backend-agnostic facade), so the
-# active ``memory.backend`` setting governs this path (pgvector by default,
-# cognee alt). Tests patch the facade; the cognee-group GET test below still
-# covers the cognee settings resolved view directly.
-class TestCogneeReindex:
-    def test_reindex_success(self, isolated_db, monkeypatch):
-        from api.routers import admin as admin_mod
-
-        async def _fake_reindex(pid):
-            return {"reindexed": True, "product_id": pid}
-
-        import api.memory as memory_mod
-        monkeypatch.setattr(memory_mod, "reindex_product_memory", _fake_reindex)
-
-        app, client = _build_client(isolated_db, admin_mod)
-        resp = client.post("/api/admin/cognee/reindex", json={"product_id": "prod_1"})
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["reindexed"] is True
-
-    def test_reindex_no_body(self, isolated_db, monkeypatch):
-        from api.routers import admin as admin_mod
-
-        async def _fake_reindex(pid):
-            assert pid is None
-            return {"reindexed": True}
-
-        import api.memory as memory_mod
-        monkeypatch.setattr(memory_mod, "reindex_product_memory", _fake_reindex)
-
-        app, client = _build_client(isolated_db, admin_mod)
-        resp = client.post("/api/admin/cognee/reindex")
-        assert resp.status_code == 200
-        assert resp.json()["reindexed"] is True
-
-    def test_reindex_failure_500(self, isolated_db, monkeypatch):
-        from api.routers import admin as admin_mod
-
-        async def _fake_reindex(pid):
-            raise RuntimeError("cognee down")
-
-        import api.memory as memory_mod
-        monkeypatch.setattr(memory_mod, "reindex_product_memory", _fake_reindex)
-
-        app, client = _build_client(isolated_db, admin_mod)
-        resp = client.post("/api/admin/cognee/reindex", json={"product_id": "prod_1"})
-        assert resp.status_code == 500
-        assert "cognee down" in resp.json()["detail"]
 
 
 # --- Memory endpoints (GET/PUT /api/admin/memory, POST reindex) --------------
@@ -664,9 +616,9 @@ class TestMemoryEndpoints:
         body = resp.json()
         assert body["group"] == "memory"
         assert "resolved" in body
-        # Default backend is pgvector; valid_backends lists both options.
+        # pgvector is the sole backend since the LangChain migration.
         assert body["resolved"]["backend"] == "pgvector"
-        assert body["resolved"]["valid_backends"] == ["pgvector", "cognee"]
+        assert body["resolved"]["valid_backends"] == ["pgvector"]
         # pgvector status fields are present (counts on SQLite are 0).
         assert "available" in body["resolved"]
         assert "chunk_count" in body["resolved"]
@@ -692,18 +644,32 @@ class TestMemoryEndpoints:
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.put(
             "/api/admin/memory",
-            json={"memory.backend": "cognee"},
+            json={"memory.backend": "pgvector"},
         )
         assert resp.status_code == 200
         assert "memory.backend" in resp.json()["saved"]
         # The setting was persisted (normalized to lowercase).
-        assert ss.get_setting("memory.backend") == "cognee"
-        # And the resolver now resolves to cognee.
+        assert ss.get_setting("memory.backend") == "pgvector"
+        # And the resolver resolves to pgvector.
         from api.memory.resolver import get_memory_backend_name
-        assert get_memory_backend_name() == "cognee"
-        # Restore default to avoid leaking into other tests.
-        ss.set_setting("memory.backend", "pgvector")
+        assert get_memory_backend_name() == "pgvector"
+        # Clean the override so other tests see the default.
+        ss.set_setting("memory.backend", "")
         reset_memory_backend_cache()
+
+    def test_put_memory_stale_cognee_backend_ignored(self, isolated_db):
+        """A leftover ``cognee`` value must be rejected, not persisted."""
+        from api.routers import admin as admin_mod
+        import api.config.settings as ss
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.put(
+            "/api/admin/memory",
+            json={"memory.backend": "cognee"},
+        )
+        assert resp.status_code == 200
+        assert "memory.backend" not in resp.json()["saved"]
+        assert ss.get_setting("memory.backend") is None
 
     def test_put_memory_invalid_backend_ignored(self, isolated_db):
         from api.routers import admin as admin_mod
@@ -728,13 +694,13 @@ class TestMemoryEndpoints:
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.put(
             "/api/admin/memory",
-            json={"memory.backend": "  CoGnEe  "},
+            json={"memory.backend": "  PGVector  "},
         )
         assert resp.status_code == 200
         assert "memory.backend" in resp.json()["saved"]
-        assert ss.get_setting("memory.backend") == "cognee"
-        # Restore default.
-        ss.set_setting("memory.backend", "pgvector")
+        assert ss.get_setting("memory.backend") == "pgvector"
+        # Clean the override.
+        ss.set_setting("memory.backend", "")
         reset_memory_backend_cache()
 
     def test_post_memory_reindex_success(self, isolated_db, monkeypatch):
@@ -782,7 +748,10 @@ class TestMemoryEndpoints:
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.post("/api/admin/memory/reindex", json={"product_id": "prod_1"})
         assert resp.status_code == 500
-        assert "memory backend down" in resp.json()["detail"]
+        # Wave F: client-facing detail is generic; the exception text (which
+        # may embed backend endpoints) stays in the server log only.
+        assert resp.json()["detail"] == "Reindex failed"
+        assert "memory backend down" not in resp.json()["detail"]
 
 
 # --- Settings group GETs (resolved views) -----------------------------------
@@ -824,18 +793,21 @@ class TestSettingsGroupGets:
         assert body["group"] == "integrations"
         assert "resolved" in body
 
-    def test_get_rlm_group(self, isolated_db):
+    def test_get_rlm_group_removed(self, isolated_db):
+        """The rlm group was removed with fast-rlm; the route 404s now."""
         from api.routers import admin as admin_mod
 
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.get("/api/admin/rlm")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["group"] == "rlm"
-        assert "resolved" in body
-        # fast-rlm not installed -> all modes are "llm"
-        for task in ("docgen", "expert", "summary"):
-            assert body["resolved"][task] == "llm"
+        assert resp.status_code == 404
+
+    def test_get_cognee_group_removed(self, isolated_db):
+        """The cognee group was removed with cognee; the route 404s now."""
+        from api.routers import admin as admin_mod
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.get("/api/admin/cognee")
+        assert resp.status_code == 404
 
     def test_get_ssl_group(self, isolated_db):
         from api.routers import admin as admin_mod
@@ -846,19 +818,6 @@ class TestSettingsGroupGets:
         body = resp.json()
         assert body["group"] == "ssl"
         assert "settings" in body
-
-    def test_get_cognee_group(self, isolated_db):
-        from api.routers import admin as admin_mod
-
-        app, client = _build_client(isolated_db, admin_mod)
-        resp = client.get("/api/admin/cognee")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["group"] == "cognee"
-        assert "resolved" in body
-        assert "max_concurrency" in body["resolved"]
-        assert "delay_seconds" in body["resolved"]
-        assert "rate_limit_rps" in body["resolved"]
 
     def test_get_embedder_group(self, isolated_db):
         from api.routers import admin as admin_mod
@@ -883,7 +842,7 @@ class TestSettingsGroupGets:
         assert body["group"] == "memory"
         assert "resolved" in body
         assert body["resolved"]["backend"] == "pgvector"
-        assert body["resolved"]["valid_backends"] == ["pgvector", "cognee"]
+        assert body["resolved"]["valid_backends"] == ["pgvector"]
 
     def test_get_timeouts_group(self, isolated_db):
         from api.routers import admin as admin_mod
@@ -901,20 +860,8 @@ class TestSettingsGroupGets:
 
 # --- Settings PUT validation ------------------------------------------------
 class TestSettingsPutValidation:
-    def test_put_rlm_invalid_mode_ignored(self, isolated_db):
-        from api.routers import admin as admin_mod
-
-        app, client = _build_client(isolated_db, admin_mod)
-        resp = client.put(
-            "/api/admin/rlm",
-            json={"rlm.expert.mode": "superuser", "rlm.docgen.mode": "auto"},
-        )
-        assert resp.status_code == 200
-        body = resp.json()
-        assert "rlm.docgen.mode" in body["saved"]
-        assert "rlm.expert.mode" not in body["saved"]
-
-    def test_put_rlm_valid_mode_saved(self, isolated_db):
+    def test_put_rlm_group_removed(self, isolated_db):
+        """The rlm group was removed; PUT now 404s."""
         from api.routers import admin as admin_mod
 
         app, client = _build_client(isolated_db, admin_mod)
@@ -922,8 +869,7 @@ class TestSettingsPutValidation:
             "/api/admin/rlm",
             json={"rlm.expert.mode": "llm"},
         )
-        assert resp.status_code == 200
-        assert "rlm.expert.mode" in resp.json()["saved"]
+        assert resp.status_code == 404
 
     def test_put_models_max_prompt_tokens_invalid(self, isolated_db):
         from api.routers import admin as admin_mod

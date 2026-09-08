@@ -19,7 +19,7 @@ from typing import Any, Dict, Optional
 import pytest
 
 # The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
-# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee stubs for every
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY for every
 # test in this module. The router tests override ``get_current_user`` via
 # ``app.dependency_overrides`` (see ``_client_and_db``) so they are independent of
 # the AUTH_PROVIDER env value anyway.
@@ -31,8 +31,11 @@ class TestRegistry:
 
         reset_registry()
         names = {c["name"] for c in list_connectors()}
-        # The four built-in connectors must be auto-discovered.
-        assert {"github", "gitlab", "confluence", "mcp"} <= names
+        # The three built-in connectors must be auto-discovered. (The legacy
+        # hand-written "mcp" connector was removed with the Wave C MCP
+        # platform — external MCP servers now live in api/mcp/ + admin CRUD.)
+        assert {"github", "gitlab", "confluence"} <= names
+        assert "mcp" not in names
 
     def test_list_connectors_has_required_fields(self):
         from api.integrations.registry import reset_registry, list_connectors
@@ -358,167 +361,6 @@ class TestMarkitdownClient:
         out = mc.convert_to_markdown(b"X", filename="foo.docx")
         assert out.startswith("<!--")
         assert "conversion error" in out
-
-
-# --- MCP connector (config-only, no network) --------------------------------
-class TestMcpConnector:
-    def test_is_configured_requires_servers(self):
-        from api.integrations.mcp import McpConnector
-
-        assert McpConnector(config={}).is_configured() is False
-        assert McpConnector(config={"servers": []}).is_configured() is False
-        assert (
-            McpConnector(
-                config={
-                    "servers": [
-                        {"name": "s1", "transport": "http", "url": "http://localhost:8080/mcp"}
-                    ]
-                }
-            ).is_configured()
-            is True
-        )
-        assert (
-            McpConnector(
-                config={
-                    "servers": [
-                        {"name": "s2", "transport": "stdio", "command": ["node", "s.js"]}
-                    ]
-                }
-            ).is_configured()
-            is True
-        )
-
-    def test_list_spaces_returns_configured_sources(self):
-        from api.integrations.mcp import McpConnector
-
-        conn = McpConnector(
-            config={
-                "servers": [
-                    {
-                        "name": "srv",
-                        "transport": "stdio",
-                        "command": ["node", "s.js"],
-                        "sources": [
-                            {"id": "s1", "title": "Wiki"},
-                            {"id": "s2", "title": "Docs"},
-                        ],
-                    }
-                ]
-            }
-        )
-        spaces = conn.list_spaces()
-        assert {s["id"] for s in spaces} == {"srv:s1", "srv:s2"}
-        assert all(s["server"] == "srv" for s in spaces)
-
-    def test_list_spaces_multi_server(self):
-        from api.integrations.mcp import McpConnector
-
-        conn = McpConnector(
-            config={
-                "servers": [
-                    {
-                        "name": "a",
-                        "transport": "http",
-                        "url": "http://x",
-                        "sources": [{"id": "a1", "title": "A1"}],
-                    },
-                    {
-                        "name": "b",
-                        "transport": "stdio",
-                        "command": ["node", "b.js"],
-                        "sources": [{"id": "b1", "title": "B1"}],
-                    },
-                ]
-            }
-        )
-        spaces = conn.list_spaces()
-        ids = {s["id"] for s in spaces}
-        assert ids == {"a:a1", "b:b1"}
-
-    def test_test_no_servers(self):
-        from api.integrations.mcp import McpConnector
-
-        result = McpConnector(config={}).test()
-        assert result["success"] is False
-        assert "servers" not in result or result.get("servers") is None or result["servers"] == []
-
-    def test_test_http_server_not_reachable(self, monkeypatch):
-        from api.integrations.mcp import McpConnector
-
-        conn = McpConnector(
-            config={
-                "servers": [
-                    {"name": "s1", "transport": "http", "url": "http://localhost:1/mcp"}
-                ]
-            }
-        )
-        # _http_initialize will fail because nothing is listening on port 1.
-        result = conn.test()
-        assert result["success"] is False
-        assert "servers" in result
-        assert len(result["servers"]) == 1
-        assert result["servers"][0]["success"] is False
-
-    def test_test_invalid_transport(self):
-        from api.integrations.mcp import McpConnector
-
-        conn = McpConnector(
-            config={"servers": [{"name": "s1", "transport": "bogus"}]}
-        )
-        result = conn.test()
-        assert result["success"] is False
-        assert result["servers"][0]["message"] == "Invalid transport 'bogus'."
-
-    def test_pull_not_configured_raises(self):
-        from api.integrations.mcp import McpConnector
-
-        with pytest.raises(ValueError):
-            McpConnector(config={}).pull("src1")
-
-    def test_pull_unknown_server_raises(self):
-        from api.integrations.mcp import McpConnector
-
-        conn = McpConnector(
-            config={"servers": [{"name": "real", "transport": "http", "url": "http://x"}]}
-        )
-        with pytest.raises(ValueError):
-            conn.pull("nonexistent")
-
-    def test_parse_source_id(self):
-        from api.integrations.mcp import McpConnector
-
-        assert McpConnector._parse_source_id("srv:tool") == ("srv", "tool")
-        assert McpConnector._parse_source_id("srv") == ("srv", None)
-        assert McpConnector._parse_source_id("srv:") == ("srv", None)
-
-    def test_pull_mocked_http(self, monkeypatch):
-        from api.integrations.mcp import McpConnector
-
-        conn = McpConnector(
-            config={
-                "servers": [
-                    {
-                        "name": "srv",
-                        "transport": "http",
-                        "url": "http://localhost:9999/mcp",
-                        "tool": "fetch",
-                    }
-                ]
-            }
-        )
-        # Mock _server_call to avoid real HTTP.
-        monkeypatch.setattr(
-            conn,
-            "_server_call",
-            lambda server, tool, arguments: "# Fetched Content\n\nHello world.",
-        )
-        result = conn.pull("srv")
-        assert result["title"] == "srv"
-        assert "Fetched Content" in result["markdown"]
-        assert result["server"] == "srv"
-        assert result["tool"] == "fetch"
-        assert result["transport"] == "http"
-        assert result["attachments"] == []
 
 
 # --- Router end-to-end (TestClient + in-memory DB) --------------------------

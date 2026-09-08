@@ -9,9 +9,9 @@ Covers:
 - ``_format_history``: empty + turns (user/assistant/other) + skipped invalid.
 
 The expert knowledge path recalls via ``api.memory.query_memory`` (the
-backend-agnostic facade; active backend = pgvector by default, cognee alt).
+backend-agnostic facade; active backend = pgvector).
 Tests inject a fake ``api.memory`` module with a mock ``query_memory`` to avoid
-the real backend (which would need pgvector/cognee + a live embedder).
+the real backend (which would need pgvector + a live embedder).
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ def _install_fake_memory(monkeypatch, query_memory_fn):
 
     ``_retrieve_product_knowledge`` recalls via ``api.memory.query_memory``
     (the backend-agnostic facade). Injecting a fake module avoids importing the
-    real backends (which pull in cognee/numpy + a live embedder). The fake
+    real backends (which pull in numpy + a live embedder). The fake
     ``query_memory`` has the same signature as the facade:
     ``query_memory(query, product_id, top_k=20) -> str``.
     """

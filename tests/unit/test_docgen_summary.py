@@ -177,80 +177,50 @@ class TestCleanText:
 class TestSafeBuildSummaryLlm:
     def test_returns_none_on_exception(self, monkeypatch):
         def boom(*a, **kw):
-            raise RuntimeError("no adalflow")
+            raise RuntimeError("no api.llm")
         monkeypatch.setattr(summary_mod, "_SummaryLLM", boom)
         assert summary_mod._safe_build_summary_llm("model") is None
 
 
 # ============================================================================
-# _SummaryLLM (mocked generator)
+# _SummaryLLM (wrapped api.llm.GenerateLLM)
 # ============================================================================
 class TestSummaryLLM:
-    def test_generate_success(self):
+    def test_generate_delegates_to_wrapped_llm(self):
         llm = summary_mod._SummaryLLM.__new__(summary_mod._SummaryLLM)
 
-        class FakeResult:
-            error = None
-            data = "summary text"
+        class FakeGenerateLLM:
+            async def generate(self, prompt: str) -> str:
+                return "summary text"
 
-        class FakeGenerator:
-            def __call__(self, prompt_kwargs=None):
-                return FakeResult()
-
-        llm.generator = FakeGenerator()
+        llm._llm = FakeGenerateLLM()
         result = asyncio.run(llm.generate("prompt"))
         assert result == "summary text"
 
-    def test_generate_error_returns_empty(self):
+    def test_generate_failure_returns_empty(self):
         llm = summary_mod._SummaryLLM.__new__(summary_mod._SummaryLLM)
 
-        class FakeResult:
-            error = Exception("model error")
-            data = None
-            response = None
-            answer = None
-            raw_response = None
-            output = None
+        class FakeGenerateLLM:
+            async def generate(self, prompt: str) -> str:
+                # GenerateLLM contract: "" on failure, never raises.
+                return ""
 
-        class FakeGenerator:
-            def __call__(self, prompt_kwargs=None):
-                return FakeResult()
-
-        llm.generator = FakeGenerator()
+        llm._llm = FakeGenerateLLM()
         result = asyncio.run(llm.generate("prompt"))
         assert result == ""
 
     def test_generate_exception_propagates(self):
-        """_SummaryLLM.generate does NOT catch generator exceptions; the caller
+        """A hard error from the underlying GenerateLLM propagates; the caller
         (generate_product_summary) is responsible for catching them."""
         llm = summary_mod._SummaryLLM.__new__(summary_mod._SummaryLLM)
 
-        class FakeGenerator:
-            def __call__(self, prompt_kwargs=None):
+        class FakeGenerateLLM:
+            async def generate(self, prompt: str) -> str:
                 raise RuntimeError("boom")
 
-        llm.generator = FakeGenerator()
+        llm._llm = FakeGenerateLLM()
         with pytest.raises(RuntimeError, match="boom"):
             asyncio.run(llm.generate("prompt"))
-
-    def test_generate_falls_through_attrs(self):
-        llm = summary_mod._SummaryLLM.__new__(summary_mod._SummaryLLM)
-
-        class FakeResult:
-            error = None
-            data = None
-            response = None
-            answer = None
-            raw_response = None
-            output = "found in output attr"
-
-        class FakeGenerator:
-            def __call__(self, prompt_kwargs=None):
-                return FakeResult()
-
-        llm.generator = FakeGenerator()
-        result = asyncio.run(llm.generate("prompt"))
-        assert result == "found in output attr"
 
 
 # ============================================================================
@@ -295,6 +265,23 @@ class TestGenerateProductSummary:
             summary_mod.generate_product_summary(product, cbs, specs, nodes)
         )
         assert result == "Generated summary text"
+
+    def test_llm_output_secrets_masked(self, monkeypatch):
+        """Deterministic secret guard: the persisted summary never carries a
+        leaked token even when the model echoes one from the context."""
+        product = FakeProduct()
+        cbs = [FakeCodebase("app", "docs")]
+        token = "ghp_" + "AB" * 15
+
+        class FakeLLM:
+            async def generate(self, prompt):
+                return f"Summary leaks {token}"
+        monkeypatch.setattr(summary_mod, "_safe_build_summary_llm", lambda *a, **kw: FakeLLM())
+        result = asyncio.run(
+            summary_mod.generate_product_summary(product, cbs, [], [])
+        )
+        assert token not in result
+        assert "***REDACTED***" in result
 
     def test_llm_returns_fenced_text(self, monkeypatch):
         product = FakeProduct()

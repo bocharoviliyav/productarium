@@ -8,16 +8,22 @@ Checks per prompt file:
   1. exists and is non-empty;
   2. contains exactly the expected runtime placeholders (contract preservation);
   3. no stray `{word}` tokens outside the expected set (typo guard);
-  4. str.format-group prompts render with dummy values (catches loose braces);
-  5. fenced code blocks (```), are balanced;
-  6. no UTF-8 replacement chars (broken Cyrillic);
-  7. JSON examples in structure.md / knowledge_graph_extraction.md parse.
+  4. fenced code blocks (```) are balanced;
+  5. no UTF-8 replacement chars (broken Cyrillic);
+  6. structural checks for the runtime-parsed contract files
+     (docgen_sections.md / docgen_subpages.md block ids).
+
+Every prompt body is substituted with str.replace (never str.format — bodies
+may carry literal JSON/Mermaid braces), so the validator only tracks the
+lowercase `{snake_case}` tokens the pipeline actually fills. The exact sets
+below were verified against the consumer code (api.docgen.codebase,
+api.docgen.verification, api.docgen.spec, api.docgen.database,
+api.expert.deep_research, api.expert.prompt).
 
 Exit code 0 = all good, 1 = at least one failure.
 """
 from __future__ import annotations
 
-import json
 import re
 import sys
 from pathlib import Path
@@ -25,64 +31,73 @@ from pathlib import Path
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "refs" / "prompts"
 
 # --- Expected placeholder contract (verified against consumer code) ----------
-# Value = set of placeholder names that MUST appear as literal {name} tokens.
+# Value = set of placeholder names that MUST appear as literal {name} tokens;
+# tokens outside the set are reported (typo guard).
 REPLACE_CONTRACT: dict[str, set[str]] = {
-    "overview.md": {"file_count", "main_directories", "primary_language",
-                    "repo_name", "repo_type", "repo_url"},
-    "architecture.md": {"main_files", "previous_content", "project_structure",
-                        "repo_name", "repo_url"},
-    "functional.md": {"api_endpoints", "app_type", "main_modules",
-                    "previous_content", "repo_name", "repo_url"},
-    "technical.md": {"config_files", "previous_content", "repo_name",
-                    "repo_url", "tech_stack"},
-    "cicd.md": {"cicd_files", "config_files", "docker_files",
-                "previous_content", "repo_name", "repo_url"},
-    "lld.md": {"api_endpoints", "components", "modules", "previous_content",
-            "repo_name", "repo_url"},
-    "datamodel.md": {"databases", "db_config", "entities", "previous_content",
-                    "repo_name", "repo_url"},
-    "structure.md": {"file_count", "main_directories", "primary_language",
-                    "repo_name", "repo_type", "repo_url"},
-    "compact_generation.md": {"project_structure", "repo_name", "repo_url",
-                            "tech_stack"},
+    # Docgen pipeline (api.docgen.codebase; judge in api.docgen.verification).
+    "docgen_router.md": {"repo_brief", "sections_list"},
+    "docgen_orchestrator.md": {"repo_name", "sections_list", "reused_sections"},
+    "docgen_agent_system.md": {"language_name"},
+    "docgen_agent_section.md": {
+        "repo_url", "repo_name", "section_id", "section_title",
+        "repo_brief", "sections_list", "section_hints",
+        "siblings_list", "section_instruction",
+    },
+    "docgen_decomposer.md": {"repo_brief", "sections_list", "section_hints"},
+    "docgen_judge.md": {"draft_section", "source_evidence"},
+    "docgen_subpages.md": {"item_title", "item_focus", "item_kind", "siblings_list"},
+    # Expert agent (api.expert.prompt) + deep research (api.expert.deep_research).
     "expert_agent_system.md": {"language_name", "product_name"},
     "expert_agent_doc.md": {"language_name", "product_name"},
+    "deep_research_planner.md": {
+        "query", "product_name", "language_name", "history", "findings",
+    },
+    "deep_research_researcher.md": {
+        "plan", "product_name", "language_name", "iteration", "max_iterations",
+    },
+    "deep_research_synthesizer.md": {
+        "query", "product_name", "language_name", "history", "findings",
+    },
+    # Spec enrichment (api.docgen.spec).
+    "spec_agent_system.md": {"language_name", "spec_kind"},
+    "spec_enrich_task.md": {"artifact_name", "content", "skeleton", "spec_kind"},
+    # Database reverse-engineering (api.docgen.database).
+    "database_doc.md": {
+        "database_name", "dsn_masked", "schema_dump", "skeleton", "language_name",
+    },
+    # Misc generation.
     "product_summary.md": {"content", "product_name"},
-    "documentation_doc.md": {"artifact_name", "content"},
     "openapi_doc.md": {"artifact_name", "content", "previous_content", "repo_name"},
     "asyncapi_doc.md": {"artifact_name", "content", "previous_content", "repo_name"},
-    "testcase_doc.md": {"artifact_name", "content", "previous_content", "repo_name"},
+    # Utilities.
     "mermaid_repair.md": {"broken_diagram", "error"},
-}
-
-# str.format-group: braces are structural — any stray brace breaks rendering.
-FORMAT_CONTRACT: dict[str, set[str]] = {
-    "deep_research_first_iteration.md": {"language_name", "repo_name",
-                                        "repo_type", "repo_url"},
-    "deep_research_intermediate_iteration.md": {"language_name", "repo_name",
-                                                "repo_type", "repo_url",
-                                                "research_iteration"},
-    "deep_research_final_iteration.md": {"language_name", "repo_name",
-                                        "repo_type", "repo_url"},
 }
 
 # No runtime placeholders at all.
 NO_PLACEHOLDER: set[str] = {"_verification_guard.md"}
 
-# recommended-next; str.replace with literal JSON braces allowed.
+# Raw contract file parsed into <section> blocks at runtime: no placeholder is
+# substituted inside the bodies (the only {language_name} occurrence is a prose
+# mention — the language is substituted upstream in docgen_agent_system.md).
 REPLACE_LOOSE: dict[str, set[str]] = {
-    "knowledge_graph_extraction.md": {"product_name", "repo_name",
-                                    "artifact_name", "content"},
+    "docgen_sections.md": set(),
 }
 
-# Files that contain a ```json block which must parse.
-JSON_EXAMPLE_FILES = {"structure.md", "knowledge_graph_extraction.md"}
+# --- Structural checks for the runtime-parsed contract files -----------------
+# Must mirror api.prompts.WIKI_SECTION_IDS (the seven canonical sections).
+CANONICAL_SECTION_IDS = (
+    "overview", "architecture", "functional", "technical", "cicd", "qa", "datamodel",
+)
+CANONICAL_SUBPAGE_IDS = ("functional_item", "technical_item", "datamodel_item")
+
+# Same id charset as api.prompts._SECTION_BLOCK_RE / _SUBPAGE_BLOCK_RE.
+SECTION_ID_RE = re.compile(r"<section\s+id=[\"']([a-z0-9_-]+)[\"']")
+SUBPAGE_ID_RE = re.compile(r"<subpage\s+id=[\"']([a-z0-9_-]+)[\"']")
 
 # Docs, not templates.
 IGNORE = {"README.md"}
 
 TOKEN_RE = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
-JSON_BLOCK_RE = re.compile(r"```json\s*\n(.*?)\n```", re.DOTALL)
 
 
 class Result:
@@ -101,22 +116,30 @@ def check_fences(text: str) -> bool:
     return fence_lines % 2 == 0
 
 
-def check_json_blocks(text: str) -> list[str]:
-    problems: list[str] = []
-    blocks = JSON_BLOCK_RE.findall(text)
-    if not blocks:
-        problems.append("no ```json block found (expected at least one)")
-        return problems
-    for i, block in enumerate(blocks):
-        try:
-            json.loads(block)
-        except json.JSONDecodeError as e:
-            problems.append(f"json block #{i + 1} invalid: {e}")
-    return problems
+def check_section_blocks(fname: str, text: str, r: Result) -> None:
+    """docgen_sections.md: exactly the canonical section blocks, nothing else."""
+    ids = SECTION_ID_RE.findall(text)
+    unknown = sorted(set(ids) - set(CANONICAL_SECTION_IDS))
+    missing = sorted(set(CANONICAL_SECTION_IDS) - set(ids))
+    if missing:
+        r.fail(fname, f"missing <section> blocks: {missing}")
+    if unknown:
+        # The runtime parser silently DROPS unknown ids (the section then runs
+        # on the generic stub) — so a typo'd id must fail loudly here.
+        r.fail(fname, f"unknown <section> blocks (dropped at runtime): {unknown}")
+    if "lld" in ids:
+        r.fail(fname, 'legacy <section id="lld"> block still present')
 
 
-def dummy(names: set[str]) -> dict[str, str]:
-    return {n: "X" for n in names}
+def check_subpage_blocks(fname: str, text: str, r: Result) -> None:
+    """docgen_subpages.md: exactly the canonical subpage-type blocks."""
+    ids = SUBPAGE_ID_RE.findall(text)
+    unknown = sorted(set(ids) - set(CANONICAL_SUBPAGE_IDS))
+    missing = sorted(set(CANONICAL_SUBPAGE_IDS) - set(ids))
+    if missing:
+        r.fail(fname, f"missing <subpage> blocks: {missing}")
+    if unknown:
+        r.fail(fname, f"unknown <subpage> blocks (dropped at runtime): {unknown}")
 
 
 def validate() -> Result:
@@ -126,7 +149,7 @@ def validate() -> Result:
         return r
 
     present = {p.name for p in PROMPTS_DIR.glob("*.md")}
-    expected = (set(REPLACE_CONTRACT) | set(FORMAT_CONTRACT) | NO_PLACEHOLDER
+    expected = (set(REPLACE_CONTRACT) | NO_PLACEHOLDER
                 | set(REPLACE_LOOSE) | IGNORE)
     for missing in sorted(expected - present):
         r.fail(missing, "expected prompt file is missing")
@@ -159,18 +182,6 @@ def validate() -> Result:
                 r.fail(fname, f"missing placeholders: {sorted(missing)}")
             if extra:
                 r.fail(fname, f"unexpected placeholder tokens: {sorted(extra)}")
-        elif fname in FORMAT_CONTRACT:
-            exp = FORMAT_CONTRACT[fname]
-            missing = exp - found
-            extra = found - exp
-            if missing:
-                r.fail(fname, f"missing placeholders: {sorted(missing)}")
-            if extra:
-                r.fail(fname, f"unexpected placeholder tokens: {sorted(extra)}")
-            try:
-                text.format(**dummy(exp))
-            except (KeyError, IndexError, ValueError) as e:
-                r.fail(fname, f"str.format render failed (stray brace?): {e!r}")
         elif fname in REPLACE_LOOSE:
             exp = REPLACE_LOOSE[fname]
             missing = exp - found
@@ -179,9 +190,10 @@ def validate() -> Result:
         else:
             r.fail(fname, "not in any known contract group (add to validator)")
 
-        if fname in JSON_EXAMPLE_FILES:
-            for prob in check_json_blocks(text):
-                r.fail(fname, prob)
+        if fname == "docgen_sections.md":
+            check_section_blocks(fname, text, r)
+        elif fname == "docgen_subpages.md":
+            check_subpage_blocks(fname, text, r)
 
     return r
 

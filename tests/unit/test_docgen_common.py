@@ -3,7 +3,7 @@
 Covers: set_main_event_loop / get_main_event_loop, _clean_llm_text,
 _repo_name_from_url, _product_name, _StandardLLM (mocked generator),
 _safe_build_llm, _llm_or_none, _make_repair_llm, _persist_artifact,
-_cognee_dataset, _index_in_background, _with_verification_guard,
+_product_dataset, _index_in_background, _with_verification_guard,
 _resolve_docgen_model.
 """
 
@@ -186,25 +186,25 @@ class TestPersistArtifact:
 
 
 # ============================================================================
-# _cognee_dataset
+# _product_dataset
 # ============================================================================
-class TestCogneeDataset:
+class TestProductDataset:
     def test_uses_product_id(self):
         class P:
             id = "prod_abc"
-        assert c._cognee_dataset(P()) == "prod_prod_abc"
+        assert c._product_dataset(P()) == "prod_prod_abc"
 
     def test_falls_back_to_product_id_attr(self):
         class P:
             id = None
             product_id = "prod_xyz"
-        assert c._cognee_dataset(P()) == "prod_prod_xyz"
+        assert c._product_dataset(P()) == "prod_prod_xyz"
 
     def test_falls_back_to_unknown(self):
         class P:
             id = None
             product_id = None
-        assert c._cognee_dataset(P()) == "prod_unknown"
+        assert c._product_dataset(P()) == "prod_unknown"
 
 
 # ============================================================================
@@ -241,73 +241,46 @@ class TestResolveDocgenModel:
 
 
 # ============================================================================
-# _StandardLLM / _safe_build_llm (mocked adalflow)
+# _StandardLLM / _safe_build_llm (wrapped api.llm.GenerateLLM)
 # ============================================================================
 class TestStandardLLM:
     def test_safe_build_llm_returns_none_on_exception(self, monkeypatch):
         # Force the import inside _StandardLLM.__init__ to fail
         def boom(*a, **kw):
-            raise RuntimeError("no adalflow")
+            raise RuntimeError("no api.llm")
         monkeypatch.setattr(c, "_StandardLLM", boom)
         assert c._safe_build_llm("model") is None
 
     def test_standard_llm_generate_success(self, monkeypatch):
-        """Test the generate() retry logic with a mocked generator."""
+        """generate() delegates to the wrapped api.llm.GenerateLLM."""
         llm = c._StandardLLM.__new__(c._StandardLLM)
 
-        class FakeResult:
-            error = None
-            data = "generated text"
+        class FakeGenerateLLM:
+            async def generate(self, prompt: str) -> str:
+                return "generated text"
 
-        class FakeGenerator:
-            def __call__(self, prompt_kwargs=None):
-                return FakeResult()
-
-        llm.generator = FakeGenerator()
+        llm._llm = FakeGenerateLLM()
 
         async def _run():
             return await llm.generate("prompt")
         result = asyncio.run(_run())
         assert result == "generated text"
 
-    def test_standard_llm_generate_error_retries(self, monkeypatch):
-        llm = c._StandardLLM.__new__(c._StandardLLM)
-        call_count = {"n": 0}
-
-        class FakeResult:
-            error = Exception("429 rate limit")
-            data = None
-            response = None
-            answer = None
-            raw_response = None
-            output = None
-
-        class FakeGenerator:
-            def __call__(self, prompt_kwargs=None):
-                call_count["n"] += 1
-                return FakeResult()
-
-        llm.generator = FakeGenerator()
-
-        async def _run():
-            return await llm.generate("prompt")
-        result = asyncio.run(_run())
-        # Error path returns "" after exhausting retries (which include sleeps).
-        assert result == ""
-
-    def test_standard_llm_generate_exception_returns_empty(self, monkeypatch):
+    def test_standard_llm_generate_exception_propagates(self, monkeypatch):
+        """A hard error from the underlying GenerateLLM propagates to the
+        caller (retry/suppression lives inside api.llm.generate)."""
         llm = c._StandardLLM.__new__(c._StandardLLM)
 
-        class FakeGenerator:
-            def __call__(self, prompt_kwargs=None):
+        class FakeGenerateLLM:
+            async def generate(self, prompt: str) -> str:
                 raise RuntimeError("connection error")
 
-        llm.generator = FakeGenerator()
+        llm._llm = FakeGenerateLLM()
 
         async def _run():
             return await llm.generate("prompt")
-        result = asyncio.run(_run())
-        assert result == ""
+        with pytest.raises(RuntimeError, match="connection error"):
+            asyncio.run(_run())
 
 
 # ============================================================================
@@ -367,6 +340,75 @@ class TestMakeRepairLlm:
         call = c._make_repair_llm("model", existing=llm)
         result = asyncio.run(call("prompt"))
         assert result == ""
+
+    def test_ownership_marker(self, monkeypatch):
+        """A repair LLM built here (existing=None) is OWNED by the caller;
+        a shared one (existing=...) is not — its owner closes it."""
+        owned = object()
+        monkeypatch.setattr(c, "_safe_build_llm", lambda *a, **kw: owned)
+        built = c._make_repair_llm("model")
+        assert built is not None and built._owned_llm is owned
+        shared = c._make_repair_llm("model", existing=object())
+        assert shared is not None and shared._owned_llm is None
+
+
+# ============================================================================
+# _safe_aclose / _close_owned_llm (client lifecycle, Wave-D review fixes)
+# ============================================================================
+class TestSafeAclose:
+    def test_closes_object_with_aclose(self):
+        closed = []
+
+        class Fake:
+            async def aclose(self):
+                closed.append(True)
+
+        asyncio.run(c._safe_aclose(Fake()))
+        assert closed == [True]
+
+    def test_none_and_missing_aclose_are_noop(self):
+        asyncio.run(c._safe_aclose(None))
+        asyncio.run(c._safe_aclose(object()))  # no aclose attr
+
+    def test_aclose_error_swallowed(self):
+        class Boom:
+            async def aclose(self):
+                raise RuntimeError("already closed")
+
+        asyncio.run(c._safe_aclose(Boom()))  # must not raise
+
+
+class TestCloseOwnedLlm:
+    def test_owned_llm_closed(self):
+        closed = []
+
+        class FakeLLM:
+            async def aclose(self):
+                closed.append(True)
+
+        async def _call(prompt):
+            return ""
+
+        _call._owned_llm = FakeLLM()
+        asyncio.run(c._close_owned_llm(_call))
+        assert closed == [True]
+
+    def test_shared_llm_not_closed(self):
+        closed = []
+
+        class FakeLLM:
+            async def aclose(self):
+                closed.append(True)
+
+        async def _call(prompt):
+            return ""
+
+        _call._owned_llm = None
+        asyncio.run(c._close_owned_llm(_call))
+        assert closed == []
+
+    def test_none_noop(self):
+        asyncio.run(c._close_owned_llm(None))
 
 
 # ============================================================================

@@ -2,15 +2,15 @@
 
 Every connector implements this interface so the registry and the
 ``/api/integrations`` router can treat them uniformly. The contract is
-intentionally small so new connectors (a new Git host, a wiki, an MCP server)
-can be added by implementing three methods:
+intentionally small so new connectors (a new Git host, a wiki) can be added
+by implementing three methods:
 
 - ``test()``          -> ``{"success": bool, "message": str}`` — validate
   connectivity / credentials. Never raises; failures are reported via the
   returned dict so admin UIs can surface them.
 - ``list_spaces()``   -> ``list[{"id", "title", "type", ...}]`` — enumerate the
   top-level sources the connector can pull from (GitHub repos, Confluence
-  spaces, MCP knowledge sources, ...).
+  spaces, ...).
 - ``pull(source_id, opts=None)`` -> ``{"title", "markdown", "attachments", ...}``
   — fetch a single space/repo/page and return its markdown representation.
   ``attachments`` is a list of ``{"filename", "markdown"}`` for converted
@@ -49,13 +49,15 @@ class IntegrationConnector(ABC):
     name: str = ""
     display_name: str = ""
     description: str = ""
-    # Connector category: "web" for HTTP/git/wiki connectors, "mcp" for MCP servers.
+    # Connector category: "web" for HTTP/git/wiki connectors. (The "mcp"
+    # category was removed with the legacy hand-written MCP client — external
+    # MCP servers are managed by the Wave C MCP platform, see api/mcp/.)
     kind: str = "web"
     # Whether the connector needs admin-configured credentials to be useful.
     requires_credentials: bool = True
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
-        # The resolved config (e.g. git creds / confluence creds / mcp config).
+        # The resolved config (e.g. git creds / confluence creds).
         # Connectors should treat missing keys gracefully.
         self.config: Dict[str, Any] = dict(config or {})
 
@@ -105,7 +107,7 @@ class IntegrationConnector(ABC):
 
         Args:
             source_id: Connector-specific source identifier (repo URL, page
-                id, MCP source name, ...).
+                id, ...).
             opts: Optional dict of per-pull options (e.g. ``{"recursive": True}``
                 to pull child pages, ``{"branch": "main"}`` for git).
 

@@ -17,7 +17,7 @@ from api.config.settings import bootstrap_secret_key
 bootstrap_secret_key()
 
 # Apply SSL/TLS configuration (corporate CA bundle / skip-verify) BEFORE any
-# HTTP client (requests, httpx, openai SDK, cognee) is constructed, so the
+# HTTP client (requests, httpx, openai SDK) is constructed, so the
 # default-trust-store consumers honor SSL_CERT_FILE for an enterprise AI
 # gateway. See api/ssl_config.py.
 from api.config.ssl import apply_ssl_env

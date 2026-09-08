@@ -28,7 +28,11 @@ def _build_client(isolated_db, monkeypatch, auth_provider="local"):
     # The keycloak callback uses SessionLocal() directly (not get_db), so
     # rebind the router's imported reference to the isolated DB.
     monkeypatch.setattr(router_mod, "SessionLocal", isolated_db.SessionLocal)
-    app, client = build_test_client(isolated_db, [router_mod], auth_none=False)
+    # default_admin_auth=False: these tests exercise the REAL
+    # get_current_user (cookie handling, 401 paths, change-password lookup).
+    app, client = build_test_client(
+        isolated_db, [router_mod], auth_none=False, default_admin_auth=False
+    )
     return app, client
 
 
@@ -386,8 +390,28 @@ class TestKeycloakEndpoints:
         monkeypatch.setattr(router_mod, "keycloak_is_configured", lambda: True)
         monkeypatch.setattr(router_mod, "exchange_code", lambda *a, **kw: None)
         _, client = _build_client(isolated_db, monkeypatch)
+        client.cookies.set("productarium_oauth_state", "y")
         resp = client.get("/api/auth/keycloak/callback", params={"code": "x", "state": "y"})
         assert resp.status_code == 400
+
+    def test_keycloak_callback_missing_state_400(self, isolated_db, monkeypatch):
+        """An omitted state parameter must never skip the CSRF check (review #5)."""
+        import api.auth.router as router_mod
+        monkeypatch.setattr(router_mod, "keycloak_is_configured", lambda: True)
+        _, client = _build_client(isolated_db, monkeypatch)
+        client.cookies.set("productarium_oauth_state", "cookie_state")
+        resp = client.get("/api/auth/keycloak/callback", params={"code": "x"})
+        assert resp.status_code == 400
+
+    def test_keycloak_callback_missing_state_cookie_400(self, isolated_db, monkeypatch):
+        """No state cookie (e.g. cookies dropped) -> refuse, not skip."""
+        import api.auth.router as router_mod
+        monkeypatch.setattr(router_mod, "keycloak_is_configured", lambda: True)
+        monkeypatch.setattr(router_mod, "exchange_code", lambda *a, **kw: {"access_token": "tok"})
+        _, client = _build_client(isolated_db, monkeypatch)
+        resp = client.get("/api/auth/keycloak/callback", params={"code": "x", "state": "y"})
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "OAuth state mismatch"
 
     def test_keycloak_callback_success(self, isolated_db, monkeypatch):
         import api.auth.router as router_mod
@@ -397,6 +421,7 @@ class TestKeycloakEndpoints:
             "sub": "kc_sub_123", "preferred_username": "kcuser", "email": "kc@b.c"
         })
         _, client = _build_client(isolated_db, monkeypatch)
+        client.cookies.set("productarium_oauth_state", "y")
         resp = client.get("/api/auth/keycloak/callback", params={"code": "x", "state": "y"}, follow_redirects=False)
         assert resp.status_code in (302, 307)
         # Session cookie should be set
@@ -425,6 +450,7 @@ class TestKeycloakEndpoints:
             "sub": "kc_existing_sub", "preferred_username": "existingkc"
         })
         _, client = _build_client(isolated_db, monkeypatch)
+        client.cookies.set("productarium_oauth_state", "y")
         resp = client.get("/api/auth/keycloak/callback", params={"code": "x", "state": "y"}, follow_redirects=False)
         assert resp.status_code in (302, 307)
         with isolated_db.SessionLocal() as db:
@@ -437,6 +463,7 @@ class TestKeycloakEndpoints:
         monkeypatch.setattr(router_mod, "exchange_code", lambda *a, **kw: {"access_token": "tok"})
         monkeypatch.setattr(router_mod, "fetch_userinfo", lambda token: None)
         _, client = _build_client(isolated_db, monkeypatch)
+        client.cookies.set("productarium_oauth_state", "y")
         resp = client.get("/api/auth/keycloak/callback", params={"code": "x", "state": "y"})
         assert resp.status_code == 400
 

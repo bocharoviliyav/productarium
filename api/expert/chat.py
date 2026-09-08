@@ -27,7 +27,6 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from api.utils import setup_logging
 from api.expert.generate import (
     _generate_answer,
-    _resolve_use_rlm,
     _stream_answer,
 )
 from api.expert.knowledge import (
@@ -56,7 +55,6 @@ async def _run_expert_chat_collect(
     query: str,
     messages: List[Dict[str, Any]],
     model: Optional[str],
-    use_rlm: Optional[bool],
 ) -> str:
     """Non-streaming chat: returns the full answer string."""
     resolved_model, base_url, api_key = _resolve_expert_model(model)
@@ -66,15 +64,13 @@ async def _run_expert_chat_collect(
         _expert_prompt.EXPERT_SYSTEM_PROMPT, _product_name_by_id(product_id), knowledge, history, query,
         base_url=base_url, model=resolved_model, api_key=api_key,
     )
-    use_rlm_resolved = _resolve_use_rlm(use_rlm, "expert", len(prompt))
     logger.info(
-        "Expert chat (collect) product=%s prompt_chars=%d use_rlm=%s",
+        "Expert chat (collect) product=%s prompt_chars=%d",
         product_id,
         len(prompt),
-        use_rlm_resolved,
     )
     return await _generate_answer(
-        prompt, resolved_model, base_url, api_key, use_rlm_resolved,
+        prompt, resolved_model, base_url, api_key,
         product_id=product_id,
         product_name=_product_name_by_id(product_id),
         query=query,
@@ -87,7 +83,6 @@ async def _run_expert_chat_stream(
     query: str,
     messages: List[Dict[str, Any]],
     model: Optional[str],
-    use_rlm: Optional[bool],
 ) -> AsyncIterator[ExpertStreamEvent]:
     """Streaming chat: yields status events then answer chunks.
 
@@ -106,17 +101,15 @@ async def _run_expert_chat_stream(
         _expert_prompt.EXPERT_SYSTEM_PROMPT, _product_name_by_id(product_id), knowledge, history, query,
         base_url=base_url, model=resolved_model, api_key=api_key,
     )
-    use_rlm_resolved = _resolve_use_rlm(use_rlm, "expert", len(prompt))
     logger.info(
-        "Expert chat (stream) product=%s prompt_chars=%d use_rlm=%s",
+        "Expert chat (stream) product=%s prompt_chars=%d",
         product_id,
         len(prompt),
-        use_rlm_resolved,
     )
     yield ExpertStreamEvent(EVENT_STATUS, EVENT_THINKING)
     content_started = False
     async for event in _stream_answer(
-        prompt, resolved_model, base_url, api_key, use_rlm_resolved,
+        prompt, resolved_model, base_url, api_key,
         product_id=product_id,
         product_name=_product_name_by_id(product_id),
         query=query,
@@ -136,7 +129,6 @@ def run_expert_chat(
     messages: Optional[List[Dict[str, Any]]] = None,
     model: Optional[str] = None,
     stream: bool = True,
-    use_rlm: Optional[bool] = None,
 ):
     """Product-scoped expert chat.
 
@@ -149,24 +141,20 @@ def run_expert_chat(
             ``models.expert`` config (with env fallbacks).
         stream: When True, returns an async generator yielding text chunks.
             When False, returns a coroutine resolving to the full answer string.
-        use_rlm: Optional explicit RLM override. ``True`` forces RLM (with LLM
-            fallback), ``False`` forces the standard LLM, ``None`` (default)
-            follows the admin ``rlm.expert.mode`` setting (auto/rlm/llm).
 
     Returns:
         An async generator (``stream=True``) or a coroutine (``stream=False``).
     """
     msgs = list(messages or [])
     if stream:
-        return _run_expert_chat_stream(product_id, query, msgs, model, use_rlm)
-    return _run_expert_chat_collect(product_id, query, msgs, model, use_rlm)
+        return _run_expert_chat_stream(product_id, query, msgs, model)
+    return _run_expert_chat_collect(product_id, query, msgs, model)
 
 
 async def run_expert_doc(
     product_id: str,
     query: str,
     model: Optional[str] = None,
-    use_rlm: Optional[bool] = None,
 ) -> str:
     """One-shot expert document: returns a full self-contained Markdown string.
 
@@ -179,15 +167,13 @@ async def run_expert_doc(
         _expert_prompt.EXPERT_DOC_PROMPT, _product_name_by_id(product_id), knowledge, "", query,
         base_url=base_url, model=resolved_model, api_key=api_key,
     )
-    use_rlm_resolved = _resolve_use_rlm(use_rlm, "expert", len(prompt))
     logger.info(
-        "Expert doc product=%s prompt_chars=%d use_rlm=%s",
+        "Expert doc product=%s prompt_chars=%d",
         product_id,
         len(prompt),
-        use_rlm_resolved,
     )
     doc = await _generate_answer(
-        prompt, resolved_model, base_url, api_key, use_rlm_resolved,
+        prompt, resolved_model, base_url, api_key,
         product_id=product_id,
         product_name=_product_name_by_id(product_id),
         query=query,
@@ -197,7 +183,7 @@ async def run_expert_doc(
         doc = (
             f"# Expert document for {product_id}\n\n"
             "_(No content was generated. Ensure the product has indexed "
-            "knowledge (cognee) or generated artifact docs, and that a local "
+            "knowledge or generated artifact docs, and that a local "
             "LLM is available.)_\n"
         )
     return doc

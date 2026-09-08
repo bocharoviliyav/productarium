@@ -9,6 +9,7 @@ import {
   Article,
   CaretDown,
   CaretUp,
+  Database as DatabaseIcon,
   FileText,
   GitBranch,
   Lightning,
@@ -22,6 +23,7 @@ import { AppHeader } from "@/components/AppHeader";
 import { ExpertChat } from "@/components/ExpertChat";
 import { SummaryBlock } from "@/components/SummaryBlock";
 import { KnowledgeTree } from "@/components/knowledge/KnowledgeTree";
+import { McpServersPanel } from "@/components/mcp/McpServersPanel";
 import { useLanguage } from "@/contexts/LanguageContext";
 import {
   Button,
@@ -40,6 +42,8 @@ import {
 } from "@/components/ui";
 import {
   type Codebase,
+  type Database,
+  type McpServerBinding,
   type Product,
   type Spec,
   entityPath,
@@ -49,7 +53,31 @@ import {
 } from "@/lib/types";
 import { useNotifications } from "@/contexts/NotificationContext";
 
-type DeleteType = "codebase" | "spec" | "links";
+type DeleteType = "codebase" | "spec" | "links" | "database";
+type GenerateType = "codebase" | "spec" | "database";
+
+// Progress block reported by the docgen job status/active endpoints
+// (api/docgen/jobs.py `_progress_snapshot`).
+type DocgenProgress = {
+  phase?: string | null;
+  sections_total?: number | null;
+  sections_done?: number;
+  current_section?: string | null;
+};
+
+// One in-flight docgen job per entity id. `jobId` null = the initial
+// POST /generate is still pending (button lock before a job exists).
+type DocgenJob = {
+  jobId: string | null;
+  type: GenerateType;
+  progress: DocgenProgress | null;
+};
+
+function withoutKey<T>(record: Record<string, T>, key: string): Record<string, T> {
+  const next: Record<string, T> = { ...record };
+  delete next[key];
+  return next;
+}
 
 export default function ProductDetailPage() {
   const router = useRouter();
@@ -74,7 +102,23 @@ export default function ProductDetailPage() {
   const [linkUrl, setLinkUrl] = useState("");
   const [linkDesc, setLinkDesc] = useState("");
 
-  const [generatingId, setGeneratingId] = useState<string | null>(null);
+  // Database ("reverse-engineered") add modal — wave E. The DSN is captured in
+  // a password input and NEVER rendered back: the API only returns
+  // `dsn_masked`, which the card displays instead.
+  const [showDatabaseModal, setShowDatabaseModal] = useState(false);
+  const [dbName, setDbName] = useState("");
+  const [dbDsn, setDbDsn] = useState("");
+  // Registry server id of the optional bound MCP server used for
+  // reverse-engineering ("" = none).
+  const [dbMcpServerId, setDbMcpServerId] = useState("");
+  // Bound MCP servers for the picker — loaded lazily when the modal opens
+  // (null = not loaded yet; [] = none bound / endpoint unavailable).
+  const [mcpBindings, setMcpBindings] = useState<McpServerBinding[] | null>(null);
+
+  // In-flight docgen jobs keyed by entity id — replaces the single
+  // `generatingId` so several entities can generate at once and the state
+  // survives reloads (restored from GET /docgen/active on mount).
+  const [generating, setGenerating] = useState<Record<string, DocgenJob>>({});
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [linksOpen, setLinksOpen] = useState(false);
 
@@ -132,6 +176,119 @@ export default function ProductDetailPage() {
     fetchProduct();
   }, [fetchProduct]);
 
+  // --- Docgen job polling (restorable after reload/navigation) ---------------
+  // Poll a 202 job until it settles. Progress snapshots land in `generating`
+  // (keyed by entity id, guarded by jobId so a stale poller can never clobber
+  // a newer run). Resolves on success (toast + refresh), rejects on
+  // failure/timeout, and returns silently once the page unmounts.
+  const pollDocgenJob = useCallback(
+    async (type: GenerateType, entityId: string, jobId: string) => {
+      const maxWaitMs = 30 * 60 * 1000;
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < maxWaitMs) {
+        if (generateAbortRef.current) return;
+        await new Promise((r) => setTimeout(r, 2000));
+        if (generateAbortRef.current) return;
+        // The status routes live under the PLURAL segment — route the
+        // segment through entityPath() (see src/lib/types.ts).
+        const stRes = await fetch(
+          `/api/products/${productId}/${entityPath(type)}/${entityId}/generate/status?job_id=${encodeURIComponent(jobId)}`,
+          { credentials: "include", cache: "no-store" },
+        );
+        if (stRes.status === 404) {
+          throw new Error(t.genJobNotFound ?? "Generation job not found.");
+        }
+        if (!stRes.ok) {
+          throw new Error(fmt(t.genStatusFailed, { status: String(stRes.status) }));
+        }
+        const st = await stRes.json().catch(() => ({}));
+        if (st.progress) {
+          setGenerating((g) =>
+            g[entityId]?.jobId === jobId
+              ? { ...g, [entityId]: { ...g[entityId], progress: st.progress } }
+              : g,
+          );
+        }
+        if (st.status === "succeeded") {
+          notify({
+            tone: "success",
+            title: t.genTitle ?? "Generation",
+            message: st.indexing_message || (t.genDone ?? "Documentation generated."),
+          });
+          await fetchProduct();
+          return;
+        }
+        if (st.status === "failed") {
+          throw new Error(st.error || st.indexing_message || (t.genFailed ?? "Generation failed."));
+        }
+      }
+      throw new Error(t.genTimeout ?? "Generation timed out.");
+    },
+    [productId, fetchProduct, notify, t, fmt],
+  );
+
+  // Poll wrapper with error toast + entry cleanup. Shared by the Generate
+  // button and the on-mount restore so both paths notify identically.
+  const runDocgenJob = useCallback(
+    async (type: GenerateType, entityId: string, jobId: string) => {
+      try {
+        await pollDocgenJob(type, entityId, jobId);
+      } catch (e) {
+        if (generateAbortRef.current) return;
+        const msg = e instanceof Error ? e.message : (t.genFailed ?? "Generation failed.");
+        notify({ tone: "error", title: t.genTitle ?? "Generation", message: msg });
+      } finally {
+        if (!generateAbortRef.current) {
+          // Clear only OUR entry — a newer run may have replaced it.
+          setGenerating((g) => (g[entityId]?.jobId === jobId ? withoutKey(g, entityId) : g));
+        }
+      }
+    },
+    [pollDocgenJob, notify, t],
+  );
+
+  // Latest wrapper without re-triggering the restore effect below.
+  const runDocgenJobRef = useRef(runDocgenJob);
+  useEffect(() => {
+    runDocgenJobRef.current = runDocgenJob;
+  }, [runDocgenJob]);
+
+  // Restore in-flight generations after a reload/navigation: the backend
+  // registry still tracks them, so the animation + polling resume. Best
+  // effort — any failure just leaves the page idle.
+  const resumedJobsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch(`/api/products/${productId}/docgen/active`, {
+          credentials: "include",
+          cache: "no-store",
+        });
+        if (!res.ok) return;
+        const jobs = await res.json();
+        if (!Array.isArray(jobs) || cancelled) return;
+        for (const job of jobs) {
+          const { job_id: jobId, entity_type: type, entity_id: entityId, progress } = job ?? {};
+          if (cancelled || !jobId || !entityId) continue;
+          if (type !== "codebase" && type !== "spec" && type !== "database") continue;
+          // One poller per job even if the effect re-runs (StrictMode/dev).
+          if (resumedJobsRef.current.has(jobId)) continue;
+          resumedJobsRef.current.add(jobId);
+          setGenerating((g) =>
+            g[entityId] ? g : { ...g, [entityId]: { jobId, type, progress: progress ?? null } },
+          );
+          void runDocgenJobRef.current(type, entityId, jobId);
+        }
+      } catch {
+        // Restore is best-effort — ignore network failures.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [productId]);
+
   const resetCodebaseForm = () => {
     setCbName("");
     setCbRepoUrl("");
@@ -142,6 +299,70 @@ export default function ProductDetailPage() {
     setLinkName("");
     setLinkUrl("");
     setLinkDesc("");
+  };
+
+  const resetDatabaseForm = () => {
+    setDbName("");
+    setDbDsn("");
+    setDbMcpServerId("");
+  };
+
+  // Open the database modal and (once) fetch the product's MCP bindings for
+  // the optional server picker. Degrades to an empty picker when the MCP
+  // endpoints are unavailable (404/offline).
+  const openDatabaseModal = async () => {
+    setShowDatabaseModal(true);
+    if (mcpBindings !== null) return;
+    try {
+      const res = await fetch(`/api/products/${productId}/mcp`, {
+        credentials: "include",
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        setMcpBindings([]);
+        return;
+      }
+      const data = await res.json();
+      setMcpBindings(Array.isArray(data) ? (data as McpServerBinding[]) : []);
+    } catch {
+      setMcpBindings([]);
+    }
+  };
+
+  // Add a database via the section-header modal: name + DSN (password input;
+  // the raw DSN is sent once and comes back masked) + optional bound MCP
+  // server whose tools drive the reverse-engineering flow.
+  const handleAddDatabase = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!product || !dbName.trim() || !dbDsn.trim() || isSaving) return;
+    setIsSaving(true);
+    try {
+      const body = {
+        id: generateId("db"),
+        name: dbName.trim(),
+        dsn: dbDsn.trim(),
+        mcp_server_id: dbMcpServerId || null,
+        source: "manual" as const,
+      };
+      const res = await fetch(`/api/products/${product.id}/databases`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `Failed to add (${res.status})`);
+      }
+      setProduct((await res.json()) as Product);
+      resetDatabaseForm();
+      setShowDatabaseModal(false);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Failed to add.";
+      notify({ tone: "error", title: t.addArtifactFailedTitle ?? "Add", message: msg });
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   // Add a codebase ("service") via the section-header modal. Codebase-only:
@@ -219,8 +440,11 @@ export default function ProductDetailPage() {
     if (!confirm(t.deleteArtifactConfirm ?? "Delete this item?")) return;
     setDeletingId(entityId);
     try {
+      // Route the segment through entityPath(): the FastAPI routers register
+      // the PLURAL segments (codebases/specs/links/databases) while `type` is
+      // the singular form-state value — raw interpolation produces a 404.
       const res = await fetch(
-        `/api/products/${product.id}/${type}/${entityId}`,
+        `/api/products/${product.id}/${entityPath(type)}/${entityId}`,
         { method: "DELETE", credentials: "include" },
       );
       if (!res.ok) throw new Error(`Failed to delete (${res.status})`);
@@ -233,14 +457,16 @@ export default function ProductDetailPage() {
     }
   };
 
-  const handleGenerate = async (type: "codebase" | "spec", entityId: string) => {
-    if (!product) return;
-    setGeneratingId(entityId);
+  const handleGenerate = async (type: GenerateType, entityId: string) => {
+    if (!product || generating[entityId]) return;
     setError(null);
+    // Lock the button immediately (also covers the POST itself).
+    setGenerating((g) => ({ ...g, [entityId]: { jobId: null, type, progress: null } }));
+    let jobId: string | null = null;
     try {
       // The FastAPI generate routes are registered under the PLURAL segment
-      // (codebases / specs), but `type` is the singular form-state value
-      // (codebase / spec). Interpolating it raw produces a 404; route the
+      // (codebases / specs / databases), but `type` is the singular
+      // form-state value. Interpolating it raw produces a 404; route the
       // segment through entityPath() (see src/lib/types.ts).
       const res = await fetch(
         `/api/products/${product.id}/${entityPath(type)}/${entityId}/generate`,
@@ -255,50 +481,50 @@ export default function ProductDetailPage() {
       if (!res.ok) {
         throw new Error(data.detail || `Generation failed (${res.status})`);
       }
-      const jobId = data.job_id;
+      jobId = data.job_id ?? null;
       if (!jobId) {
         notify({ tone: "info", title: t.genTitle ?? "Generation", message: data.message || data.status || (t.genTriggered ?? "Generation triggered.") });
         await fetchProduct();
         return;
       }
+      setGenerating((g) => ({ ...g, [entityId]: { jobId, type, progress: null } }));
       notify({ tone: "info", title: t.genTitle ?? "Generation", message: t.genStarted ?? "Generation started…" });
-      const maxWaitMs = 30 * 60 * 1000;
-      const startedAt = Date.now();
-      while (Date.now() - startedAt < maxWaitMs) {
-        if (generateAbortRef.current) return;
-        await new Promise((r) => setTimeout(r, 2000));
-        if (generateAbortRef.current) return;
-        const stRes = await fetch(
-          `/api/products/${product.id}/${entityPath(type)}/${entityId}/generate/status?job_id=${encodeURIComponent(jobId)}`,
-          { credentials: "include", cache: "no-store" },
-        );
-        if (stRes.status === 404) {
-          throw new Error(t.genJobNotFound ?? "Generation job not found.");
-        }
-        if (!stRes.ok) {
-          throw new Error(fmt(t.genStatusFailed, { status: String(stRes.status) }));
-        }
-        const st = await stRes.json().catch(() => ({}));
-        if (st.status === "succeeded") {
-          notify({
-            tone: "success",
-            title: t.genTitle ?? "Generation",
-            message: st.indexing_message || (t.genDone ?? "Documentation generated."),
-          });
-          await fetchProduct();
-          return;
-        }
-        if (st.status === "failed") {
-          throw new Error(st.error || st.indexing_message || (t.genFailed ?? "Generation failed."));
-        }
-      }
-      throw new Error(t.genTimeout ?? "Generation timed out.");
     } catch (e) {
       const msg = e instanceof Error ? e.message : (t.genFailed ?? "Generation failed.");
       notify({ tone: "error", title: t.genTitle ?? "Generation", message: msg });
+      return;
     } finally {
-      setGeneratingId(null);
+      // Unlock the pending lock when no polling job took over the entry.
+      setGenerating((g) => (g[entityId]?.jobId === null ? withoutKey(g, entityId) : g));
     }
+    await runDocgenJob(type, entityId, jobId);
+  };
+
+  // Card label while generating: "3/7 · System Architecture" in the sections
+  // phase, the phase name otherwise (cloning/verifying/…), the plain
+  // "Generating…" fallback before the first progress snapshot arrives.
+  const genProgressText = (job: DocgenJob): string => {
+    const p = job.progress;
+    const fallback = t.generating ?? "Generating…";
+    if (!p) return fallback;
+    const total = p.sections_total ?? 0;
+    if (p.phase === "sections" && total > 0) {
+      const done = String(Math.max(0, p.sections_done ?? 0));
+      if (p.current_section) {
+        const sid = String(p.current_section);
+        const key = `genSection${sid.charAt(0).toUpperCase()}${sid.slice(1)}`;
+        return fmt(t.genProgress ?? "{done}/{total} · {section}", {
+          done,
+          total: String(total),
+          section: t[key] ?? sid,
+        });
+      }
+      return `${done}/${total}`;
+    }
+    const phaseKey = p.phase
+      ? `genPhase${p.phase.charAt(0).toUpperCase()}${p.phase.slice(1)}`
+      : null;
+    return (phaseKey ? t[phaseKey] : undefined) ?? fallback;
   };
 
   const onTreeSelect = (node: { node_type: string; id: string }) => {
@@ -310,6 +536,9 @@ export default function ProductDetailPage() {
   const codebases = product?.codebases ?? [];
   const specs = product?.specs ?? [];
   const links = product?.links ?? [];
+  // Optional on the Product contract (wave E backend lands in parallel) —
+  // always read through `?? []` so the page keeps rendering on old payloads.
+  const databases = product?.databases ?? [];
 
   return (
     <div className="min-h-screen bg-canvas text-ink">
@@ -553,6 +782,70 @@ export default function ProductDetailPage() {
               </form>
             </Modal>
 
+            {/* Database add modal — opened from the Databases section header */}
+            <Modal
+              open={showDatabaseModal}
+              onClose={() => setShowDatabaseModal(false)}
+              title={t.addDatabase ?? "Add database"}
+              footer={null}
+            >
+              <form onSubmit={handleAddDatabase} className="grid gap-5">
+                <div>
+                  <Label>{t.databaseName ?? "Database name"}</Label>
+                  <Input
+                    value={dbName}
+                    onChange={(e) => setDbName(e.target.value)}
+                    placeholder={t.databaseNamePlaceholder ?? ""}
+                    required
+                    autoFocus
+                  />
+                </div>
+                <div>
+                  <Label>{t.dsn ?? "DSN"}</Label>
+                  <Input
+                    type="password"
+                    value={dbDsn}
+                    onChange={(e) => setDbDsn(e.target.value)}
+                    placeholder={t.dsnPlaceholder ?? ""}
+                    required
+                    autoComplete="off"
+                  />
+                  <p className="mt-1.5 text-xs text-muted">
+                    {t.dsnHint ?? ""}
+                  </p>
+                </div>
+                <div>
+                  <Label>{t.mcpServer ?? "MCP server"}</Label>
+                  <Select
+                    value={dbMcpServerId}
+                    onChange={(e) => setDbMcpServerId(e.target.value)}
+                  >
+                    <option value="">{t.mcpServerNone ?? "None"}</option>
+                    {(mcpBindings ?? []).map((b) => (
+                      <option key={b.id} value={b.mcp_server_id}>
+                        {b.name}
+                        {b.enabled ? "" : ` · ${t.mcpServerOff ?? "off"}`}
+                      </option>
+                    ))}
+                  </Select>
+                  {mcpBindings !== null && mcpBindings.length === 0 && (
+                    <p className="mt-1.5 text-xs text-muted">
+                      {t.mcpServerEmpty ?? ""}
+                    </p>
+                  )}
+                </div>
+                <div className="flex items-center justify-end gap-2">
+                  <Button type="button" variant="ghost" onClick={() => setShowDatabaseModal(false)}>
+                    {tc.cancel ?? "Cancel"}
+                  </Button>
+                  <Button type="submit" disabled={isSaving || !dbName.trim() || !dbDsn.trim()}>
+                    {isSaving ? <Spinner /> : <Plus size={16} weight="bold" />}
+                    {t.saveArtifact ?? "Save"}
+                  </Button>
+                </div>
+              </form>
+            </Modal>
+
             {/* Two-column: (specs + knowledge tree) | main content */}
             <div className="mt-12 grid grid-cols-1 gap-8 lg:grid-cols-[320px_1fr]">
               <aside className="lg:sticky lg:top-20 lg:self-start">
@@ -645,7 +938,8 @@ export default function ProductDetailPage() {
                     ) : (
                       <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
                         {codebases.map((c: Codebase, i) => {
-                          const isGenerating = generatingId === c.id;
+                          const gen = generating[c.id] ?? null;
+                          const isGenerating = Boolean(gen);
                           const isDeleting = deletingId === c.id;
                           const hasDocs = Boolean(c.generated_docs);
                           return (
@@ -687,6 +981,13 @@ export default function ProductDetailPage() {
                                     {isDeleting ? <Spinner /> : <Trash size={16} weight="regular" />}
                                   </IconButton>
                                 </div>
+
+                                {isGenerating && (
+                                  <p className="mt-4 flex items-center gap-2 font-mono text-xs text-muted">
+                                    <Spinner className="h-3.5 w-3.5" />
+                                    {genProgressText(gen)}
+                                  </p>
+                                )}
 
                                 {c.repo_url && (
                                   <p className="mt-4 truncate font-mono text-xs text-muted">
@@ -733,6 +1034,145 @@ export default function ProductDetailPage() {
                   </div>
                 </section>
 
+                {/* Databases (reverse-engineered via MCP tools) */}
+                <section>
+                  <SectionHeader
+                    title={tArt?.database?.label ?? "Databases"}
+                    subtitle={
+                      databases.length
+                        ? fmt(t.databasesCount ?? "{n} database(s)", { n: databases.length })
+                        : (t.dbEmptySubtitle ?? "")
+                    }
+                    action={
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        onClick={() => void openDatabaseModal()}
+                      >
+                        <Plus size={14} weight="bold" />
+                        {t.addDatabase ?? "Add database"}
+                      </Button>
+                    }
+                  />
+
+                  <div className="mt-6">
+                    {databases.length === 0 ? (
+                      <EmptyState
+                        icon={<DatabaseIcon size={20} weight="regular" />}
+                        title={t.noDatabasesTitle ?? "No databases yet"}
+                        description={t.noDatabasesDesc ?? ""}
+                        action={
+                          <Button onClick={() => void openDatabaseModal()}>
+                            <Plus size={16} weight="bold" />
+                            {t.addDatabase ?? "Add database"}
+                          </Button>
+                        }
+                      />
+                    ) : (
+                      <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
+                        {databases.map((d: Database, i) => {
+                          const gen = generating[d.id] ?? null;
+                          const isGenerating = Boolean(gen);
+                          const isDeleting = deletingId === d.id;
+                          const hasDocs = Boolean(d.generated_docs);
+                          return (
+                            <Reveal key={d.id} delayMs={Math.min(i, 6) * 80}>
+                              <Card
+                                hover
+                                className="group relative flex h-full flex-col overflow-hidden p-6"
+                              >
+                                {isGenerating && (
+                                  <span className="gen-progress-bar" aria-hidden />
+                                )}
+                                <div className="flex items-start justify-between gap-3">
+                                  <div className="flex items-center gap-2.5">
+                                    <span className="flex h-9 w-9 items-center justify-center rounded-md bg-surface-2 text-ink">
+                                      <DatabaseIcon size={18} weight="regular" />
+                                    </span>
+                                    <div className="min-w-0">
+                                      <h3 className="truncate text-sm font-medium text-ink">
+                                        {d.name}
+                                      </h3>
+                                      <div className="mt-1 flex flex-wrap items-center gap-2">
+                                        <Tag tone="blue">{tArt?.database?.label ?? "Database"}</Tag>
+                                        {d.mcp_server_name && (
+                                          <Tag tone="neutral">{d.mcp_server_name}</Tag>
+                                        )}
+                                        {hasDocs && (
+                                          <Tag tone="green">{t.docsReady ?? "Docs ready"}</Tag>
+                                        )}
+                                        {d.verified && (
+                                          <Tag tone="green">{t.verified ?? "Verified"}</Tag>
+                                        )}
+                                      </div>
+                                    </div>
+                                  </div>
+                                  <IconButton
+                                    aria-label={t.deleteArtifact ?? "Delete"}
+                                    title={t.deleteArtifact ?? "Delete"}
+                                    onClick={() => handleDelete("database", d.id)}
+                                    disabled={isDeleting}
+                                    className="opacity-0 transition-opacity group-hover:opacity-100"
+                                  >
+                                    {isDeleting ? <Spinner /> : <Trash size={16} weight="regular" />}
+                                  </IconButton>
+                                </div>
+
+                                {isGenerating && (
+                                  <p className="mt-4 flex items-center gap-2 font-mono text-xs text-muted">
+                                    <Spinner className="h-3.5 w-3.5" />
+                                    {genProgressText(gen)}
+                                  </p>
+                                )}
+
+                                {/* Masked DSN only — the raw DSN never comes back. */}
+                                {d.dsn_masked && (
+                                  <p className="mt-4 truncate font-mono text-xs text-muted">
+                                    {d.dsn_masked}
+                                  </p>
+                                )}
+
+                                {hasDocs && (
+                                  <div className="mt-4 max-h-28 overflow-hidden rounded-md border border-divider bg-surface-2 p-3 font-mono text-xs leading-relaxed text-muted">
+                                    {d.generated_docs?.slice(0, 280)}
+                                    {(d.generated_docs?.length ?? 0) > 280 && "…"}
+                                  </div>
+                                )}
+
+                                <div className="mt-6 flex items-center justify-between border-t border-divider pt-4">
+                                  <button
+                                    onClick={() =>
+                                      router.push(`/products/${product.id}/artifacts/${d.id}`)
+                                    }
+                                    className={cn(
+                                      "inline-flex items-center gap-1 text-xs font-medium text-ink",
+                                      "transition-transform hover:translate-x-0.5",
+                                    )}
+                                  >
+                                    {t.openDocs ?? "Open"}
+                                    <ArrowRight size={14} weight="bold" />
+                                  </button>
+                                  <Button
+                                    size="sm"
+                                    variant="subtle"
+                                    onClick={() => handleGenerate("database", d.id)}
+                                    disabled={isGenerating}
+                                  >
+                                    {isGenerating ? <Spinner /> : <Lightning size={14} weight="fill" />}
+                                    {isGenerating
+                                      ? (t.reverseEngineering ?? "Reverse-engineering…")
+                                      : (t.reverseEngineer ?? "Reverse-engineer")}
+                                  </Button>
+                                </div>
+                              </Card>
+                            </Reveal>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </section>
+
                 {/* Expert agent chat */}
                 <section>
                   <Reveal>
@@ -753,6 +1193,11 @@ export default function ProductDetailPage() {
                     </Card>
                   </Reveal>
                 </section>
+
+                {/* MCP servers bound to this product (tools for the expert agent) */}
+                <Reveal>
+                  <McpServersPanel productId={product.id} />
+                </Reveal>
               </div>
             </div>
           </>

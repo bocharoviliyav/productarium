@@ -186,6 +186,69 @@ class TestCreateProduct:
 
 
 # --------------------------------------------------------------------------- #
+# Full-product upsert: database DSN masking + verified ownership (review #4)
+# --------------------------------------------------------------------------- #
+def _database_payload_db(dbid: str = "db_1", **overrides) -> dict:
+    payload = {
+        "id": dbid,
+        "name": "Main DB",
+        "dsn": "postgresql://app:sup3rs3cret@db.internal:5432/prod",
+        "mcp_server_id": None,
+        "generated_docs": None,
+        "pages": None,
+        "verified": False,
+        "verified_by": None,
+        "verified_at": None,
+        "source": "manual",
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestUpsertDatabaseDsnMasking:
+    def test_put_product_masks_dsn_with_special_chars(self, isolated_db):
+        # Review #4 HIGH: passwords containing '/' or '@' must be masked on
+        # the full-product upsert path too (PUT /api/products/{id}).
+        _seed_product(isolated_db)
+        app, client = _make_client(isolated_db)
+        payload = _product_payload()
+        payload["databases"] = [
+            _database_payload_db(dsn="postgresql://app:p@ss/w0rd@db:5432/prod")
+        ]
+        r = client.put("/api/products/prod_1", json=payload)
+        assert r.status_code == 200
+        db = r.json()["databases"][0]
+        assert db["dsn_masked"] == "postgresql://app:***REDACTED***@db:5432/prod"
+        assert "p@ss/w0rd" not in r.text
+
+    def test_put_product_passwordless_dsn_not_500(self, isolated_db):
+        _seed_product(isolated_db)
+        app, client = _make_client(isolated_db)
+        payload = _product_payload()
+        payload["databases"] = [
+            _database_payload_db(dsn="postgres://localhost:5432/db")
+        ]
+        r = client.put("/api/products/prod_1", json=payload)
+        assert r.status_code == 200
+        assert r.json()["databases"][0]["dsn_masked"] == "postgres://localhost:5432/db"
+
+    def test_put_product_forces_verified_false_for_new_database(self, isolated_db):
+        # Review #4: a NEW database cannot arrive verified through the
+        # full-product upsert.
+        _seed_product(isolated_db)
+        app, client = _make_client(isolated_db)
+        payload = _product_payload()
+        payload["databases"] = [
+            _database_payload_db(verified=True, verified_by="user_evil")
+        ]
+        r = client.put("/api/products/prod_1", json=payload)
+        assert r.status_code == 200
+        db = r.json()["databases"][0]
+        assert db["verified"] is False
+        assert db["verified_by"] is None
+
+
+# --------------------------------------------------------------------------- #
 # GET /api/products/{id}
 # --------------------------------------------------------------------------- #
 class TestGetProduct:
@@ -544,10 +607,69 @@ class TestBuildDatabaseUrl:
         monkeypatch.setattr(db_mod, "DB_NAME", "n")
         assert db_mod._build_database_url().startswith("postgresql+psycopg://")
 
-    def test_non_postgres_falls_back_to_sqlite(self, monkeypatch):
+    def test_unsupported_provider_falls_back_to_memory(self, monkeypatch):
+        import api.db as db_mod
+        monkeypatch.setattr(db_mod, "DB_PROVIDER", "mysql")
+        assert db_mod._build_database_url() == "sqlite:///:memory:"
+
+    def test_sqlite_provider_explicit_path(self, monkeypatch, tmp_path):
+        import api.db as db_mod
+        db_file = tmp_path / "smoke.db"
+        monkeypatch.setattr(db_mod, "DB_PROVIDER", "sqlite")
+        monkeypatch.setattr(db_mod, "DB_NAME", str(db_file))
+        monkeypatch.setattr(db_mod, "DB_HOST", "localhost")
+        assert db_mod._build_database_url() == f"sqlite:///{db_file}"
+
+    def test_sqlite_provider_memory(self, monkeypatch):
         import api.db as db_mod
         monkeypatch.setattr(db_mod, "DB_PROVIDER", "sqlite")
+        monkeypatch.setattr(db_mod, "DB_NAME", ":memory:")
         assert db_mod._build_database_url() == "sqlite:///:memory:"
+
+    def test_sqlite_provider_bare_name_with_dir_host(self, monkeypatch, tmp_path):
+        import api.db as db_mod
+        monkeypatch.setattr(db_mod, "DB_PROVIDER", "sqlite")
+        monkeypatch.setattr(db_mod, "DB_NAME", "test.db")
+        monkeypatch.setattr(db_mod, "DB_HOST", str(tmp_path))
+        assert db_mod._build_database_url() == f"sqlite:///{tmp_path / 'test.db'}"
+
+    def test_sqlite_provider_bare_name_defaults_to_state_dir(self, monkeypatch, tmp_path):
+        import api.db as db_mod
+        monkeypatch.setattr(db_mod, "DB_PROVIDER", "sqlite")
+        monkeypatch.setattr(db_mod, "DB_NAME", "test.db")
+        monkeypatch.setattr(db_mod, "DB_HOST", "localhost")  # not a dir here
+        monkeypatch.setenv("PRODUCTARIUM_STATE_DIR", str(tmp_path))
+        assert db_mod._build_database_url() == f"sqlite:///{tmp_path / 'test.db'}"
+
+    def test_sqlite_provider_empty_name_defaults(self, monkeypatch, tmp_path):
+        import api.db as db_mod
+        monkeypatch.setattr(db_mod, "DB_PROVIDER", "sqlite")
+        monkeypatch.setattr(db_mod, "DB_NAME", "")
+        monkeypatch.setattr(db_mod, "DB_HOST", "localhost")
+        monkeypatch.setenv("PRODUCTARIUM_STATE_DIR", str(tmp_path))
+        assert db_mod._build_database_url() == f"sqlite:///{tmp_path / 'productarium.db'}"
+
+    def test_sqlite_rejects_parent_traversal(self, monkeypatch, tmp_path):
+        """A path-like DB_NAME containing '..' segments raises ValueError:
+        the SQLite file location is operator config, not a traversal
+        surface (review fix [8])."""
+        import api.db as db_mod
+        monkeypatch.setattr(db_mod, "DB_PROVIDER", "sqlite")
+        monkeypatch.setattr(db_mod, "DB_NAME", str(tmp_path / ".." / "escape.db"))
+        with pytest.raises(ValueError, match=r"\.\."):
+            db_mod._build_database_url()
+        # The relative traversal form is equally rejected.
+        monkeypatch.setattr(db_mod, "DB_NAME", "../escape.db")
+        with pytest.raises(ValueError, match=r"\.\."):
+            db_mod._build_database_url()
+
+    def test_sqlite_engine_connect_args_thread_safe(self, monkeypatch, tmp_path):
+        import api.db as db_mod
+        assert db_mod._engine_connect_args("sqlite:///foo.db") == {
+            "check_same_thread": False,
+            "timeout": 30,
+        }
+        assert db_mod._engine_connect_args("postgresql+psycopg://u:p@h/db") == {}
 
 
 # --------------------------------------------------------------------------- #

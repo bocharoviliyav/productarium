@@ -6,7 +6,7 @@ Architectural Guarantees:
 2. At application startup, defaults are collected from JSON config files and
    environment variables, populating the settings store DB if empty.
 3. When settings are updated in the admin panel UI, new values are written to DB,
-   pushed to `os.environ`, and all runtime singletons (`cognee.config`, `_MODEL_CTX_CACHE`,
+   pushed to `os.environ`, and all runtime caches (`_MODEL_CTX_CACHE`,
    model client caches) are updated INSTANTLY without requiring a container restart.
 4. All services read task configs through `get_task_config(task)`, guaranteeing
    they always see the highest-precedence active settings.
@@ -20,19 +20,16 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-_ALL_MODEL_TASKS = ("docgen", "expert", "summary", "cognee", "embedder")
+_ALL_MODEL_TASKS = ("docgen", "expert", "summary", "embedder")
 
 
 def sync_runtime_settings() -> None:
     """Force all process subsystems to synchronize with DB settings immediately.
 
     1. Syncs active task API keys and base URLs to process environment variables.
-    2. Re-applies cognee runtime config (mutates LLMConfig & EmbeddingConfig singletons).
-    3. Clears model context window cache in `api.utils`.
-    4. Exports admin-store timeout overrides to their canonical env vars so
-       subprocess / module-level readers (e.g. fast-rlm's Pyodide REPL, which
-       reads RLM_API_TIMEOUT_MS from the process environment and cannot reach
-       host Python) see admin-set values without a restart.
+    2. Clears model context window cache in `api.utils`.
+    3. Exports admin-store timeout overrides to their canonical env vars so
+       module-level readers see admin-set values without a restart.
     """
     try:
         from api.utils import _MODEL_CTX_CACHE
@@ -55,20 +52,14 @@ def sync_runtime_settings() -> None:
         logger.debug("sync_runtime_settings: env sync skipped: %s", e)
 
     try:
-        from api.cognee import apply_cognee_runtime_config
-        apply_cognee_runtime_config()
-    except Exception as e:
-        logger.debug("sync_runtime_settings: apply_cognee_runtime_config skipped: %s", e)
-
-    try:
         from api.config.timeout import sync_timeout_env
         sync_timeout_env()
     except Exception as e:
         logger.debug("sync_runtime_settings: sync_timeout_env skipped: %s", e)
 
-    # Invalidate the cached memory backend instance so an admin switch of
-    # ``memory.backend`` (pgvector <-> cognee) takes effect on the next call
-    # without a process restart.
+    # Invalidate the cached memory backend instance so an admin change of
+    # ``memory.backend`` takes effect on the next call without a process
+    # restart.
     try:
         from api.memory.resolver import reset_memory_backend_cache
         reset_memory_backend_cache()

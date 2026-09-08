@@ -1,7 +1,7 @@
 """Expert prompt assembly + text cleaning + tunables + loaded prompt bodies.
 
 Split out of the former ``api/expert_agent.py`` (Step 6). Owns:
-- Tunables: ``RLM_MIN_CHARS``, ``KNOWLEDGE_MAX_CHARS``, ``STREAM_CHUNK_SIZE``,
+- Tunables: ``KNOWLEDGE_MAX_CHARS``, ``STREAM_CHUNK_SIZE``,
   ``_DEFAULT_LANGUAGE_NAME``.
 - Loaded prompt bodies: ``EXPERT_SYSTEM_PROMPT`` / ``EXPERT_DOC_PROMPT``
   (from ``refs/prompts/expert_agent_*.md`` via ``api.prompts.load_prompt_file``).
@@ -38,15 +38,11 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 # Tunables
 # --------------------------------------------------------------------------- #
-# RLM is for long context only (per the plan / api.docgen.codebase). Below this
-# combined-prompt size we use the standard LLM directly.
-RLM_MIN_CHARS = 20_000
 # Cap the knowledge block injected into the prompt so very large products don't
-# blow the LLM context window. RLM (when triggered) still receives the full
-# prompt; this cap keeps the standard-LLM path manageable.
+# blow the LLM context window.
 KNOWLEDGE_MAX_CHARS = 60_000
-# Chunk size used when streaming a non-streaming source (RLM, or standard-LLM
-# fallback) so the client still receives incremental SSE chunks.
+# Chunk size used when streaming a non-streaming source (the standard-LLM
+# chunked fallback) so the client still receives incremental SSE chunks.
 STREAM_CHUNK_SIZE = 80
 
 # Loaded once at import; the .md files are the source of truth.
@@ -173,7 +169,7 @@ def _build_prompt(
         )
 
     # 2. Knowledge gets the remaining budget (keep the head: knowledge is
-    #    retrieved top-first by cognee, so the most relevant docs come first).
+    #    retrieved top-first by semantic recall, so the most relevant docs come first).
     knowledge_budget_chars = max(2048, avail_chars - len(clamped_history))
     clamped_knowledge = ""
     if knowledge:

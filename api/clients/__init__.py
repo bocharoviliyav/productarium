@@ -1,10 +1,11 @@
-"""LLM client layer — external integration with OpenAI-compatible providers.
+"""Client layer — external integrations.
 
 Members:
-- ``openai_client`` — OpenAIClient (adalflow ModelClient wrapper for any
-  OpenAI-compatible local/remote endpoint: LM Studio, llama.cpp, vLLM, etc.).
-- ``git``          — GitHub/GitLab clone + remote file content APIs
+- ``git`` — GitHub/GitLab clone + remote file content APIs
   (``download_repo``, ``get_file_content``, ...).
+
+The LLM client now lives in ``api.llm`` (langchain ``ChatOpenAI`` for any
+OpenAI-compatible local/remote endpoint: LM Studio, llama.cpp, vLLM, etc.).
 """
 
 from api.clients.git import (

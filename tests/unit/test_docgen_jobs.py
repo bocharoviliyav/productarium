@@ -9,6 +9,7 @@ _run_docgen_job (worker thread entry point).
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 import time
@@ -117,7 +118,7 @@ class TestRunDocgenJobAsyncCodebase:
         monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
 
         # Mock generate_codebase_docs
-        async def fake_generate(artifact, product, model=None, language="ru"):
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
             return "Generated docs content"
         import api.docgen.codebase as codebase_mod
         monkeypatch.setattr(codebase_mod, "generate_codebase_docs", fake_generate)
@@ -180,7 +181,7 @@ class TestRunDocgenJobAsyncSpec:
 
         monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
 
-        async def fake_generate(spec, product, model=None, language="ru"):
+        async def fake_generate(spec, product, model=None, language="ru", progress=None):
             return "Spec docs"
         import api.docgen.spec as spec_mod
         monkeypatch.setattr(spec_mod, "generate_openapi_docs", fake_generate)
@@ -213,18 +214,17 @@ class TestRunDocgenJobAsyncSpec:
 
         monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
 
-        # jobs.py reads spec_kind attr (not kind); add a property that
-        # exposes kind as spec_kind so the asyncapi branch is exercised
-        monkeypatch.setattr(SpecORM, "spec_kind", property(lambda self: self.kind), raising=False)
+        # jobs.py reads the REAL SpecORM.kind column; the row above carries
+        # kind="asyncapi", so the asyncapi branch is exercised honestly.
 
-        async def fake_async_generate(spec, product, model=None, language="ru"):
+        async def fake_async_generate(spec, product, model=None, language="ru", progress=None):
             return "AsyncAPI docs"
         import api.docgen.spec as spec_mod
         monkeypatch.setattr(spec_mod, "generate_asyncapi_docs", fake_async_generate)
 
         # Also patch openapi to ensure it's NOT called
         openapi_called = {"v": False}
-        async def fake_openapi_generate(spec, product, model=None, language="ru"):
+        async def fake_openapi_generate(spec, product, model=None, language="ru", progress=None):
             openapi_called["v"] = True
             return "OpenAPI docs"
         monkeypatch.setattr(spec_mod, "generate_openapi_docs", fake_openapi_generate)
@@ -320,7 +320,7 @@ class TestRunDocgenJobAsyncErrors:
 
         monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
 
-        async def boom_generate(artifact, product, model=None, language="ru"):
+        async def boom_generate(artifact, product, model=None, language="ru", progress=None):
             raise RuntimeError("Generator exploded")
         import api.docgen.codebase as codebase_mod
         monkeypatch.setattr(codebase_mod, "generate_codebase_docs", boom_generate)
@@ -332,7 +332,10 @@ class TestRunDocgenJobAsyncErrors:
 
         job = jobs_mod.get_job(job_id)
         assert job["status"] == "failed"
-        assert "Generator exploded" in job["error"]
+        # Non-ValueError exceptions get a generic client-facing message
+        # (review #5): the exception text may embed local paths/stderr.
+        assert job["error"] == "Generation failed (RuntimeError); see server logs"
+        assert "Generator exploded" not in job["error"]
         assert job["finished_at"] is not None
 
 
@@ -359,7 +362,7 @@ class TestRunDocgenJob:
 
         monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
 
-        async def fake_generate(artifact, product, model=None, language="ru"):
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
             return "Thread docs"
         import api.docgen.codebase as codebase_mod
         monkeypatch.setattr(codebase_mod, "generate_codebase_docs", fake_generate)
@@ -393,7 +396,7 @@ class TestRunDocgenJob:
 
         monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
 
-        async def fake_generate(artifact, product, model=None, language="ru"):
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
             return "Drain docs"
         import api.docgen.codebase as codebase_mod
         monkeypatch.setattr(codebase_mod, "generate_codebase_docs", fake_generate)
@@ -435,7 +438,7 @@ class TestSubmitJob:
 
         monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
 
-        async def fake_generate(artifact, product, model=None, language="ru"):
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
             return "Submit docs"
         import api.docgen.codebase as codebase_mod
         monkeypatch.setattr(codebase_mod, "generate_codebase_docs", fake_generate)
@@ -456,6 +459,123 @@ class TestSubmitJob:
         job = jobs_mod.get_job(job_id)
         assert job["status"] == "succeeded"
         assert job["docs_chars"] == len("Submit docs")
+
+
+# ============================================================================
+# Progress reporting (report_progress / _progress_snapshot / _fmt_duration)
+# ============================================================================
+class TestProgressReporting:
+    def test_report_progress_merges_fields(self):
+        job_id = jobs_mod.create_job("prod_p", "codebase", "cb_1")
+        jobs_mod.report_progress(job_id, phase="cloning")
+        jobs_mod.report_progress(
+            job_id, phase="sections", sections_total=7, current_section="overview"
+        )
+        jobs_mod.report_progress(job_id, section_done="overview", section_seconds=1.5)
+
+        prog = jobs_mod.get_job(job_id)["progress"]
+        assert prog["phase"] == "sections"
+        assert prog["sections_total"] == 7
+        assert prog["sections_done"] == 1
+        assert prog["current_section"] is None  # cleared on completion
+        assert prog["section_durations"] == {"overview": 1.5}
+
+    def test_report_progress_logs_section_line(self, caplog):
+        job_id = jobs_mod.create_job("prod_p", "codebase", "cb_1")
+        jobs_mod._docgen_jobs[job_id]["started_at"] = time.time()
+        with caplog.at_level(logging.INFO, logger="api.docgen.jobs"):
+            jobs_mod.report_progress(
+                job_id, phase="sections", sections_total=7, current_section="architecture"
+            )
+            jobs_mod.report_progress(job_id, section_done="architecture", section_seconds=42.1)
+        assert any(
+            "docgen progress [1/7] architecture done in 42.1s" in r.getMessage()
+            for r in caplog.records
+        )
+        assert any(
+            "phase queued -> sections" in r.getMessage() for r in caplog.records
+        )
+
+    def test_report_progress_unknown_job_is_noop(self):
+        jobs_mod.report_progress("no-such-job", phase="cloning")  # must not raise
+
+    def test_report_progress_broken_fields_never_raises(self):
+        job_id = jobs_mod.create_job("prod_p", "codebase", "cb_1")
+        # Non-numeric section_seconds must not blow up the job.
+        jobs_mod.report_progress(job_id, section_done="x", section_seconds="garbage")
+        prog = jobs_mod.get_job(job_id)["progress"]
+        assert prog["sections_done"] == 1
+
+    def test_progress_snapshot_is_a_copy(self):
+        job_id = jobs_mod.create_job("prod_p", "codebase", "cb_1")
+        jobs_mod.report_progress(job_id, section_done="overview", section_seconds=1.0)
+        snap = jobs_mod._progress_snapshot(jobs_mod.get_job(job_id))
+        snap["section_durations"]["injected"] = 99
+        live = jobs_mod.get_job(job_id)["progress"]
+        assert "injected" not in live["section_durations"]
+
+    def test_fmt_duration_formats(self):
+        assert jobs_mod._fmt_duration(42.1) == "42.1s"
+        assert jobs_mod._fmt_duration(130.0) == "2m10s"
+        assert jobs_mod._fmt_duration(None) == "0.0s"
+
+    def test_created_job_has_progress_block(self):
+        job_id = jobs_mod.create_job("prod_p", "spec", "s1")
+        prog = jobs_mod.get_job(job_id)["progress"]
+        assert prog["phase"] == "queued"
+        assert prog["sections_total"] is None
+        assert prog["sections_done"] == 0
+        assert prog["current_section"] is None
+        assert prog["section_durations"] == {}
+
+
+class TestProgressCallbackDispatch:
+    def test_dispatch_passes_progress_callback_and_done_phase(self, isolated_db, monkeypatch):
+        """jobs.py threads a live progress callback into generate_* and marks
+        the phase done on success."""
+        from api.models import ProductORM, CodebaseORM
+
+        db = isolated_db.SessionLocal()
+        try:
+            db.add(ProductORM(id="prod_prog", name="P"))
+            db.flush()
+            db.add(CodebaseORM(
+                id="cb_prog", product_id="prod_prog", name="repo",
+                repo_url="https://github.com/o/repo",
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
+
+        seen = {}
+
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
+            seen["progress"] = progress
+            if progress:
+                progress(phase="cloning")
+                progress(
+                    phase="sections", sections_total=7, current_section="overview"
+                )
+                progress(section_done="overview", section_seconds=0.1)
+            return "Docs"
+
+        import api.docgen.codebase as codebase_mod
+        monkeypatch.setattr(codebase_mod, "generate_codebase_docs", fake_generate)
+
+        job_id = jobs_mod.create_job("prod_prog", "codebase", "cb_prog")
+        asyncio.run(jobs_mod._run_docgen_job_async(
+            job_id, "prod_prog", "codebase", "cb_prog", None, "ru"
+        ))
+
+        job = jobs_mod.get_job(job_id)
+        assert callable(seen["progress"])
+        prog = job["progress"]
+        assert prog["phase"] == "done"  # set by jobs.py on success
+        assert prog["sections_total"] == 7
+        assert prog["sections_done"] == 1
+        assert prog["section_durations"] == {"overview": pytest.approx(0.1, abs=0.05)}
 
 
 # ============================================================================

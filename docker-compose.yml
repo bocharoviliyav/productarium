@@ -37,26 +37,14 @@ services:
       - SERVER_BASE_URL=http://localhost:${PORT:-8001}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - LOG_FORMAT=${LOG_FORMAT:-logfmt}
-      # --- Postgres + pgvector for cognee ---
+      # --- Postgres + pgvector (relational + vector store; legacy user/db
+      # names kept: the existing postgres_data volume is initialized with them)
       - DB_PROVIDER=postgres
       - DB_HOST=postgres
       - DB_PORT=5432
       - DB_NAME=cognee_db
       - DB_USERNAME=cognee
       - DB_PASSWORD=cognee
-      - VECTOR_DB_PROVIDER=pgvector
-      # Vector store credentials (pgvector). Mirrored from DB_* so cognee's
-      # VectorEngine uses the SAME Postgres as the relational + graph stores
-      # and does not log the "PGVector credentials are not fully configured"
-      # fallback warning. Hardcoded (docker-internal infra, like DB_* above):
-      # compose `environment:` wins over `env_file: .env`, so an empty .env is
-      # sufficient and .env cannot accidentally break the in-network host. For
-      # an external Postgres, override these by editing the compose file.
-      - VECTOR_DB_HOST=postgres
-      - VECTOR_DB_PORT=5432
-      - VECTOR_DB_NAME=cognee_db
-      - VECTOR_DB_USERNAME=cognee
-      - VECTOR_DB_PASSWORD=cognee
       # --- LM Studio (OpenAI-compatible server on the host, port 1234) ---
       # extra_hosts below maps host.docker.internal to the host gateway (Linux).
       # On Docker Desktop (macOS/Windows) host.docker.internal already resolves.
@@ -64,83 +52,19 @@ services:
       - LOCAL_OPENAI_BASE_URL=${LM_STUDIO_HOST:-http://host.docker.internal:1234}/v1
       - LOCAL_OPENAI_API_KEY=${LOCAL_OPENAI_API_KEY:-not-needed}
       - LOCAL_OPENAI_MODEL=${LOCAL_OPENAI_MODEL:-qwen/qwen3.6-27b}
-      # --- cognee -> LM Studio (OpenAI-compatible; NO cloud API key) ---
-      # cognee's LLM provider "openai" POSTs to {LLM_ENDPOINT}/chat/completions.
-      # CRITICAL: embeddings provider MUST be "openai_compatible" (NOT "openai").
-      # cognee's create_embedding_engine routes only "openai_compatible" to a
-      # safe engine; "openai" falls through to LiteLLMEmbeddingEngine,
-      # which calls tiktoken.encoding_for_model(<nomic model>) and raises KeyError,
-      # breaking every cognee.add()/cognify(). OpenAICompatibleEmbeddingEngine uses
-      # the openai SDK directly and falls back to cl100k_base when transformers is
-      # not installed.
-      # Structured output: cognee's cognify uses instructor with a Pydantic model.
-      # LLM_INSTRUCTOR_MODE=markdown_json_mode is the only mode LM Studio accepts
-      # (JSON_SCHEMA/JSON/TOOLS raise BadRequestError: Invalid tool_choice).
-      - LLM_PROVIDER=openai
-      - LLM_ENDPOINT=${LM_STUDIO_HOST:-http://host.docker.internal:1234}/v1
-      - LLM_MODEL=${LLM_MODEL:-qwen/qwen3.6-27b}
-      - LLM_API_KEY=${LOCAL_OPENAI_API_KEY:-not-needed}
-      - LLM_INSTRUCTOR_MODE=${LLM_INSTRUCTOR_MODE:-markdown_json_mode}
-      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-openai_compatible}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-nomic-embed-text-v1.5}
-      - EMBEDDING_ENDPOINT=${LM_STUDIO_HOST:-http://host.docker.internal:1234}/v1
-      - EMBEDDING_DIMENSIONS=768
-      - EMBEDDING_API_KEY=${LOCAL_OPENAI_API_KEY:-not-needed}
-      - HUGGINGFACE_TOKENIZER=${HUGGINGFACE_TOKENIZER:-nomic-ai/nomic-embed-text-v1.5}
-      # cognee graph engine. Default is "ladybug" (an embedded LanceDB-like
-      # store) whose first run tries to DOWNLOAD its json extension from
-      # extension.ladybugdb.com -- impossible offline in this container, so
-      # cognify fails with "IO exception: Failed to load library .../libjson.
-      # lbug_extension". Use Postgres (same DB as relational + vector) instead;
-      # GRAPH_DATABASE_* fall back to the relational DB_* config when unset.
-      - GRAPH_DATABASE_PROVIDER=${GRAPH_DATABASE_PROVIDER:-postgres}
-      # Graph store credentials (Postgres). Mirrored from DB_* so cognee's
-      # GraphEngine uses the SAME Postgres and does not log the "Postgres graph
-      # credentials are not fully configured" fallback warning. Hardcoded for
-      # the same reason as VECTOR_DB_* above (docker-authoritative infra).
-      - GRAPH_DATABASE_HOST=postgres
-      - GRAPH_DATABASE_PORT=5432
-      - GRAPH_DATABASE_NAME=cognee_db
-      - GRAPH_DATABASE_USERNAME=cognee
-      - GRAPH_DATABASE_PASSWORD=cognee
-      # --- fast-rlm (iterative reasoning) -> LM Studio (NO cloud key) ---
-      # RLM talks to an OpenAI-compatible endpoint. Point it at LM Studio on the
-      # host (host.docker.internal in Docker) with the "/v1" path. Without this,
-      # rlm_runner falls back to http://localhost:1234/v1, which inside the
-      # container is the container itself -- nothing is there, so RLM fails
-      # with "Connection error".
-      - RLM_MODEL_BASE_URL=${LM_STUDIO_HOST:-http://host.docker.internal:1234}/v1
-      - RLM_MODEL_API_KEY=${LOCAL_OPENAI_API_KEY:-not-needed}
-      - RLM_MODEL_NAME=${RLM_MODEL_NAME:-qwen/qwen3.6-27b}
+      # --- Productarium state (repo clones, SQLite checkpointer fallback) ---
+      - PRODUCTARIUM_STATE_DIR=/var/lib/productarium
       # --- Productarium auth + settings ---
       - AUTH_PROVIDER=${AUTH_PROVIDER:-local}
       - BOOTSTRAP_ADMIN_USERNAME=${BOOTSTRAP_ADMIN_USERNAME:-admin}
       - BOOTSTRAP_ADMIN_PASSWORD=${BOOTSTRAP_ADMIN_PASSWORD:-change-me}
       - SETTINGS_SECRET_KEY=${SETTINGS_SECRET_KEY:-}
-      # Skip cognee's blocking LLM connection test (item 10 bug fix).
-      - COGNEE_SKIP_CONNECTION_TEST=true
-      # Shrink cognee's LLM connection timeout (seconds) when the test is enabled.
-      - COGNEE_LLM_CONNECTION_TIMEOUT=${COGNEE_LLM_CONNECTION_TIMEOUT:-5}
-      # Connection-pool args for cognee's async Postgres engines (Fix #2:
-      # asyncpg cross-loop crash). NullPool opens a fresh connection per
-      # checkout so no asyncpg connection ever crosses event loops.
-      # The create_async_engine monkeypatch in api/cognee/ converts
-      # "nullpool" string to NullPool class across relational, graph, and vector stores.
-      # JSON literal is single-quoted so YAML/compose treat it as a plain string.
-      - 'POOL_ARGS={"poolclass": "nullpool", "pool_pre_ping": true}'
-      - 'DATABASE_POOL_ARGS={"poolclass": "nullpool", "pool_pre_ping": true}'
-      # Single-user posture: disable cognee's multi-tenant access control so
-      # add()/cognify()/recall() use the shared DB without tenant routing.
-      - ENABLE_BACKEND_ACCESS_CONTROL=false
-      # Persist the Deno + fast-rlm (npm/jsr + Pyodide) cache so the one-time
-      # first-run download happens only once, not on every container restart.
-      - DENO_DIR=/root/.deno
     # Allow the container to reach the host OpenAI-compatible server (Linux).
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ~/.adalflow:/root/.adalflow      # Persist repository and embedding data
-      - deno_cache:/root/.deno            # Persist Deno + fast-rlm package cache
+      # Persist managed state dir: docgen repo clones + SQLite checkpointer fallback
+      - productarium_state:/var/lib/productarium
     # Resource limits for docker-compose up (not Swarm mode)
     mem_limit: 6g
     mem_reservation: 2g
@@ -214,7 +138,7 @@ volumes:
   postgres_data:
   keycloak_pg_data:
   keycloak_data:
-  deno_cache:
+  productarium_state:
 
 networks:
     app-network:

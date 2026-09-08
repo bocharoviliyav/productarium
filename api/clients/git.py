@@ -10,8 +10,11 @@ Split out of the former ``api/data_pipeline.py`` (Step 5). Handles:
 
 Token hygiene: ``_sanitize_git_stderr`` strips raw + URL-encoded tokens from
 git stderr/stdout so clone errors logged or surfaced to the UI never leak the
-credential. All network/subprocess calls are inside the functions (not at
-import time) so this module imports cleanly without git/requests available.
+credential. After a token-authed clone/refresh, ``_reset_origin_url`` resets
+the ``origin`` remote to the credential-free URL so the token is never
+persisted in ``<clone>/.git/config``. All network/subprocess calls are inside
+the functions (not at import time) so this module imports cleanly without
+git/requests available.
 """
 
 from __future__ import annotations
@@ -54,6 +57,35 @@ def _build_authed_clone_url(repo_url: str, repo_type: str, access_token: str) ->
     if repo_type == "gitlab":
         return urlunparse((parsed.scheme, f"oauth2:{encoded_token}@{parsed.netloc}", parsed.path, '', '', ''))
     return repo_url
+
+
+def _reset_origin_url(local_path: str, clean_url: str, access_token: str) -> None:
+    """Strip an embedded credential from the clone's ``origin`` URL.
+
+    ``git clone <authed-url>`` persists the URL — token included — into
+    ``<clone>/.git/config``. After a successful clone/refresh we reset origin
+    back to the credential-free URL so nothing reading the clone's git config
+    (agent tools, doc uploads) can ever leak the token. Best-effort: a
+    failure is logged (sanitized) and never breaks the clone flow.
+    """
+    if not access_token:
+        return
+    try:
+        subprocess.run(
+            ["git", "-C", local_path, "remote", "set-url", "origin", clean_url],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as e:
+        err = _sanitize_git_stderr((e.stderr or b"").decode("utf-8", "replace"), access_token)
+        logger.warning(
+            "Could not strip the credential from the origin URL at %s: %s", local_path, err
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(
+            "Could not strip the credential from the origin URL at %s: %s", local_path, e
+        )
 
 
 def download_repo(
@@ -101,8 +133,11 @@ def download_repo(
                 try:
                     fetch_url = _build_authed_clone_url(repo_url, repo_type, access_token)
                     logger.info("Refreshing existing repository (force_refresh): %s", local_path)
+                    # Fetch by explicit URL (NOT via the origin remote): origin
+                    # is kept credential-free (see _reset_origin_url), so the
+                    # token is passed here per-fetch only.
                     subprocess.run(
-                        ["git", "-C", local_path, "fetch", "--depth=1", "origin", fetch_url],
+                        ["git", "-C", local_path, "fetch", "--depth=1", fetch_url],
                         check=True,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
@@ -120,6 +155,8 @@ def download_repo(
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                     )
+                    # Also covers legacy clones whose origin still embeds a token.
+                    _reset_origin_url(local_path, repo_url, access_token)
                     logger.info("Repository refreshed to latest remote tip.")
                     return f"Refreshed existing repository at {local_path}"
                 except subprocess.CalledProcessError as e:
@@ -169,6 +206,9 @@ def download_repo(
             stderr=subprocess.PIPE,
         )
 
+        # The authed clone URL is persisted in .git/config — reset origin to
+        # the credential-free URL right away.
+        _reset_origin_url(local_path, repo_url, access_token)
         logger.info("Repository cloned successfully")
         return result.stdout.decode("utf-8")
 

@@ -16,11 +16,12 @@ from sqlalchemy.orm import Session, selectinload
 from api.db import get_db  # re-exported so routers import it from the repo
 from api.models import (
     CodebaseORM,
+    DatabaseORM,
     LinksORM,
     ProductORM,
     SpecORM,
 )
-from api.schemas import Codebase, Links, Product, Spec
+from api.schemas import Codebase, Database, Links, Product, Spec
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,32 @@ def _links_orm_from_pydantic(l: Links) -> LinksORM:
         verified_by=l.verified_by,
         verified_at=l.verified_at,
         source=l.source or "manual",
+    )
+
+
+def _database_orm_from_pydantic(d: Database) -> DatabaseORM:
+    """Build a DatabaseORM from the API model.
+
+    Secret hygiene: a raw ``dsn`` is masked via ``mask_dsn`` and ONLY the
+    masked form reaches the ORM (``dsn_masked``); a provided ``dsn_masked``
+    (round-trip echo) is preferred as-is, then re-masked defensively so a
+    client-crafted "dsn_masked" containing credentials cannot smuggle a
+    secret into storage either.
+    """
+    from api.docgen.verification import mask_dsn
+
+    dsn_masked = d.dsn_masked if d.dsn_masked is not None else d.dsn
+    return DatabaseORM(
+        id=d.id,
+        name=d.name,
+        dsn_masked=mask_dsn(dsn_masked) if dsn_masked else None,
+        mcp_server_id=d.mcp_server_id,
+        generated_docs=d.generated_docs,
+        pages=d.pages,
+        verified=d.verified,
+        verified_by=d.verified_by,
+        verified_at=d.verified_at,
+        source=d.source or "manual",
     )
 
 
@@ -116,6 +143,21 @@ def orm_to_product(p_orm: ProductORM) -> Product:
             )
             for l in p_orm.links
         ],
+        databases=[
+            Database(
+                id=d.id,
+                name=d.name,
+                dsn_masked=d.dsn_masked,
+                mcp_server_id=d.mcp_server_id,
+                generated_docs=d.generated_docs,
+                pages=d.pages,
+                verified=d.verified,
+                verified_by=d.verified_by,
+                verified_at=d.verified_at,
+                source=d.source,
+            )
+            for d in p_orm.databases
+        ],
     )
 
 
@@ -125,6 +167,7 @@ def _load_options():
         selectinload(ProductORM.codebases),
         selectinload(ProductORM.specs),
         selectinload(ProductORM.links),
+        selectinload(ProductORM.databases),
     )
 
 
@@ -166,7 +209,17 @@ def upsert_product(db: Session, product: Product) -> ProductORM:
         p_orm.summary = product.summary
         p_orm.owner_id = product.owner_id
 
-    for model in (CodebaseORM, SpecORM, LinksORM):
+    # Verified state is server-owned (review #4): capture the STORED
+    # verification triple per database id BEFORE the child replace, so the
+    # re-insert below preserves it for existing artifacts and forces False
+    # for new ones — a client cannot grant verification through the payload
+    # (only the owner/admin verify endpoint can).
+    prev_db_verified = {
+        d.id: (d.verified, d.verified_by, d.verified_at)
+        for d in p_orm.databases
+    }
+
+    for model in (CodebaseORM, SpecORM, LinksORM, DatabaseORM):
         db.query(model).filter(model.product_id == product.id).delete(
             synchronize_session=False
         )
@@ -181,6 +234,16 @@ def upsert_product(db: Session, product: Product) -> ProductORM:
         db.add(orm)
     for l in product.links:
         orm = _links_orm_from_pydantic(l)
+        orm.product_id = product.id
+        db.add(orm)
+    for d in product.databases:
+        orm = _database_orm_from_pydantic(d)
+        verified, verified_by, verified_at = prev_db_verified.get(
+            d.id, (False, None, None)
+        )
+        orm.verified, orm.verified_by, orm.verified_at = (
+            verified, verified_by, verified_at,
+        )
         orm.product_id = product.id
         db.add(orm)
 
@@ -242,6 +305,12 @@ def add_links(db: Session, product_id: str, links: Links) -> Product:
     return _add_child(db, product_id, orm, "links")
 
 
+def add_database(db: Session, product_id: str, database: Database) -> Product:
+    orm = _database_orm_from_pydantic(database)
+    orm.product_id = product_id
+    return _add_child(db, product_id, orm, "databases")
+
+
 def delete_codebase(db: Session, product_id: str, codebase_id: str) -> Product:
     return _delete_child(db, product_id, codebase_id, CodebaseORM, "codebases")
 
@@ -254,7 +323,75 @@ def delete_links(db: Session, product_id: str, links_id: str) -> Product:
     return _delete_child(db, product_id, links_id, LinksORM, "links")
 
 
+def delete_database(db: Session, product_id: str, database_id: str) -> Product:
+    return _delete_child(db, product_id, database_id, DatabaseORM, "databases")
+
+
 # --- Content updates (WYSIWYG saves) ----------------------------------------
+def update_database_content(
+    db: Session,
+    product_id: str,
+    database_id: str,
+    *,
+    pages: Optional[dict] = None,
+    page_id: Optional[str] = None,
+    content: Optional[str] = None,
+    generated_docs: Optional[str] = None,
+) -> Tuple[Product, Optional[str]]:
+    """Apply one of the WYSIWYG edit shapes to a database's docs.
+
+    Same shapes/semantics as ``update_codebase_content`` (the artifact viewer
+    reuses the codebase editor for databases): ``pages`` wholesale, a single
+    page upsert via ``page_id`` + ``content``, or the whole ``generated_docs``
+    blob. Returns (product, indexed_text) for memory re-indexing; raises
+    ValueError when the product/database is missing or no shape was provided.
+    """
+    p_orm = load_product_orm(db, product_id)
+    if p_orm is None:
+        raise ValueError("Product not found")
+    database = next((d for d in p_orm.databases if d.id == database_id), None)
+    if database is None:
+        raise ValueError("Database not found")
+
+    indexed_text: Optional[str] = None
+
+    if pages is not None:
+        database.pages = pages
+        indexed_text = json.dumps(pages, ensure_ascii=False)
+    elif page_id is not None and content is not None:
+        # Copy-on-write: SQLAlchemy does NOT track in-place mutations of a
+        # JSON column, so mutating the loaded dict in place would silently
+        # persist nothing — build fresh dicts so the assignment marks the
+        # column dirty.
+        current = dict(database.pages) if isinstance(database.pages, dict) else {}
+        page = dict(current.get(page_id) or {})
+        if page:
+            page["content"] = content
+        else:
+            page = {
+                "id": page_id,
+                "title": page_id,
+                "content": content,
+                "filePaths": [],
+                "importance": "medium",
+                "relatedPages": [],
+            }
+        current[page_id] = page
+        database.pages = current
+        indexed_text = content
+    elif generated_docs is not None:
+        database.generated_docs = generated_docs
+        indexed_text = generated_docs
+    else:
+        raise ValueError(
+            "Provide one of: pages, (page_id + content), or generated_docs"
+        )
+
+    db.commit()
+    db.refresh(p_orm)
+    return orm_to_product(p_orm), indexed_text
+
+
 def update_codebase_content(
     db: Session,
     product_id: str,
@@ -268,8 +405,8 @@ def update_codebase_content(
     """Apply one of the WYSIWYG edit shapes to a codebase's docs.
 
     Returns (product, indexed_text) where indexed_text is what should be
-    re-indexed into cognee (may be None). Raises ValueError if product or
-    codebase is missing, or if no edit shape was provided.
+    re-indexed into the memory backend (may be None). Raises ValueError if
+    product or codebase is missing, or if no edit shape was provided.
     """
     p_orm = load_product_orm(db, product_id)
     if p_orm is None:
@@ -284,10 +421,14 @@ def update_codebase_content(
         codebase.pages = pages
         indexed_text = json.dumps(pages, ensure_ascii=False)
     elif page_id is not None and content is not None:
-        current = codebase.pages if isinstance(codebase.pages, dict) else {}
-        page = current.get(page_id)
-        if page is None:
-            current[page_id] = {
+        # Copy-on-write (same as update_database_content): in-place mutation
+        # of the loaded JSON dict would silently persist nothing.
+        current = dict(codebase.pages) if isinstance(codebase.pages, dict) else {}
+        page = dict(current.get(page_id) or {})
+        if page:
+            page["content"] = content
+        else:
+            page = {
                 "id": page_id,
                 "title": page_id,
                 "content": content,
@@ -295,9 +436,7 @@ def update_codebase_content(
                 "importance": "medium",
                 "relatedPages": [],
             }
-        else:
-            page["content"] = content
-            current[page_id] = page
+        current[page_id] = page
         codebase.pages = current
         indexed_text = content
     elif generated_docs is not None:
@@ -343,6 +482,42 @@ def update_links_content(
     db.commit()
     db.refresh(p_orm)
     return orm_to_product(p_orm), content
+
+
+def update_database_meta(
+    db: Session,
+    product_id: str,
+    database_id: str,
+    *,
+    name: Optional[str] = None,
+    dsn: Optional[str] = None,
+    dsn_masked: Optional[str] = None,
+    mcp_server_id: Optional[str] = None,
+) -> Product:
+    """Update a database artifact's metadata (name / DSN / MCP server pin).
+
+    A raw ``dsn`` is masked via ``mask_dsn`` before persistence; only the
+    masked form is stored (same contract as creation). ``mcp_server_id`` may
+    be cleared by passing the empty string.
+    """
+    from api.docgen.verification import mask_dsn
+
+    p_orm = load_product_orm(db, product_id)
+    if p_orm is None:
+        raise ValueError("Product not found")
+    database = next((d for d in p_orm.databases if d.id == database_id), None)
+    if database is None:
+        raise ValueError("Database not found")
+    if name is not None:
+        database.name = name
+    if dsn is not None or dsn_masked is not None:
+        raw = dsn if dsn is not None else dsn_masked
+        database.dsn_masked = mask_dsn(raw) if (raw or "").strip() else None
+    if mcp_server_id is not None:
+        database.mcp_server_id = mcp_server_id or None
+    db.commit()
+    db.refresh(p_orm)
+    return orm_to_product(p_orm)
 
 
 # --- Verification (item 5) --------------------------------------------------

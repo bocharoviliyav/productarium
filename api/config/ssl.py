@@ -1,19 +1,17 @@
 """Central SSL/TLS configuration for HTTP clients.
 
 Lets an admin point every outbound HTTPS call (``requests``, ``httpx``,
-the OpenAI SDK, and cognee's aiohttp adapters) at a corporate CA bundle,
-or skip certificate verification entirely, for an enterprise AI gateway
-whose cert is signed by an internal CA not present in the default trust
-store.
+the OpenAI SDK) at a corporate CA bundle, or skip certificate verification
+entirely, for an enterprise AI gateway whose cert is signed by an internal
+CA not present in the default trust store.
 
 Two knobs, both runtime-configurable via the admin panel AND env vars:
 
 - **CA bundle path** (``ssl.ca_bundle`` setting / ``SSL_CA_BUNDLE`` /
   ``SSL_CERT_FILE`` / ``REQUESTS_CA_BUNDLE`` env). When set, the path is
   pushed into ``SSL_CERT_FILE`` / ``REQUESTS_CA_BUNDLE`` / ``CURL_CA_BUNDLE``
-  so ``ssl.create_default_context()`` (used by httpx + cognee's aiohttp
-  ``create_secure_ssl_context``), ``requests``, and ``curl`` all trust the
-  corporate root cert. Verification stays ON.
+  so ``ssl.create_default_context()`` (used by httpx), ``requests``, and
+  ``curl`` all trust the corporate root cert. Verification stays ON.
 
 - **Skip verification** (``ssl.verify`` setting / ``SSL_VERIFY`` env). When
   explicitly ``false``, certificate verification is disabled for every
@@ -26,12 +24,7 @@ store. Local HTTP model servers are unaffected (no TLS).
 
 The admin-panel values win over env vars so a runtime save takes effect
 without a restart for any client that reads the value per call
-(``requests`` calls, ``OpenAIClient`` httpx client). cognee's aiohttp SSL
-context is built once at cognee import, so for cognee the env vars must be
-set before cognee is imported (``apply_ssl_env`` is called early in
-``main.py`` and ``cognee_manager`` imports ``apply_ssl_env``); a
-``apply_cognee_ssl_patch`` monkeypatch handles the skip-verify case at
-runtime.
+(``requests`` calls, the langchain ChatOpenAI httpx client).
 """
 
 from __future__ import annotations
@@ -66,7 +59,7 @@ def _to_bool(value: Optional[Union[str, bool]], default: bool = True) -> bool:
 
 
 def _setting(key: str) -> Optional[str]:
-    """Read a setting from the store (best-effort; None if DB/cognee down)."""
+    """Read a setting from the store (best-effort; None if DB down)."""
     try:
         from api.config.settings import get_setting  # lazy: avoids circular import
         return get_setting(key)
@@ -83,8 +76,8 @@ def get_ca_bundle() -> Optional[str]:
     """
     path = _setting(_SSL_CA_BUNDLE_KEY)
     if not path:
-        # ``SSL_CERT_FILE`` is honored by ssl.create_default_context (httpx,
-        # cognee aiohttp) and by the OpenAI SDK's httpx transport.
+        # ``SSL_CERT_FILE`` is honored by ssl.create_default_context (httpx)
+        # and by the OpenAI SDK's httpx transport.
         # ``REQUESTS_CA_BUNDLE`` / ``CURL_CA_BUNDLE`` are honored by requests.
         path = (
             os.environ.get("SSL_CA_BUNDLE")
@@ -144,53 +137,11 @@ def httpx_verify() -> Union[bool, str]:
     return requests_verify()
 
 
-def apply_litellm_ssl() -> None:
-    """Propagate the skip-verify / CA-bundle state onto litellm.
-
-    litellm (used by cognee's cognify structured-output path) builds its OWN
-    httpx/openai-SDK client (``OpenAIChatCompletion._get_async_http_client``),
-    NOT the adalflow ``OpenAIClient`` that receives ``verify=`` explicitly. To
-    honor skip-verify / a corporate CA bundle, litellm reads
-    ``os.getenv("SSL_VERIFY", litellm.ssl_verify)`` in ``get_ssl_verify``
-    (``litellm/llms/custom_httpx/http_handler.py``) and, when verification is
-    on, falls back to ``os.getenv("SSL_CERT_FILE")`` for the CA bundle.
-
-    Gap this closes: ``apply_ssl_env`` previously set neither ``SSL_VERIFY``
-    nor ``litellm.ssl_verify`` in skip-verify mode, so the cognify/litellm
-    path kept verifying the corporate TLS cert and failed with
-    ``OpenAIException - Connection error`` while adalflow docgen (explicit
-    ``verify=False``) and the admin ``requests``-based model test worked.
-
-    litellm also CACHES its openai client (``set_cached_openai_client``), so
-    this MUST run before the first litellm call. It is called from
-    :func:`apply_ssl_env` (which runs at ``cognee_manager`` import + in
-    ``main.py``) and from :func:`apply_cognee_ssl_patch`. Best-effort and
-    never raises: litellm may be absent in a dev env without cognee.
-    """
-    try:
-        import litellm  # type: ignore
-    except Exception:  # pragma: no cover - litellm optional (cognee dep)
-        return
-    try:
-        if not get_verify():
-            # Skip-verify: litellm reads SSL_VERIFY env first, then
-            # litellm.ssl_verify. Set BOTH so a cached client built between
-            # calls still sees the disabled state.
-            os.environ.setdefault("SSL_VERIFY", "false")
-            litellm.ssl_verify = False
-            return
-        # Verify ON: restore litellm default and let SSL_CERT_FILE (set in
-        # apply_ssl_env) supply the corporate CA bundle for the openai route.
-        litellm.ssl_verify = True
-    except Exception as e:  # pragma: no cover - defensive
-        logger.debug("apply_litellm_ssl failed (non-fatal): %s", e)
-
-
 def apply_openai_ssl_patch() -> None:
     """Patch openai.AsyncOpenAI and openai.OpenAI default http_client to honor ssl_config.
 
     Ensures that any OpenAI or AsyncOpenAI client constructed without an explicit
-    http_client (e.g. inside cognee, litellm, instructor) automatically uses
+    http_client (e.g. inside litellm, instructor) automatically uses
     an httpx.AsyncClient / httpx.Client configured with httpx_verify() and a generous timeout,
     preventing ConnectionError / SSL verification failures against external corporate gateways.
     """
@@ -201,9 +152,9 @@ def apply_openai_ssl_patch() -> None:
         if not getattr(openai, "_productarium_ssl_patched", False):
             # Resolve the per-request timeout through the central timeout config
             # (admin > env > default) so every patched OpenAI/AsyncOpenAI client
-            # (cognee, litellm, instructor) honors the same long-running timeout
-            # as the explicit adalflow clients. Generation + cognify can run for
-            # hours on a local model; the previous 300s ceiling aborted those
+            # (langchain, instructor) honors the same long-running timeout as
+            # the explicit ChatOpenAI clients. Generation on a large repo can
+            # run for hours on a local model; a short ceiling would abort those
             # calls mid-flight. Read at patch time; admin overrides take effect
             # on the next patch (a process restart, since the patch is once-only).
             try:
@@ -234,31 +185,22 @@ def apply_openai_ssl_patch() -> None:
 
 
 def apply_ssl_env() -> None:
-    """Push the CA bundle path into env vars honored by httpx/cognee/requests.
+    """Push the CA bundle path into env vars honored by httpx/requests.
 
-    Call this as early as possible (before httpx/cognee/openai clients are
+    Call this as early as possible (before httpx/openai clients are
     constructed) so the default-trust-store consumers pick up the corporate
     root cert. Safe to call repeatedly; never raises.
 
     Sets ``SSL_CERT_FILE`` (honored by ``ssl.create_default_context`` ->
-    httpx + cognee aiohttp ``create_secure_ssl_context``),
-    ``REQUESTS_CA_BUNDLE`` + ``CURL_CA_BUNDLE`` (requests), but only when an
-    admin/env CA bundle is configured AND verification is enabled. Does NOT
-    unset pre-existing env values from the process environment.
+    httpx), ``REQUESTS_CA_BUNDLE`` + ``CURL_CA_BUNDLE`` (requests), but only
+    when an admin/env CA bundle is configured AND verification is enabled.
+    Does NOT unset pre-existing env values from the process environment.
     """
     try:
         apply_openai_ssl_patch()
         if not get_verify():
             # Skip-verify mode: do not force a CA bundle on the environment.
             # Per-call clients (requests/httpx) get verify=False directly.
-            # cognee's aiohttp context is patched separately.
-            #
-            # Propagate skip-verify to litellm too: its cognify
-            # structured-output path builds its OWN httpx/openai client (not
-            # the adalflow client that takes verify= explicitly) and reads
-            # SSL_VERIFY / litellm.ssl_verify. Without this the cognify path
-            # keeps verifying the corporate cert -> "Connection error".
-            apply_litellm_ssl()
             #
             # Suppress urllib3's per-request InsecureRequestWarning spam: with
             # skip-verify ON, every unverified HTTPS call (Confluence/MCP/git /
@@ -289,54 +231,3 @@ def apply_ssl_env() -> None:
             os.environ.setdefault("CURL_CA_BUNDLE", ca)
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("apply_ssl_env failed (non-fatal): %s", e)
-
-
-def apply_cognee_ssl_patch() -> None:
-    """Patch cognee's aiohttp SSL context for skip-verify / CA bundle.
-
-    cognee's ``cognee.shared.utils.create_secure_ssl_context`` returns
-    ``ssl.create_default_context()``. With an admin CA bundle we already
-    export ``SSL_CERT_FILE`` (honored by ``ssl.create_default_context``),
-    so the CA case is covered by :func:`apply_ssl_env`. For the skip-verify
-    case we monkeypatch the function to return an unverified context so
-    cognee's OpenAI-compatible aiohttp embedders stop failing with
-    ``unable to get local issuer certificate``.
-
-    Safe to call when cognee is unavailable (no-op). Never raises.
-    """
-    # Re-assert the litellm skip-verify/CA state on every call so a runtime
-    # flip of ssl.verify (admin panel) propagates to litellm's cached client
-    # before the next cognify call. apply_ssl_env() runs once at import; this
-    # covers the case where the admin toggles ssl.verify AFTER startup.
-    apply_litellm_ssl()
-    try:
-        import cognee.shared.utils as _cutils  # type: ignore
-    except Exception:
-        return  # cognee not installed / not imported yet
-    try:
-        if get_verify():
-            # Verification ON: restore the original function if we previously
-            # patched it, so a runtime flip back to verify=True is honored.
-            orig = getattr(_cutils.create_secure_ssl_context, "__ssl_orig__", None)
-            if orig is not None:
-                _cutils.create_secure_ssl_context = orig  # type: ignore
-                logger.info("cognee SSL: verification re-enabled (restored default context).")
-            return
-
-        import ssl as _ssl
-
-        def _unverified_context() -> "ssl.SSLContext":
-            ctx = _ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = _ssl.CERT_NONE
-            return ctx
-
-        if not hasattr(_cutils.create_secure_ssl_context, "__ssl_orig__"):
-            _unverified_context.__ssl_orig__ = _cutils.create_secure_ssl_context  # type: ignore[attr-defined]
-        _cutils.create_secure_ssl_context = _unverified_context  # type: ignore
-        logger.warning(
-            "cognee SSL: certificate verification DISABLED "
-            "(ssl.verify=false). This is insecure (MITM risk)."
-        )
-    except Exception as e:  # pragma: no cover - defensive
-        logger.debug("apply_cognee_ssl_patch failed (non-fatal): %s", e)

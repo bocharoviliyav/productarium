@@ -11,7 +11,9 @@ API-token-authenticated endpoints for external integrations:
 
 All endpoints require a valid Bearer API token (``require_api_token``), which
 also updates ``last_used_at``. Only verified content (``KnowledgeNode`` /
-``Codebase``/``Spec``/``Links`` with ``verified=True``) is exported or pushed.
+``Codebase``/``Spec``/``Links``/``Database`` with ``verified=True``) is exported
+or pushed. Database exports carry only the MASKED DSN — the raw DSN never
+leaves the server.
 """
 
 from __future__ import annotations
@@ -29,7 +31,8 @@ from sqlalchemy.orm import Session
 from api.auth.deps import require_api_token
 from api.db import get_db
 from api.models import (
-    ApiTokenORM, CodebaseORM, KnowledgeNodeORM, LinksORM, ProductORM, SpecORM,
+    ApiTokenORM, CodebaseORM, DatabaseORM, KnowledgeNodeORM, LinksORM,
+    ProductORM, SpecORM,
 )
 from api.config.settings import get_confluence_creds, get_git_creds
 
@@ -79,6 +82,14 @@ def _verified_links(product_id: str, db: Session) -> List[LinksORM]:
     )
 
 
+def _verified_databases(product_id: str, db: Session) -> List[DatabaseORM]:
+    return (
+        db.query(DatabaseORM)
+        .filter(DatabaseORM.product_id == product_id, DatabaseORM.verified.is_(True))
+        .all()
+    )
+
+
 def _verified_nodes(product_id: str, db: Session) -> List[KnowledgeNodeORM]:
     return (
         db.query(KnowledgeNodeORM)
@@ -109,6 +120,8 @@ def _knowledge_as_json(
     specs: List[SpecORM],
     links: List[LinksORM],
     nodes: List[KnowledgeNodeORM],
+    *,
+    databases: Optional[List[DatabaseORM]] = None,
 ) -> Dict[str, Any]:
     def _vmeta(e: Any) -> Dict[str, Any]:
         return {
@@ -133,6 +146,16 @@ def _knowledge_as_json(
             {"id": l.id, "name": l.name, "content": l.content, **_vmeta(l)}
             for l in links
         ],
+        "databases": [
+            {
+                "id": d.id,
+                "name": d.name,
+                "dsn_masked": d.dsn_masked,
+                "generated_docs": d.generated_docs,
+                **_vmeta(d),
+            }
+            for d in (databases or [])
+        ],
         "nodes": [
             {
                 "id": n.id, "parent_id": n.parent_id, "title": n.title, "slug": n.slug,
@@ -149,6 +172,8 @@ def _knowledge_as_markdown(
     specs: List[SpecORM],
     links: List[LinksORM],
     nodes: List[KnowledgeNodeORM],
+    *,
+    databases: Optional[List[DatabaseORM]] = None,
 ) -> str:
     lines: List[str] = [f"# {product.name} — Verified Knowledge", ""]
     if product.summary:
@@ -167,6 +192,7 @@ def _knowledge_as_markdown(
                 lines.extend([content, ""])
 
     _section("Codebases", codebases, "generated_docs")
+    _section("Databases", databases or [], "generated_docs")
     _section("Specifications", specs, "content")
     _section("Links", links, "content")
 
@@ -181,6 +207,11 @@ def _knowledge_as_markdown(
 
 
 def _load_verified(product_id: str, db: Session):
+    """(codebases, specs, links, nodes) — pre-Wave-E shape, kept for callers.
+
+    ``api.mcp.inbound`` and older callers unpack this 4-tuple; the export /
+    push endpoints additionally load databases via ``_verified_databases``.
+    """
     return (
         _verified_codebases(product_id, db),
         _verified_specs(product_id, db),
@@ -225,9 +256,14 @@ def export_knowledge(
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
     codebases, specs, links, nodes = _load_verified(product_id, db)
+    databases = _verified_databases(product_id, db)
     if fmt == "json":
-        return JSONResponse(content=_knowledge_as_json(product, codebases, specs, links, nodes))
-    md = _knowledge_as_markdown(product, codebases, specs, links, nodes)
+        return JSONResponse(content=_knowledge_as_json(
+            product, codebases, specs, links, nodes, databases=databases
+        ))
+    md = _knowledge_as_markdown(
+        product, codebases, specs, links, nodes, databases=databases
+    )
     return Response(content=md, media_type="text/markdown; charset=utf-8")
 
 
@@ -246,7 +282,8 @@ async def ask(
     try:
         from api.expert.chat import run_expert_chat  # lazy: built in parallel
     except Exception as e:
-        raise HTTPException(status_code=501, detail=f"Expert agent not available: {e}")
+        logger.warning("expert chat unavailable on the public ask path: %s", e)
+        raise HTTPException(status_code=501, detail="Expert agent is not available")
 
     async def event_stream():
         try:
@@ -266,8 +303,9 @@ async def ask(
                 yield f"data: {json.dumps({'delta': str(result)})}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:  # pragma: no cover - streamed error path
-            logger.warning("expert chat stream failed: %s", e)
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            # Generic message: the exception may embed internal endpoints.
+            logger.warning("expert chat stream failed: %s", e, exc_info=True)
+            yield f"data: {json.dumps({'error': 'internal error while streaming the answer'})}\n\n"
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -298,12 +336,14 @@ async def push(
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
     codebases, specs, links, nodes = _load_verified(product_id, db)
+    databases = _verified_databases(product_id, db)
     target = (body.target or _default_push_target()).lower()
 
     try:
         from api.integrations import registry as _reg  # lazy: built in parallel
     except Exception as e:
-        raise HTTPException(status_code=501, detail=f"Integrations not available: {e}")
+        logger.warning("integrations unavailable on the public push path: %s", e)
+        raise HTTPException(status_code=501, detail="Integrations are not available")
     getter = getattr(_reg, "get_connector", None)
     connector = getter(target) if callable(getter) else None
     if connector is None:
@@ -314,7 +354,9 @@ async def push(
     if not callable(push_fn):
         raise HTTPException(status_code=501, detail=f"Connector '{target}' does not support push/export.")
 
-    md = _knowledge_as_markdown(product, codebases, specs, links, nodes)
+    md = _knowledge_as_markdown(
+        product, codebases, specs, links, nodes, databases=databases
+    )
     payload = {
         "product_id": product_id,
         "product_name": product.name,
@@ -329,7 +371,10 @@ async def push(
         if hasattr(result, "__await__"):
             result = await result
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Push to '{target}' failed: {e}")
+        # Push exceptions (Confluence/git HTTP stacks) can embed authenticated
+        # URLs — log the details, keep the client message generic.
+        logger.warning("public push to %r failed: %s", target, e, exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Push to '{target}' failed")
     if isinstance(result, dict):
         return result
     return {"success": True, "target": target, "message": "Pushed verified knowledge."}

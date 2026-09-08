@@ -132,7 +132,7 @@ def list_connectors() -> List[Dict[str, Any]]:
         - ``name``: connector slug
         - ``display_name``: human-readable name
         - ``description``: short description
-        - ``kind``: connector category ("web" or "mcp")
+        - ``kind``: connector category ("web")
         - ``requires_credentials``: bool
         - ``configured``: bool — whether the connector has config loaded
     """

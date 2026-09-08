@@ -6,6 +6,7 @@ import { useParams, useRouter } from "next/navigation";
 import {
   ArrowLeft,
   Chats,
+  Database as DatabaseIcon,
   FileText,
   GitBranch,
   LinkSimple,
@@ -37,6 +38,7 @@ import {
 import {
   type ArtifactPage,
   type Codebase,
+  type Database,
   type EntityKind,
   type LinkItem,
   type Links,
@@ -127,8 +129,13 @@ export default function EntityDocsViewer() {
     }
   }, [kind, artifactId, productId, router]);
 
+  // Databases share the codebase page-tree contract (pages dict keyed by id,
+  // plus the additive provenance block the verification pipeline persists).
   const pages: ArtifactPage[] = useMemo(
-    () => (entity && kind === "codebase" ? normalizePages((entity as Codebase).pages) : []),
+    () =>
+      entity && (kind === "codebase" || kind === "database")
+        ? normalizePages((entity as Codebase | Database).pages)
+        : [],
     [entity, kind],
   );
 
@@ -143,17 +150,44 @@ export default function EntityDocsViewer() {
     [pages, activePageId],
   );
 
+  // Nested page tree: a page whose `parent` references another page in the
+  // set renders as its child (insertion order, no alphabetical sorting —
+  // matches the backend's canonical section order). Legacy flat pages and
+  // orphaned `parent` references render top-level exactly as before.
+  const pageTree = useMemo(() => {
+    const ids = new Set(pages.map((p) => p.id));
+    const childrenByParent = new Map<string, ArtifactPage[]>();
+    const roots: ArtifactPage[] = [];
+    for (const p of pages) {
+      const parent = p.parent?.trim();
+      if (parent && parent !== p.id && ids.has(parent)) {
+        const list = childrenByParent.get(parent) ?? [];
+        list.push(p);
+        childrenByParent.set(parent, list);
+      } else {
+        roots.push(p);
+      }
+    }
+    return { roots, childrenByParent };
+  }, [pages]);
+
   const isCodebase = kind === "codebase";
+  const isDatabase = kind === "database";
   const isSpec = kind === "spec";
   const isLinks = kind === "links";
   const codebase = entity as Codebase | undefined;
+  const databaseEntity = entity as Database | undefined;
   const spec = entity as Spec | undefined;
   const linksEntity = entity as Links | undefined;
 
-  const hasDocs = Boolean(codebase?.generated_docs || pages.length > 0);
+  const hasDocs = Boolean(
+    codebase?.generated_docs || databaseEntity?.generated_docs || pages.length > 0,
+  );
   const hasRawContent = Boolean(spec?.content || linksEntity?.content);
   const canEdit =
-    (isCodebase && hasDocs) || ((isSpec || isLinks) && hasRawContent);
+    (isCodebase && hasDocs) ||
+    (isDatabase && hasDocs) ||
+    ((isSpec || isLinks) && hasRawContent);
 
   useEffect(() => {
     if (editing) return;
@@ -167,11 +201,11 @@ export default function EntityDocsViewer() {
       setDraftContent(
         activePage
           ? activePage.content || ""
-          : spec?.content || codebase?.generated_docs || "",
+          : spec?.content || codebase?.generated_docs || databaseEntity?.generated_docs || "",
       );
     }
     setDirty(false);
-  }, [activePage, codebase, spec, linksEntity, editing, isLinks]);
+  }, [activePage, codebase, databaseEntity, spec, linksEntity, editing, isLinks]);
 
   const startEditing = () => {
     if (isLinks) {
@@ -184,7 +218,7 @@ export default function EntityDocsViewer() {
       setDraftContent(
         activePage
           ? activePage.content || ""
-          : spec?.content || codebase?.generated_docs || "",
+          : spec?.content || codebase?.generated_docs || databaseEntity?.generated_docs || "",
       );
     }
     setDirty(false);
@@ -242,12 +276,16 @@ export default function EntityDocsViewer() {
 
   const entityLabel = isCodebase
     ? (tArt?.codebase?.label ?? "Codebase")
-    : isSpec
-      ? (tArt?.spec?.label ?? "Spec")
-      : (tArt?.links?.label ?? "Links");
-  const entityTone = isCodebase ? "blue" : isSpec ? "green" : "yellow";
+    : isDatabase
+      ? (tArt?.database?.label ?? "Database")
+      : isSpec
+        ? (tArt?.spec?.label ?? "Spec")
+        : (tArt?.links?.label ?? "Links");
+  const entityTone =
+    isCodebase || isDatabase ? "blue" : isSpec ? "green" : "yellow";
   const entityIcon =
     isCodebase ? <GitBranch size={18} weight="regular" /> :
+    isDatabase ? <DatabaseIcon size={18} weight="regular" /> :
     isSpec ? <FileText size={18} weight="regular" /> :
     <LinkSimple size={18} weight="regular" />;
 
@@ -279,7 +317,7 @@ export default function EntityDocsViewer() {
     }
   };
 
-  const empty = isCodebase ? !hasDocs : !hasRawContent;
+  const empty = (isCodebase || isDatabase) ? !hasDocs : !hasRawContent;
 
   return (
     <div className="min-h-screen bg-canvas text-ink">
@@ -331,6 +369,14 @@ export default function EntityDocsViewer() {
                       <span className="font-mono text-xs text-muted">
                         {entity.id}
                       </span>
+                      {isDatabase && databaseEntity?.dsn_masked && (
+                        <span
+                          className="max-w-[240px] truncate font-mono text-xs text-muted"
+                          title={databaseEntity.dsn_masked}
+                        >
+                          {databaseEntity.dsn_masked}
+                        </span>
+                      )}
                       {verified && (
                         <VerifiedBadge verified={verified} verifiedBy={verifiedBy} />
                       )}
@@ -392,10 +438,12 @@ export default function EntityDocsViewer() {
                   description={
                     isCodebase
                       ? (t.noDocsDesc ?? "")
-                      : (t.noRawContentDesc ?? "Add content from the edit button above.")
+                      : isDatabase
+                        ? (t.noDbDocsDesc ?? "")
+                        : (t.noRawContentDesc ?? "Add content from the edit button above.")
                   }
                   action={
-                    isCodebase ? (
+                    isCodebase || isDatabase ? (
                       <Link href={`/products/${productId}`}>
                         <Button>{t.generateOnProductPage ?? "Generate on product page"}</Button>
                       </Link>
@@ -519,29 +567,60 @@ export default function EntityDocsViewer() {
               </div>
             )}
 
-            {!empty && isCodebase && (
+            {/* Databases render exactly like codebases: page nav + markdown
+                (Mermaid inside) with the generated summary as fallback. */}
+            {!empty && (isCodebase || isDatabase) && (
               <div className="mt-8 grid grid-cols-1 gap-8 lg:grid-cols-[240px_1fr]">
                 <aside className="lg:sticky lg:top-20 lg:self-start">
                   <SectionHeader title={t.pages ?? "Pages"} className="mb-3" />
                   {pages.length > 0 ? (
                     <nav className="flex flex-col gap-0.5">
-                      {pages.map((p) => {
+                      {pageTree.roots.map((p) => {
                         const isActive = p.id === activePageId;
+                        const children = pageTree.childrenByParent.get(p.id) ?? [];
                         return (
-                          <button
-                            key={p.id}
-                            onClick={() => setActivePageId(p.id)}
-                            disabled={editing}
-                            className={cn(
-                              "rounded-md px-3 py-2 text-left text-sm transition-colors",
-                              "disabled:cursor-not-allowed disabled:opacity-50",
-                              isActive
-                                ? "bg-surface-2 font-medium text-ink"
-                                : "text-muted hover:bg-surface-2 hover:text-ink",
+                          <div key={p.id} className="flex flex-col gap-0.5">
+                            <button
+                              onClick={() => setActivePageId(p.id)}
+                              disabled={editing}
+                              className={cn(
+                                "rounded-md px-3 py-2 text-left text-sm transition-colors",
+                                "disabled:cursor-not-allowed disabled:opacity-50",
+                                isActive
+                                  ? "bg-surface-2 font-medium text-ink"
+                                  : "text-muted hover:bg-surface-2 hover:text-ink",
+                              )}
+                            >
+                              {p.title}
+                            </button>
+                            {children.length > 0 && (
+                              <div
+                                className="ml-3 flex flex-col gap-0.5 border-l border-divider pl-2"
+                                role="group"
+                                aria-label={p.title}
+                              >
+                                {children.map((c) => {
+                                  const childActive = c.id === activePageId;
+                                  return (
+                                    <button
+                                      key={c.id}
+                                      onClick={() => setActivePageId(c.id)}
+                                      disabled={editing}
+                                      className={cn(
+                                        "rounded-md px-3 py-1.5 text-left text-[13px] leading-snug transition-colors",
+                                        "disabled:cursor-not-allowed disabled:opacity-50",
+                                        childActive
+                                          ? "bg-surface-2 font-medium text-ink"
+                                          : "text-muted hover:bg-surface-2 hover:text-ink",
+                                      )}
+                                    >
+                                      {c.title}
+                                    </button>
+                                  );
+                                })}
+                              </div>
                             )}
-                          >
-                            {p.title}
-                          </button>
+                          </div>
                         );
                       })}
                     </nav>
@@ -585,7 +664,13 @@ export default function EntityDocsViewer() {
                         <h2 className="font-editorial text-2xl tracking-tight text-ink">
                           {t.generatedDocs ?? "Generated documentation"}
                         </h2>
-                        <Markdown content={codebase?.generated_docs || ""} />
+                        <Markdown
+                          content={
+                            codebase?.generated_docs ||
+                            databaseEntity?.generated_docs ||
+                            ""
+                          }
+                        />
                       </article>
                     )}
                   </Card>
@@ -600,17 +685,22 @@ export default function EntityDocsViewer() {
   );
 }
 
-/** Find a codebase/spec/links entity by id across the product's three lists. */
+/** Find a codebase/spec/links/database entity by id across the product's lists. */
 function findEntity(
   product: Product,
   entityId: string,
-): { entity: Codebase | Spec | Links | undefined; kind: EntityKind | undefined } {
+): {
+  entity: Codebase | Spec | Links | Database | undefined;
+  kind: EntityKind | undefined;
+} {
   const c = product.codebases.find((x) => x.id === entityId);
   if (c) return { entity: c, kind: "codebase" };
   const s = product.specs.find((x) => x.id === entityId);
   if (s) return { entity: s, kind: "spec" };
   const l = product.links.find((x) => x.id === entityId);
   if (l) return { entity: l, kind: "links" };
+  const d = (product.databases ?? []).find((x) => x.id === entityId);
+  if (d) return { entity: d, kind: "database" };
   return { entity: undefined, kind: undefined };
 }
 

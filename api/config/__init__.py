@@ -7,8 +7,6 @@ from typing import List, Union, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-from api.clients.openai_client import OpenAIClient
-
 
 # Local OpenAI-compatible API settings (e.g., LM Studio, llama.cpp server, vLLM,
 # text-generation-webui). Default is LM Studio's OpenAI-compatible endpoint.
@@ -19,11 +17,6 @@ LOCAL_OPENAI_API_KEY = os.environ.get('LOCAL_OPENAI_API_KEY') or 'not-needed'  #
 # These can be overridden via UI for each request
 GITHUB_ENTERPRISE_URL = os.environ.get('GITHUB_ENTERPRISE_URL', '')  # e.g., https://github.company.com
 GITLAB_SELF_HOSTED_URL = os.environ.get('GITLAB_SELF_HOSTED_URL', '')  # e.g., https://gitlab.company.com
-
-# Wiki authentication settings
-raw_auth_mode = os.environ.get('DEEPWIKI_AUTH_MODE', 'False')
-WIKI_AUTH_MODE = raw_auth_mode.lower() in ['true', '1', 't']
-WIKI_AUTH_CODE = os.environ.get('DEEPWIKI_AUTH_CODE', '')
 
 # Get configuration directory from environment variable, or use default if not set
 CONFIG_DIR = os.environ.get('DEEPWIKI_CONFIG_DIR', None)
@@ -84,27 +77,25 @@ def load_json_config(filename):
 
 # Load generator model configuration
 def load_generator_config():
-    generator_config = load_json_config("generator.json")
+    """Load generator.json (model parameters per model name).
 
-    # Resolve the model client class for the openai_local provider. Every
-    # supported local server (LM Studio, llama.cpp, vLLM, ...)
-    # exposes the OpenAI-compatible /v1 API, so OpenAIClient covers all.
-    if "providers" in generator_config:
-        for provider_id, provider_config in generator_config["providers"].items():
-            provider_config["model_client"] = OpenAIClient
-
-    return generator_config
+    Every supported local server (LM Studio, llama.cpp, vLLM, ...)
+    exposes the OpenAI-compatible /v1 API, so the single ``openai_local``
+    provider config covers all cases. The model client is built by
+    ``api.llm.client.build_chat_model`` (langchain ChatOpenAI) from these
+    parameters; no client class is stored in the config.
+    """
+    return load_json_config("generator.json")
 
 # Load embedder configuration
 def load_embedder_config():
-    embedder_config = load_json_config("embedder.json")
+    """Load embedder.json (embedder model parameters).
 
-    # Resolve the embedder client class (OpenAIClient for all local servers).
-    for key in ["embedder_openai_local"]:
-        if key in embedder_config:
-            embedder_config[key]["model_client"] = OpenAIClient
+    The embedder client is built by ``api.tools.embedder.get_embedder``
+    (langchain OpenAIEmbeddings) from these parameters.
+    """
+    return load_json_config("embedder.json")
 
-    return embedder_config
 
 def get_embedder_config():
     """
@@ -112,13 +103,12 @@ def get_embedder_config():
 
     Every supported local server (LM Studio, llama.cpp, vLLM, ...)
     exposes an OpenAI-compatible /v1/embeddings endpoint, so the single
-    ``embedder_openai_local`` (OpenAIClient) config covers all cases.
+    ``embedder_openai_local`` config covers all cases.
 
     Returns:
-        dict: The embedder configuration with model_client resolved
+        dict: The embedder configuration (model parameters only)
     """
     return configs.get("embedder_openai_local", {})
-
 # Load repository and file filters configuration
 def load_repo_config():
     return load_json_config("repo.json")
@@ -222,13 +212,14 @@ def get_model_config(model=None):
 
     Every supported local server (LM Studio, llama.cpp, vLLM, ...)
     exposes an OpenAI-compatible /v1 API, so the single ``openai_local``
-    provider (OpenAIClient) is always used.
+    provider is always used. The client itself is built by
+    ``api.llm.client.build_chat_model`` from the returned kwargs.
 
     Parameters:
         model (str): Model name, or None to use default model
 
     Returns:
-        dict: Configuration containing model_client, model and other parameters
+        dict: Configuration containing model_kwargs (model name + parameters)
     """
     # Get provider configuration
     if "providers" not in configs:
@@ -237,10 +228,6 @@ def get_model_config(model=None):
     provider_config = configs["providers"].get("openai_local")
     if not provider_config:
         raise ValueError("Configuration for provider 'openai_local' not found")
-
-    model_client = provider_config.get("model_client")
-    if not model_client:
-        raise ValueError("Model client not specified for provider 'openai_local'")
 
     # If model not provided, use default model for the provider
     if not model:
@@ -258,7 +245,6 @@ def get_model_config(model=None):
 
     # Every supported server uses the flat OpenAI-compatible parameter shape.
     return {
-        "model_client": model_client,
         "model_kwargs": {"model": model, **model_params},
     }
 

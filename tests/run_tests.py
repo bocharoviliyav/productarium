@@ -81,10 +81,10 @@ def check_environment():
 
     # Check Python dependencies
     try:
-        import adalflow
-        print("✅ adalflow available")
+        import langchain
+        print("✅ langchain available")
     except ImportError:
-        print("❌ adalflow not available - install with: pip install adalflow")
+        print("❌ langchain not available - install with: poetry install -C api")
 
     try:
         import requests

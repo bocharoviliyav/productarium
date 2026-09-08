@@ -2,15 +2,12 @@
 
 Provides:
 - ``_isolated_env`` (autouse): every test gets an isolated SQLite DB + a stable
-  ``SETTINGS_SECRET_KEY`` + cognee connection-test skip, so no real Postgres /
-  cognee is required and tests never touch the developer's data.
+  ``SETTINGS_SECRET_KEY``, so no real Postgres is required and tests never touch
+  the developer's data.
 - ``isolated_db``: rebinds ``api.db`` (engine + ``SessionLocal`` + ``_db_ready``
   reset) to an in-memory ``StaticPool`` SQLite engine usable across the worker
   thread FastAPI's TestClient runs in, then runs ``init_db``. Returns the
   reloaded ``api.db`` module.
-- ``fake_cognee``: injects a stub ``cognee`` package into ``sys.modules`` so the
-  cognee happy paths in ``api/cognee/*`` execute without the real dependency
-  installed (it is optional locally).
 - ``mock_llm`` factory: returns an object whose ``generate(prompt)`` returns
   canned text (and ``stream`` yields ``ExpertStreamEvent`` content events).
 - ``test_app`` / ``client``: build a FastAPI app + TestClient over the isolated
@@ -25,9 +22,6 @@ tests and is safe because the autouse fixture is idempotent with them.
 from __future__ import annotations
 
 import importlib
-import os
-import sys
-import types
 from datetime import datetime
 from typing import Any, Iterator
 
@@ -37,7 +31,7 @@ import pytest
 # --- Isolated environment (autouse) -----------------------------------------
 @pytest.fixture(autouse=True)
 def _isolated_env(tmp_path_factory, monkeypatch):
-    """Isolated SQLite DB + stable secret + cognee stubs for every test.
+    """Isolated SQLite DB + stable secret for every test.
 
     Uses ``tmp_path_factory`` (session-scoped temp dir) so DB files live under a
     per-test temp path without colliding. ``monkeypatch.setenv`` is
@@ -50,7 +44,14 @@ def _isolated_env(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("DB_USERNAME", "")
     monkeypatch.setenv("DB_PASSWORD", "")
     monkeypatch.setenv("AUTH_PROVIDER", "local")
-    monkeypatch.setenv("COGNEE_SKIP_CONNECTION_TEST", "true")
+    # Per-test managed state dir: anything the app writes outside the DB
+    # (introspection disk cache, checkpointer fallback, …) stays inside the
+    # test sandbox instead of the developer's ~/.productarium. Tests that
+    # exercise the DEFAULT state-dir resolution delenv this explicitly.
+    monkeypatch.setenv("PRODUCTARIUM_STATE_DIR", str(tmp_path / "state"))
+    # Hermetic suite: the runtime checkpointer is Postgres-only and FATAL on
+    # failure — tests opt into the in-memory saver instead (api/agents/runtime).
+    monkeypatch.setenv("PRODUCTARIUM_CHECKPOINTER", "memory")
     # A stable-per-process Fernet key so encryption roundtrips are deterministic
     # within a test. cryptography is a hard dependency of the project.
     from cryptography.fernet import Fernet
@@ -95,90 +96,6 @@ def session(isolated_db):
         yield s
     finally:
         s.close()
-
-
-# --- Fake cognee -------------------------------------------------------------
-class _FakeCogneeResult:
-    """Minimal async-callable stand-in for cognee's async API."""
-
-    def __init__(self, data: Any = None):
-        self.data = data
-
-
-@pytest.fixture
-def fake_cognee(monkeypatch):
-    """Inject a stub ``cognee`` package into ``sys.modules``.
-
-    The real ``cognee`` dependency is optional locally. Several modules under
-    ``api/cognee/`` import ``cognee`` lazily inside functions; this fixture
-    installs an in-memory fake so those import paths execute. The fake exposes
-    ``add``, ``cognify``, ``search`` (async) + ``DataPipeline`` + config helpers
-    used by ``api/cognee/_runtime.py``.
-
-    Returns the fake module so a test can assert on recorded calls.
-    """
-    calls: dict[str, list[Any]] = {"add": [], "cognify": [], "search": []}
-
-    fake = types.ModuleType("cognee")
-
-    async def _add(data):
-        calls["add"].append(data)
-        return ["fake_node"]
-
-    async def _cognify():
-        calls["cognify"].append(None)
-        return ["fake_cognify"]
-
-    async def _search(query, query_type=None, **kwargs):
-        calls["search"].append(query)
-        return ["fake search result"]
-
-    fake.add = _add
-    fake.cognify = _cognify
-    fake.search = _search
-
-    # ``cognee.modules.data.extraction`` etc. are accessed by _runtime config.
-    # Provide a minimal getattr-fallback module so arbitrary attribute access
-    # returns a stub rather than ImportError.
-    class _AttrModule(types.ModuleType):
-        def __getattr__(self, name):
-            return types.ModuleType(f"cognee.{name}")
-
-    fake.modules = _AttrModule("cognee.modules")
-    fake.modules.data = _AttrModule("cognee.modules.data")
-    fake.modules.data.extraction = _AttrModule("cognee.modules.data.extraction")
-    fake.modules.pipelines = _AttrModule("cognee.modules.pipelines")
-
-    # Config helpers used by _runtime.
-    class _ConfigStub:
-        def __init__(self):
-            self._d: dict[str, Any] = {}
-
-        def get(self, *keys):
-            return None
-
-        def set(self, key, value):
-            self._d[key] = value
-
-        def get_existing_config_without_default(self, *keys):
-            return {}
-
-    fake.get_config = _ConfigStub().get
-    fake.set_config = _ConfigStub().set
-    fake.get_existing_config_without_default = _ConfigStub().get_existing_config_without_default
-
-    monkeypatch.setitem(sys.modules, "cognee", fake)
-    # Pre-register submodules some code imports directly.
-    for sub in (
-        "cognee.modules.data",
-        "cognee.modules.data.extraction",
-        "cognee.modules.pipelines",
-        "cognee.api",
-        "cognee.api.v1",
-    ):
-        monkeypatch.setitem(sys.modules, sub, _AttrModule(sub))
-    fake.calls = calls
-    return fake
 
 
 # --- Mock LLM ----------------------------------------------------------------
@@ -242,7 +159,9 @@ def api_token_orm():
     )
 
 
-def build_test_client(db_mod, routers, *, auth_none: bool = True) -> tuple[Any, Any]:
+def build_test_client(
+    db_mod, routers, *, auth_none: bool = True, default_admin_auth: bool = True
+) -> tuple[Any, Any]:
     """Build a FastAPI app + TestClient over an isolated DB.
 
     Args:
@@ -251,6 +170,11 @@ def build_test_client(db_mod, routers, *, auth_none: bool = True) -> tuple[Any, 
         auth_none: when True, ``AUTH_PROVIDER`` is left at the autouse default
             (``local``); callers needing unauthenticated access set it to
             ``none`` via their own ``monkeypatch`` on ``api.auth.deps``.
+        default_admin_auth: when True, ``get_current_user`` is overridden with
+            a fixed admin for every included router module (needed since the
+            products/docgen/databases routers enforce router-level auth).
+            Tests exercising REAL auth semantics (real cookies, 401 paths)
+            pass False.
     """
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -273,4 +197,26 @@ def build_test_client(db_mod, routers, *, auth_none: bool = True) -> tuple[Any, 
         if get_db is not None and id(get_db) not in seen:
             app.dependency_overrides[get_db] = _get_test_db
             seen.add(id(get_db))
+
+    # Default auth: a fixed admin user for every router module that uses
+    # get_current_user, so router-level auth (products/docgen/databases)
+    # doesn't 401 tests exercising CRUD/masking logic rather than authz.
+    # Tests needing a specific (e.g. non-admin) user override the same key
+    # AFTER building the client (last write wins); tests that monkeypatch
+    # AUTH_PROVIDER="none" are unaffected; tests exercising real auth
+    # semantics opt out via default_admin_auth=False.
+    if default_admin_auth:
+        from api.models import UserORM
+
+        _default_admin = UserORM(
+            id="user_admin1",
+            username="admin",
+            role="admin",
+            provider="local",
+            created_at=datetime.utcnow(),
+        )
+        for mod in routers:
+            gcu = getattr(mod, "get_current_user", None)
+            if gcu is not None and gcu not in app.dependency_overrides:
+                app.dependency_overrides[gcu] = lambda: _default_admin
     return app, TestClient(app)

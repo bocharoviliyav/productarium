@@ -7,13 +7,13 @@ Exposes the scalable integrations framework:
 - ``POST /api/integrations/{name}/test``                  — admin only; call a
   connector's ``test()`` to validate connectivity/credentials.
 - ``GET  /api/integrations/{name}/spaces``                — any authenticated
-  user; list the connector's pull sources (repos / spaces / MCP sources).
+  user; list the connector's pull sources (repos / spaces).
 - ``POST /api/products/{product_id}/codebases/from-integration`` — git
   connectors only; pull a repo and create a ``CodebaseORM``.
 - ``POST /api/products/{product_id}/knowledge/from-integration``  — any
   connector; pull a space/page and create one or more ``KnowledgeNodeORM``.
 
-Pulled markdown is indexed into the product-scoped cognee dataset
+Pulled markdown is indexed into the product-scoped pgvector memory
 ``prod_{product_id}`` (background, non-fatal).
 
 Router note: this router has NO prefix (a single prefix cannot host routes
@@ -50,7 +50,7 @@ _GIT_CONNECTORS = {"github", "gitlab"}
 
 # --- Request / response models ----------------------------------------------
 class FromIntegrationRequest(BaseModel):
-    connector: str = Field(..., description="Connector name (e.g. github, confluence, mcp).")
+    connector: str = Field(..., description="Connector name (e.g. github, confluence).")
     source_id: str = Field(..., description="Connector-specific source id (repo URL, page id, ...).")
     name: Optional[str] = Field(
         None, description="Name for the created codebase/node. Defaults to the pulled title."
@@ -129,9 +129,8 @@ def _index_in_background(
 ) -> None:
     """Fire-and-forget memory-backend indexing into the product-scoped dataset.
 
-    Delegates to ``api.memory.index_document`` (active backend: pgvector by
-    default, cognee alt) so the admin ``memory.backend`` switch governs this
-    path too.
+    Delegates to ``api.memory.index_document`` (active backend: pgvector) so
+    the admin ``memory.backend`` setting governs this path too.
     """
     if not text:
         return
@@ -205,8 +204,13 @@ def list_connector_spaces(
     try:
         return connector.list_spaces()
     except Exception as e:
+        # Generic client-facing message: connector exceptions may embed
+        # internal URLs/paths (potentially with credentials).
         logger.warning("Connector %s list_spaces() raised: %s", name, e)
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to list sources for connector '{name}'",
+        )
 
 
 @router.post(
@@ -244,10 +248,14 @@ def codebase_from_integration(
     try:
         pulled = connector.pull(body.source_id, body.opts)
     except ValueError as e:
+        # Controlled validation messages from our own connector layer.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         logger.warning("Connector %s pull(%r) failed: %s", body.connector, body.source_id, e)
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Pull failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Pull failed; see server logs for details",
+        )
 
     name = body.name or pulled.get("title") or body.source_id
     codebase = CodebaseORM(
@@ -288,7 +296,7 @@ async def knowledge_from_integration(
 
     Multi-page Confluence trees become a root node + children (parent links
     preserved). The pulled markdown (+ converted attachments) is indexed into
-    the product-scoped cognee dataset in the background (non-fatal).
+    the product-scoped pgvector memory in the background (non-fatal).
     """
     if db.get(ProductORM, product_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
@@ -302,10 +310,14 @@ async def knowledge_from_integration(
     try:
         pulled = connector.pull(body.source_id, body.opts)
     except ValueError as e:
+        # Controlled validation messages from our own connector layer.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         logger.warning("Connector %s pull(%r) failed: %s", body.connector, body.source_id, e)
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Pull failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Pull failed; see server logs for details",
+        )
 
     title = pulled.get("title") or body.source_id
     name = body.name or title

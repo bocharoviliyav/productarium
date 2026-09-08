@@ -3,14 +3,16 @@
 Covers:
 - ``_extract_chunk_fields`` for all chunk shapes: native message
   (object + dict), OpenAI /v1 choices/delta, OpenAI object .choices[0].delta,
-  adalflow .response/.data/.text, empty chunk -> (None, None).
+  plain-text object shapes (.response/.data/.text), empty chunk -> (None, None).
 - ``_ThinkingStreamParser``: feed/flush (open+close across chunks, unclosed
   flush as reasoning, partial tag buffering, no-tag passthrough, empty feed).
 - ``_strip_thinking_tags``: closed block, unclosed block, no tags.
-- ``_ExpertLLM.generate``: monkeypatch adal Generator; error returns '',
-  normal returns data.
-- ``_ExpertLLM.stream``: monkeypatch model_client.acall to yield chunks;
-  fallback to generate on failure; no chunks -> fallback.
+- ``_ExpertLLM.generate``: delegates to the wrapped ``api.llm.GenerateLLM``;
+  errors surface as ``""`` (suppressed inside GenerateLLM contract) — here the
+  wrapper is exercised via a monkeypatched GenerateLLM module attribute.
+- ``_ExpertLLM.stream``: content + reasoning deltas via
+  ``api.llm.stream_chat_fields``; inline ``<think>`` tags parsed; fallback to
+  chunked generate when the stream yields nothing / raises.
 - ``_safe_build_llm``: success + exception returns None.
 - ``_resolve_expert_model``: admin config present + missing -> defaults.
 - ``_get_field``: dict + object, multiple keys, missing.
@@ -21,13 +23,13 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-import types
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import pytest
 
+import api.llm as llm_pkg
 from api.expert.llm import (
     _ExpertLLM,
     _ThinkingStreamParser,
@@ -40,86 +42,40 @@ from api.expert.llm import (
 from api.expert.types import EVENT_CONTENT, EVENT_REASONING, ExpertStreamEvent
 
 
-def _install_fake_adalflow(monkeypatch, *, generator_result=None, generate_text=None):
-    """Inject a fake adalflow module into sys.modules so _ExpertLLM can construct.
+def _install_fake_generate(monkeypatch, *, generate_text=""):
+    """Patch api.llm.GenerateLLM with a fake returning canned text.
 
-    Under --cov, numpy's C extension corrupts when loaded via the adalflow import
-    chain. This fake provides ``Generator`` (for __init__) and ``core.types.ModelType"
-    (for stream) without loading real adalflow/numpy.
+    The expert wrapper imports ``GenerateLLM`` lazily from ``api.llm`` inside
+    ``_ExpertLLM.__init__``, so patching the package attribute is enough.
     """
-    fake = types.ModuleType("adalflow")
+    captured: dict = {}
 
-    class _FakeGenerator:
-        def __init__(self, *a, **kw):
-            self._result = generator_result
-            self._text = generate_text
+    class _FakeGenerateLLM:
+        def __init__(self, model=None, base_url=None, api_key=None):
+            captured["model"] = model
+            captured["base_url"] = base_url
+            captured["api_key"] = api_key
 
-        def __call__(self, prompt_kwargs):
-            if self._result is not None:
-                return self._result
-            return SimpleNamespace(error=None, data=self._text, response=None)
+        async def generate(self, prompt: str) -> str:
+            captured["prompts"] = captured.get("prompts", []) + [prompt]
+            return generate_text
 
-    fake.Generator = _FakeGenerator
-
-    # adalflow.core.types.ModelType is imported in _ExpertLLM.stream
-    core_mod = types.ModuleType("adalflow.core")
-    types_mod = types.ModuleType("adalflow.core.types")
-    types_mod.ModelType = type("ModelType", (), {"LLM": "llm"})
-    core_mod.types = types_mod
-    fake.core = core_mod
-
-    monkeypatch.setitem(sys.modules, "adalflow", fake)
-    monkeypatch.setitem(sys.modules, "adalflow.core", core_mod)
-    monkeypatch.setitem(sys.modules, "adalflow.core.types", types_mod)
+    monkeypatch.setattr(llm_pkg, "GenerateLLM", _FakeGenerateLLM)
+    return captured
 
 
-def _install_fake_api_config(monkeypatch, *, client_chunks=None, client_exc=None):
-    """Inject a fake api.config module with get_model_config + fake model client.
+def _install_fake_stream(monkeypatch, *, pairs=None, exc=None):
+    """Patch api.llm.stream_chat_fields with a fake async generator."""
+    pairs = pairs or []
 
-    The fake model client supports both generate (via Generator) and stream
-    (via acall yielding chunks).
-    """
-    fake_cfg = types.ModuleType("api.config")
+    async def _fake_stream(prompt, model=None, base_url=None, api_key=None):
+        if exc is not None:
+            raise exc
+        for content, reasoning in pairs:
+            yield content, reasoning
 
-    class _FakeClient:
-        def __init__(self, **kw):
-            self._chunks = client_chunks
-            self._exc = client_exc
-
-        def convert_inputs_to_api_kwargs(self, **kw):
-            return {"messages": [{"role": "user", "content": kw.get("input", "")}]}
-
-        async def acall(self, **kw):
-            if self._exc:
-                raise self._exc
-            return _AsyncIter(self._chunks or [])
-
-    def _get_model_config(model=None):
-        return {
-            "model_client": _FakeClient,
-            "model_kwargs": {"model": model or "test-model", "temperature": 0.1, "top_p": 0.9},
-        }
-
-    fake_cfg.get_model_config = _get_model_config
-    monkeypatch.setitem(sys.modules, "api.config", fake_cfg)
-
-
-class _AsyncIter:
-    """Minimal async iterator wrapping a sync list."""
-
-    def __init__(self, items):
-        self._items = list(items)
-        self._idx = 0
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        if self._idx >= len(self._items):
-            raise StopAsyncIteration
-        item = self._items[self._idx]
-        self._idx += 1
-        return item
+    monkeypatch.setattr(llm_pkg, "stream_chat_fields", _fake_stream)
+    return _fake_stream
 
 
 # --------------------------------------------------------------------------- #
@@ -227,19 +183,19 @@ class TestExtractChunkFields:
         chunk = SimpleNamespace(choices=[])
         assert _extract_chunk_fields(chunk) == (None, None)
 
-    def test_adalflow_response_attr(self):
+    def test_plain_object_response_attr(self):
         chunk = SimpleNamespace(response="resp_text")
         assert _extract_chunk_fields(chunk) == ("resp_text", None)
 
-    def test_adalflow_data_attr(self):
+    def test_plain_object_data_attr(self):
         chunk = SimpleNamespace(data="data_text")
         assert _extract_chunk_fields(chunk) == ("data_text", None)
 
-    def test_adalflow_text_attr(self):
+    def test_plain_object_text_attr(self):
         chunk = SimpleNamespace(text="text_val")
         assert _extract_chunk_fields(chunk) == ("text_val", None)
 
-    def test_adalflow_non_string_data_skipped(self):
+    def test_plain_object_non_string_data_skipped(self):
         chunk = SimpleNamespace(data=123)
         assert _extract_chunk_fields(chunk) == (None, None)
 
@@ -387,76 +343,59 @@ class TestStripThinkingTags:
 # _ExpertLLM.generate
 # --------------------------------------------------------------------------- #
 class TestExpertLLMGenerate:
-    def _make_llm(self, monkeypatch, generator_result):
-        """Build an _ExpertLLM with a mocked adal Generator."""
-        _install_fake_adalflow(monkeypatch, generator_result=generator_result)
-        _install_fake_api_config(monkeypatch)
-        return _ExpertLLM("test-model")
-
-    def test_generate_returns_data(self, monkeypatch):
-        result = SimpleNamespace(error=None, data="generated text", response=None, answer=None, raw_response=None, output=None)
-        llm = self._make_llm(monkeypatch, result)
+    def test_generate_delegates_to_wrapped_llm(self, monkeypatch):
+        captured = _install_fake_generate(monkeypatch, generate_text="generated text")
+        llm = _ExpertLLM("test-model")
         text = asyncio.run(llm.generate("my prompt"))
         assert text == "generated text"
+        assert captured["prompts"] == ["my prompt"]
+        assert captured["model"] == "test-model"
 
-    def test_generate_returns_response_when_no_data(self, monkeypatch):
-        result = SimpleNamespace(error=None, data=None, response="resp", answer=None, raw_response=None, output=None)
-        llm = self._make_llm(monkeypatch, result)
-        text = asyncio.run(llm.generate("prompt"))
-        assert text == "resp"
+    def test_generate_failure_returns_empty(self, monkeypatch):
+        class _FailingLLM:
+            def __init__(self, model=None, base_url=None, api_key=None):
+                pass
 
-    def test_generate_returns_answer_when_no_data_response(self, monkeypatch):
-        result = SimpleNamespace(error=None, data=None, response=None, answer="ans", raw_response=None, output=None)
-        llm = self._make_llm(monkeypatch, result)
-        text = asyncio.run(llm.generate("prompt"))
-        assert text == "ans"
+            async def generate(self, prompt: str) -> str:
+                # GenerateLLM's contract: "" on failure, never raises.
+                return ""
 
-    def test_generate_error_returns_empty(self, monkeypatch):
-        result = SimpleNamespace(error="some error", data=None, response=None)
-        llm = self._make_llm(monkeypatch, result)
-        text = asyncio.run(llm.generate("prompt"))
-        assert text == ""
-
-    def test_generate_no_fields_returns_empty(self, monkeypatch):
-        result = SimpleNamespace(error=None, data=None, response=None, answer=None, raw_response=None, output=None)
-        llm = self._make_llm(monkeypatch, result)
-        text = asyncio.run(llm.generate("prompt"))
-        assert text == ""
+        monkeypatch.setattr(llm_pkg, "GenerateLLM", _FailingLLM)
+        llm = _ExpertLLM("test-model")
+        assert asyncio.run(llm.generate("prompt")) == ""
 
 
 # --------------------------------------------------------------------------- #
 # _ExpertLLM.stream
 # --------------------------------------------------------------------------- #
 class TestExpertLLMStream:
-    def _make_llm_with_client(self, monkeypatch, acall_chunks=None, acall_exc=None, generate_text=None):
-        """Build an _ExpertLLM with a mocked model_client for streaming."""
-        _install_fake_adalflow(monkeypatch, generator_result=None, generate_text=generate_text)
-        _install_fake_api_config(monkeypatch, client_chunks=acall_chunks, client_exc=acall_exc)
+    def _make_llm(self, monkeypatch):
+        _install_fake_generate(monkeypatch, generate_text="")
         return _ExpertLLM("test-model")
 
     def test_stream_yields_content_from_chunks(self, monkeypatch):
-        chunks = [
-            SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="hello ", reasoning_content=None))]),
-            SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="world", reasoning_content=None))]),
-        ]
-        llm = self._make_llm_with_client(monkeypatch, acall_chunks=chunks)
+        _install_fake_stream(
+            monkeypatch,
+            pairs=[("hello ", ""), ("world", "")],
+        )
+        llm = self._make_llm(monkeypatch)
         events = []
         async def _collect():
             async for ev in llm.stream("prompt"):
                 events.append(ev)
         asyncio.run(_collect())
-        assert len(events) >= 2
+        assert len(events) == 2
         assert all(e.type == EVENT_CONTENT for e in events)
         text = "".join(e.content for e in events)
         assert "hello" in text
         assert "world" in text
 
     def test_stream_yields_reasoning_from_chunks(self, monkeypatch):
-        chunks = [
-            SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=None, reasoning_content="thinking..."))]),
-            SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="answer", reasoning_content=None))]),
-        ]
-        llm = self._make_llm_with_client(monkeypatch, acall_chunks=chunks)
+        _install_fake_stream(
+            monkeypatch,
+            pairs=[("", "thinking..."), ("answer", "")],
+        )
+        llm = self._make_llm(monkeypatch)
         events = []
         async def _collect():
             async for ev in llm.stream("prompt"):
@@ -467,10 +406,11 @@ class TestExpertLLMStream:
         assert EVENT_CONTENT in types
 
     def test_stream_inline_think_tags_parsed(self, monkeypatch):
-        chunks = [
-            SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="text<think>reasoning</think>after", reasoning_content=None))]),
-        ]
-        llm = self._make_llm_with_client(monkeypatch, acall_chunks=chunks)
+        _install_fake_stream(
+            monkeypatch,
+            pairs=[("text<think>reasoning</think>after", "")],
+        )
+        llm = self._make_llm(monkeypatch)
         events = []
         async def _collect():
             async for ev in llm.stream("prompt"):
@@ -481,8 +421,9 @@ class TestExpertLLMStream:
         assert EVENT_CONTENT in types
 
     def test_stream_no_chunks_falls_back_to_generate(self, monkeypatch):
-        chunks = []
-        llm = self._make_llm_with_client(monkeypatch, acall_chunks=chunks, generate_text="fallback text")
+        _install_fake_stream(monkeypatch, pairs=[])
+        _install_fake_generate(monkeypatch, generate_text="fallback text")
+        llm = _ExpertLLM("test-model")
         events = []
         async def _collect():
             async for ev in llm.stream("prompt"):
@@ -492,13 +433,10 @@ class TestExpertLLMStream:
         text = "".join(e.content for e in events)
         assert "fallback text" in text
 
-    def test_stream_acall_exception_falls_back_to_generate(self, monkeypatch):
-        llm = self._make_llm_with_client(
-            monkeypatch,
-            acall_chunks=None,
-            acall_exc=RuntimeError("connection refused"),
-            generate_text="fallback after error",
-        )
+    def test_stream_exception_falls_back_to_generate(self, monkeypatch):
+        _install_fake_stream(monkeypatch, exc=RuntimeError("connection refused"))
+        _install_fake_generate(monkeypatch, generate_text="fallback after error")
+        llm = _ExpertLLM("test-model")
         events = []
         async def _collect():
             async for ev in llm.stream("prompt"):
@@ -513,38 +451,28 @@ class TestExpertLLMStream:
 # --------------------------------------------------------------------------- #
 class TestSafeBuildLLM:
     def test_success_returns_llm(self, monkeypatch):
-        _install_fake_adalflow(monkeypatch, generator_result=None, generate_text="")
-        _install_fake_api_config(monkeypatch)
+        _install_fake_generate(monkeypatch, generate_text="")
         llm = _safe_build_llm("m")
         assert llm is not None
         assert isinstance(llm, _ExpertLLM)
 
     def test_exception_returns_none(self, monkeypatch):
-        # Patch get_model_config on the real api.config module (if loaded) or
-        # inject a fake api.config that raises.
-        import sys
-        if "api.config" in sys.modules:
-            monkeypatch.setattr(sys.modules["api.config"], "get_model_config", lambda model=None: (_ for _ in ()).throw(RuntimeError("config error")))
-        else:
-            fake_cfg = types.ModuleType("api.config")
-            fake_cfg.get_model_config = lambda model=None: (_ for _ in ()).throw(RuntimeError("config error"))
-            monkeypatch.setitem(sys.modules, "api.config", fake_cfg)
-        result = _safe_build_llm("m")
-        assert result is None
+        class _Boom:
+            def __init__(self, *a, **kw):
+                raise RuntimeError("config error")
+
+        monkeypatch.setattr(llm_pkg, "GenerateLLM", _Boom)
+        assert _safe_build_llm("m") is None
 
 
 # --------------------------------------------------------------------------- #
 # _resolve_expert_model
 # --------------------------------------------------------------------------- #
 def _install_fake_abstraction(monkeypatch, get_task_config_fn):
-    """Inject a fake api.config.abstraction module with a mock get_task_config.
+    """Patch the real api.config.abstraction.get_task_config."""
+    import api.config.abstraction as ab
 
-    Under --cov, importing the real api.config.abstraction triggers the
-    api.config -> adalflow -> numpy chain which corrupts. This fake avoids it.
-    """
-    fake_abs = types.ModuleType("api.config.abstraction")
-    fake_abs.get_task_config = get_task_config_fn
-    monkeypatch.setitem(sys.modules, "api.config.abstraction", fake_abs)
+    monkeypatch.setattr(ab, "get_task_config", get_task_config_fn)
 
 
 class TestResolveExpertModel:

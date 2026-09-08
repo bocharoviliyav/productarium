@@ -7,38 +7,38 @@ standard local LLM for a summary. The result is stored onto
 
 Decoupling notes (per the Wave 2 plan):
 - This module does NOT depend on ``api.expert`` (built in parallel).
-- This module replicates the minimal ``_StandardLLM`` wrapper pattern (now in
-  ``api.docgen._common``) so it stays self-contained.
+- The LLM is ``api.llm.GenerateLLM`` (langchain ``ChatOpenAI``) shared with
+  the rest of the stack.
 - Provider/model are resolved from the settings store task ``summary``
   (``api.config.settings.get_model_for_task``) with env fallback, so the admin
   panel can configure the summary model without touching this file.
 
-All LLM/cognee/DB dependencies are imported lazily so this module imports
+All LLM/DB dependencies are imported lazily so this module imports
 cleanly even when no live LLM/Postgres is available.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
 import re
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Iterable, Optional
 
 from api.prompts import load_prompt_file
 from api.utils.llm_helpers import (  # noqa: E402
     cap as _cap,
     strip_inline_line_numbers as _strip_inline_line_numbers,
 )
+from api.docgen._common import _safe_aclose, _with_verification_guard
+from api.docgen.verification import mask_secrets
 
 logger = logging.getLogger(__name__)
 
 # Cap the concatenated context handed to the LLM so very large products stay
-# within a single (non-RLM) prompt. The summary is intentionally concise, so a
-# truncated context is acceptable. ~20k chars tokenizes to ~6k tokens, leaving
-# headroom for the model response inside an 8192-token context window (the
-# previous 60_000 cap overflowed to ~18.5k tokens and raised
-# "n_keep >= n_ctx" on the default served model).
+# within a single prompt. The summary is intentionally concise, so a truncated
+# context is acceptable. ~20k chars tokenizes to ~6k tokens, leaving headroom
+# for the model response inside an 8192-token context window (the previous
+# 60_000 cap overflowed to ~18.5k tokens and raised "n_keep >= n_ctx" on the
+# default served model).
 SUMMARY_CONTEXT_MAX_CHARS = 20_000
 
 # Inline fallback prompt used only if refs/prompts/product_summary.md is missing.
@@ -50,8 +50,7 @@ _SUMMARY_PROMPT_FALLBACK = (
 
 
 # --------------------------------------------------------------------------- #
-# Standard (non-RLM) LLM wrapper -- replicated from api.docgen._common._StandardLLM
-# (kept local so this module never imports/edits the codebase pipeline).
+# Standard LLM -- api.llm.GenerateLLM (langchain ChatOpenAI).
 # --------------------------------------------------------------------------- #
 class _SummaryLLM:
     """Thin non-streaming text generator over the configured local LLM."""
@@ -62,51 +61,20 @@ class _SummaryLLM:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
     ):
-        import adalflow as adal
-        from api.config import get_model_config
+        from api.llm import GenerateLLM
 
-        generator_config = get_model_config(model)
-        model_client_class = generator_config["model_client"]
-        # Thread admin base_url/api_key through to the OpenAI-compatible client
-        # so the summary LLM hits the configured endpoint (corporate AI gateway,
-        # LM Studio, ...) rather than a dead env-default. Mirrors
-        # _StandardLLM/_ExpertLLM: every supported server exposes the
-        # OpenAI-compatible /v1 API, so OpenAIClient covers all cases (SSL verify
-        # wired via ssl_config).
-        client_kwargs: Dict[str, Any] = {}
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        if api_key:
-            client_kwargs["api_key"] = api_key
-        self.model_client = model_client_class(**client_kwargs)
-        self.model_kwargs = generator_config["model_kwargs"]
-        self.generator = adal.Generator(
-            template="{{input_str}}",
-            model_client=self.model_client,
-            model_kwargs=self.model_kwargs,
-        )
+        # GenerateLLM threads admin base_url/api_key through to the
+        # OpenAI-compatible endpoint (corporate AI gateway, LM Studio, ...)
+        # and returns "" on any failure, so a model error never leaks the
+        # prompt into the stored product summary.
+        self._llm = GenerateLLM(model=model, base_url=base_url, api_key=api_key)
 
     async def generate(self, prompt: str) -> str:
-        def _call() -> str:
-            # adalflow 1.x Generator.call() takes ``prompt_kwargs`` (the dict
-            # that fills the ``{{input_str}}`` template placeholder), NOT a
-            # bare ``input_str=`` kwarg -- passing that raises TypeError.
-            result = self.generator(prompt_kwargs={"input_str": prompt})
-            # On a model error adalflow returns a GeneratorOutput with ``error``
-            # set and stores the full prompt on ``input``. Returning
-            # ``str(result)`` would leak the prompt (incl. concatenated
-            # artifact/knowledge content) into the stored product summary.
-            # Treat any error as "no generation" instead.
-            if getattr(result, "error", None):
-                logger.warning("Summary LLM returned an error: %s", result.error)
-                return ""
-            for attr in ("data", "response", "answer", "raw_response", "output"):
-                val = getattr(result, attr, None)
-                if val:
-                    return str(val)
-            return ""
+        return await self._llm.generate(prompt)
 
-        return await asyncio.to_thread(_call)
+    async def aclose(self) -> None:
+        """Close the wrapped generator's httpx client."""
+        await _safe_aclose(self._llm)
 
 
 def _safe_build_summary_llm(
@@ -178,7 +146,9 @@ def _build_summary_prompt(product_name: str, content: str) -> str:
     out = template
     out = out.replace("{product_name}", product_name)
     out = out.replace("{content}", content)
-    return out
+    # Same deterministic verification guard as the docgen flows (Wave D):
+    # no secrets, no invented facts, source-bound claims.
+    return _with_verification_guard(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -234,10 +204,21 @@ async def generate_product_summary(
     if llm is None:
         return ""
     try:
-        return _clean_text(await llm.generate(_build_summary_prompt(product_name, content)))
+        raw = _clean_text(await llm.generate(_build_summary_prompt(product_name, content)))
     except Exception as e:  # pragma: no cover - depends on live LLM
         logger.warning("Summary LLM generation failed: %s", e)
         return ""
+    finally:
+        await _safe_aclose(llm)
+    # Deterministic secret guard: the summary lands in ProductORM.summary and
+    # the products API — the same masked-text contract as the docgen flows.
+    masked, findings = mask_secrets(raw)
+    if findings:
+        logger.warning(
+            "Product summary guard: masked %d secret-like value(s) (%s)",
+            len(findings), ", ".join(sorted(set(findings))),
+        )
+    return masked
 
 
 __all__ = ["generate_product_summary"]

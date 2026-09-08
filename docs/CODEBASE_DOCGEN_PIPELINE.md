@@ -1,5 +1,7 @@
 # Пайплайн добавления кодовой базы, генерации документации и показа в UI
 
+> **⚠️ Исторический документ.** Описывает пайплайн ДО миграции на LangChain/pgvector: графа знаний `cognee` (`cognify`, `DataItem`, `api/cognee/`), FAISS и fast-rlm в этой форме больше не существуют. Актуальная архитектура — в `AGENTS.md` и `README.md`: глубокие агенты (deepagents) генерируют разделы, сгенерированные документы индексируются в pgvector-память (`knowledge_chunks`, HNSW cosine recall).
+
 Этот документ содержит подробное описание алгоритма добавления кодовой базы, асинхронной генерации 7 разделов документации (Wiki), индексации в Граф Знаний `cognee`, интеграции с MCP-сервером и отображения статусов пользователю в интерфейсе **Продуктариума**.
 
 ---
@@ -12,8 +14,7 @@
 * **LLM & Embeddings Gateway**: Локальный OpenAI-совместимый API (LM Studio / vLLM / llama.cpp) (модели: `qwen3.6-27b`, эмбеддинги: `nomic-embed-text-v2-moe`).
 * **RLM Engine (`fast-rlm`)**: Движок рекурсивного рассуждения на базе Deno + Pyodide (изолированный REPL-интерпретатор Python), используемый для длинного контекста кодовых баз.
 * **Knowledge Graph (`cognee` 1.2.2)**: Движок извлечения сущностей, связей и триплетов в Граф Знаний через `instructor` (Pydantic JSON schema mode).
-* **MCP Server (`api/routers/mcp_server.py`)**: Нативный сервер Model Context Protocol (спецификация 2024-11-05, HTTP/SSE) для подключения внешних AI-агентов (Claude Desktop, Cursor, Windsurf).
-* **Local MCP Client (`api/mcp_client.py`)**: Внутренний MCP-клиент для вызова инструментов локальных/удаленных MCP-серверов.
+* **MCP Platform (`api/mcp/`)**: Двунаправленная платформа Model Context Protocol: inbound-сервер (`inbound.py`, FastMCP streamable HTTP на `/api/mcp`, авторизация Bearer API-токенами) для подключения внешних AI-агентов (Claude Desktop, Cursor, Windsurf) и outbound-менеджер (`manager.py`, langchain-mcp-adapters) для вызова инструментов внешних MCP-серверов, привязанных к продукту.
 
 ---
 
@@ -185,9 +186,9 @@ flowchart TD
    * Встроенный чат `POST /api/products/{product_id}/ask` выполняет поиск гибридным RAG (`cognee` recall + FAISS) по набору знаний продукта и выдаёт точные ответы.
 3. **Публичный REST API (`api/routers/public.py`)**:
    * Внешние системы с API-токеном запрашивают верифицированные знания продукта: `GET /api/public/products/{product_id}/knowledge` (в формате Markdown или JSON).
-4. **Нативный MCP Server (`api/routers/mcp_server.py`)**:
-   * Внешние AI-агенты (Claude Desktop, Cursor, Windsurf, авто-агенты) подключаются по протоколу MCP (`/api/mcp/sse`) и вызывают инструменты:
+4. **Inbound MCP Server (`api/mcp/inbound.py`, FastMCP streamable HTTP)**:
+   * Внешние AI-агенты (Claude Desktop, Cursor, Windsurf, авто-агенты) подключаются по протоколу MCP к `/api/mcp` (авторизация — Bearer API-токен) и вызывают инструменты:
      * `list_products` — список доступных продуктов.
      * `get_product_knowledge` — выгрузка верифицированной документации продукта.
-     * `search_product_graph` — прямые запросы к Графу Знаний cognee (`prod_{product_id}`) за фактами и связями.
+     * `search_knowledge` — семантический поиск по проиндексированным знаниям продукта (pgvector).
      * `ask_expert` — обращение к экспертному агенту Продуктариума для решения задач доработки или разработки нового функционала.

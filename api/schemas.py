@@ -58,6 +58,27 @@ class Links(BaseModel):
     source: str = "manual"
 
 
+class Database(BaseModel):
+    """Reverse-engineered database artifact (Wave E).
+
+    ``dsn`` is INPUT-ONLY: it is masked on acceptance (``mask_dsn``) and only
+    the masked form is persisted / returned as ``dsn_masked``. A round-trip
+    (GET → PUT) echoes ``dsn_masked`` back safely.
+    """
+
+    id: str
+    name: str
+    dsn: Optional[str] = None  # input-only; never persisted or returned
+    dsn_masked: Optional[str] = None
+    mcp_server_id: Optional[str] = None
+    generated_docs: Optional[str] = None
+    pages: Optional[Dict[str, Any]] = None
+    verified: bool = False
+    verified_by: Optional[str] = None
+    verified_at: Optional[datetime] = None
+    source: str = "manual"
+
+
 class Product(BaseModel):
     id: str
     name: str
@@ -67,6 +88,7 @@ class Product(BaseModel):
     codebases: List[Codebase] = []
     specs: List[Spec] = []
     links: List[Links] = []
+    databases: List[Database] = []
 
 
 # --- User -------------------------------------------------------------------

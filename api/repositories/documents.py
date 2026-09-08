@@ -1,13 +1,16 @@
-"""Document reading + FAISS indexing pipeline + DatabaseManager.
+"""Document reading + clone orchestration (DatabaseManager).
 
 Split out of the former ``api/data_pipeline.py`` (Step 5). Owns:
 - ``count_tokens``: tiktoken-based token estimation.
 - ``read_all_documents``: recursive directory walk with include/exclude
-  filters, producing adalflow ``Document`` objects with file metadata.
-- ``prepare_data_pipeline`` / ``transform_documents_and_save_to_db``: the
-  TextSplitter + embedder pipeline that builds a FAISS-backed ``LocalDB``.
+  filters, producing lightweight ``Document`` records with file metadata.
 - ``DatabaseManager``: orchestrates clone (via ``api.clients.git.download_repo``)
-  -> read -> transform -> persist, with load-existing fast-path.
+  -> read, with paths under ``~/.adalflow`` kept for backward compatibility
+  with existing on-disk clones.
+
+Embedding/indexing no longer happens here: generated docs are indexed into
+the pgvector memory backend (``api.memory``) by the docgen pipeline, and the
+former FAISS ``LocalDB`` persistence was removed together with adalflow.
 
 The git clone lives in ``api.clients.git`` (one-way dependency: this module
 imports ``download_repo`` from there; git does NOT import this module).
@@ -18,21 +21,65 @@ from __future__ import annotations
 import glob
 import logging
 import os
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
-import adalflow as adal
 import tiktoken
-from adalflow.components.data_process import TextSplitter, ToEmbeddings
-from adalflow.core.db import LocalDB
-from adalflow.core.types import Document, List
-from adalflow.utils import get_adalflow_default_root_path
 
 from api.config import configs, DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES
-from api.tools.embedder import get_embedder
 
 logger = logging.getLogger(__name__)
 
 # Maximum token limit for OpenAI embedding models
 MAX_EMBEDDING_TOKENS = 8192
+# Cap on one file read (chars) during document collection. Files anywhere near
+# the token limits are skipped anyway; the cap only stops a huge file (or a
+# special file reached through a symlinked directory) from being slurped into
+# memory whole before that decision is made.
+_READ_MAX_CHARS = 1_000_000
+
+
+def _read_confined_file(root_real: str, file_path: str) -> Optional[str]:
+    """Symlink-safe, root-confined read of one clone file (capped), or None.
+
+    Git preserves symlinks, so a malicious repo can plant ``evil.py ->
+    /etc/passwd`` inside a clone. Every collected file must therefore be a
+    regular file INSIDE the clone root: symlinked entries are skipped, the
+    realpath must stay under ``root_real`` (already realpath-resolved by the
+    caller), and the final open goes through ``open_read_nofollow`` (O_NOFOLLOW)
+    so a symlink swapped onto the last component cannot win the race.
+    """
+    from api.utils.fs import open_read_nofollow
+
+    try:
+        if os.path.islink(file_path):
+            return None
+        real = os.path.realpath(file_path)
+        if os.path.commonpath([root_real, real]) != root_real:
+            return None
+        with open_read_nofollow(real) as f:
+            return f.read(_READ_MAX_CHARS)
+    except (OSError, ValueError):
+        # Unreadable/undecodable/escaping entries are skipped, never fatal.
+        return None
+
+# Root directory for clones and legacy artifacts. Historically the
+# adalflow default root; kept as the same path so existing clones on disk
+# keep working after the langchain migration.
+DEFAULT_REPO_ROOT = os.path.expanduser("~/.adalflow")
+
+
+@dataclass
+class Document:
+    """A single source file read from a repository.
+
+    Minimal replacement for the former adalflow ``Document``: plain text plus
+    the file metadata the docgen pipeline (blob building, file analysis,
+    chunking) consumes.
+    """
+
+    text: str
+    meta_data: Dict[str, Any] = field(default_factory=dict)
 
 def count_tokens(text: str) -> int:
     """
@@ -200,6 +247,9 @@ def read_all_documents(path: str,
 
             return not is_excluded
 
+    # Clone root (resolved once) used to confine every collected file.
+    root_real = os.path.realpath(path)
+
     # Process code files first
     for ext in code_extensions:
         files = glob.glob(f"{path}/**/*{ext}", recursive=True)
@@ -209,35 +259,37 @@ def read_all_documents(path: str,
                 continue
 
             try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    relative_path = os.path.relpath(file_path, path)
+                content = _read_confined_file(root_real, file_path)
+                if content is None:
+                    logger.debug("Skipping unreadable/symlinked file %s", file_path)
+                    continue
+                relative_path = os.path.relpath(file_path, path)
 
-                    # Determine if this is an implementation file
-                    is_implementation = (
-                        not relative_path.startswith("test_")
-                        and not relative_path.startswith("app_")
-                        and "test" not in relative_path.lower()
-                    )
+                # Determine if this is an implementation file
+                is_implementation = (
+                    not relative_path.startswith("test_")
+                    and not relative_path.startswith("app_")
+                    and "test" not in relative_path.lower()
+                )
 
-                    # Check token count
-                    token_count = count_tokens(content)
-                    if token_count > MAX_EMBEDDING_TOKENS * 10:
-                        logger.warning(f"Skipping large file {relative_path}: Token count ({token_count}) exceeds limit")
-                        continue
+                # Check token count
+                token_count = count_tokens(content)
+                if token_count > MAX_EMBEDDING_TOKENS * 10:
+                    logger.warning(f"Skipping large file {relative_path}: Token count ({token_count}) exceeds limit")
+                    continue
 
-                    doc = Document(
-                        text=content,
-                        meta_data={
-                            "file_path": relative_path,
-                            "type": ext[1:],
-                            "is_code": True,
-                            "is_implementation": is_implementation,
-                            "title": relative_path,
-                            "token_count": token_count,
-                        },
-                    )
-                    documents.append(doc)
+                doc = Document(
+                    text=content,
+                    meta_data={
+                        "file_path": relative_path,
+                        "type": ext[1:],
+                        "is_code": True,
+                        "is_implementation": is_implementation,
+                        "title": relative_path,
+                        "token_count": token_count,
+                    },
+                )
+                documents.append(doc)
             except Exception as e:
                 logger.error(f"Error reading {file_path}: {e}")
 
@@ -250,28 +302,30 @@ def read_all_documents(path: str,
                 continue
 
             try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    relative_path = os.path.relpath(file_path, path)
+                content = _read_confined_file(root_real, file_path)
+                if content is None:
+                    logger.debug("Skipping unreadable/symlinked file %s", file_path)
+                    continue
+                relative_path = os.path.relpath(file_path, path)
 
-            # Check token count
-                    token_count = count_tokens(content)
-                    if token_count > MAX_EMBEDDING_TOKENS:
-                        logger.warning(f"Skipping large file {relative_path}: Token count ({token_count}) exceeds limit")
-                        continue
+                # Check token count
+                token_count = count_tokens(content)
+                if token_count > MAX_EMBEDDING_TOKENS:
+                    logger.warning(f"Skipping large file {relative_path}: Token count ({token_count}) exceeds limit")
+                    continue
 
-                    doc = Document(
-                        text=content,
-                        meta_data={
-                            "file_path": relative_path,
-                            "type": ext[1:],
-                            "is_code": False,
-                            "is_implementation": False,
-                            "title": relative_path,
-                            "token_count": token_count,
-                        },
-                    )
-                    documents.append(doc)
+                doc = Document(
+                    text=content,
+                    meta_data={
+                        "file_path": relative_path,
+                        "type": ext[1:],
+                        "is_code": False,
+                        "is_implementation": False,
+                        "title": relative_path,
+                        "token_count": token_count,
+                    },
+                )
+                documents.append(doc)
             except Exception as e:
                 logger.error(f"Error reading {file_path}: {e}")
 
@@ -279,60 +333,27 @@ def read_all_documents(path: str,
     return documents
 
 def prepare_data_pipeline():
+    """Deprecated alias kept for backward compatibility (returns None).
+
+    The adalflow TextSplitter + ToEmbeddings pipeline was removed in the
+    langchain migration; indexing now goes through ``api.memory``
+    (pgvector). Kept as a stub so older imports keep working.
     """
-    Creates and returns the data transformation pipeline.
+    return None
 
-    Returns:
-        adal.Sequential: The data transformation pipeline
-    """
-    from api.config import get_embedder_config
-
-    splitter = TextSplitter(**configs["text_splitter"])
-    embedder_config = get_embedder_config()
-
-    embedder = get_embedder()
-
-    # Every supported server exposes an OpenAI-compatible /v1/embeddings
-    # endpoint, so the batch ToEmbeddings processor covers all cases.
-    batch_size = embedder_config.get("batch_size", 500)
-    embedder_transformer = ToEmbeddings(
-        embedder=embedder, batch_size=batch_size
-    )
-
-    data_transformer = adal.Sequential(
-        splitter, embedder_transformer
-    )  # sequential will chain together splitter and embedder
-    return data_transformer
-
-def transform_documents_and_save_to_db(
-    documents: List[Document], db_path: str
-) -> LocalDB:
-    """
-    Transforms a list of documents and saves them to a local database.
-
-    Args:
-        documents (list): A list of `Document` objects.
-        db_path (str): The path to the local database file.
-    """
-    # Get the data transformer
-    data_transformer = prepare_data_pipeline()
-
-    # Save the documents to a local database
-    db = LocalDB()
-    db.register_transformer(transformer=data_transformer, key="split_and_embed")
-    db.load(documents)
-    db.transform(key="split_and_embed")
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    db.save_state(filepath=db_path)
-    return db
 
 class DatabaseManager:
     """
-    Manages the creation, loading, transformation, and persistence of LocalDB instances.
+    Manages repository clones and document reading (no local index).
+
+    Historically owned FAISS ``LocalDB`` creation/loading/persistence; that
+    was removed with adalflow. What remains: cloning (via
+    ``api.clients.git.download_repo``) and reading files into ``Document``
+    records for the docgen pipeline. Existing ``.pkl`` database files under
+    ``~/.adalflow/databases`` are ignored (stale FAISS artifacts).
     """
 
     def __init__(self):
-        self.db = None
         self.repo_url_or_path = None
         self.repo_paths = None
 
@@ -361,9 +382,8 @@ class DatabaseManager:
 
     def reset_database(self):
         """
-        Reset the database to its initial state.
+        Reset the manager to its initial state.
         """
-        self.db = None
         self.repo_url_or_path = None
         self.repo_paths = None
 
@@ -392,7 +412,6 @@ class DatabaseManager:
         Download and prepare all paths.
         Paths:
         ~/.adalflow/repos/{owner}_{repo_name} (for url, local path will be the same)
-        ~/.adalflow/databases/{owner}_{repo_name}.pkl
 
         Args:
             repo_type(str): Type of repository
@@ -409,7 +428,7 @@ class DatabaseManager:
             # Strip whitespace to handle URLs with leading/trailing spaces
             repo_url_or_path = repo_url_or_path.strip()
 
-            root_path = get_adalflow_default_root_path()
+            root_path = DEFAULT_REPO_ROOT
 
             os.makedirs(root_path, exist_ok=True)
             # url
@@ -438,13 +457,8 @@ class DatabaseManager:
                 repo_name = os.path.basename(repo_url_or_path)
                 save_repo_dir = repo_url_or_path
 
-            save_db_file = os.path.join(root_path, "databases", f"{repo_name}.pkl")
-            os.makedirs(save_repo_dir, exist_ok=True)
-            os.makedirs(os.path.dirname(save_db_file), exist_ok=True)
-
             self.repo_paths = {
                 "save_repo_dir": save_repo_dir,
-                "save_db_file": save_db_file,
             }
             self.repo_url_or_path = repo_url_or_path
             logger.info(f"Repo paths: {self.repo_paths}")
@@ -457,7 +471,12 @@ class DatabaseManager:
                         excluded_dirs: List[str] = None, excluded_files: List[str] = None,
                         included_dirs: List[str] = None, included_files: List[str] = None) -> List[Document]:
         """
-        Prepare the indexed database for the repository.
+        Read the repository files into ``Document`` records.
+
+        Retains its historical name (the FAISS index build it used to perform
+        was removed with adalflow); now a thin wrapper over
+        ``read_all_documents`` using the clone directory captured by
+        ``_create_repo``.
 
         Args:
             excluded_dirs (List[str], optional): List of directories to exclude from processing
@@ -466,68 +485,17 @@ class DatabaseManager:
             included_files (List[str], optional): List of file patterns to include exclusively
 
         Returns:
-            List[Document]: List of Document objects
+            List[Document]: List of Document records
         """
-        def _embedding_vector_length(doc: Document) -> int:
-            vector = getattr(doc, "vector", None)
-            if vector is None:
-                return 0
-            try:
-                if hasattr(vector, "shape"):
-                    if len(vector.shape) == 0:
-                        return 0
-                    return int(vector.shape[-1])
-                if hasattr(vector, "__len__"):
-                    return int(len(vector))
-            except Exception:
-                return 0
-            return 0
-
-        # check the database
-        if self.repo_paths and os.path.exists(self.repo_paths["save_db_file"]):
-            logger.info("Loading existing database...")
-            try:
-                self.db = LocalDB.load_state(self.repo_paths["save_db_file"])
-                documents = self.db.get_transformed_data(key="split_and_embed")
-                if documents:
-                    lengths = [_embedding_vector_length(doc) for doc in documents]
-                    non_empty = sum(1 for n in lengths if n > 0)
-                    empty = len(lengths) - non_empty
-                    sample_sizes = sorted({n for n in lengths if n > 0})[:3]
-                    logger.info(
-                        "Loaded %s documents from existing database (embeddings: %s non-empty, %s empty; sample_dims=%s)",
-                        len(documents),
-                        non_empty,
-                        empty,
-                        sample_sizes,
-                    )
-
-                    if non_empty == 0:
-                        logger.warning(
-                            "Existing database contains no usable embeddings. Rebuilding embeddings..."
-                        )
-                    else:
-                        return documents
-            except Exception as e:
-                logger.error(f"Error loading existing database: {e}")
-                # Continue to create a new database
-
-        # prepare the database
-        logger.info("Creating new database...")
-        documents = read_all_documents(
+        if not self.repo_paths:
+            raise ValueError("No repository prepared; call _create_repo first.")
+        return read_all_documents(
             self.repo_paths["save_repo_dir"],
             excluded_dirs=excluded_dirs,
             excluded_files=excluded_files,
             included_dirs=included_dirs,
             included_files=included_files
         )
-        self.db = transform_documents_and_save_to_db(
-            documents, self.repo_paths["save_db_file"]
-        )
-        logger.info(f"Total documents: {len(documents)}")
-        transformed_docs = self.db.get_transformed_data(key="split_and_embed")
-        logger.info(f"Total transformed documents: {len(transformed_docs)}")
-        return transformed_docs
 
     def prepare_retriever(self, repo_url_or_path: str, repo_type: str = None, access_token: str = None):
         """

@@ -17,9 +17,22 @@ export interface ArtifactPage {
   id: string;
   title: string;
   content: string;
+  /**
+   * Parent page id for generated subpages (docgen units model: children of
+   * the functional/technical/datamodel sections carry the parent's page id).
+   * Legacy pages have no parent and render flat — the viewer must tolerate
+   * orphaned parents/children without breaking.
+   */
+  parent?: string;
   filePaths?: string[];
   importance?: "high" | "medium" | "low";
   relatedPages?: string[];
+  /**
+   * Additive provenance block persisted by the verification pipeline
+   * (api/docgen/verification.py). Unknown to legacy pages — the viewer must
+   * tolerate its presence without breaking.
+   */
+  provenance?: Record<string, unknown>;
 }
 
 /**
@@ -78,6 +91,28 @@ export interface Links {
   source?: ArtifactSource;
 }
 
+/**
+ * A reverse-engineered database attached to a product (wave E).
+ *
+ * The raw DSN never leaves the server: reads return `dsn_masked` only.
+ * `mcp_server_id` references the admin MCP registry entry whose tools are
+ * used for the reverse-engineering flow; the backend may additionally serve
+ * `mcp_server_name` for display (tolerated, not required).
+ */
+export interface Database {
+  id: string;
+  name: string;
+  dsn_masked?: string | null;
+  mcp_server_id?: string | null;
+  mcp_server_name?: string | null;
+  generated_docs?: string | null;
+  pages?: ArtifactPages;
+  verified?: boolean;
+  verified_by?: string | null;
+  verified_at?: string | null;
+  source?: ArtifactSource;
+}
+
 export interface Product {
   id: string;
   name: string;
@@ -89,6 +124,12 @@ export interface Product {
   codebases: Codebase[];
   specs: Spec[];
   links: Links[];
+  /**
+   * Reverse-engineered databases (wave E). Optional so the UI keeps working
+   * against backends that do not serve the field yet — always read via
+   * `product.databases ?? []`.
+   */
+  databases?: Database[];
 }
 
 /* ------------------------------------------------------------------ */
@@ -164,19 +205,77 @@ export interface SettingOut {
 }
 
 /* ------------------------------------------------------------------ */
+/* MCP servers (admin registry + per-product bindings, wave C)         */
+/* ------------------------------------------------------------------ */
+
+export type McpTransport = "http" | "stdio";
+export type McpServerStatus = "ok" | "error" | "unknown";
+
+/**
+ * Registry entry served by the admin MCP registry
+ * (GET/POST/PUT /api/admin/mcp/servers, POST .../test). Header and env
+ * values come back masked — secrets never leave the server.
+ */
+export interface McpServer {
+  id: string;
+  name: string;
+  transport: McpTransport;
+  url?: string | null;
+  command?: string | null;
+  args?: string[] | null;
+  headers_masked?: Record<string, string> | null;
+  env_masked?: Record<string, string> | null;
+  enabled: boolean;
+  status: McpServerStatus;
+  status_checked_at?: string | null;
+  status_error?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+/** A tool discovered on an MCP server (name + optional description). */
+export interface McpToolInfo {
+  name: string;
+  description?: string | null;
+}
+
+/** Result of POST /api/admin/mcp/servers/{id}/test (health + discovery). */
+export interface McpTestResult {
+  ok: boolean;
+  detail?: string | null;
+  tools: McpToolInfo[];
+}
+
+/**
+ * Per-product binding served by /api/products/{product_id}/mcp.
+ * `allowed_tools: null` means every tool of the bound server is exposed to
+ * the expert agent (no allowlist filter).
+ */
+export interface McpServerBinding {
+  id: string;
+  mcp_server_id: string;
+  name: string;
+  transport: McpTransport;
+  enabled: boolean;
+  allowed_tools: string[] | null;
+  status: McpServerStatus;
+}
+
+/* ------------------------------------------------------------------ */
 /* Entity kinds (codebase / spec / links)                               */
 /* ------------------------------------------------------------------ */
 
-export type EntityKind = "codebase" | "spec" | "links";
+export type EntityKind = "codebase" | "spec" | "links" | "database";
 
 /**
  * Backend URL segment for an entity kind.
  *
  * The FastAPI routers (``api/routers/products.py``, ``docgen.py``) register
  * these sub-resources under the PLURAL segments (``codebases`` / ``specs`` /
- * ``links``). The UI stores the SINGULAR kind (``codebase`` / ``spec`` /
- * ``links``) in form state, so every API URL must go through this helper —
- * interpolating the raw kind directly produces 404s.
+ * ``links`` / ``databases``). The UI stores the SINGULAR kind
+ * (``codebase`` / ``spec`` / ``links`` / ``database``) in form state, so every
+ * API URL must go through this helper — interpolating the raw kind directly
+ * produces 404s.
  */
 export function entityPath(kind: EntityKind): string {
   switch (kind) {
@@ -186,6 +285,8 @@ export function entityPath(kind: EntityKind): string {
       return "specs";
     case "links":
       return "links";
+    case "database":
+      return "databases";
   }
 }
 
@@ -344,7 +445,9 @@ export function normalizePages(pages: ArtifactPages): ArtifactPage[] {
 }
 
 /** A short, stable id for new client-created entities before the server roundtrip. */
-export function generateId(prefix: "prod" | "cb" | "spec" | "links" | "node"): string {
+export function generateId(
+  prefix: "prod" | "cb" | "spec" | "links" | "db" | "node",
+): string {
   const rand = Math.random().toString(36).slice(2, 8);
   return `${prefix}_${Date.now().toString(36)}${rand}`;
 }

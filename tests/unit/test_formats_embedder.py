@@ -250,27 +250,34 @@ class TestConvertTextContentFallback:
 # --------------------------------------------------------------------------- #
 # api.tools.embedder
 # --------------------------------------------------------------------------- #
+def _secret_value(secret) -> str:
+    """Extract the raw string from an OpenAIEmbeddings SecretStr field."""
+    return secret.get_secret_value() if secret is not None else ""
+
+
 class TestGetEmbedder:
     def test_returns_embedder_instance(self):
         from api.tools.embedder import get_embedder
 
         embedder = get_embedder(base_url="http://localhost:1234/v1", api_key="not-needed")
         assert embedder is not None
-        # adal.Embedder has a model_client and model_kwargs
-        assert hasattr(embedder, "model_client")
-        assert hasattr(embedder, "model_kwargs")
+        # langchain OpenAIEmbeddings exposes ``embed_documents``/``embed_query``
+        assert hasattr(embedder, "embed_documents")
+        assert hasattr(embedder, "embed_query")
+        # The 768d nomic embedding model from embedder.json is the default.
+        assert embedder.model == "text-embedding-nomic-embed-text-v1.5"
 
     def test_uses_custom_base_url(self):
         from api.tools.embedder import get_embedder
 
         embedder = get_embedder(base_url="http://custom:9999/v1", api_key="not-needed")
-        assert embedder.model_client.base_url == "http://custom:9999/v1"
+        assert embedder.openai_api_base == "http://custom:9999/v1"
 
     def test_uses_custom_api_key(self):
         from api.tools.embedder import get_embedder
 
         embedder = get_embedder(base_url="http://localhost:1234/v1", api_key="sk-test-key")
-        assert embedder.model_client._api_key == "sk-test-key"
+        assert _secret_value(embedder.openai_api_key) == "sk-test-key"
 
     def test_defaults_to_config_base_url(self, monkeypatch):
         from api.tools.embedder import get_embedder
@@ -280,8 +287,10 @@ class TestGetEmbedder:
         assert "embedder_openai_local" in configs
         embedder = get_embedder()
         assert embedder is not None
-        # Default base_url comes from LOCAL_OPENAI_BASE_URL env or "http://localhost:8080/v1"
-        assert embedder.model_client.base_url is not None
+        # Default base_url comes from LOCAL_OPENAI_BASE_URL env or the built-in
+        # local-server default; the test env usually has no LM Studio running.
+        assert embedder.openai_api_base is not None
+        assert embedder.openai_api_base.startswith("http")
 
     def test_raises_when_no_config(self, monkeypatch):
         import api.tools.embedder as emb_mod
@@ -302,28 +311,65 @@ class TestGetEmbedder:
         from api.tools.embedder import get_embedder
 
         embedder = get_embedder(base_url="http://localhost:1234/v1", api_key="not-needed")
-        # The config embedder.json has batch_size=100
-        assert hasattr(embedder, "batch_size")
-        assert embedder.batch_size == 100
+        # embedder.json batch_size=100 maps to the OpenAIEmbeddings chunk_size
+        # (per-request batch), not an adalflow-style batch_size attribute.
+        assert embedder.chunk_size == 100
 
     def test_admin_config_overrides_model(self, monkeypatch):
+        import api.tools.embedder as emb_mod
         from api.tools.embedder import get_embedder
 
-        # Mock get_model_for_task to return a custom embedder model
+        # An EXPLICIT admin-configured embedder model wins over embedder.json.
+        monkeypatch.setattr(
+            "api.config.settings.get_setting",
+            lambda key, default=None: "custom-emb-model" if key == "models.embedder.model" else default,
+        )
+        # get_model_for_task still resolves base_url/api_key for the task.
         monkeypatch.setattr(
             "api.config.settings.get_model_for_task",
             lambda task: {"model": "custom-emb-model", "base_url": "http://localhost:1234/v1", "api_key": "not-needed"},
         )
         embedder = get_embedder()
-        assert embedder.model_kwargs["model"] == "custom-emb-model"
+        assert embedder.model == "custom-emb-model"
 
     def test_admin_config_provides_base_url_and_key(self, monkeypatch):
+        import api.tools.embedder as emb_mod
         from api.tools.embedder import get_embedder
 
         monkeypatch.setattr(
             "api.config.settings.get_model_for_task",
             lambda task: {"model": "emb", "base_url": "http://admin-emb:5555/v1", "api_key": "emb-key-123"},
         )
+        monkeypatch.setattr(
+            "api.config.settings.get_setting",
+            lambda key, default=None: None,
+        )
         embedder = get_embedder()
-        assert embedder.model_client.base_url == "http://admin-emb:5555/v1"
-        assert embedder.model_client._api_key == "emb-key-123"
+        assert embedder.openai_api_base == "http://admin-emb:5555/v1"
+        assert _secret_value(embedder.openai_api_key) == "emb-key-123"
+
+    def test_chat_default_model_does_not_shadow_embedder_model(self, monkeypatch):
+        """The chat default model must never shadow the 768d embedding model.
+
+        ``get_model_for_task('embedder')`` falls back to the chat default
+        (``qwen/...``) when nothing is stored; only an explicit admin value
+        (``models.embedder.model``) may override the JSON-configured
+        embedding model.
+        """
+        import api.tools.embedder as emb_mod
+        from api.tools.embedder import get_embedder
+
+        monkeypatch.setattr(
+            "api.config.settings.get_model_for_task",
+            lambda task: {
+                "model": "qwen/qwen3.6-27b",  # chat default — must be ignored
+                "base_url": "http://localhost:1234/v1",
+                "api_key": "not-needed",
+            },
+        )
+        monkeypatch.setattr(
+            "api.config.settings.get_setting",
+            lambda key, default=None: None,
+        )
+        embedder = get_embedder()
+        assert embedder.model == "text-embedding-nomic-embed-text-v1.5"

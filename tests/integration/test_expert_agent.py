@@ -2,9 +2,9 @@
 """Unit tests for the product-scoped expert agent (api.expert) and its
 router (api.routers.expert) — Wave 2 scope F.
 
-Runs under pytest (pytest.ini: testpaths=test). No live LLM / cognee / RLM /
-Postgres required: the LLM, cognee recall, and fast-rlm are mocked. The
-fallback-artifact-docs test uses an isolated SQLite DB.
+Runs under pytest (pytest.ini: testpaths=test). No live LLM / memory /
+RLM / Postgres required: the LLM, memory recall, and fast-rlm are mocked.
+The fallback-artifact-docs test uses an isolated SQLite DB.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Any, AsyncIterator, Dict, List, Tuple
 import pytest
 
 # The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
-# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee stubs for every
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY for every
 # test in this module. Auth is NOT disabled by env here: ``api.auth`` snapshots
 # AUTH_PROVIDER at import time, so router tests patch ``api.auth.deps.AUTH_PROVIDER``
 # directly (see ``TestExpertRouter.app_and_client``) regardless of the env value.
@@ -67,27 +67,18 @@ def _patch_llm(monkeypatch, text: str = "FAKE ANSWER", chunks: List[str] | None 
     return fake
 
 
-def _patch_cognee(monkeypatch, payload: str):
+def _patch_memory_recall(monkeypatch, payload: str):
     """Patch the memory-backend recall path to return ``payload``.
 
     The expert recalls via ``api.memory.query_memory`` (the backend-agnostic
-    facade; active backend = pgvector by default, cognee alt), so patch the
-    facade rather than the cognee backend directly.
+    facade; active backend = pgvector), so patch the facade rather than the
+    backend directly.
     """
 
     async def _fake_query(query: str, product_id: str, top_k: int = 20) -> str:
         return payload
 
     monkeypatch.setattr("api.memory.query_memory", _fake_query)
-
-
-def _patch_rlm(monkeypatch, result: str, success: bool = True):
-    """Patch api.rlm.runner.run_rlm_task to return a fixed result dict."""
-
-    async def _fake_rlm(query: str, model_name: str | None = None) -> Dict[str, Any]:
-        return {"results": result, "usage": {}, "success": success}
-
-    monkeypatch.setattr("api.rlm.runner.run_rlm_task", _fake_rlm)
 
 
 # ============================================================================
@@ -196,14 +187,14 @@ class TestHelpers:
 
 
 # ============================================================================
-# Knowledge retrieval (cognee + fallback)
+# Knowledge retrieval (memory recall + fallback)
 # ============================================================================
 class TestKnowledgeRetrieval:
-    def test_retrieve_uses_cognee_when_available(self, monkeypatch):
+    def test_retrieve_uses_memory_recall_when_available(self, monkeypatch):
         import api.expert as ea
-        _patch_cognee(monkeypatch, "COGNEE CONTEXT")
+        _patch_memory_recall(monkeypatch, "MEMORY CONTEXT")
         out = asyncio.run(ea._retrieve_product_knowledge("prod_1", "q"))
-        assert out == "COGNEE CONTEXT"
+        assert out == "MEMORY CONTEXT"
 
     def test_retrieve_falls_back_to_artifact_docs(self, monkeypatch):
         import api.expert as ea
@@ -225,8 +216,8 @@ class TestKnowledgeRetrieval:
             )
             session.commit()
 
-        # cognee empty -> fallback
-        _patch_cognee(monkeypatch, "")
+        # recall empty -> fallback
+        _patch_memory_recall(monkeypatch, "")
         out = asyncio.run(ea._retrieve_product_knowledge("prod_1", "q"))
         assert "the docs" in out
         assert "PAGE CONTENT" in out
@@ -235,7 +226,7 @@ class TestKnowledgeRetrieval:
     def test_fallback_returns_empty_for_missing_product(self, monkeypatch):
         import api.expert as ea
         db = _sqlite_db()
-        _patch_cognee(monkeypatch, "")
+        _patch_memory_recall(monkeypatch, "")
         out = asyncio.run(ea._retrieve_product_knowledge("does_not_exist", "q"))
         assert out == ""
 
@@ -263,7 +254,7 @@ class TestKnowledgeRetrieval:
 class TestRunExpertDoc:
     def test_returns_markdown_from_llm(self, monkeypatch):
         import api.expert as ea
-        _patch_cognee(monkeypatch, "CTX")
+        _patch_memory_recall(monkeypatch, "CTX")
         _patch_llm(monkeypatch, text="# Generated Doc\n\nbody text")
         out = asyncio.run(ea.run_expert_doc("prod_1", "summarize the service"))
         assert out.startswith("# Generated Doc")
@@ -271,24 +262,11 @@ class TestRunExpertDoc:
 
     def test_returns_placeholder_when_llm_empty(self, monkeypatch):
         import api.expert as ea
-        _patch_cognee(monkeypatch, "CTX")
+        _patch_memory_recall(monkeypatch, "CTX")
         _patch_llm(monkeypatch, text="")
         out = asyncio.run(ea.run_expert_doc("prod_1", "q"))
         assert "No content was generated" in out
         assert "prod_1" in out
-
-    def test_rlm_used_for_long_context(self, monkeypatch):
-        import api.expert as ea
-        import api.config.settings as ss
-        monkeypatch.setattr(ss, "get_rlm_mode", lambda task: "auto")
-        # Big knowledge -> prompt >= RLM_MIN_CHARS -> RLM path.
-        _patch_cognee(monkeypatch, "K" * (ea.RLM_MIN_CHARS + 5000))
-        _patch_rlm(monkeypatch, "RLM DOC RESULT")
-        # Standard LLM would return this if (incorrectly) used.
-        _patch_llm(monkeypatch, text="STANDARD DOC")
-        out = asyncio.run(ea.run_expert_doc("prod_1", "deep synthesis question"))
-        assert out == "RLM DOC RESULT"
-
 
 # ============================================================================
 # run_expert_chat
@@ -296,7 +274,7 @@ class TestRunExpertDoc:
 class TestRunExpertChat:
     def test_collect_returns_full_answer(self, monkeypatch):
         import api.expert as ea
-        _patch_cognee(monkeypatch, "CTX")
+        _patch_memory_recall(monkeypatch, "CTX")
         _patch_llm(monkeypatch, text="# Answer\nthe body")
         out = asyncio.run(
             ea.run_expert_chat("prod_1", "what is it?", stream=False)
@@ -306,7 +284,7 @@ class TestRunExpertChat:
     def test_stream_yields_chunks(self, monkeypatch):
         import api.expert as ea
         from api.expert.types import EVENT_CONTENT, EVENT_STATUS, ExpertStreamEvent
-        _patch_cognee(monkeypatch, "CTX")
+        _patch_memory_recall(monkeypatch, "CTX")
         _patch_llm(monkeypatch, text="FULL", chunks=["Hel", "lo", " world"])
 
         async def _collect():
@@ -327,52 +305,9 @@ class TestRunExpertChat:
         content_events = [e for e in events if isinstance(e, ExpertStreamEvent) and e.type == EVENT_CONTENT]
         assert [e.content for e in content_events] == ["Hel", "lo", " world"]
 
-    def test_stream_uses_rlm_for_long_context(self, monkeypatch):
-        import api.expert as ea
-        from api.expert.types import EVENT_CONTENT, ExpertStreamEvent
-        import api.config.settings as ss
-        monkeypatch.setattr(ss, "get_rlm_mode", lambda task: "auto")
-        _patch_cognee(monkeypatch, "K" * (ea.RLM_MIN_CHARS + 5000))
-        _patch_rlm(monkeypatch, "RLM CHUNKED ANSWER")
-        _patch_llm(monkeypatch, text="STANDARD", chunks=["SHOULD", "NOT", "HAPPEN"])
-
-        async def _collect():
-            out = []
-            async for c in ea.run_expert_chat("prod_1", "deep q", stream=True):
-                out.append(c)
-            return out
-
-        events = asyncio.run(_collect())
-        content = "".join(
-            e.content for e in events
-            if isinstance(e, ExpertStreamEvent) and e.type == EVENT_CONTENT
-        )
-        assert content == "RLM CHUNKED ANSWER"
-
-    def test_stream_rlm_empty_falls_back_to_llm(self, monkeypatch):
-        import api.expert as ea
-        from api.expert.types import EVENT_CONTENT, ExpertStreamEvent
-        _patch_cognee(monkeypatch, "K" * (ea.RLM_MIN_CHARS + 5000))
-        # RLM fails -> standard LLM stream is used.
-        _patch_rlm(monkeypatch, "", success=False)
-        _patch_llm(monkeypatch, text="FALLBACK", chunks=["FALL", "BACK"])
-
-        async def _collect():
-            out = []
-            async for c in ea.run_expert_chat("prod_1", "deep q", stream=True):
-                out.append(c)
-            return out
-
-        events = asyncio.run(_collect())
-        content_chunks = [
-            e.content for e in events
-            if isinstance(e, ExpertStreamEvent) and e.type == EVENT_CONTENT
-        ]
-        assert content_chunks == ["FALL", "BACK"]
-
     def test_collect_no_llm_returns_empty(self, monkeypatch):
         import api.expert as ea
-        _patch_cognee(monkeypatch, "CTX")
+        _patch_memory_recall(monkeypatch, "CTX")
         # _safe_build_llm returns None -> empty answer.
         monkeypatch.setattr("api.expert.generate._safe_build_llm", lambda *a, **k: None)
         out = asyncio.run(ea.run_expert_chat("prod_1", "q", stream=False))
@@ -386,8 +321,9 @@ class TestRunExpertChat:
         import api.expert.chat as chat
         captured: dict = {}
 
-        async def _fake_generate_answer(prompt, model, base_url, api_key, use_rlm):
+        async def _fake_generate_answer(prompt, model, base_url, api_key, **kwargs):
             captured["prompt"] = prompt
+            captured["kwargs"] = kwargs
             return "ok"
 
         monkeypatch.setattr(chat, "_generate_answer", _fake_generate_answer)
@@ -395,12 +331,18 @@ class TestRunExpertChat:
         monkeypatch.setattr(chat, "_product_name_by_id", lambda pid: "Acme")
         asyncio.run(
             chat._run_expert_chat_collect(
-                "prod_1", "current q", [{"role": "user", "content": "prior"}], None, None
+                "prod_1", "current q", [{"role": "user", "content": "prior"}], None
             )
         )
         assert "<conversation_history>" in captured["prompt"]
         assert "<user>prior</user>" in captured["prompt"]
         assert "<query>\ncurrent q\n</query>" in captured["prompt"]
+        # Context kwargs are threaded through to the LLM call (used by the
+        # generation-side prompt-routing logic).
+        assert captured["kwargs"].get("product_id") == "prod_1"
+        assert captured["kwargs"].get("product_name") == "Acme"
+        assert captured["kwargs"].get("query") == "current q"
+        assert "<user>prior</user>" in captured["kwargs"].get("history", "")
 
 
 def _async_value(value):
@@ -554,14 +496,13 @@ class TestExpertRouter:
         import api.routers.expert as expert_router
         from api.expert.types import EVENT_CONTENT, EVENT_REASONING, ExpertStreamEvent
 
-        def _fake_chat(product_id, query, messages, model, stream=True, use_rlm=None, **kwargs):
-            async def gen():
-                yield ExpertStreamEvent(EVENT_REASONING, "let me think...")
-                yield ExpertStreamEvent(EVENT_CONTENT, "Hello")
-                yield ExpertStreamEvent(EVENT_CONTENT, " world")
-            return gen()
+        async def _fake_agent_stream(product_id, query, session_id=None,
+                                     history=None, model=None, **kwargs):
+            yield ExpertStreamEvent(EVENT_REASONING, "let me think...")
+            yield ExpertStreamEvent(EVENT_CONTENT, "Hello")
+            yield ExpertStreamEvent(EVENT_CONTENT, " world")
 
-        monkeypatch.setattr(expert_router, "run_expert_chat", _fake_chat)
+        monkeypatch.setattr(expert_router, "run_agent_chat_stream", _fake_agent_stream)
         resp = client.post("/api/products/prod_1/ask", json={"query": "hi"})
         assert resp.status_code == 200
         body = resp.text
@@ -575,13 +516,12 @@ class TestExpertRouter:
         import api.routers.expert as expert_router
         from api.expert.types import EVENT_CONTENT, ExpertStreamEvent
 
-        def _fake_chat(product_id, query, messages, model, stream=True, use_rlm=None, **kwargs):
-            async def gen():
-                yield ExpertStreamEvent(EVENT_CONTENT, "Hello")
-                yield ExpertStreamEvent(EVENT_CONTENT, " world")
-            return gen()
+        async def _fake_agent_stream(product_id, query, session_id=None,
+                                     history=None, model=None, **kwargs):
+            yield ExpertStreamEvent(EVENT_CONTENT, "Hello")
+            yield ExpertStreamEvent(EVENT_CONTENT, " world")
 
-        monkeypatch.setattr(expert_router, "run_expert_chat", _fake_chat)
+        monkeypatch.setattr(expert_router, "run_agent_chat_stream", _fake_agent_stream)
         resp = client.post("/api/products/prod_1/ask", json={"query": "hi"})
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/event-stream")
@@ -597,7 +537,7 @@ class TestExpertRouter:
         async def _fake_doc(product_id, query, model=None, use_rlm=None, **kwargs):
             return "# Title\n\ndoc body"
 
-        monkeypatch.setattr(expert_router, "run_expert_doc", _fake_doc)
+        monkeypatch.setattr(expert_router, "run_agent_doc", _fake_doc)
         resp = client.post(
             "/api/products/prod_1/ask/doc", json={"query": "write the doc"}
         )
