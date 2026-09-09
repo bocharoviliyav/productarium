@@ -24,7 +24,20 @@ except Exception as _e:  # pragma: no cover - dep missing
     logger.warning("PyJWT not available; session tokens disabled: %s", _e)
 
 SESSION_COOKIE_NAME = "productarium_session"
-SESSION_TOKEN_TTL = int(os.environ.get("SESSION_TOKEN_TTL", str(60 * 60 * 24 * 7)))  # 7d
+
+
+def _env_int(name: str, default: int) -> int:
+    """Import-time env parsing that never crashes on garbage values."""
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        if raw:
+            logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+
+
+SESSION_TOKEN_TTL = _env_int("SESSION_TOKEN_TTL", 60 * 60 * 24 * 7)  # 7d
 
 # Ephemeral fallback secret (stable per process) used when no env secret is set.
 _FALLBACK_SECRET = _secrets.token_urlsafe(32)

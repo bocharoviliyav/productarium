@@ -11,7 +11,7 @@ import logging
 import os
 import re
 import time
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 
@@ -117,13 +117,97 @@ def get_model_context_window(
     return final_ctx
 
 
-def _count_tokens(text: str) -> int:
-    """Approximate token count for prompt budget estimation."""
+# P1-23: hybrid token counting. The default is the cheap chars/4 heuristic
+# (encoding a whole codebase chunk-by-chunk is CPU-heavy and was O(total_chars)
+# per call with per-call get_encoding). Precise tiktoken counting is opt-in via
+# the admin setting ``llm.precise_tokens`` or env ``LLM_PRECISE_TOKENS`` — one
+# cl100k_base encoder per process (providers/models change, the encoding does
+# not need to).
+_PRECISE_TOKENS_ENV = "LLM_PRECISE_TOKENS"
+_PRECISE_TOKENS_SETTING = "llm.precise_tokens"
+_ENCODER: Any = None
+_ENCODER_LOADED = False
+
+
+def _truthy(raw: Any) -> bool:
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _precise_tokens_enabled() -> bool:
+    """True when precise tiktoken counting is explicitly enabled."""
+    env_raw = os.environ.get(_PRECISE_TOKENS_ENV)
+    if env_raw is not None and env_raw.strip():
+        return _truthy(env_raw)
+    try:
+        from api.config.settings import get_setting
+
+        val = get_setting(_PRECISE_TOKENS_SETTING)
+        if val is not None and str(val).strip():
+            return _truthy(val)
+    except Exception:  # pragma: no cover - settings store is import-safe
+        pass
+    return False
+
+
+def _get_encoder() -> Any:
+    """Singleton cl100k_base encoder (built once per process). None if unavailable."""
+    global _ENCODER, _ENCODER_LOADED
+    if not _ENCODER_LOADED:
+        _ENCODER_LOADED = True
+        try:
+            import tiktoken  # type: ignore
+
+            _ENCODER = tiktoken.get_encoding("cl100k_base")
+        except Exception:  # pragma: no cover - optional dep
+            _ENCODER = None
+    return _ENCODER
+
+
+def count_tokens(text: str, precise: Optional[bool] = None) -> int:
+    """Approximate token count for prompt budget estimation (P1-23 hybrid).
+
+    - default: ``max(1, len(text) // 4)`` — a fast chars/4 heuristic;
+    - precise mode (``precise=True``, or globally enabled via the admin
+      setting ``llm.precise_tokens`` / env ``LLM_PRECISE_TOKENS``): exact
+      tiktoken cl100k_base count via a process-wide singleton encoder,
+      falling back to the heuristic when tiktoken is unavailable.
+    """
     if not text:
         return 0
-    try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text, disallowed_special=()))
-    except Exception:
-        return max(1, len(text) // 4)
+    use_precise = _precise_tokens_enabled() if precise is None else bool(precise)
+    if use_precise:
+        enc = _get_encoder()
+        if enc is not None:
+            try:
+                return len(enc.encode(text, disallowed_special=()))
+            except Exception:  # pragma: no cover - defensive
+                pass
+    return max(1, len(text) // 4)
+
+
+# Backwards-compatible alias (callers import ``_count_tokens``).
+_count_tokens = count_tokens
+
+
+async def get_model_context_window_async(
+    base_url: Optional[str] = None,
+    model_name: Optional[str] = None,
+    api_key: Optional[str] = None,
+    task: Optional[str] = None,
+) -> int:
+    """Async variant of :func:`get_model_context_window` (P1-13).
+
+    The sync resolver may perform a live ``requests.get`` (first call per
+    model/endpoint, 5-minute cache afterwards) which would block the event
+    loop. This wrapper runs it in a worker thread — safe to await from async
+    request handlers.
+    """
+    import asyncio
+
+    return await asyncio.to_thread(
+        get_model_context_window,
+        base_url=base_url,
+        model_name=model_name,
+        api_key=api_key,
+        task=task,
+    )

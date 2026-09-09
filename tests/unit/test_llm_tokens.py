@@ -438,3 +438,78 @@ class TestCountTokens:
         # Very short text -> max(1, len // 4)
         count = _count_tokens("ab")  # 2 chars -> 0 -> max(1, 0) = 1
         assert count == 1
+
+    # --- P1-23: hybrid — precise counting is opt-in ---------------------------- #
+    def test_default_is_heuristic_not_tiktoken(self, monkeypatch):
+        """Without opt-in the cheap len//4 heuristic is used even though an
+        encoder is available (CPU hot spot on whole-codebase counting)."""
+        monkeypatch.delenv("LLM_PRECISE_TOKENS", raising=False)
+
+        class _FakeEnc:
+            def encode(self, text, disallowed_special=()):
+                return [0] * 999  # would dominate if used
+
+        monkeypatch.setattr(llm_tokens, "_ENCODER", _FakeEnc())
+        monkeypatch.setattr(llm_tokens, "_ENCODER_LOADED", True)
+        assert llm_tokens.count_tokens("hello world test") == len("hello world test") // 4
+
+    def test_explicit_precise_true_uses_encoder(self, monkeypatch):
+        class _FakeEnc:
+            def encode(self, text, disallowed_special=()):
+                return [0] * 7
+
+        monkeypatch.setattr(llm_tokens, "_ENCODER", _FakeEnc())
+        monkeypatch.setattr(llm_tokens, "_ENCODER_LOADED", True)
+        # Explicit per-call opt-in wins regardless of the global default.
+        monkeypatch.setenv("LLM_PRECISE_TOKENS", "0")
+        assert llm_tokens.count_tokens("hello world test", precise=True) == 7
+
+    def test_env_opt_in_uses_encoder(self, monkeypatch):
+        monkeypatch.setenv("LLM_PRECISE_TOKENS", "true")
+
+        class _FakeEnc:
+            def encode(self, text, disallowed_special=()):
+                return [0] * 5
+
+        monkeypatch.setattr(llm_tokens, "_ENCODER", _FakeEnc())
+        monkeypatch.setattr(llm_tokens, "_ENCODER_LOADED", True)
+        assert llm_tokens.count_tokens("hello world test") == 5
+
+    def test_env_opt_out_disables_encoder(self, monkeypatch):
+        monkeypatch.setenv("LLM_PRECISE_TOKENS", "0")
+
+        class _FakeEnc:
+            def encode(self, text, disallowed_special=()):
+                return [0] * 999
+
+        monkeypatch.setattr(llm_tokens, "_ENCODER", _FakeEnc())
+        monkeypatch.setattr(llm_tokens, "_ENCODER_LOADED", True)
+        assert llm_tokens.count_tokens("hello world test") == len("hello world test") // 4
+
+    def test_precise_without_encoder_falls_back_to_heuristic(self, monkeypatch):
+        monkeypatch.setenv("LLM_PRECISE_TOKENS", "1")
+        monkeypatch.setattr(llm_tokens, "_ENCODER", None)
+        monkeypatch.setattr(llm_tokens, "_ENCODER_LOADED", True)  # loaded but unavailable
+        assert llm_tokens.count_tokens("hello world test") == len("hello world test") // 4
+
+    def test_encoder_is_singleton(self, monkeypatch):
+        """_get_encoder builds the encoder exactly once per process."""
+        monkeypatch.setattr(llm_tokens, "_ENCODER", None)
+        monkeypatch.setattr(llm_tokens, "_ENCODER_LOADED", False)
+        calls = []
+
+        try:
+            import tiktoken as _tk
+        except Exception:  # pragma: no cover - env without tiktoken
+            pytest.skip("tiktoken not installed")
+        real_get_encoding = _tk.get_encoding
+
+        def _counting_get_encoding(name):
+            calls.append(name)
+            return real_get_encoding(name)
+
+        monkeypatch.setattr("tiktoken.get_encoding", _counting_get_encoding)
+        e1 = llm_tokens._get_encoder()
+        e2 = llm_tokens._get_encoder()
+        assert e1 is e2
+        assert calls == ["cl100k_base"]  # built once

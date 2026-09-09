@@ -17,7 +17,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import pytest
 
 import api.docgen.spec as spec_mod
-from api.docgen._common import _cognee_dataset
 
 
 # ============================================================================
@@ -317,6 +316,13 @@ class TestRenderRawFallback:
 # _generate_spec_doc (shared flow)
 # ============================================================================
 class TestGenerateSpecDoc:
+    @pytest.fixture(autouse=True)
+    def _hermetic_flow(self, monkeypatch):
+        """Keep these (Wave-A era) tests on the standard-LLM seam: no react
+        agent build (would hit a live model) and no judge stage."""
+        monkeypatch.setattr(spec_mod, "_build_spec_agent", lambda *a, **kw: (None, None))
+        monkeypatch.setenv("DOCGEN_JUDGE_ENABLED", "false")
+
     @pytest.fixture
     def fake_spec(self):
         class FakeSpec:
@@ -452,6 +458,260 @@ class TestGenerateSpecDoc:
 
         result = asyncio.run(spec_mod.generate_openapi_docs(fake_spec, fake_product))
         assert "docs with mermaid" in result
+
+
+# ============================================================================
+# Wave D: _lookup_path (dot-path resolution over the parsed spec)
+# ============================================================================
+class TestLookupPath:
+    SPEC = {
+        "info": {"title": "Test API", "version": "1.0"},
+        "paths": {
+            "/users": {"get": {"summary": "List users"}},
+        },
+        "channels": [{"name": "ch0"}, {"name": "ch1"}],
+        "a.b": "dotted-key-value",
+    }
+
+    def test_nested_keys(self):
+        assert spec_mod._lookup_path(self.SPEC, "info.title") == "Test API"
+        assert spec_mod._lookup_path(self.SPEC, "info.version") == "1.0"
+
+    def test_openapi_dotted_path_key(self):
+        # Path keys contain dots/slashes; the longest join must win.
+        value = spec_mod._lookup_path(self.SPEC, "paths./users.get")
+        assert value == {"summary": "List users"}
+
+    def test_key_containing_dots(self):
+        assert spec_mod._lookup_path(self.SPEC, "a.b") == "dotted-key-value"
+
+    def test_list_index(self):
+        assert spec_mod._lookup_path(self.SPEC, "channels.0") == {"name": "ch0"}
+        assert spec_mod._lookup_path(self.SPEC, "channels.1.name") == "ch1"
+
+    def test_missing_returns_sentinel(self):
+        assert spec_mod._lookup_path(self.SPEC, "nope.nope") is spec_mod._MISSING
+        assert spec_mod._lookup_path(self.SPEC, "info.nope") is spec_mod._MISSING
+
+    def test_out_of_range_and_bad_index(self):
+        assert spec_mod._lookup_path(self.SPEC, "channels.9") is spec_mod._MISSING
+        assert spec_mod._lookup_path(self.SPEC, "channels.abc") is spec_mod._MISSING
+
+    def test_descend_into_scalar_is_missing(self):
+        assert spec_mod._lookup_path(self.SPEC, "info.title.deeper") is spec_mod._MISSING
+
+    def test_empty_path_returns_root(self):
+        assert spec_mod._lookup_path(self.SPEC, "") == self.SPEC
+
+
+class TestSpecLookupTool:
+    def test_invoke_returns_pretty_json(self):
+        tool = spec_mod.make_spec_lookup_tool({"info": {"title": "Test API"}})
+        out = tool.invoke({"path": "info"})
+        assert "Test API" in out
+
+    def test_invoke_missing_path_error(self):
+        tool = spec_mod.make_spec_lookup_tool({"info": {}})
+        assert "ERROR" in tool.invoke({"path": "ghost.path"})
+
+
+class _FakeSpecAgent:
+    """Stub react agent: ainvoke returns a scripted message list."""
+
+    def __init__(self, text="Agent enriched docs", error=None):
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        self.error = error
+        self._messages = [HumanMessage(content="task"), AIMessage(content=text)]
+
+    async def ainvoke(self, payload, config=None):
+        if self.error:
+            raise self.error
+        return {"messages": self._messages}
+
+
+# ============================================================================
+# Wave D: enrich node agent path + guard node verification
+# ============================================================================
+class TestSpecAgentFlow:
+    @pytest.fixture
+    def fake_spec(self):
+        class FakeSpec:
+            name = "TestSpec"
+            content = json.dumps({
+                "openapi": "3.0.0",
+                "info": {"title": "Test API", "version": "1.0"},
+                "paths": {"/users": {"get": {"summary": "List users"}}},
+            })
+        return FakeSpec()
+
+    @pytest.fixture
+    def fake_product(self):
+        class P:
+            id = "prod_agent"
+        return P()
+
+    def _patch_flow(self, monkeypatch, agent):
+        monkeypatch.setattr(
+            spec_mod, "_build_spec_agent", lambda *a, **kw: (agent, None)
+        )
+        monkeypatch.setenv("DOCGEN_JUDGE_ENABLED", "false")
+        monkeypatch.setattr(spec_mod, "_make_repair_llm", lambda *a, **kw: None)
+        monkeypatch.setattr(spec_mod, "_index_in_background", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            spec_mod, "run_repair_loop",
+            lambda content, llm: _async_return_pair((content, {})),
+        )
+
+    def test_agent_text_used_and_written_back(self, fake_spec, fake_product, monkeypatch):
+        self._patch_flow(monkeypatch, _FakeSpecAgent(text="Agent enriched docs"))
+        # The standard-LLM fallback must NOT be consulted when the agent wins.
+        monkeypatch.setattr(
+            spec_mod, "_llm_or_none", lambda *a, **kw: _async_return("LLM fallback text")
+        )
+
+        result = asyncio.run(spec_mod.generate_openapi_docs(fake_spec, fake_product))
+        assert result == "Agent enriched docs"
+        assert fake_spec.content == "Agent enriched docs"
+
+    def test_agent_failure_falls_back_to_standard_llm(self, fake_spec, fake_product, monkeypatch):
+        self._patch_flow(monkeypatch, _FakeSpecAgent(error=RuntimeError("agent down")))
+        monkeypatch.setattr(
+            spec_mod, "_llm_or_none", lambda *a, **kw: _async_return("LLM fallback text")
+        )
+
+        result = asyncio.run(spec_mod.generate_openapi_docs(fake_spec, fake_product))
+        assert result == "LLM fallback text"
+        assert fake_spec.content == "LLM fallback text"
+
+    def test_guard_masks_secrets_from_llm_text(self, fake_spec, fake_product, monkeypatch):
+        """The guard node masks secret-looking values in model output before
+        the doc is persisted (spec.content) or indexed."""
+        self._patch_flow(monkeypatch, _FakeSpecAgent(error=RuntimeError("down")))
+        token = "ghp_" + "AB" * 15
+        monkeypatch.setattr(
+            spec_mod, "_llm_or_none",
+            lambda *a, **kw: _async_return(f"Docs mention token: {token}"),
+        )
+
+        result = asyncio.run(spec_mod.generate_openapi_docs(fake_spec, fake_product))
+        assert token not in result
+        assert "***REDACTED***" in result
+        assert token not in fake_spec.content
+
+
+class TestSpecJudgePolicy:
+    """The judge runs ONLY for model-generated docs (agent / standard-llm);
+    the deterministic skeleton is grounded in the spec by construction."""
+
+    @pytest.fixture
+    def fake_spec(self):
+        class FakeSpec:
+            name = "TestSpec"
+            content = json.dumps({
+                "openapi": "3.0.0",
+                "info": {"title": "Test API"},
+            })
+        return FakeSpec()
+
+    @pytest.fixture
+    def fake_product(self):
+        class P:
+            id = "prod_judge"
+        return P()
+
+    def _common_patches(self, monkeypatch):
+        from api.docgen.verification import JudgeVerdict
+
+        monkeypatch.setattr(spec_mod, "_build_spec_agent", lambda *a, **kw: (None, None))
+        monkeypatch.setenv("DOCGEN_JUDGE_ENABLED", "true")
+        monkeypatch.setattr(spec_mod, "_make_repair_llm", lambda *a, **kw: None)
+        monkeypatch.setattr(spec_mod, "_index_in_background", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            spec_mod, "run_repair_loop",
+            lambda content, llm: _async_return_pair((content, {})),
+        )
+        calls = []
+
+        async def fake_judge(section_id, draft, evidence, *, model=None):
+            calls.append((section_id, draft))
+            return JudgeVerdict(verdict="consistent", issues=[])
+
+        monkeypatch.setattr(spec_mod, "judge_section", fake_judge)
+        return calls
+
+    def test_judge_skipped_for_skeleton_source(self, fake_spec, fake_product, monkeypatch):
+        calls = self._common_patches(monkeypatch)
+        monkeypatch.setattr(
+            spec_mod, "_llm_or_none", lambda *a, **kw: _async_return("")
+        )
+
+        result = asyncio.run(spec_mod.generate_openapi_docs(fake_spec, fake_product))
+        assert "Test API" in result  # skeleton used
+        assert calls == []  # deterministic skeleton -> no judge call
+
+    def test_judge_called_for_model_generated_source(self, fake_spec, fake_product, monkeypatch):
+        calls = self._common_patches(monkeypatch)
+        monkeypatch.setattr(
+            spec_mod, "_llm_or_none", lambda *a, **kw: _async_return("LLM docs")
+        )
+
+        asyncio.run(spec_mod.generate_openapi_docs(fake_spec, fake_product))
+        assert len(calls) == 1
+        assert calls[0][1] == "LLM docs"  # the draft is judged
+
+
+class TestSpecGraphRuntime:
+    """The LangGraph runtime and the straight-line fallback both work."""
+
+    @pytest.fixture
+    def fake_spec(self):
+        class FakeSpec:
+            name = "TestSpec"
+            content = json.dumps({"openapi": "3.0.0", "info": {"title": "T"}})
+        return FakeSpec()
+
+    @pytest.fixture
+    def fake_product(self):
+        class P:
+            id = "prod_graph"
+        return P()
+
+    def _patches(self, monkeypatch):
+        monkeypatch.setattr(spec_mod, "_build_spec_agent", lambda *a, **kw: (None, None))
+        monkeypatch.setenv("DOCGEN_JUDGE_ENABLED", "false")
+        monkeypatch.setattr(spec_mod, "_make_repair_llm", lambda *a, **kw: None)
+        monkeypatch.setattr(spec_mod, "_index_in_background", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            spec_mod, "run_repair_loop",
+            lambda content, llm: _async_return_pair((content, {})),
+        )
+
+    def test_graph_compiles(self):
+        assert spec_mod._get_spec_graph() is not None
+
+    def test_graph_flow_end_to_end(self, fake_spec, fake_product, monkeypatch):
+        """Through the REAL compiled graph (parse → enrich → guard)."""
+        self._patches(monkeypatch)
+        monkeypatch.setattr(
+            spec_mod, "_llm_or_none", lambda *a, **kw: _async_return("Graph docs")
+        )
+
+        result = asyncio.run(spec_mod.generate_openapi_docs(fake_spec, fake_product))
+        assert result == "Graph docs"
+        assert fake_spec.content == "Graph docs"
+
+    def test_straight_line_fallback(self, fake_spec, fake_product, monkeypatch):
+        """With the graph unavailable the SAME nodes run straight-line."""
+        self._patches(monkeypatch)
+        monkeypatch.setattr(spec_mod, "_get_spec_graph", lambda: None)
+        monkeypatch.setattr(
+            spec_mod, "_llm_or_none", lambda *a, **kw: _async_return("Straight-line docs")
+        )
+
+        result = asyncio.run(spec_mod.generate_openapi_docs(fake_spec, fake_product))
+        assert result == "Straight-line docs"
+        assert fake_spec.content == "Straight-line docs"
 
 
 # ============================================================================

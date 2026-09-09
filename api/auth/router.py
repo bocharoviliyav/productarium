@@ -15,9 +15,14 @@ they return 501 with a clear message (Keycloak is configured separately).
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
+import os
+import secrets
 import uuid
 from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
@@ -46,7 +51,8 @@ from api.auth.tokens import (
     create_session_token,
 )
 from api.db import SessionLocal, get_db
-from api.models import UserORM
+from api.models import UserORM, USER_ROLES
+from api.utils.rate_limit import enforce_ip_rate_limit
 from api.schemas import (
     ChangePasswordRequest,
     LoginRequest,
@@ -60,9 +66,20 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
-# Cookies are httpOnly + SameSite=Lax. Set secure=True behind HTTPS in prod via
-# an env flag if needed.
-_COOKIE_KWARGS = {"httponly": True, "samesite": "lax", "secure": False, "path": "/"}
+# Cookies are httpOnly + SameSite=Lax. Set COOKIE_SECURE=true when serving
+# behind HTTPS (adds the Secure attribute to every session/OAuth cookie).
+_COOKIE_SECURE = (os.environ.get("COOKIE_SECURE") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_COOKIE_KWARGS = {
+    "httponly": True,
+    "samesite": "lax",
+    "secure": _COOKIE_SECURE,
+    "path": "/",
+}
 
 
 def _user_out(user: UserORM) -> UserOut:
@@ -83,13 +100,52 @@ def _user_out(user: UserORM) -> UserOut:
     )
 
 
+# Lazily-computed dummy bcrypt hash so a login attempt for a NON-existent
+# username costs the same as one for an existing username (timing parity,
+# P0-7). Without this, user enumeration via response-time side channel is
+# trivial: existing users pay the ~100ms bcrypt cost, missing ones return fast.
+_DUMMY_HASH: Optional[str] = None
+
+
+def _dummy_verify(password: str) -> None:
+    """Burn one bcrypt comparison against a dummy hash (result discarded)."""
+    global _DUMMY_HASH
+    if _DUMMY_HASH is None:
+        try:
+            _DUMMY_HASH = hash_password(secrets.token_urlsafe(16))
+        except Exception:  # pragma: no cover - bcrypt unavailable
+            return
+    try:
+        verify_password(password, _DUMMY_HASH)
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
 @router.post("/login", response_model=UserOut)
-def login(body: LoginRequest, response: Response, db: Session = Depends(get_db)):
-    """Local username/password login. Sets the ``productarium_session`` cookie."""
+def login(
+    body: LoginRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """Local username/password login. Sets the ``productarium_session`` cookie.
+
+    Rate-limited per IP (P0-7): ``rate.auth.per_ip_minute`` admin setting >
+    ``RATE_AUTH_PER_IP_MINUTE`` env > 10/min default. 429 + Retry-After beyond.
+    """
+    enforce_ip_rate_limit(
+        request,
+        setting_key="rate.auth.per_ip_minute",
+        env_name="RATE_AUTH_PER_IP_MINUTE",
+        default_per_minute=10,
+    )
     if AUTH_PROVIDER == "none":
         return UserOut(id="system", username="system", role="admin", provider="local")
     user = db.query(UserORM).filter(UserORM.username == body.username).first()
-    if user is None or not verify_password(body.password, user.password_hash or ""):
+    if user is None:
+        _dummy_verify(body.password)  # timing parity with the found-user path
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    if not verify_password(body.password, user.password_hash or ""):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     token = create_session_token(user)
     response.set_cookie(
@@ -210,12 +266,24 @@ def change_password(
 
 
 @router.post("/reset-password")
-def reset_password(body: ResetPasswordRequest, db: Session = Depends(get_db)):
+def reset_password(
+    body: ResetPasswordRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
     """Public password reset via a one-time reset token.
 
-    Validates the token (sha256 hash match + not expired), sets the new
-    password, and clears the reset token + ``must_change_password``.
+    Rate-limited per IP (P0-7): ``rate.auth.per_ip_minute`` admin setting >
+    ``RATE_AUTH_PER_IP_MINUTE`` env > 10/min default. Validates the token
+    (sha256 hash match + not expired), sets the new password, and clears the
+    reset token + ``must_change_password``.
     """
+    enforce_ip_rate_limit(
+        request,
+        setting_key="rate.auth.per_ip_minute",
+        env_name="RATE_AUTH_PER_IP_MINUTE",
+        default_per_minute=10,
+    )
     if not body.token or not body.new_password:
         raise HTTPException(status_code=400, detail="Token and new password are required.")
     token_hash = hash_token(body.token)
@@ -266,6 +334,69 @@ def keycloak_login(request: Request):
     return resp
 
 
+def _keycloak_role_mapping() -> Dict[str, str]:
+    """Group -> role mapping (P0-2): admin setting > env > empty.
+
+    Sources: ``auth.keycloak.role_mapping`` in the admin settings store or the
+    ``KEYCLOAK_ROLE_MAPPING`` env var; both hold a JSON object like
+    ``{"/productarium-admins": "admin", "/editors": "manager"}``.
+    """
+    raw: Optional[str] = None
+    try:
+        from api.config.settings import get_setting
+
+        raw = get_setting("auth.keycloak.role_mapping")
+    except Exception:  # pragma: no cover - store down
+        raw = None
+    if not raw:
+        raw = os.environ.get("KEYCLOAK_ROLE_MAPPING", "")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        logger.warning("Ignoring invalid Keycloak role mapping %r: %s", raw[:120], e)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k).strip(): str(v).strip() for k, v in data.items()}
+
+
+def _access_token_groups(access_token: Optional[str]) -> List[str]:
+    """Extract the ``groups`` claim from a JWT payload (decode-only, no verify).
+
+    The token itself was already obtained over TLS from Keycloak; we only need
+    the IdP-issued groups for role mapping, not authenticated claims.
+    """
+    if not access_token:
+        return []
+    try:
+        payload_part = access_token.split(".")[1]
+        payload_part += "=" * (-len(payload_part) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_part))
+        groups = payload.get("groups") or []
+        return [g for g in groups if isinstance(g, str)]
+    except Exception:  # pragma: no cover - malformed token
+        return []
+
+
+def _map_keycloak_role(groups: List[str]) -> Optional[str]:
+    """Map IdP groups to a Productarium role via the configured mapping.
+
+    First matching group wins (mapping order is significant). Only valid roles
+    from ``USER_ROLES`` are honoured; no match / no mapping -> None (role stays
+    unchanged for existing users, 'user' for new ones).
+    """
+    mapping = _keycloak_role_mapping()
+    if not mapping:
+        return None
+    group_set = {g.strip().lower() for g in groups if isinstance(g, str) and g.strip()}
+    for group, role in mapping.items():
+        if group.lower() in group_set and role in USER_ROLES:
+            return role
+    return None
+
+
 @router.get("/keycloak/callback", name="keycloak_callback")
 def keycloak_callback(
     request: Request,
@@ -284,9 +415,10 @@ def keycloak_callback(
         raise HTTPException(status_code=400, detail=f"Keycloak error: {error}")
     if not code:
         raise HTTPException(status_code=400, detail="Missing authorization code")
-    # Validate state round-trip (defensive; mismatch -> 400).
+    # Validate state round-trip (CSRF): both sides must be PRESENT and equal.
+    # An omitted state parameter must never skip the check (review #5).
     cookie_state = request.cookies.get("productarium_oauth_state")
-    if cookie_state and state and cookie_state != state:
+    if not state or not cookie_state or cookie_state != state:
         raise HTTPException(status_code=400, detail="OAuth state mismatch")
     code_verifier = request.cookies.get("productarium_pkce_verifier")
     redirect_uri = str(request.url_for("keycloak_callback"))
@@ -306,18 +438,25 @@ def keycloak_callback(
             if sub
             else None
         )
+        groups = [g for g in (userinfo.get("groups") or []) if isinstance(g, str)]
+        groups += _access_token_groups(access_token)
+        mapped_role = _map_keycloak_role(groups)
         if user is None:
             user = UserORM(
                 id=f"user_{uuid.uuid4().hex[:24]}",
                 username=username or sub or "keycloak_user",
                 email=email,
-                role="user",
+                role=mapped_role or "user",
                 provider="keycloak",
                 provider_subject=sub,
             )
             db.add(user)
             db.commit()
             db.refresh(user)
+        elif mapped_role and user.role != mapped_role:
+            # Keep the local role in sync with the IdP group mapping (P0-2).
+            user.role = mapped_role
+            db.commit()
         token = create_session_token(user)
     resp = RedirectResponse("/")
     resp.set_cookie(

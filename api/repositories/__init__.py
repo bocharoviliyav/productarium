@@ -6,24 +6,22 @@ sessions inline, keeping DB logic in one place.
 
 Members:
 - ``product_repo`` — Product/Artifact ORM<->Pydantic mapping + persistence.
-- ``documents``    — Document reading + FAISS indexing pipeline + DatabaseManager
-  (clone via ``api.clients.git.download_repo`` -> read -> transform -> persist).
+- ``documents``    — Document reading + clone orchestration (DatabaseManager;
+  clone via ``api.clients.git.download_repo`` -> read).
 """
 
 from api.repositories.documents import (
     DatabaseManager,
+    Document,
     count_tokens,
     read_all_documents,
-    prepare_data_pipeline,
-    transform_documents_and_save_to_db,
     MAX_EMBEDDING_TOKENS,
 )
 
 __all__ = [
     "DatabaseManager",
+    "Document",
     "count_tokens",
     "read_all_documents",
-    "prepare_data_pipeline",
-    "transform_documents_and_save_to_db",
     "MAX_EMBEDDING_TOKENS",
 ]

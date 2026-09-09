@@ -8,7 +8,7 @@ import React, {
   useEffect,
   ReactNode,
 } from "react";
-import { locales } from "@/i18n";
+import enMessages from "../messages/en.json";
 
 type Messages = Record<string, any>;
 /** Interpolate `{name}` placeholders in a template string. */
@@ -38,8 +38,10 @@ const LanguageContext = createContext<LanguageContextType | undefined>(
 export function LanguageProvider({ children }: { children: ReactNode }) {
   // Initialize with 'en' or get from localStorage if available
   const [language, setLanguageState] = useState<string>("en");
-  const [messages, setMessages] = useState<Messages>({});
-  const [isLoading, setIsLoading] = useState<boolean>(true);
+  // P2-31: the app renders IMMEDIATELY with the bundled English messages;
+  // the user's language (localStorage / browser) is applied asynchronously
+  // once /api/lang/config resolves — no full-app spinner gate.
+  const [messages, setMessages] = useState<Messages>(enMessages);
   const [supportedLanguages, setSupportedLanguages] = useState({});
   const [defaultLanguage, setDefaultLanguage] = useState("en");
 
@@ -53,38 +55,21 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
       // Get browser language (navigator.language returns full locale like 'en-US')
       const browserLang =
         navigator.language || (navigator as any).userLanguage || "";
-      console.log("Detected browser language:", browserLang);
-
       if (!browserLang) {
-        return "en"; // Default to English if browser language is not available
+        return "en";
       }
 
       // Extract the language code (first 2 characters)
       const langCode = browserLang.split("-")[0].toLowerCase();
-      console.log("Extracted language code:", langCode);
 
-      // Check if the detected language is supported
-      if (locales.includes(langCode as any)) {
-        console.log("Language supported, using:", langCode);
-        return langCode;
-      }
-
-      // Special case for Chinese variants
-      if (langCode === "zh") {
-        console.log("Chinese language detected");
-        // Check for traditional Chinese variants
-        if (browserLang.includes("TW") || browserLang.includes("HK")) {
-          console.log("Traditional Chinese variant detected");
-          return "zh"; // Use Mandarin for traditional Chinese
-        }
-        return "zh"; // Use Mandarin for simplified Chinese
-      }
-
-      console.log("Language not supported, defaulting to English");
-      return "en"; // Default to English if not supported
-    } catch (error) {
-      console.error("Error detecting browser language:", error);
-      return "en"; // Default to English on error
+      // Check if the detected language is supported: the fetched config
+      // when available, else the message files known to ship with the app
+      // (used before /api/lang/config resolves).
+      const supported = Object.keys(supportedLanguages);
+      const known = supported.length > 0 ? supported : ["en", "ru"];
+      return known.includes(langCode) ? langCode : "en";
+    } catch {
+      return "en";
     }
   };
 
@@ -98,9 +83,9 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
         const data = await response.json();
         setSupportedLanguages(data.supported_languages);
         setDefaultLanguage(data.default);
-      } catch (err) {
-        console.error("Failed to fetch auth status:", err);
-        // Assuming auth is required if fetch fails to avoid blocking UI for safety
+      } catch {
+        // Offline / backend down: fall back to the bundled set — the app is
+        // already rendered with English messages, nothing blocks.
         const defaultSupportedLanguages = {
           en: "English",
           ru: "Русский (Russian)",
@@ -123,31 +108,21 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
 
             // If no language is stored, detect browser language
             if (!storedLanguage) {
-              console.log(
-                "No language in localStorage, detecting browser language",
-              );
               storedLanguage = detectBrowserLanguage();
-
-              // Store the detected language
               localStorage.setItem("language", storedLanguage);
             }
           } else {
-            console.log("Running on server-side, using default language");
             storedLanguage = "en";
           }
 
-          console.log(
-            "Supported languages loaded, validating language:",
-            storedLanguage,
-          );
           const validLanguage = Object.keys(supportedLanguages).includes(
             storedLanguage as any,
           )
             ? storedLanguage
             : defaultLanguage;
-          console.log("Valid language determined:", validLanguage);
 
-          // Load messages for the language
+          // Load messages for the language and swap them in — the app stays
+          // interactive (English) until this resolves.
           const langMessages = (
             await import(`../messages/${validLanguage}.json`)
           ).default;
@@ -161,12 +136,13 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
           }
         } catch (error) {
           console.error("Failed to load language:", error);
-          // Fallback to English
-          console.log("Falling back to English due to error");
-          const enMessages = (await import("../messages/en.json")).default;
-          setMessages(enMessages);
-        } finally {
-          setIsLoading(false);
+          // Fallback to English (already rendered — nothing to un-block)
+          try {
+            const fallback = (await import("../messages/en.json")).default;
+            setMessages(fallback);
+          } catch {
+            // keep the statically bundled English messages in state
+          }
         }
       };
 
@@ -177,7 +153,6 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
   // Update language and load new messages
   const setLanguage = async (lang: string) => {
     try {
-      console.log("Setting language to:", lang);
       const validLanguage = Object.keys(supportedLanguages).includes(
         lang as any,
       )
@@ -204,14 +179,6 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
       console.error("Failed to set language:", error);
     }
   };
-
-  if (isLoading) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-canvas text-muted">
-        <div className="h-8 w-8 animate-spin rounded-full border-2 border-divider border-t-ink" />
-      </div>
-    );
-  }
 
   return (
     <LanguageContext.Provider

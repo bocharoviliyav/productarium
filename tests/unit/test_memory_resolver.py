@@ -1,18 +1,19 @@
 """Unit tests for ``api.memory.resolver``.
 
 Covers:
-- ``get_memory_backend_name``: default (pgvector), invalid→default, setting
-  read (admin store), case-insensitive normalization, get_setting failure→default.
-- ``get_memory_backend``: instance caching (same name → same instance), switch
-  after cache reset.
-- ``_build_backend``: cognee fallback to pgvector when CogneeMemoryBackend()
-  raises (defensive import/instantiation error).
+- ``get_memory_backend_name``: default (pgvector), stale ``cognee`` value from
+  a pre-migration install → default, invalid→default, case-insensitive
+  normalization, get_setting failure→default.
+- ``get_memory_backend``: instance caching (same name → same instance), fresh
+  instance after cache reset.
+- ``_build_backend``: pgvector is the sole backend; any other name falls back
+  to pgvector instead of raising.
 - ``reset_memory_backend_cache``: drops the cached instance.
 
 The resolver reads ``memory.backend`` from the settings store (admin > env >
 default). Tests use the ``isolated_db`` fixture so the settings store is a real
-SQLite table; no cognee/pgvector dependency is required (CogneeMemoryBackend
-construction does not import cognee — imports are lazy per-method).
+SQLite table; no pgvector/Postgres dependency is required (PgVectorMemoryBackend
+construction does not connect — connections happen per method).
 """
 
 from __future__ import annotations
@@ -37,12 +38,14 @@ class TestGetMemoryBackendName:
         # No memory.backend setting stored → default.
         assert get_memory_backend_name() == "pgvector"
 
-    def test_reads_setting(self, isolated_db):
+    def test_stale_cognee_setting_falls_back_to_default(self, isolated_db):
+        # A leftover ``cognee`` value (pre-LangChain-migration install) must
+        # not brick the memory path: the resolver falls back to pgvector.
         from api.config.settings import set_setting
         from api.memory.resolver import get_memory_backend_name
 
         set_setting("memory.backend", "cognee")
-        assert get_memory_backend_name() == "cognee"
+        assert get_memory_backend_name() == "pgvector"
 
     def test_invalid_setting_falls_back_to_default(self, isolated_db):
         from api.config.settings import set_setting
@@ -62,8 +65,8 @@ class TestGetMemoryBackendName:
         from api.config.settings import set_setting
         from api.memory.resolver import get_memory_backend_name
 
-        set_setting("memory.backend", "  CoGnEe  ")
-        assert get_memory_backend_name() == "cognee"
+        set_setting("memory.backend", "  PGVector  ")
+        assert get_memory_backend_name() == "pgvector"
 
     def test_get_setting_failure_falls_back_to_default(self, monkeypatch):
         # Force get_setting to raise — the resolver must not propagate.
@@ -92,7 +95,7 @@ class TestGetMemoryBackendCaching:
         assert b1 is b2
         assert b1.name == "pgvector"
 
-    def test_switch_after_reset(self, isolated_db):
+    def test_stale_cognee_setting_still_builds_pgvector_after_reset(self, isolated_db):
         from api.config.settings import set_setting
         from api.memory.resolver import (
             get_memory_backend,
@@ -103,12 +106,12 @@ class TestGetMemoryBackendCaching:
         pg = get_memory_backend()
         assert pg.name == "pgvector"
 
-        # Switch to cognee + reset cache → next call builds a cognee backend.
+        # A stale ``cognee`` value still resolves to pgvector; the cache is
+        # keyed by the resolved name, so the same instance comes back.
         set_setting("memory.backend", "cognee")
         reset_memory_backend_cache()
-        cog = get_memory_backend()
-        assert cog.name == "cognee"
-        assert cog is not pg
+        again = get_memory_backend()
+        assert again.name == "pgvector"
 
     def test_reset_without_switch_keeps_type(self, isolated_db):
         from api.memory.resolver import (
@@ -126,33 +129,21 @@ class TestGetMemoryBackendCaching:
 
 
 # --------------------------------------------------------------------------- #
-# _build_backend (fallback)
+# _build_backend (pgvector is the sole backend)
 # --------------------------------------------------------------------------- #
 class TestBuildBackendFallback:
-    def test_cognee_instantiation_failure_falls_back_to_pgvector(self, monkeypatch):
-        from api.memory import cognee_backend as cognee_be_mod
+    def test_unknown_name_falls_back_to_pgvector(self):
         from api.memory.resolver import _build_backend
 
-        class _Boom:
-            def __init__(self, *a, **k):
-                raise RuntimeError("cognee import broken")
-
-        monkeypatch.setattr(cognee_be_mod, "CogneeMemoryBackend", _Boom)
-
-        result = _build_backend("cognee")
-        assert result.name == "pgvector"
+        # Unknown/stale names must not raise — they build pgvector.
+        for name in ("cognee", "bogus", ""):
+            assert _build_backend(name).name == "pgvector"
 
     def test_build_pgvector_directly(self):
         from api.memory.resolver import _build_backend
 
         result = _build_backend("pgvector")
         assert result.name == "pgvector"
-
-    def test_build_cognee_directly(self):
-        from api.memory.resolver import _build_backend
-
-        result = _build_backend("cognee")
-        assert result.name == "cognee"
 
 
 # --------------------------------------------------------------------------- #

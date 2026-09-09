@@ -1,24 +1,26 @@
 """Resolve the active memory backend from the ``memory.backend`` admin setting.
 
-The active backend (``pgvector`` default, ``cognee`` alternative) is read from
-the settings store on every ``get_memory_backend()`` call, but the backend
-instance is cached so a hot recall path does not re-instantiate it per call.
-The cache is invalidated by ``reset_memory_backend_cache`` (called from
-``sync_runtime_settings`` after an admin save) so a switch takes effect on the
-next call without a process restart.
+The backend instance is read from the settings store on every
+``get_memory_backend()`` call, but cached so a hot recall path does not
+re-instantiate it per call. The cache is invalidated by
+``reset_memory_backend_cache`` (called from ``sync_runtime_settings`` after
+an admin save) so a change takes effect on the next call without a process
+restart.
+
+pgvector (``knowledge_chunks`` + cosine recall) is the only supported
+backend since the LangChain migration removed cognee.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from api.memory.base import MemoryBackend
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_BACKEND = "pgvector"
-_VALID_BACKENDS = ("pgvector", "cognee")
+_VALID_BACKENDS = ("pgvector",)
 
 # Cached backend instance + the name it was built for. Reset by
 # reset_memory_backend_cache (called after an admin setting change).
@@ -26,11 +28,12 @@ _cache: dict = {"backend": None, "name": None}
 
 
 def get_memory_backend_name() -> str:
-    """Return the configured backend name (``pgvector`` | ``cognee``).
+    """Return the configured backend name (``pgvector``).
 
     Reads ``memory.backend`` from the settings store (admin > env), falling
-    back to the default. An invalid value falls back to the default rather
-    than raising, so a typo cannot brick the memory path.
+    back to the default. Any other value (e.g. a leftover ``cognee`` from a
+    pre-migration install) falls back to the default rather than raising,
+    so a stale setting cannot brick the memory path.
     """
     try:
         from api.config.settings import get_setting
@@ -49,8 +52,8 @@ def get_memory_backend_name() -> str:
 def get_memory_backend() -> MemoryBackend:
     """Return the active ``MemoryBackend`` instance (cached per backend name).
 
-    The cache is keyed by the resolved name so switching backends via the admin
-    panel invalidates it naturally: a different name builds a new instance.
+    The cache is keyed by the resolved name so a settings change invalidates
+    it naturally: a different name builds a new instance.
     """
     name = get_memory_backend_name()
     if _cache["backend"] is not None and _cache["name"] == name:
@@ -65,25 +68,21 @@ def reset_memory_backend_cache() -> None:
     """Drop the cached backend instance so the next call rebuilds it.
 
     Called from ``sync_runtime_settings`` after an admin save so a backend
-    switch takes effect immediately. Safe to call any time.
+    change takes effect immediately. Safe to call any time.
     """
     _cache["backend"] = None
     _cache["name"] = None
 
 
 def _build_backend(name: str) -> MemoryBackend:
-    """Instantiate a backend by name. Falls back to pgvector on import error."""
-    if name == "cognee":
-        try:
-            from api.memory.cognee_backend import CogneeMemoryBackend
+    """Instantiate a backend by name (pgvector only).
 
-            return CogneeMemoryBackend()
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning(
-                "Could not build cognee memory backend (%s); falling back to pgvector.", e
-            )
-            name = "pgvector"
-    # default + fallback
+    Unknown names fall back to pgvector — the sole supported backend.
+    """
+    if name != "pgvector":
+        logger.warning(
+            "Unknown memory backend %r; falling back to pgvector.", name
+        )
     from api.memory.pgvector_backend import PgVectorMemoryBackend
 
     return PgVectorMemoryBackend()

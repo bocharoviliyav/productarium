@@ -1,13 +1,12 @@
-"""Shared helpers for the docgen pipeline (event loop, LLM wrapper, persistence).
+"""Shared helpers for the docgen pipeline (event loop, LLM, persistence).
 
 Moved out of the former ``api/artifact_docgen.py`` during the Step 4 split so the
-codebase / spec / simple generators can share one LLM wrapper, one cognee
+codebase / spec / simple generators can share one LLM path, one memory-backend
 indexing handoff, and one set of prompt/naming helpers without cross-importing
 each other.
 
-The three LLM wrapper classes (``_StandardLLM`` / ``_ExpertLLM`` / ``_SummaryLLM``)
-are NOT identical (retry vs streaming vs simple) and stay in their domain
-packages; only ``_StandardLLM`` (the docgen retry wrapper) lives here. Likewise
+The LLM itself is ``api.llm.GenerateLLM`` (langchain ``ChatOpenAI`` with retry);
+the domain wrappers keep their own cleaning/prompt logic. Likewise
 ``_clean_llm_text`` differs between modules (expert strips ``<r>`` blocks) so
 the docgen variant lives here and expert keeps its own.
 """
@@ -16,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 from typing import Any, Dict, Optional, Tuple
 
@@ -24,6 +22,7 @@ from api.utils import setup_logging
 from api.utils.llm_helpers import (  # noqa: E402
     safe_replace as _safe_replace,
     cap as _cap,
+    aclose_llm as _aclose_llm,
     strip_inline_line_numbers as _strip_inline_line_numbers,
     strip_number_prefixes_from_block as _strip_number_prefixes_from_block,
     LINE_NUM_PREFIX_RE as _LINE_NUM_PREFIX_RE,
@@ -36,8 +35,8 @@ logger = logging.getLogger(__name__)
 
 # Long-lived main FastAPI event loop, captured at startup so the docgen worker
 # threads (which run their own short-lived loops) can hand off fire-and-forget
-# cognee indexing via ``asyncio.run_coroutine_threadsafe``. This lets the
-# long-running cognify survive the worker loop teardown instead of being
+# memory indexing via ``asyncio.run_coroutine_threadsafe``. This lets the
+# long-running indexing survive the worker loop teardown instead of being
 # cancelled when ``_run_docgen_job`` finishes. Set by ``set_main_event_loop``
 # from ``api.api.startup_event``.
 _main_event_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -47,7 +46,7 @@ def set_main_event_loop(loop: Optional[asyncio.AbstractEventLoop]) -> None:
     """Record the long-lived main event loop for cross-thread task handoff.
 
     Called once from ``api.api.startup_event``. Docgen worker threads then use
-    ``get_main_event_loop`` to schedule cognee indexing so the cognify coroutine
+    ``get_main_event_loop`` to schedule memory indexing so the coroutine
     is NOT cancelled when the worker's own loop closes.
     """
     global _main_event_loop
@@ -101,6 +100,24 @@ def _repo_name_from_url(repo_url: str) -> str:
     return name or repo_url
 
 
+def emit_progress(progress: Optional[Any], **fields: Any) -> None:
+    """Invoke a docgen progress callback; a no-op when absent, never raises.
+
+    ``progress`` is the optional ``Callable[..., None]`` threaded from
+    ``api.docgen.jobs.report_progress`` through the generate_* entry points
+    (None for legacy/test callers). Accepted fields: ``phase``,
+    ``sections_total``, ``sections_done``, ``current_section``,
+    ``section_done`` (+ ``section_seconds``). Broken progress plumbing must
+    never fail a generation run.
+    """
+    if progress is None:
+        return
+    try:
+        progress(**fields)
+    except Exception:
+        logger.debug("docgen progress callback failed", exc_info=True)
+
+
 def _product_name(product: Any, artifact: Any) -> str:
     if product is not None and getattr(product, "name", None):
         return product.name
@@ -110,9 +127,8 @@ def _product_name(product: Any, artifact: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Standard (non-RLM) LLM wrapper -- adalflow Generator over the
-# OpenAI-compatible local server. Built lazily from api.config.get_model_config
-# (no cloud keys).
+# Standard LLM -- api.llm.GenerateLLM (langchain ChatOpenAI) over the
+# OpenAI-compatible local server. Retry/backoff lives in api.llm.generate.
 # ---------------------------------------------------------------------------
 class _StandardLLM:
     """Thin non-streaming text generator over the configured local LLM.
@@ -128,64 +144,36 @@ class _StandardLLM:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
     ):
-        import adalflow as adal
-        from api.config import get_model_config
+        from api.llm import GenerateLLM
 
         if not model:
             model = "qwen/qwen3.6-27b"
-        generator_config = get_model_config(model)
-        model_client_class = generator_config["model_client"]
-        # Thread admin base_url/api_key through to the OpenAI-compatible client
-        # so docgen hits the configured endpoint (corporate gateway, LM Studio,
-        # ...) rather than the env default. Every supported server exposes the
-        # OpenAI-compatible /v1 API, so OpenAIClient covers all cases. SSL
-        # verify is wired via ssl_config.
-        client_kwargs: Dict[str, Any] = {}
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        if api_key:
-            client_kwargs["api_key"] = api_key
-        self.model_client = model_client_class(**client_kwargs)
-        self.model_kwargs = generator_config["model_kwargs"]
-        self.generator = adal.Generator(
-            template="{{input_str}}",
-            model_client=self.model_client,
-            model_kwargs=self.model_kwargs,
-        )
+        self._llm = GenerateLLM(model=model, base_url=base_url, api_key=api_key)
 
     async def generate(self, prompt: str) -> str:
-        async def _call_with_retry() -> str:
-            def _single_call():
-                try:
-                    result = self.generator(prompt_kwargs={"input_str": prompt})
-                    if getattr(result, "error", None):
-                        return "", Exception(str(result.error))
-                    for attr in ("data", "response", "answer", "raw_response", "output"):
-                        val = getattr(result, attr, None)
-                        if val:
-                            return str(val), None
-                    return "", None
-                except Exception as ex:
-                    return "", ex
+        return await self._llm.generate(prompt)
 
-            max_retries = 3
-            for attempt in range(max_retries):
-                res_str, exc = await asyncio.to_thread(_single_call)
-                if res_str:
-                    return res_str
-                if exc:
-                    emsg = str(exc).lower()
-                    if ("429" in emsg or "rate limit" in emsg or "too many requests" in emsg) and attempt < max_retries - 1:
-                        backoff = (attempt + 1) * 2.5
-                        logger.warning("Standard LLM hit rate limit (attempt %d/%d). Sleeping %.1fs: %s", attempt + 1, max_retries, backoff, exc)
-                        await asyncio.sleep(backoff)
-                    else:
-                        if exc:
-                            logger.warning("Standard LLM returned an error: %s", exc)
-                        break
-            return ""
+    async def aclose(self) -> None:
+        """Close the wrapped generator's httpx client (docgen pool hygiene)."""
+        await _safe_aclose(self._llm)
 
-        return await _call_with_retry()
+
+async def _safe_aclose(llm: Any) -> None:
+    """Close the httpx client behind an LLM wrapper (best-effort, never raises).
+
+    Works with anything exposing ``aclose()`` (``GenerateLLM``, the docgen
+    ``_StandardLLM``/``_SummaryLLM`` wrappers); silently ignores objects
+    without one (fakes in tests, factory changes).
+    """
+    if llm is None:
+        return
+    aclose = getattr(llm, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception:
+        logger.debug("could not close an LLM httpx client", exc_info=True)
 
 
 def _resolve_docgen_model(
@@ -221,7 +209,7 @@ def _safe_build_llm(
     except Exception as e:  # pragma: no cover - depends on live config/LLM
         logger.warning(
             "Could not initialise standard LLM (%s): %s. "
-            "Falling back to RLM/skeleton where possible.", model, e,
+            "Falling back to skeleton where possible.", model, e,
         )
         return None
 
@@ -232,7 +220,11 @@ async def _llm_or_none(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> str:
-    """Run the standard LLM on ``prompt``; return cleaned text or "" on failure."""
+    """Run the standard LLM on ``prompt``; return cleaned text or "" on failure.
+
+    Builds, uses and CLOSES its own client (one per call): the caller never
+    has to manage the lifecycle.
+    """
     if not prompt:
         return ""
     llm = _safe_build_llm(model, base_url=base_url, api_key=api_key)
@@ -243,6 +235,10 @@ async def _llm_or_none(
     except Exception as e:  # pragma: no cover - depends on live LLM
         logger.warning("Standard LLM generation failed: %s", e)
         return ""
+    finally:
+        # P1-14: release httpx pools. Duck-typed close — the factory is a
+        # patch point and may return objects without ``aclose``.
+        await _safe_aclose(llm)
 
 
 def _make_repair_llm(
@@ -254,29 +250,52 @@ def _make_repair_llm(
     """Build an async ``(prompt) -> str`` callable for the mermaid repair loop.
 
     Reuses an already-built ``_StandardLLM`` when available (so the codebase
-    path doesn't construct a second client); otherwise builds one from the same
-    model/base_url/api_key. Returns None if no LLM could be built
+    path doesn't construct a second client — its owner closes it); otherwise
+    builds one from the same model/base_url/api_key and marks OWNERSHIP via
+    the ``_owned_llm`` attribute: the caller MUST then close it through
+    ``_close_owned_llm`` (spec flow). Returns None if no LLM could be built
     (repairs are then skipped and broken diagrams are surfaced with a marker).
     """
-    if existing is not None:
-        llm = existing
-    else:
-        llm = _safe_build_llm(model, base_url=base_url, api_key=api_key)
+    def _build() -> Optional[_StandardLLM]:
+        return existing if existing is not None else _safe_build_llm(
+            model, base_url=base_url, api_key=api_key
+        )
+
+    owns_llm = existing is None
+    llm = _build()
     if llm is None:
         return None
 
     async def _call(prompt: str) -> str:
+        # P1-14: when this closure owns the LLM (no ``existing`` passed), build
+        # per call and close it in ``finally`` so no httpx pool leaks. When an
+        # ``existing`` LLM is reused, its owner is responsible for closing.
+        owned = existing is None
+        llm = _build()
+        if llm is None:
+            return ""
         try:
             return await llm.generate(prompt)
         except Exception as e:  # pragma: no cover - depends on live LLM
             logger.warning("Mermaid repair LLM call failed: %s", e)
             return ""
+        finally:
+            if owned:
+                await _aclose_llm(llm)  # P1-14 (duck-typed; see _llm_or_none)
 
+    _call._owned_llm = llm if owns_llm else None  # type: ignore[attr-defined]
     return _call
 
 
+async def _close_owned_llm(repair_llm: Any) -> None:
+    """Close the LLM built by ``_make_repair_llm`` when it owns one."""
+    owned = getattr(repair_llm, "_owned_llm", None)
+    if owned is not None:
+        await _safe_aclose(owned)
+
+
 # ---------------------------------------------------------------------------
-# Persistence + cognee indexing helpers
+# Persistence + memory indexing helpers
 # ---------------------------------------------------------------------------
 def _persist_artifact(artifact: Any, markdown: str, pages: Dict[str, Any]) -> None:
     """Write generated_docs + pages onto the artifact (ORM or Pydantic)."""
@@ -287,14 +306,65 @@ def _persist_artifact(artifact: Any, markdown: str, pages: Dict[str, Any]) -> No
         logger.warning("Could not write generated_docs/pages onto artifact: %s", e)
 
 
-def _cognee_dataset(product: Any) -> str:
-    """Product-scoped dataset/product key: ``prod_{product_id}``.
+def _checkpoint_partial_docs(
+    artifact_id: Any,
+    model: Any,
+    markdown: str,
+    pages: Dict[str, Any],
+) -> bool:
+    """Persist a PARTIAL doc set onto the artifact row mid-run (item 2.3a).
 
-    Historically the cognee dataset name; now also the key from which the
-    memory-backend indexing path extracts the ``product_id`` (the active
-    backend — pgvector or cognee — is selected by the ``memory.backend`` admin
-    setting, so callers stay backend-agnostic). Falls back to ``unknown`` if
-    the product has no id.
+    Short-lived session, immediate commit: a crash later in the run (worker
+    kill, LLM outage at section 6 of 7) keeps every already-verified section
+    durable, and the rerun picks those sections up via diff regeneration
+    (``plan_regeneration`` reuse) instead of paying for them again — the
+    checkpoint stores exactly the provenance/fingerprint payload the final
+    persist would. On success the worker's own session later overwrites the
+    row with the complete doc set; on failure its rollback leaves the
+    checkpoints intact (that is the point).
+
+    Best-effort by contract: any error is logged and swallowed — a checkpoint
+    must never fail a generation run.
+    """
+    if not artifact_id or model is None:
+        return False
+    from api.db import SessionLocal
+
+    session = SessionLocal()
+    try:
+        row = session.get(model, artifact_id)
+        if row is None:
+            logger.debug(
+                "checkpoint target %s %s not found; skipping", model, artifact_id,
+            )
+            return False
+        row.generated_docs = markdown
+        row.pages = pages
+        session.commit()
+        return True
+    except Exception as e:  # pragma: no cover - checkpoint must never break gen
+        try:
+            session.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "Partial docs checkpoint failed for %s %s: %s", model, artifact_id, e,
+        )
+        return False
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+def _product_dataset(product: Any) -> str:
+    """Product-scoped dataset key for memory indexing: ``prod_{product_id}``.
+
+    ``_index_in_background`` extracts the ``product_id`` back out of this key
+    (the active backend is selected by the ``memory.backend`` admin setting, so
+    callers stay backend-agnostic). Falls back to ``unknown`` if the product
+    has no id.
     """
     pid = getattr(product, "id", None) or getattr(product, "product_id", None) or "unknown"
     return f"prod_{pid}"
@@ -316,16 +386,14 @@ def _index_in_background(
 ) -> None:
     """Fire-and-forget memory-backend indexing. Failures are logged, never fatal.
 
-    Delegates to ``api.memory.index_document`` (active backend: pgvector by
-    default, cognee alt) so the admin ``memory.backend`` switch governs this
-    path too. The indexing coroutine is handed off to the long-lived MAIN
-    FastAPI event loop (captured at startup) via
-    ``asyncio.run_coroutine_threadsafe`` so it survives the docgen worker
-    thread's own short-lived loop teardown. This is essential because a cognee
-    ``cognify`` can legitimately run 20-30 min — if it were scheduled on the
-    worker loop, closing that loop when the docgen job finishes would CANCEL
-    the still-running cognify. By moving it to the main loop, the job can
-    return immediately while indexing continues in the background.
+    Delegates to ``api.memory.index_document`` (active backend: pgvector). The
+    indexing coroutine is handed off to the long-lived MAIN FastAPI event loop
+    (captured at startup) via ``asyncio.run_coroutine_threadsafe`` so it
+    survives the docgen worker thread's own short-lived loop teardown —
+    indexing a large artifact can legitimately run for many minutes, and
+    scheduling it on the worker loop would CANCEL it when the docgen job
+    finishes. By moving it to the main loop, the job can return immediately
+    while indexing continues in the background.
     """
     product_id = _product_id_from_dataset(dataset_name)
 

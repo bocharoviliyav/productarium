@@ -1,29 +1,27 @@
 """Expert LLM wrapper + factory + chunk-text extraction + model resolution.
 
 Split out of the former ``api/expert_agent.py`` (Step 6). Owns the
-``_ExpertLLM`` adalflow Generator wrapper (non-streaming ``generate`` + async
-``stream`` with chunked fallback), the ``_safe_build_llm`` graceful-degrade
-factory, ``_extract_chunk_fields`` (native + OpenAI
-streaming-chunk shape handling including reasoning/thinking fields),
-``_ThinkingStreamParser`` (inline ``⬢`` tag splitter), and
+``_ExpertLLM`` wrapper (non-streaming ``generate`` + async ``stream`` with
+chunked fallback over the langchain ``ChatOpenAI`` client from ``api.llm``),
+the ``_safe_build_llm`` graceful-degrade factory, ``_extract_chunk_fields``
+(native + OpenAI streaming-chunk shape handling including reasoning/thinking
+fields), ``_ThinkingStreamParser`` (inline ``<think>`` tag splitter), and
 ``_resolve_expert_model`` (admin-configured model/
 base_url/api_key resolution for the ``expert`` task).
 
-``_ExpertLLM`` mirrors ``api.docgen._common._StandardLLM`` for non-streaming
-generation (file-disjoint per the Wave 2 scope contract) and adds async
-streaming that bypasses the Generator to call the model client's
-``acall(stream=True)`` directly.
+Streaming goes through ``api.llm.stream_chat_fields`` (content + reasoning
+delta pairs); the ``<think>`` parser below still handles models that inline
+the reasoning trace inside the content field.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
 import re
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, List, Optional, Tuple
 
 from api.utils import setup_logging
+from api.utils.llm_helpers import aclose_llm as _aclose_llm
 from api.expert.types import (
     EVENT_CONTENT,
     EVENT_REASONING,
@@ -45,11 +43,11 @@ _THINK_UNCLOSED_RE = re.compile(r"<think>.*$", re.DOTALL)
 class _ExpertLLM:
     """Thin LLM wrapper over the configured local model.
 
-    Mirrors ``api.docgen._common._StandardLLM`` for non-streaming generation
-    (adalflow ``Generator`` with ``template=\"{{input_str}}\"``) and adds an async
-    ``stream()`` that bypasses the Generator to call the model client's
-    ``acall(stream=True)`` directly. Honors admin-configured ``base_url`` / ``api_key``
-    from ``api.config.settings.get_model_for_task`` when provided.
+    Built on ``api.llm.GenerateLLM`` (langchain ``ChatOpenAI`` with the
+    corporate TLS / timeout / placeholder-key policy) for non-streaming
+generation, and on ``api.llm.stream_chat_fields`` for async streaming
+(content + reasoning delta pairs). Honors admin-configured ``base_url`` /
+``api_key`` from ``api.config.settings.get_model_for_task`` when provided.
     """
 
     def __init__(
@@ -58,56 +56,30 @@ class _ExpertLLM:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
     ):
-        import adalflow as adal
-        from api.config import get_model_config
+        from api.llm import GenerateLLM
 
-        generator_config = get_model_config(model)
-        client_cls = generator_config["model_client"]
-        self.model_kwargs = generator_config["model_kwargs"]
-        self.model = self.model_kwargs.get("model", model)
+        # Kept for the streaming path, which builds its own ChatOpenAI per
+        # call via ``stream_chat_fields`` (same model/base_url/api_key).
+        self._model = model
+        self._base_url = base_url
+        self._api_key = api_key
+        self._llm = GenerateLLM(model=model, base_url=base_url, api_key=api_key)
 
-        # Every supported local server (LM Studio, llama.cpp, vLLM, ...)
-        # exposes the OpenAI-compatible /v1 API, so OpenAIClient covers all
-        # cases. SSL verify is wired via ssl_config.
-        client_kwargs: Dict[str, Any] = {}
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        if api_key:
-            client_kwargs["api_key"] = api_key
-        self.model_client = client_cls(**client_kwargs)
-        self.generator = adal.Generator(
-            template="{{input_str}}",
-            model_client=self.model_client,
-            model_kwargs=self.model_kwargs,
-        )
+    async def aclose(self) -> None:
+        """Close the underlying model client's httpx connection pools (P1-14).
+
+        Each ``_ExpertLLM`` is built per expert request/answer; without an
+        explicit close every one of them leaked an open ``httpx.Client`` + a
+        lazily-built ``httpx.AsyncClient``. Never raises.
+        """
+        await _aclose_llm(self.model_client)
 
     async def generate(self, prompt: str) -> str:
         """Non-streaming generation. Returns the raw response text."""
-
-        def _call() -> str:
-            # adalflow 1.x Generator.call() takes ``prompt_kwargs`` (the dict
-            # that fills the ``{{input_str}}`` template placeholder), NOT a
-            # bare ``input_str=`` kwarg. Passing ``input_str=`` raises
-            # ``TypeError: Generator.call() got an unexpected keyword argument
-            # 'input_str'`` (see api/docgen/wiki.py for the pattern).
-            result = self.generator(prompt_kwargs={"input_str": prompt})
-            # On a model error (e.g. 401 / connection refused) adalflow returns
-            # a GeneratorOutput with ``error`` set and ``data=None`` but stores
-            # the full prompt on ``input`` for tracing. Returning
-            # ``str(result)`` would leak the entire prompt (system prompt +
-            # retrieved context + query) into the expert chat/doc. Treat any
-            # error as "no generation" so the caller surfaces a graceful
-            # failure message instead of the raw prompt.
-            if getattr(result, "error", None):
-                logger.warning("Expert LLM returned an error: %s", result.error)
-                return ""
-            for attr in ("data", "response", "answer", "raw_response", "output"):
-                val = getattr(result, attr, None)
-                if val:
-                    return str(val)
-            return ""
-
-        return await asyncio.to_thread(_call)
+        # GenerateLLM returns "" on any failure (never raises), so a model
+        # error surfaces as "no generation" instead of leaking the prompt
+        # into the expert chat/doc.
+        return await self._llm.generate(prompt)
 
     async def stream(self, prompt: str) -> AsyncIterator[ExpertStreamEvent]:
         """Async-stream typed events from the local LLM.
@@ -125,34 +97,17 @@ class _ExpertLLM:
         # Late import: prompt.py defines _clean_llm_text + _chunk_text. Kept
         # local to avoid an import cycle (prompt -> llm would otherwise circle).
         from api.expert.prompt import _clean_llm_text, _chunk_text
+        from api.llm import stream_chat_fields
 
         try:
-            from adalflow.core.types import ModelType
-
-            # Every supported server uses the flat OpenAI-compatible streaming
-            # request shape.
-            mk = {
-                "model": self.model,
-                "stream": True,
-                "temperature": self.model_kwargs.get("temperature", 0.1),
-            }
-            if "top_p" in self.model_kwargs:
-                mk["top_p"] = self.model_kwargs["top_p"]
-            if "seed" in self.model_kwargs:
-                mk["seed"] = self.model_kwargs["seed"]
-
-            api_kwargs = self.model_client.convert_inputs_to_api_kwargs(
-                input=prompt, model_kwargs=mk, model_type=ModelType.LLM
-            )
-            response = await self.model_client.acall(
-                api_kwargs=api_kwargs, model_type=ModelType.LLM
-            )
             parser = _ThinkingStreamParser()
             produced = False
-            async for chunk in response:  # type: ignore[union-attr]
-                content_text, reasoning_text = _extract_chunk_fields(
-                    chunk
-                )
+            async for content_text, reasoning_text in stream_chat_fields(
+                prompt,
+                model=self._model,
+                base_url=self._base_url,
+                api_key=self._api_key,
+            ):
                 # Separate reasoning field (DeepSeek/vLLM thinking) —
                 # yield directly, no inline-tag parsing needed.
                 if reasoning_text:
@@ -384,7 +339,7 @@ def _extract_chunk_fields(
             if (isinstance(content, str) and content) or reasoning:
                 return content, reasoning
 
-    # adalflow GeneratorOutput-style: .response / .data
+    # Plain-text object shape: .response / .data / .text
     for attr in ("response", "data", "text"):
         val = getattr(chunk, attr, None)
         if isinstance(val, str) and val:

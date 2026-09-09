@@ -5,17 +5,14 @@ Covers:
 - ``get_ca_bundle`` (admin store, env vars, missing file, whitespace).
 - ``get_verify`` (admin store, env var, default True).
 - ``requests_verify`` / ``httpx_verify`` (CA path when verify on, False when off).
-- ``apply_litellm_ssl`` (skip-verify path, verify-on path, litellm absent).
 - ``apply_openai_ssl_patch`` (patches openai.AsyncOpenAI/OpenAI __init__).
-- ``apply_ssl_env`` (skip-verify path, CA bundle path path, litellm skip).
-- ``apply_cognee_ssl_patch`` (skip-verify patch, restore on verify-on, cognee absent).
+- ``apply_ssl_env`` (skip-verify path, CA bundle path, no overwrite).
 """
 
 from __future__ import annotations
 
 import os
 import sys
-import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -215,39 +212,6 @@ class TestRequestsVerify:
 
 
 # ---------------------------------------------------------------------------
-# apply_litellm_ssl
-# ---------------------------------------------------------------------------
-
-class TestApplyLitellmSsl:
-    def test_skip_verify_when_litellm_absent(self, monkeypatch):
-        # litellm is not installed in the test env; apply_litellm_ssl should no-op
-        monkeypatch.setattr(ssl_mod, "_setting", lambda key: "false" if key == "ssl.verify" else None)
-        # Should not raise even though litellm import fails
-        ssl_mod.apply_litellm_ssl()
-
-    def test_verify_on_when_litellm_absent(self, monkeypatch):
-        monkeypatch.setattr(ssl_mod, "_setting", lambda key: "true" if key == "ssl.verify" else None)
-        ssl_mod.apply_litellm_ssl()
-
-    def test_skip_verify_with_litellm_mock(self, monkeypatch):
-        fake_litellm = types.ModuleType("litellm")
-        fake_litellm.ssl_verify = True
-        monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
-        monkeypatch.setattr(ssl_mod, "_setting", lambda key: "false" if key == "ssl.verify" else None)
-        ssl_mod.apply_litellm_ssl()
-        assert fake_litellm.ssl_verify is False
-        assert os.environ.get("SSL_VERIFY") == "false"
-
-    def test_verify_on_with_litellm_mock(self, monkeypatch):
-        fake_litellm = types.ModuleType("litellm")
-        fake_litellm.ssl_verify = False
-        monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
-        monkeypatch.setattr(ssl_mod, "_setting", lambda key: "true" if key == "ssl.verify" else None)
-        ssl_mod.apply_litellm_ssl()
-        assert fake_litellm.ssl_verify is True
-
-
-# ---------------------------------------------------------------------------
 # apply_openai_ssl_patch
 # ---------------------------------------------------------------------------
 
@@ -328,10 +292,22 @@ class TestApplySslEnv:
         monkeypatch.setattr(ssl_mod, "_setting", setting)
         for k in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
             monkeypatch.delenv(k, raising=False)
-        ssl_mod.apply_ssl_env()
-        assert os.environ.get("SSL_CERT_FILE") == str(ca)
-        assert os.environ.get("REQUESTS_CA_BUNDLE") == str(ca)
-        assert os.environ.get("CURL_CA_BUNDLE") == str(ca)
+        # apply_ssl_env writes os.environ DIRECTLY (invisible to monkeypatch,
+        # so the garbage CA path would leak into every later test's SSL
+        # context) — snapshot and restore around the call.
+        _keys = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+        _saved = {k: os.environ.get(k) for k in _keys}
+        try:
+            ssl_mod.apply_ssl_env()
+            assert os.environ.get("SSL_CERT_FILE") == str(ca)
+            assert os.environ.get("REQUESTS_CA_BUNDLE") == str(ca)
+            assert os.environ.get("CURL_CA_BUNDLE") == str(ca)
+        finally:
+            for k, v in _saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
     def test_does_not_overwrite_existing_env(self, monkeypatch, tmp_path):
         ca = tmp_path / "ca.pem"
@@ -346,9 +322,18 @@ class TestApplySslEnv:
 
         monkeypatch.setattr(ssl_mod, "_setting", setting)
         monkeypatch.setenv("SSL_CERT_FILE", "/pre-existing")
-        ssl_mod.apply_ssl_env()
-        # Should not overwrite the pre-existing value
-        assert os.environ.get("SSL_CERT_FILE") == "/pre-existing"
+        _keys = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+        _saved = {k: os.environ.get(k) for k in _keys}
+        try:
+            ssl_mod.apply_ssl_env()
+            # Should not overwrite the pre-existing value
+            assert os.environ.get("SSL_CERT_FILE") == "/pre-existing"
+        finally:
+            for k, v in _saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
     def test_verify_on_no_ca_does_not_set_env(self, monkeypatch):
         monkeypatch.setattr(ssl_mod, "_setting", lambda key: "true" if key == "ssl.verify" else None)
@@ -357,89 +342,3 @@ class TestApplySslEnv:
         ssl_mod.apply_ssl_env()
         assert "SSL_CERT_FILE" not in os.environ
         assert "REQUESTS_CA_BUNDLE" not in os.environ
-
-
-# ---------------------------------------------------------------------------
-# apply_cognee_ssl_patch
-# ---------------------------------------------------------------------------
-
-class TestApplyCogneeSslPatch:
-    def test_cognee_absent_noop(self, monkeypatch):
-        monkeypatch.setattr(ssl_mod, "_setting", lambda key: "false" if key == "ssl.verify" else None)
-        # cognee is not imported; apply_cognee_ssl_patch should return early
-        ssl_mod.apply_cognee_ssl_patch()
-
-    def test_skip_verify_patches_cognee(self, monkeypatch):
-        # Install a fake cognee.shared.utils module
-        fake_cognee = types.ModuleType("cognee")
-        fake_shared = types.ModuleType("cognee.shared")
-        fake_utils = types.ModuleType("cognee.shared.utils")
-        import ssl as _ssl
-
-        def _orig_create_context():
-            return _ssl.create_default_context()
-
-        fake_utils.create_secure_ssl_context = _orig_create_context
-        fake_shared.utils = fake_utils
-        fake_cognee.shared = fake_shared
-        monkeypatch.setitem(sys.modules, "cognee", fake_cognee)
-        monkeypatch.setitem(sys.modules, "cognee.shared", fake_shared)
-        monkeypatch.setitem(sys.modules, "cognee.shared.utils", fake_utils)
-        monkeypatch.setattr(ssl_mod, "_setting", lambda key: "false" if key == "ssl.verify" else None)
-        ssl_mod.apply_cognee_ssl_patch()
-        # The function should now be replaced with _unverified_context
-        assert hasattr(fake_utils.create_secure_ssl_context, "__ssl_orig__")
-        ctx = fake_utils.create_secure_ssl_context()
-        assert ctx.verify_mode == _ssl.CERT_NONE
-        assert ctx.check_hostname is False
-
-    def test_verify_on_restores_original(self, monkeypatch):
-        import ssl as _ssl
-
-        fake_cognee = types.ModuleType("cognee")
-        fake_shared = types.ModuleType("cognee.shared")
-        fake_utils = types.ModuleType("cognee.shared.utils")
-
-        def _orig():
-            ctx = _ssl.create_default_context()
-            return ctx
-
-        # Simulate a previously-patched function
-        def _patched():
-            ctx = _ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = _ssl.CERT_NONE
-            return ctx
-
-        _patched.__ssl_orig__ = _orig  # type: ignore
-        fake_utils.create_secure_ssl_context = _patched
-        fake_shared.utils = fake_utils
-        fake_cognee.shared = fake_shared
-        monkeypatch.setitem(sys.modules, "cognee", fake_cognee)
-        monkeypatch.setitem(sys.modules, "cognee.shared", fake_shared)
-        monkeypatch.setitem(sys.modules, "cognee.shared.utils", fake_utils)
-        monkeypatch.setattr(ssl_mod, "_setting", lambda key: "true" if key == "ssl.verify" else None)
-        ssl_mod.apply_cognee_ssl_patch()
-        # The original should be restored
-        assert fake_utils.create_secure_ssl_context is _orig
-
-    def test_verify_on_no_previous_patch_noop(self, monkeypatch):
-        import ssl as _ssl
-
-        fake_cognee = types.ModuleType("cognee")
-        fake_shared = types.ModuleType("cognee.shared")
-        fake_utils = types.ModuleType("cognee.shared.utils")
-
-        def _orig():
-            return _ssl.create_default_context()
-
-        fake_utils.create_secure_ssl_context = _orig
-        fake_shared.utils = fake_utils
-        fake_cognee.shared = fake_shared
-        monkeypatch.setitem(sys.modules, "cognee", fake_cognee)
-        monkeypatch.setitem(sys.modules, "cognee.shared", fake_shared)
-        monkeypatch.setitem(sys.modules, "cognee.shared.utils", fake_utils)
-        monkeypatch.setattr(ssl_mod, "_setting", lambda key: "true" if key == "ssl.verify" else None)
-        ssl_mod.apply_cognee_ssl_patch()
-        # No __ssl_orig__ attribute means it wasn't patched before; function unchanged
-        assert fake_utils.create_secure_ssl_context is _orig

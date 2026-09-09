@@ -1,16 +1,18 @@
 """Unit tests for the Confluence integration connector (api.integrations.confluence).
 
 Covers:
-- ``test()`` connectivity — direct REST (v2 success, v2→v1 fallback, full
-  failure) and MCP mode dispatch.
+- ``test()`` connectivity — REST (v2 success, v2→v1 fallback, full failure).
 - ``list_spaces()`` — pagination via ``_links.next``, ``configured_space``
   filtering, empty/not-configured.
 - ``pull()`` — single page, recursive tree (depth-bounded), attachment
-  conversion via markitdown (monkeypatched), MCP mode, not-configured error.
+  conversion via markitdown (monkeypatched), not-configured error.
 - ``_auth_headers`` — Basic (Cloud) vs Bearer (Server/DC).
 - ``_base()`` — trailing slash + ``/wiki`` stripping.
 - ``_get`` / ``_get_bytes`` — HTTP error + non-JSON handling.
 - ``_pages_to_markdown`` — heading hierarchy + page_id comments.
+- ``_extract_page_id`` — URL → page id normalization (friendly /pages/{id}
+  URLs, ?pageId= query form, errors, passthrough) and ``pull()`` accepting a
+  full Confluence page URL (issue #6).
 
 All HTTP calls are mocked via monkeypatching ``requests.get`` or the
 connector's own ``_get`` / ``_get_bytes`` methods. ``convert_to_markdown``
@@ -27,7 +29,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import base64
 from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -52,8 +53,8 @@ class _FakeResp:
 
 
 def _direct_config(**kw) -> Dict[str, Any]:
-    """A minimal direct-mode Confluence config."""
-    base = {"mode": "direct", "base_url": "https://confluence.example.com", "token": "tok123"}
+    """A minimal Confluence config (direct REST mode)."""
+    base = {"base_url": "https://confluence.example.com", "token": "tok123"}
     base.update(kw)
     return base
 
@@ -67,7 +68,7 @@ def _connector(config=None, **overrides):
 
 
 # ===========================================================================
-# is_configured / _is_mcp_mode / _base / _auth_headers
+# is_configured / _base / _auth_headers
 # ===========================================================================
 class TestConfigHelpers:
     def test_is_configured_direct_true(self):
@@ -81,35 +82,6 @@ class TestConfigHelpers:
     def test_is_configured_direct_missing_base_url(self):
         c = _connector(base_url="", token="tok")
         assert c.is_configured() is False
-
-    def test_is_configured_mcp_mode(self, monkeypatch):
-        c = _connector(mode="mcp")
-        fake_client = MagicMock()
-        fake_client.is_configured = lambda: True
-        monkeypatch.setattr("api.utils.LocalMcpClient", lambda *a, **kw: fake_client)
-        assert c.is_configured() is True
-
-    def test_is_configured_mcp_mode_failure(self, monkeypatch):
-        c = _connector(mode="mcp")
-
-        def _boom(*a, **kw):
-            raise ImportError("no mcp")
-
-        monkeypatch.setattr("api.utils.LocalMcpClient", _boom)
-        assert c.is_configured() is False
-
-    def test_is_mcp_mode_direct(self):
-        c = _connector(mode="direct")
-        assert c._is_mcp_mode() is False
-
-    def test_is_mcp_mode_mcp(self):
-        c = _connector(mode="MCP")
-        assert c._is_mcp_mode() is True
-
-    def test_is_mcp_mode_default(self):
-        c = _connector()
-        c.config = {}  # no mode key
-        assert c._is_mcp_mode() is False  # defaults to direct
 
     def test_base_strips_trailing_slash(self):
         c = _connector(base_url="https://x.example.com/")
@@ -154,7 +126,6 @@ class TestConfigHelpers:
         cfg = ConfluenceConnector.get_config()
         assert cfg["base_url"] == "https://stored.example.com"
         assert cfg["token"] == "stored-tok"
-        assert cfg["mode"] == "direct"
 
 
 # ===========================================================================
@@ -299,38 +270,9 @@ class TestConfluenceTest:
         # Non-list results → n=1
         assert "1 space(s)" in result["message"]
 
-    # --- MCP mode test ---
-    def test_mcp_mode_test_success(self, monkeypatch):
-        c = _connector(mode="mcp")
-        fake_client = MagicMock()
-        fake_client.is_configured = lambda: True
-        fake_client.test_connections = lambda: {"success": True, "message": "all good"}
-        # is_configured() instantiates LocalMcpClient; _mcp_test() calls get_local_mcp_client.
-        monkeypatch.setattr("api.utils.LocalMcpClient", lambda *a, **kw: fake_client)
-        monkeypatch.setattr("api.utils.get_local_mcp_client", lambda: fake_client)
-        result = c.test()
-        assert result["success"] is True
-        assert "all good" in result["message"]
-
-    def test_mcp_mode_test_failure(self, monkeypatch):
-        c = _connector(mode="mcp")
-
-        class _BadClient:
-            def is_configured(self):
-                return True
-
-            def test_connections(self):
-                raise RuntimeError("mcp down")
-
-        monkeypatch.setattr("api.utils.LocalMcpClient", lambda *a, **kw: _BadClient())
-        monkeypatch.setattr("api.utils.get_local_mcp_client", lambda: _BadClient())
-        result = c.test()
-        assert result["success"] is False
-        assert "mcp down" in result["message"]
-
 
 # ===========================================================================
-# list_spaces() — direct mode
+# list_spaces()
 # ===========================================================================
 class TestListSpaces:
     def test_not_configured(self):
@@ -437,42 +379,6 @@ class TestListSpaces:
         spaces = c.list_spaces()
         assert len(spaces) == 1
         assert spaces[0]["key"] == "A"
-
-    # --- MCP mode list_spaces ---
-    def test_mcp_mode_list_spaces(self, monkeypatch):
-        c = _connector(mode="mcp")
-        # is_configured() instantiates LocalMcpClient.
-        fake_client = MagicMock()
-        fake_client.is_configured = lambda: True
-        monkeypatch.setattr("api.utils.LocalMcpClient", lambda *a, **kw: fake_client)
-        tools = [{"id": "confluence:t1", "server": "confluence"}, {"id": "other:t2", "server": "other"}]
-        monkeypatch.setattr("api.utils.list_all_mcp_tools", lambda: tools)
-        spaces = c.list_spaces()
-        assert len(spaces) == 1
-        assert spaces[0]["server"] == "confluence"
-
-    def test_mcp_mode_list_spaces_fallback_all(self, monkeypatch):
-        c = _connector(mode="mcp")
-        fake_client = MagicMock()
-        fake_client.is_configured = lambda: True
-        monkeypatch.setattr("api.utils.LocalMcpClient", lambda *a, **kw: fake_client)
-        tools = [{"id": "x:t1", "server": "x"}, {"id": "y:t2", "server": "y"}]
-        monkeypatch.setattr("api.utils.list_all_mcp_tools", lambda: tools)
-        spaces = c.list_spaces()
-        # No server matches "confluence" → returns all tools.
-        assert len(spaces) == 2
-
-    def test_mcp_mode_list_spaces_failure(self, monkeypatch):
-        c = _connector(mode="mcp")
-        fake_client = MagicMock()
-        fake_client.is_configured = lambda: True
-        monkeypatch.setattr("api.utils.LocalMcpClient", lambda *a, **kw: fake_client)
-
-        def _boom():
-            raise RuntimeError("mcp down")
-
-        monkeypatch.setattr("api.utils.list_all_mcp_tools", _boom)
-        assert c.list_spaces() == []
 
 
 # ===========================================================================
@@ -660,6 +566,51 @@ class TestPagesToMarkdown:
 
 
 # ===========================================================================
+# _extract_page_id — URL → page id normalization (issue #6)
+# ===========================================================================
+class TestExtractPageId:
+    def _extract(self, source_id):
+        from api.integrations.confluence import ConfluenceConnector
+
+        return ConfluenceConnector._extract_page_id(source_id)
+
+    def test_numeric_passthrough(self):
+        assert self._extract("12345") == "12345"
+
+    def test_numeric_strips_whitespace(self):
+        assert self._extract("  678  ") == "678"
+
+    def test_friendly_url_with_title(self):
+        url = "https://confluence.example.com/wiki/spaces/TEAM/pages/12345/My+Page"
+        assert self._extract(url) == "12345"
+
+    def test_friendly_url_bare_pages_path(self):
+        assert self._extract("https://host.example.com/pages/77") == "77"
+
+    def test_relative_url_supported(self):
+        assert self._extract("/wiki/spaces/KEY/pages/9") == "9"
+
+    def test_pageid_query_param(self):
+        # Server/DC viewpage URLs carry the id as ?pageId=...
+        assert self._extract("https://host/pages/viewpage.action?pageId=9999") == "9999"
+
+    def test_query_param_wins_over_path(self):
+        assert self._extract("/pages/5?pageId=9") == "9"
+
+    def test_url_without_id_raises(self):
+        with pytest.raises(ValueError, match="page id"):
+            self._extract("https://host.example.com/wiki/spaces/KEY")
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match="empty"):
+            self._extract("   ")
+
+    def test_non_numeric_non_url_passthrough(self):
+        # Legacy string ids pass through verbatim.
+        assert self._extract("ENG-legacy-id") == "ENG-legacy-id"
+
+
+# ===========================================================================
 # pull() — direct mode
 # ===========================================================================
 class TestConfluencePull:
@@ -777,68 +728,31 @@ class TestConfluencePull:
         assert len(result["attachments"]) == 1
         assert result["attachments"][0]["markdown"] == "md-doc.pdf"
 
+    def test_pull_by_url_extracts_page_id(self, monkeypatch):
+        """pull() accepts a full Confluence URL and fetches that page (issue #6)."""
+        c = _connector()
+        urls: List[str] = []
 
-# ===========================================================================
-# pull() — MCP mode
-# ===========================================================================
-class TestConfluenceMcpPull:
-    def _setup_mcp(self, monkeypatch):
-        """Patch LocalMcpClient so is_configured() returns True in MCP mode."""
-        fake_client = MagicMock()
-        fake_client.is_configured = lambda: True
-        monkeypatch.setattr("api.utils.LocalMcpClient", lambda *a, **kw: fake_client)
+        def _get(url, **kw):
+            urls.append(url)
+            return _FakeResp(
+                200,
+                text='{"id":"100","title":"My Page","body":{"value":"<p>hi</p>"}}',
+                headers={"content-type": "application/json"},
+                json_data={"id": "100", "title": "My Page", "body": {"value": "<p>hi</p>"}},
+            )
 
-    def test_mcp_pull_success(self, monkeypatch):
-        c = _connector(mode="mcp")
-        self._setup_mcp(monkeypatch)
-        pulled = {"title": "MCP Page", "markdown": "# MCP content", "attachments": [{"filename": "a.pdf", "markdown": "md"}]}
-        monkeypatch.setattr("api.utils.invoke_mcp_tool", lambda sid, opts=None: pulled)
-        result = c.pull("page123")
-        assert result["title"] == "MCP Page"
-        assert result["markdown"] == "# MCP content"
-        assert result["page_id"] == "page123"
-        assert result["source"] == "confluence_mcp"
-        assert len(result["attachments"]) == 1
+        monkeypatch.setattr("requests.get", _get)
+        result = c.pull(
+            "https://confluence.example.com/wiki/spaces/TEAM/pages/100/Title"
+        )
+        assert result["page_id"] == "100"
+        assert result["title"] == "My Page"
+        # The page was fetched by its extracted numeric id, not the raw URL.
+        assert urls[0].endswith("/wiki/api/v2/pages/100")
 
-    def test_mcp_pull_adds_server_prefix(self, monkeypatch):
-        c = _connector(mode="mcp", mcp_server="myconf")
-        self._setup_mcp(monkeypatch)
-        captured: Dict[str, Any] = {}
-
-        def _invoke(sid, opts=None):
-            captured["sid"] = sid
-            return {"markdown": "content"}
-
-        monkeypatch.setattr("api.utils.invoke_mcp_tool", _invoke)
-        result = c.pull("page123")  # no colon → server prefix added
-        assert captured["sid"] == "myconf:page123"
-        assert result["markdown"] == "content"
-
-    def test_mcp_pull_keeps_colon_source_id(self, monkeypatch):
-        c = _connector(mode="mcp", mcp_server="myconf")
-        self._setup_mcp(monkeypatch)
-        captured: Dict[str, Any] = {}
-
-        def _invoke(sid, opts=None):
-            captured["sid"] = sid
-            return {"markdown": "content"}
-
-        monkeypatch.setattr("api.utils.invoke_mcp_tool", _invoke)
-        c.pull("confluence:page123")
-        assert captured["sid"] == "confluence:page123"
-
-    def test_mcp_pull_missing_fields(self, monkeypatch):
-        c = _connector(mode="mcp")
-        self._setup_mcp(monkeypatch)
-        monkeypatch.setattr("api.utils.invoke_mcp_tool", lambda sid, opts=None: {})
-        result = c.pull("page123")
-        assert result["title"] == "page123"
-        assert result["markdown"] == "{}"
-        assert result["attachments"] == []
-
-    def test_mcp_pull_string_result(self, monkeypatch):
-        c = _connector(mode="mcp")
-        self._setup_mcp(monkeypatch)
-        monkeypatch.setattr("api.utils.invoke_mcp_tool", lambda sid, opts=None: "raw string")
-        result = c.pull("page123")
-        assert result["markdown"] == "raw string"
+    def test_pull_by_url_without_id_raises(self):
+        """A URL with no recognizable page id fails fast with a clear error."""
+        c = _connector()
+        with pytest.raises(ValueError, match="page id"):
+            c.pull("https://confluence.example.com/wiki/spaces/TEAM")

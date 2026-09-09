@@ -18,6 +18,20 @@ import { useLanguage } from "@/contexts/LanguageContext";
 import type { SetupStatus } from "@/lib/types";
 
 /**
+ * P0-6: sanitize the post-login redirect target. `next` is attacker-
+ * controllable via the URL, so only same-app paths survive: it must start
+ * with "/" but not "//" (protocol-relative origin hop) or "/\" (browser-
+ * normalized scheme-relative hop), and must not contain "://".
+ */
+function safeNext(raw: string | null): string {
+  const candidate = (raw ?? "").trim();
+  if (!candidate.startsWith("/")) return "/";
+  if (candidate.startsWith("//") || candidate.startsWith("/\\")) return "/";
+  if (candidate.includes("://")) return "/";
+  return candidate;
+}
+
+/**
  * Productarium sign-in (contract J) + first-run admin setup.
  *
  * On mount we probe GET /api/auth/setup-status:
@@ -54,7 +68,7 @@ function AuthForm() {
   const [suEmail, setSuEmail] = useState("");
   const [suSubmitting, setSuSubmitting] = useState(false);
 
-  const next = params.get("next") || "/";
+  const next = safeNext(params.get("next"));
 
   // Probe setup-status once.
   useEffect(() => {

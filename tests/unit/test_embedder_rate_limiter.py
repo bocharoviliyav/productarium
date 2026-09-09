@@ -1,17 +1,17 @@
 """Unit tests for ``api.tools.rate_limiter`` (EmbedderRateLimiter).
 
-Mirrors ``test_cognee_rate_limiter.py`` but targets the embedder limiter used
-by the pgvector memory backend:
+Targets the embedder limiter used by the pgvector memory backend:
 
 - ``EmbedderRateLimiter.get_rate_settings``: defaults (4, 0.1), admin-store
   overrides (embedder.max_concurrency, embedder.delay_seconds,
   embedder.rate_limit_rps), env-var fallbacks (EMBEDDER_MAX_CONCURRENCY,
   EMBEDDER_DELAY_SECONDS, EMBEDDER_RATE_LIMIT_RPS), invalid values ignored.
-- ``EmbedderRateLimiter._get_loop_primitives``: per-loop semaphore/lock caching,
-  re-creation when max_concurrency changes, None when no running loop.
+- ``EmbedderRateLimiter._get_semaphore`` (P1-21): ONE process-level threading
+  semaphore, re-created only when max_concurrency changes.
 - ``EmbedderRateLimiter.execute``: successful call returns result, concurrency
   semaphore gating, 429 retry with backoff (succeeds on retry), non-429 errors
-  propagate, max-retries exhausted raises.
+  propagate, max-retries exhausted raises. Two "loop" contexts (separate
+  ``asyncio.run`` invocations / threads) share the same process-level limit.
 - The module-level ``_embedder_rate_limiter`` singleton.
 """
 
@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import threading
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -188,49 +189,65 @@ class TestGetRateSettings:
 
 
 # --------------------------------------------------------------------------- #
-# _get_loop_primitives
+# _get_semaphore (P1-21: process-level primitives)
 # --------------------------------------------------------------------------- #
-class TestGetLoopPrimitives:
-    def test_returns_none_when_no_running_loop(self):
+class TestGetSemaphore:
+    def test_same_semaphore_reused(self):
         rl = EmbedderRateLimiter()
-        sem, lock = rl._get_loop_primitives(4)
-        assert sem is None
-        assert lock is None
+        sem1 = rl._get_semaphore(4)
+        sem2 = rl._get_semaphore(4)
+        assert sem1 is sem2
 
-    def test_returns_semaphore_and_lock_in_loop(self):
+    def test_semaphore_recreated_when_max_concurrency_changes(self):
         rl = EmbedderRateLimiter()
-
-        async def _run():
-            return rl._get_loop_primitives(4)
-
-        sem, lock = asyncio.run(_run())
-        assert sem is not None
-        assert lock is not None
-        assert isinstance(sem, asyncio.Semaphore)
-        assert isinstance(lock, asyncio.Lock)
-
-    def test_cached_primitives_reused_same_loop(self):
-        rl = EmbedderRateLimiter()
-
-        async def _run():
-            sem1, lock1 = rl._get_loop_primitives(4)
-            sem2, lock2 = rl._get_loop_primitives(4)
-            return sem1 is sem2, lock1 is lock2
-
-        same_sem, same_lock = asyncio.run(_run())
-        assert same_sem
-        assert same_lock
-
-    def test_primitives_recreated_when_max_concurrency_changes(self):
-        rl = EmbedderRateLimiter()
-
-        async def _run():
-            sem1, _ = rl._get_loop_primitives(4)
-            sem2, _ = rl._get_loop_primitives(8)
-            return sem1, sem2
-
-        sem1, sem2 = asyncio.run(_run())
+        sem1 = rl._get_semaphore(4)
+        sem2 = rl._get_semaphore(8)
         assert sem1 is not sem2
+
+    def test_semaphore_is_threading_based_and_loop_agnostic(self):
+        rl = EmbedderRateLimiter()
+        sem = rl._get_semaphore(4)
+        assert isinstance(sem, threading.BoundedSemaphore)
+        # Same primitive from two DIFFERENT event loops (sequential runs):
+        # a process-level limiter must not reset across loop contexts.
+        async def _run():
+            return rl._get_semaphore(4)
+
+        assert asyncio.run(_run()) is sem
+        assert asyncio.run(_run()) is sem
+
+    def test_two_loop_contexts_share_one_limit(self):
+        """P1-21: two concurrent "loop" contexts share one process-level limit."""
+        rl = EmbedderRateLimiter()
+        active = 0
+        max_active = 0
+        guard = threading.Lock()
+
+        async def _func():
+            nonlocal active, max_active
+            with guard:
+                active += 1
+                max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            with guard:
+                active -= 1
+            return "ok"
+
+        def _run_one_loop():
+            async def _run():
+                with patch.object(rl, "get_rate_settings", return_value=(1, 0.0)):
+                    await asyncio.gather(rl.execute(_func), rl.execute(_func))
+
+            asyncio.run(_run())
+
+        # Two threads, each with its OWN event loop, sharing the ONE limiter.
+        t1 = threading.Thread(target=_run_one_loop)
+        t2 = threading.Thread(target=_run_one_loop)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        assert max_active == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -350,20 +367,25 @@ class TestExecute:
         # max_retries = 5
         assert call_count == 5
 
-    def test_no_semaphore_when_no_loop_in_get_primitives(self):
-        """When _get_loop_primitives returns (None, None), execute still runs."""
+    def test_semaphore_released_on_error(self):
+        """A failing call must release its semaphore slot back."""
         rl = EmbedderRateLimiter()
 
         async def _func():
-            return "ok"
+            raise ValueError("boom")
 
         async def _run():
             with patch.object(rl, "get_rate_settings", return_value=(1, 0.0)):
-                with patch.object(rl, "_get_loop_primitives", return_value=(None, None)):
-                    return await rl.execute(_func)
+                with pytest.raises(ValueError):
+                    await rl.execute(_func)
+            # The slot is free again: a second call succeeds.
+            ok = await rl.execute(_func_ok)
+            return ok
 
-        result = asyncio.run(_run())
-        assert result == "ok"
+        async def _func_ok():
+            return "ok"
+
+        assert asyncio.run(_run()) == "ok"
 
     def test_delay_between_calls(self):
         """When delay_sec > 0, execute enforces a minimum gap via the lock."""

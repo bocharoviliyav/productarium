@@ -11,11 +11,11 @@ Precedence (highest -> lowest):
    admin "Timeouts" panel; takes effect on the next :func:`resolve_*` call
    without a restart (resolvers are read-through; no caching). Exported to the
    canonical env var by :func:`sync_timeout_env` so module-level / subprocess
-   readers (e.g. fast-rlm Pyodide reads ``RLM_API_TIMEOUT_MS``) also see it.
+   readers also see it.
 2. Environment variable (the ``env_var`` for the key) -- the fallback when the
    admin store is unset or the DB is down. Also documented in ``.env.example``.
 3. Default value -- a sensible per-key constant, raised so long-running work
-   on large repos (multi-hour cognify, long-context RLM generation) is not
+   on large repos (multi-hour docgen runs, long-context LLM generation) is not
    prematurely aborted.
 
 Every resolver is defensive: an invalid value (non-numeric, negative, empty)
@@ -47,15 +47,13 @@ class TimeoutKey:
             under ``timeouts.<key>`` in the SettingORM table.
         env_var: The environment variable used as the env-level fallback.
         default: The default value used when neither the admin store nor the
-            env var is set. For ``docgen_indexing_drain`` this is a sentinel
-            consumed by its resolver (the default is derived from the cognify
-            timeout at call time).
+            env var is set.
         floor: The minimum clamped value so a typo can't make a timeout
             dangerously small.
         label: A short human-readable label shown in the admin UI.
         unit: ``"seconds"`` or ``"milliseconds"`` -- the unit of the value,
             shown in the admin UI helper text.
-        group: UI grouping label (e.g. ``"LLM"``, ``"Cognee"``).
+        group: UI grouping label (e.g. ``"LLM"``, ``"Memory"``).
     """
 
     key: str
@@ -71,7 +69,7 @@ class TimeoutKey:
 # when introducing a new timeout; the regression test asserts every key
 # referenced by the codebase is present.
 TIMEOUT_KEYS: List[TimeoutKey] = [
-    # --- LLM (adalflow OpenAIClient + patched openai SDK clients) ---------
+    # --- LLM (langchain ChatOpenAI + patched openai SDK clients) ---------
     TimeoutKey(
         key="llm_request",
         env_var="LLM_REQUEST_TIMEOUT_SECONDS",
@@ -88,65 +86,42 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         label="LLM retry max time",
         group="LLM",
     ),
-    # --- Cognee (knowledge graph) ---------------------------------------
-    TimeoutKey(
-        key="cognee_graph_extraction",
-        env_var="COGNEE_GRAPH_EXTRACTION_TIMEOUT",
-        # Per-chunk structured-output LLM call (instructor + markdown_json_mode)
-        # over a cognee chunk. A slow corporate gateway can take several minutes
-        # for a single JSON-schema extraction (the mode appends a "return JSON"
-        # instruction and parses a JSON block out of the plain-text completion,
-        # so the model emits a full section's worth of tokens before the parse).
-        # The previous 600s (10 min) default bit on corporate LLMs and logged
-        # "graph extraction skipped chunk due to TimeoutError" repeatedly.
-        default=1800.0,
-        floor=60.0,
-        label="Cognee graph extraction (per chunk)",
-        group="Cognee",
-    ),
-    TimeoutKey(
-        key="cognee_cognify",
-        env_var="COGNEE_COGNIFY_TIMEOUT",
-        default=7200.0,
-        floor=300.0,
-        label="Cognee cognify (full run)",
-        group="Cognee",
-    ),
-    TimeoutKey(
-        key="cognee_llm_connection",
-        env_var="COGNEE_LLM_CONNECTION_TIMEOUT",
-        default=10.0,
-        floor=1.0,
-        label="Cognee LLM connection test",
-        group="Cognee",
-    ),
-    TimeoutKey(
-        key="cognee_init",
-        env_var="COGNEE_INIT_TIMEOUT",
-        default=120.0,
-        floor=10.0,
-        label="Cognee startup init (migrations)",
-        group="Cognee",
-    ),
-    TimeoutKey(
-        key="cognee_recall",
-        env_var="COGNEE_RECALL_TIMEOUT",
-        default=120.0,
-        floor=15.0,
-        label="Cognee recall (graph query)",
-        group="Cognee",
-    ),
     # --- Docgen worker ---------------------------------------------------
-    # default is a sentinel; the resolver derives the effective default from
-    # cognee_cognify at call time so a leftover cognify task gets the full
-    # budget instead of being killed at 30s.
+    # Best-effort ceiling for draining leftover worker-loop tasks after the
+    # docs are committed; a drain timeout is non-fatal by design.
     TimeoutKey(
         key="docgen_indexing_drain",
         env_var="DOCGEN_INDEXING_DRAIN_SECONDS",
-        default=-1.0,
+        default=300.0,
         floor=5.0,
         label="Docgen indexing drain",
-        group="Cognee",
+        group="LLM",
+    ),
+    # Not a timeout but a tunable knob that shares the registry's precedence
+    # (admin store > env > default) + floor machinery: max parallel LLM calls
+    # in the agentic docgen MAP phase (P1-24).
+    TimeoutKey(
+        key="docgen_map_concurrency",
+        env_var="DOCGEN_MAP_CONCURRENCY",
+        default=3.0,
+        floor=1.0,
+        label="Docgen map-phase parallel LLM calls",
+        unit="parallel calls",
+        group="LLM",
+    ),
+    # --- Expert chat (detached ask turns, api/expert/turns.py) ----------
+    # Wall-clock budget for ONE expert ask turn (regular agent or deep
+    # research) including retrieval, tool calls, and streaming. The turn is
+    # a detached background task: on expiry the partial answer is persisted
+    # and subscribers get an error frame (issue #9 — such turns legitimately
+    # run for minutes on a local LLM).
+    TimeoutKey(
+        key="expert_stream",
+        env_var="EXPERT_STREAM_TIMEOUT_SECONDS",
+        default=1800.0,
+        floor=60.0,
+        label="Expert ask turn budget (wall-clock)",
+        group="Expert",
     ),
     # --- Memory backend (pgvector recall) -------------------------------
     TimeoutKey(
@@ -156,32 +131,6 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         floor=5.0,
         label="Memory backend semantic query (pgvector cosine)",
         group="Memory",
-    ),
-    # --- RLM (fast-rlm) --------------------------------------------------
-    TimeoutKey(
-        key="rlm_api_ms",
-        env_var="RLM_API_TIMEOUT_MS",
-        default=3_600_000.0,
-        floor=30_000.0,
-        label="RLM per-API-call timeout",
-        unit="milliseconds",
-        group="RLM",
-    ),
-    TimeoutKey(
-        key="rlm_section",
-        env_var="RLM_SECTION_TIMEOUT",
-        default=1800.0,
-        floor=60.0,
-        label="RLM per-section timeout (docgen)",
-        group="RLM",
-    ),
-    TimeoutKey(
-        key="rlm_expert",
-        env_var="RLM_EXPERT_TIMEOUT",
-        default=1800.0,
-        floor=60.0,
-        label="RLM expert timeout",
-        group="RLM",
     ),
     # --- Model listing / existence checks -------------------------------
     TimeoutKey(
@@ -241,6 +190,14 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         label="Mermaid max repair attempts",
         group="Mermaid",
     ),
+    TimeoutKey(
+        key="mermaid_repair_deadline",
+        env_var="MERMAID_REPAIR_DEADLINE_SECONDS",
+        default=600.0,
+        floor=10.0,
+        label="Mermaid repair loop wall-clock budget",
+        group="Mermaid",
+    ),
     # --- Provider connection test (admin panel "Test" button) ----------
     TimeoutKey(
         key="provider_test",
@@ -249,6 +206,19 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         floor=3.0,
         label="Provider connection test",
         group="LLM",
+    ),
+    # --- Database presets (api/mcp/presets.py) --------------------------
+    # Wall-clock budget for the preset connection check: a REAL MCP
+    # handshake (launcher spawn + initialize + tools/list + one probe tool
+    # call). The default is generous because the docker-fallback launcher
+    # may pull the server image on the very first check.
+    TimeoutKey(
+        key="db_connect_check",
+        env_var="DB_CONNECT_CHECK_SECONDS",
+        default=180.0,
+        floor=5.0,
+        label="Database preset connection check (MCP handshake)",
+        group="Databases",
     ),
 ]
 
@@ -277,8 +247,7 @@ def _resolve_with_key(key: str) -> float:
 
     1. admin store ``timeouts.<key>``  -> if set + parses + >= 0, use it
     2. env var ``env_var``             -> if set + parses + >= 0, use it
-    3. default                         -> for ``docgen_indexing_drain`` the
-       default is derived from the cognify timeout at call time
+    3. default                         -> the per-key constant
 
     Any invalid value falls through to the next level. The final value is
     clamped to the key's floor so a typo can't make a timeout dangerously small.
@@ -310,12 +279,7 @@ def _resolve_with_key(key: str) -> float:
     if parsed is not None and parsed >= 0:
         return max(spec.floor, parsed)
 
-    # 3. Default. docgen_indexing_drain derives from the cognify timeout so a
-    # leftover cognify task (that wasn't handed off to the main loop) gets the
-    # full cognify budget instead of being cancelled at a fixed 30s.
-    if key == "docgen_indexing_drain":
-        return max(spec.floor, _resolve_with_key("cognee_cognify"))
-
+    # 3. Default.
     return max(spec.floor, spec.default)
 
 
@@ -346,58 +310,37 @@ def resolve_llm_retry_max_time() -> float:
     return resolve_timeout("llm_retry_max_time")
 
 
-def resolve_cognee_graph_extraction_timeout() -> float:
-    """Per-chunk cognee graph-extraction LLM call timeout (seconds)."""
-    return resolve_timeout("cognee_graph_extraction")
-
-
-def resolve_cognee_cognify_timeout() -> float:
-    """Overall timeout for a full cognee.cognify() run (seconds)."""
-    return resolve_timeout("cognee_cognify")
-
-
-def resolve_cognee_llm_connection_timeout() -> float:
-    """Cognee LLM connection test timeout (seconds)."""
-    return resolve_timeout("cognee_llm_connection")
-
-
-def resolve_cognee_init_timeout() -> float:
-    """Overall timeout for ``init_cognee()`` (startup migrations + setup).
-
-    ``cognee.init()`` / ``run_startup_migrations()`` / ``setup()`` can each
-    stall on a slow/unreachable Postgres, blocking app startup. This ceiling
-    lets the app start and serve requests (docgen reads/writes the product DB
-    directly; expert/summary fall back to artifact docs) while cognee finishes
-    initializing -- or gives up -- in the background. cognee creates tables
-    lazily on first write, so a skipped init is non-fatal.
-    """
-    return resolve_timeout("cognee_init")
-
-
-def resolve_cognee_recall_timeout() -> float:
-    """Overall timeout for a single ``cognee.recall()`` query (seconds).
-
-    recall's GRAPH_COMPLETION makes an LLM completion call internally; on a
-    slow/contended local model this can hang indefinitely and block the
-    expert SSE stream. This ceiling returns "" (-> artifact-docs fallback)
-    instead of letting the request hang until the HTTP proxy times out.
-    Default 120s (down from 300s): cognee is non-blocking, so a recall that
-    hasn't answered in two minutes is treated as unavailable and the expert
-    falls back to the artifact-docs baseline -- the user should NOT wait 5
-    minutes for a graph query before seeing an answer.
-    """
-    return resolve_timeout("cognee_recall")
-
-
 def resolve_docgen_indexing_drain_seconds() -> float:
     """Best-effort ceiling for the docgen worker-loop indexing drain (seconds).
 
-    Default derives from the cognee cognify timeout so a leftover cognify task
-    that wasn't handed off to the main event loop gets the full cognify budget
-    instead of being cancelled at a fixed 30s (which previously dropped the
-    connection mid-graph-build).
+    Leftover worker-loop tasks (e.g. a memory-indexing task that wasn't handed
+    off to the main event loop) get this budget instead of being cancelled
+    immediately; a drain timeout is non-fatal because the docs are already
+    committed.
     """
     return resolve_timeout("docgen_indexing_drain")
+
+
+def resolve_docgen_map_concurrency() -> int:
+    """Max parallel LLM calls in the agentic docgen MAP phase (P1-24).
+
+    The Phase-1 map loop (``_agentic_bottom_up_docgen``) issues one independent
+    LLM call per codebase chunk; awaiting them strictly sequentially wastes wall
+    clock on a local model. This knob bounds the parallelism (asyncio.Semaphore
+    + gather) so the local server is not flooded. The RLM map loop stays
+    sequential (shared REPL session). Floor 1 = sequential fallback.
+    """
+    return resolve_timeout_int("docgen_map_concurrency")
+
+
+def resolve_expert_stream_timeout() -> float:
+    """Wall-clock budget for one detached expert ask turn (seconds).
+
+    Bounds the background task in ``api/expert/turns.py`` (regular agent or
+    deep research). On expiry the turn is cancelled, the partial answer is
+    persisted, and subscribers receive an error frame.
+    """
+    return resolve_timeout("expert_stream")
 
 
 def resolve_memory_query_timeout() -> float:
@@ -409,21 +352,6 @@ def resolve_memory_query_timeout() -> float:
     artifact docs.
     """
     return resolve_timeout("memory_query")
-
-
-def resolve_rlm_api_timeout_ms() -> int:
-    """fast-rlm per-API-call timeout (milliseconds)."""
-    return resolve_timeout_int("rlm_api_ms")
-
-
-def resolve_rlm_section_timeout() -> float:
-    """Per-section RLM timeout for the docgen path (seconds)."""
-    return resolve_timeout("rlm_section")
-
-
-def resolve_rlm_expert_timeout() -> float:
-    """Per-section RLM timeout for the expert-agent path (seconds)."""
-    return resolve_timeout("rlm_expert")
 
 
 def resolve_model_list_timeout() -> float:
@@ -461,9 +389,29 @@ def resolve_mermaid_max_repair_attempts() -> int:
     return resolve_timeout_int("mermaid_max_repair_attempts")
 
 
+def resolve_mermaid_repair_deadline() -> float:
+    """Wall-clock budget for the whole mermaid repair drain (seconds).
+
+    P1-15: caps the TOTAL time run_repair_loop may spend draining repairs for
+    one page, so a mutating LLM that produces a fresh broken body on every
+    call cannot spin the loop indefinitely (each new body hash previously
+    earned its own per-body budget).
+    """
+    return resolve_timeout("mermaid_repair_deadline")
+
+
 def resolve_provider_test_timeout() -> float:
     """HTTP timeout for the admin panel provider connection test (seconds)."""
     return resolve_timeout("provider_test")
+
+
+def resolve_db_connect_check_timeout() -> float:
+    """Wall-clock budget for the preset DB connection check (seconds).
+
+    Bounds the full MCP handshake (launcher spawn + initialize + tools/list
+    + one probe tool call) in ``api/mcp/presets.check_preset_connection``.
+    """
+    return resolve_timeout("db_connect_check")
 
 
 def sync_timeout_env() -> None:
@@ -471,9 +419,8 @@ def sync_timeout_env() -> None:
 
     Called from :func:`api.config.abstraction.sync_runtime_settings` at startup
     and after every admin save. This makes module-level / subprocess readers
-    (e.g. fast-rlm's Pyodide REPL, which reads ``RLM_API_TIMEOUT_MS`` from the
-    process environment and cannot reach host Python) see admin-set values
-    without a restart.
+    (which read the canonical env vars from the process environment) see
+    admin-set values without a restart.
 
     Best-effort and never raises: a missing settings store or an invalid value
     just leaves the env var untouched.
@@ -523,14 +470,10 @@ __all__ = [
     "resolve_timeout_int",
     "resolve_llm_request_timeout",
     "resolve_llm_retry_max_time",
-    "resolve_cognee_graph_extraction_timeout",
-    "resolve_cognee_cognify_timeout",
-    "resolve_cognee_llm_connection_timeout",
+    "resolve_expert_stream_timeout",
     "resolve_docgen_indexing_drain_seconds",
+    "resolve_docgen_map_concurrency",
     "resolve_memory_query_timeout",
-    "resolve_rlm_api_timeout_ms",
-    "resolve_rlm_section_timeout",
-    "resolve_rlm_expert_timeout",
     "resolve_model_list_timeout",
     "resolve_integration_http_timeout",
     "resolve_git_file_content_timeout",
@@ -538,7 +481,9 @@ __all__ = [
     "resolve_mermaid_verify_timeout",
     "resolve_mermaid_repair_timeout",
     "resolve_mermaid_max_repair_attempts",
+    "resolve_mermaid_repair_deadline",
     "resolve_provider_test_timeout",
+    "resolve_db_connect_check_timeout",
     "sync_timeout_env",
     "get_timeout_resolved_view",
 ]

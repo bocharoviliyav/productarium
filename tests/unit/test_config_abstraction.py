@@ -2,7 +2,8 @@
 
 Covers:
 - ``get_task_config`` (present + env fallback + hardcoded defaults).
-- ``sync_runtime_settings`` (env export, cognee sync skip, timeout sync, cache clear).
+- ``sync_runtime_settings`` (env export, timeout sync, cache clear, memory
+  backend cache reset).
 - ``bootstrap_config`` (secret key bootstrap + runtime sync).
 """
 
@@ -40,7 +41,7 @@ class TestGetTaskConfig:
         assert cfg["base_url"] == "http://store:1234/v1"
 
     def test_all_tasks_supported(self, isolated_db):
-        for task in ("docgen", "expert", "summary", "cognee", "embedder"):
+        for task in ("docgen", "expert", "summary", "embedder"):
             cfg = abst.get_task_config(task)
             assert isinstance(cfg, dict)
             assert "model" in cfg
@@ -127,12 +128,14 @@ class TestSyncRuntimeSettings:
         # Should not raise
         abst.sync_runtime_settings()
 
-    def test_cognee_sync_failure_handled(self, monkeypatch, isolated_db):
-        import api.cognee
+    def test_memory_cache_reset_failure_handled(self, monkeypatch, isolated_db):
+        # sync_runtime_settings resets the memory backend cache; a failure
+        # there must not propagate (the sync is best-effort).
+        import api.memory.resolver as resolver_mod
 
         monkeypatch.setattr(
-            "api.cognee.apply_cognee_runtime_config",
-            lambda: (_ for _ in ()).throw(RuntimeError("cognee boom")),
+            resolver_mod, "reset_memory_backend_cache",
+            lambda: (_ for _ in ()).throw(RuntimeError("resolver boom")),
         )
         # Should not raise
         abst.sync_runtime_settings()

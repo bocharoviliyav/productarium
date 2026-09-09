@@ -1,18 +1,73 @@
-import React from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { tomorrow } from 'react-syntax-highlighter/dist/cjs/styles/prism';
 import Mermaid from './Mermaid';
+import { safeExternalHref } from '@/lib/links';
 
 interface MarkdownProps {
   content: string;
 }
 
+// Sanitize schema: the default (GitHub-style) allow-list extended with the
+// attributes our renderers rely on (className for syntax highlighting and
+// mermaid code blocks; anchor target/rel). Applied AFTER rehype-raw so raw
+// HTML in LLM output is reduced to a safe subset — no scripts, no event
+// handlers, no javascript:/data: URLs.
+const sanitizeSchema = {
+  ...defaultSchema,
+  attributes: {
+    ...defaultSchema.attributes,
+    '*': [...(defaultSchema.attributes?.['*'] ?? []), 'className'],
+    a: [...(defaultSchema.attributes?.['a'] ?? []), 'target', 'rel'],
+    code: [...(defaultSchema.attributes?.['code'] ?? []), 'className'],
+    span: [...(defaultSchema.attributes?.['span'] ?? []), 'className'],
+  },
+};
+
 const Markdown: React.FC<MarkdownProps> = ({ content }) => {
-  // Define markdown components
-  const MarkdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] = {
+  // P2-29: throttle re-parsing while the answer streams in — content is
+  // repainted at most ~10x/s (trailing edge always paints the newest text),
+  // and Prism highlighting is deferred until the stream settles (the code
+  // renderer checks the ref and emits a plain <pre> while streaming).
+  const [display, setDisplay] = useState(content);
+  const latestRef = useRef(content);
+  const lastPaintRef = useRef(Date.now());
+  const trailingRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const streamingRef = useRef(false);
+
+  useEffect(() => {
+    latestRef.current = content;
+    streamingRef.current = true;
+    const paint = () => {
+      lastPaintRef.current = Date.now();
+      streamingRef.current = latestRef.current !== content;
+      setDisplay(latestRef.current);
+    };
+    if (trailingRef.current) clearTimeout(trailingRef.current);
+    const elapsed = Date.now() - lastPaintRef.current;
+    if (elapsed >= 100) {
+      paint();
+    } else {
+      trailingRef.current = setTimeout(() => {
+        trailingRef.current = null;
+        paint();
+      }, 100 - elapsed);
+    }
+  }, [content]);
+
+  useEffect(
+    () => () => {
+      if (trailingRef.current) clearTimeout(trailingRef.current);
+    },
+    [],
+  );
+
+  // Define markdown components (stable identity — built once)
+  const MarkdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] = useMemo(() => ({
     p({ children, ...props }: { children?: React.ReactNode }) {
       return <p className="mb-3 text-sm leading-relaxed dark:text-white" {...props}>{children}</p>;
     },
@@ -58,9 +113,17 @@ const Markdown: React.FC<MarkdownProps> = ({ content }) => {
       return <li className="mb-2 text-sm leading-relaxed dark:text-white" {...props}>{children}</li>;
     },
     a({ children, href, ...props }: { children?: React.ReactNode; href?: string }) {
+      // P0-4: markdown (generated docs, specs) is untrusted — only allowlisted
+      // schemes (http/https/mailto) and same-page #anchors become links
+      // (defense in depth on top of rehype-sanitize); javascript:/data: and
+      // other targets render as plain text.
+      const safeHref = safeExternalHref(href);
+      if (!safeHref) {
+        return <span className="font-medium" {...props}>{children}</span>;
+      }
       return (
         <a
-          href={href}
+          href={safeHref}
           className="text-purple-600 dark:text-purple-400 hover:underline font-medium"
           target="_blank"
           rel="noopener noreferrer"
@@ -137,6 +200,20 @@ const Markdown: React.FC<MarkdownProps> = ({ content }) => {
 
       // Handle code blocks
       if (!inline && match) {
+        // P2-29: while the message is still streaming, skip Prism — a plain
+        // styled <pre> is cheap; full highlighting runs once it settles.
+        if (streamingRef.current) {
+          return (
+            <div className="my-6 rounded-md overflow-hidden text-sm shadow-sm">
+              <div className="bg-gray-800 text-gray-200 px-5 py-2 text-sm flex justify-between items-center">
+                <span>{match[1]}</span>
+              </div>
+              <pre className="overflow-x-auto bg-gray-900 px-4 py-3 text-sm leading-relaxed text-gray-100">
+                <code>{codeContent}</code>
+              </pre>
+            </div>
+          );
+        }
         return (
           <div className="my-6 rounded-md overflow-hidden text-sm shadow-sm">
             <div className="bg-gray-800 text-gray-200 px-5 py-2 text-sm flex justify-between items-center">
@@ -190,16 +267,16 @@ const Markdown: React.FC<MarkdownProps> = ({ content }) => {
         </code>
       );
     },
-  };
+  }), []);
 
   return (
     <div className="prose prose-base dark:prose-invert max-w-none px-2 py-4">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeRaw]}
+        rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema]]}
         components={MarkdownComponents}
       >
-        {content}
+        {display}
       </ReactMarkdown>
     </div>
   );

@@ -2,17 +2,17 @@
 
 Thread-safe non-blocking setup: a ``QueueHandler`` feeds a single
 ``QueueListener`` thread that owns the real ``StreamHandler``, so log calls
-from ANY thread (including ``asyncio.to_thread`` workers used by adalflow /
-RLM / docgen) never block on a slow/full stdout pipe.
+from ANY thread (including ``asyncio.to_thread`` workers used by the LLM /
+docgen pipelines) never block on a slow/full stdout pipe.
 
 Environment variables:
     LOG_LEVEL: Log level (default: INFO)
     LOG_FORMAT: ``logfmt`` (default) or ``json``
     LOG_MAX_RECORD_CHARS: Truncate each log record to this many chars
-        (default: 8192). Protects against multi-MB records (adalflow's
-        ``log.info(f"output: {output}")`` dumps the full LLM completion)
-        which, when written from a worker thread to a pipe-backed stdout,
-        raise ``BlockingIOError`` once the pipe buffer fills.
+        (default: 8192). Protects against multi-MB records (a vendored
+        library dumping the full LLM completion) which, when written from a
+        worker thread to a pipe-backed stdout, raise ``BlockingIOError``
+        once the pipe buffer fills.
 """
 
 from __future__ import annotations
@@ -29,6 +29,29 @@ logger = logging.getLogger(__name__)
 class IgnoreLogChangeDetectedFilter(logging.Filter):
     def filter(self, record: logging.LogRecord):
         return "Detected file change in" not in record.getMessage()
+
+
+class DocgenPollNoiseFilter(logging.Filter):
+    """Drop the noisy 2-second docgen polling access lines (200 responses).
+
+    Paths: ``generate/status`` (per-job polling) and ``docgen/active``
+    (page-mount restore polling) are hit every ~2s by the UI and drown out
+    everything else in uvicorn.access. Non-200 responses stay visible —
+    those are real errors worth seeing. Attached at the LOGGER level
+    (``uvicorn.access``) because uvicorn's dictConfig replaces handlers but
+    leaves logger-level filters intact.
+    """
+
+    NOISY_PATHS = ("generate/status", "docgen/active")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:  # pragma: no cover - defensive
+            return True
+        if not any(p in msg for p in self.NOISY_PATHS):
+            return True
+        return not msg.rstrip().endswith(" 200")
 
 
 class _TruncatingFormatter(logging.Formatter):
@@ -91,14 +114,24 @@ def setup_logging():
 
     logging.basicConfig(level=log_level, handlers=[queue_handler], force=True)
 
-    # Route third-party loggers (adalflow, litellm, httpx, ...) through the
+    # Mute the 2s docgen status-poll spam in uvicorn.access (200s only).
+    # Attached to the LOGGER, not a handler: uvicorn's own dictConfig (run at
+    # uvicorn.run) replaces the access logger's handlers but preserves
+    # logger-level filters, so installing it here survives uvicorn setup.
+    # Idempotent: setup_logging(force=True) may run more than once.
+    uv_access = logging.getLogger("uvicorn.access")
+    uv_access.filters = [
+        f for f in uv_access.filters if not isinstance(f, DocgenPollNoiseFilter)
+    ]
+    uv_access.addFilter(DocgenPollNoiseFilter())
+
+    # Route third-party loggers (langchain, httpx, ...) through the
     # root QueueHandler. They attach their OWN StreamHandler(sys.stdout) with
     # propagate=False, which writes synchronously from worker threads and
     # raises BlockingIOError on pipe-backed stdout. Clear their handlers,
     # enable propagation, and raise their level to WARNING to cut INFO spam.
     for _vendor_name in (
-        "adalflow", "adalflow.core", "adalflow.utils", "adalflow.components",
-        "litellm", "litellm.litellm_logging_utils", "litellm.utils",
+        "langchain", "langchain_core", "langchain_openai",
         "httpx", "httpcore", "openai._base_client",
     ):
         try:

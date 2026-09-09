@@ -17,9 +17,22 @@ export interface ArtifactPage {
   id: string;
   title: string;
   content: string;
+  /**
+   * Parent page id for generated subpages (docgen units model: children of
+   * the functional/technical/datamodel sections carry the parent's page id).
+   * Legacy pages have no parent and render flat — the viewer must tolerate
+   * orphaned parents/children without breaking.
+   */
+  parent?: string;
   filePaths?: string[];
   importance?: "high" | "medium" | "low";
   relatedPages?: string[];
+  /**
+   * Additive provenance block persisted by the verification pipeline
+   * (api/docgen/verification.py). Unknown to legacy pages — the viewer must
+   * tolerate its presence without breaking.
+   */
+  provenance?: Record<string, unknown>;
 }
 
 /**
@@ -46,7 +59,14 @@ export interface Codebase {
   name: string;
   repo_url?: string | null;
   repo_type?: string | null;
+  /**
+   * Write-only field: the backend accepts a token on create/update but never
+   * returns it (Pydantic `exclude`). Responses carry `has_token` instead —
+   * the token itself is resolved server-side from encrypted storage.
+   */
   token?: string | null;
+  /** True when the backend has a stored (encrypted) access token. */
+  has_token?: boolean;
   generated_docs?: string | null;
   pages?: ArtifactPages;
   verified?: boolean;
@@ -78,6 +98,61 @@ export interface Links {
   source?: ArtifactSource;
 }
 
+/**
+ * A reverse-engineered database attached to a product (wave E).
+ *
+ * The raw DSN never leaves the server. Preset databases (`db_type` set —
+ * the hardcoded UI flow) store the DSN only inside the dedicated preset
+ * MCP server row's encrypted env: no `dsn_masked` is persisted or shown
+ * anywhere. Legacy rows (no `db_type`) keep a masked form in `dsn_masked`,
+ * which the UI deliberately does NOT display either.
+ * `mcp_server_id` references the MCP registry entry whose tools are used
+ * for the reverse-engineering flow; the backend may additionally serve
+ * `mcp_server_name` for display (tolerated, not required).
+ */
+export interface Database {
+  id: string;
+  name: string;
+  /** Preset type key (postgresql|mysql|mariadb|sqlserver|sqlite|oracle) or null (legacy manual row). */
+  db_type?: string | null;
+  dsn_masked?: string | null;
+  mcp_server_id?: string | null;
+  mcp_server_name?: string | null;
+  generated_docs?: string | null;
+  pages?: ArtifactPages;
+  verified?: boolean;
+  verified_by?: string | null;
+  verified_at?: string | null;
+  source?: ArtifactSource;
+}
+
+/* ------------------------------------------------------------------ */
+/* Database presets (GET /api/db-presets, api/mcp/presets.py)           */
+/* ------------------------------------------------------------------ */
+
+/** License attribution of the preset MCP server behind a database type. */
+export interface DbPresetServer {
+  name: string;
+  homepage: string;
+  license: string;
+  license_notice: string;
+}
+
+/**
+ * One hardcoded database preset served by GET /api/db-presets: the type
+ * selector entry for the add-database dialog. Static payload — no secrets,
+ * no DSNs; `dsn_example`/`dsn_hint` describe the accepted connection-string
+ * shape for the selected engine.
+ */
+export interface DbPreset {
+  key: string;
+  label: string;
+  engine: string;
+  dsn_example: string;
+  dsn_hint: string;
+  server: DbPresetServer;
+}
+
 export interface Product {
   id: string;
   name: string;
@@ -89,6 +164,40 @@ export interface Product {
   codebases: Codebase[];
   specs: Spec[];
   links: Links[];
+  /**
+   * Reverse-engineered databases (wave E). Optional so the UI keeps working
+   * against backends that do not serve the field yet — always read via
+   * `product.databases ?? []`.
+   */
+  databases?: Database[];
+}
+
+/**
+ * Light product row served by GET /api/products (P1-16): children appear
+ * only as SQL-counted totals — no child payloads. The endpoint keeps the
+ * bare JSON-array response shape (no envelope): pagination goes via
+ * `limit`/`offset` query params and the filtered total rides in the
+ * `X-Total-Count` response header. The full object is served only by
+ * GET /api/products/{id}. Counter fields are optional so a full `Product`
+ * (e.g. the POST create response prepended to a list) is assignable to
+ * this type — read counters via `?? child?.length ?? 0` fallbacks.
+ */
+export interface ProductListItem {
+  id: string;
+  name: string;
+  description: string;
+  summary?: string | null;
+  owner_id?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  codebases_count?: number;
+  specs_count?: number;
+  links_count?: number;
+  databases_count?: number;
+  verified_codebases?: number;
+  verified_specs?: number;
+  verified_links?: number;
+  verified_databases?: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -121,7 +230,7 @@ export interface KnowledgeNode {
 /* Auth + admin (contract J)                                           */
 /* ------------------------------------------------------------------ */
 
-export type UserRole = "user" | "admin";
+export type UserRole = "user" | "admin" | "manager" | "viewer_global";
 export type AuthProvider = "local" | "keycloak";
 
 export interface User {
@@ -164,19 +273,112 @@ export interface SettingOut {
 }
 
 /* ------------------------------------------------------------------ */
+/* MCP servers (admin registry + per-product bindings, wave C)         */
+/* ------------------------------------------------------------------ */
+
+export type McpTransport = "http" | "sse" | "stdio";
+export type McpServerStatus = "ok" | "error" | "unknown";
+
+/**
+ * Registry entry served by the admin MCP registry
+ * (GET/POST/PUT /api/admin/mcp/servers, POST .../test). Header and env
+ * values come back masked — secrets never leave the server.
+ */
+export interface McpServer {
+  id: string;
+  name: string;
+  transport: McpTransport;
+  url?: string | null;
+  command?: string | null;
+  args?: string[] | null;
+  headers_masked?: Record<string, string> | null;
+  env_masked?: Record<string, string> | null;
+  enabled: boolean;
+  status: McpServerStatus;
+  status_checked_at?: string | null;
+  status_error?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+/** A tool discovered on an MCP server (name + optional description). */
+export interface McpToolInfo {
+  name: string;
+  description?: string | null;
+}
+
+/* ------------------------------------------------------------------ */
+/* HTTP integrations (admin registry, issue #3)                        */
+/* ------------------------------------------------------------------ */
+
+/** One declared {placeholder} of an integration's URL template. */
+export interface HttpIntegrationVariable {
+  name: string;
+  description?: string | null;
+  default?: string | null;
+}
+
+/**
+ * Registry entry served by GET/POST/PUT /api/admin/integrations/http.
+ * Header values come back masked — secrets never leave the server.
+ */
+export interface HttpIntegration {
+  id: string;
+  name: string;
+  description?: string | null;
+  url_template: string;
+  headers_masked?: Record<string, string> | null;
+  variables?: HttpIntegrationVariable[] | null;
+  enabled: boolean;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+/** Result of POST /api/admin/integrations/http/{id}/test. */
+export interface HttpIntegrationTestResult {
+  ok: boolean;
+  status_code?: number | null;
+  detail?: string | null;
+  body_preview?: string | null;
+}
+
+/** Result of POST /api/admin/mcp/servers/{id}/test (health + discovery). */
+export interface McpTestResult {
+  ok: boolean;
+  detail?: string | null;
+  tools: McpToolInfo[];
+}
+
+/**
+ * Per-product binding served by /api/products/{product_id}/mcp.
+ * `allowed_tools: null` means every tool of the bound server is exposed to
+ * the expert agent (no allowlist filter).
+ */
+export interface McpServerBinding {
+  id: string;
+  mcp_server_id: string;
+  name: string;
+  transport: McpTransport;
+  enabled: boolean;
+  allowed_tools: string[] | null;
+  status: McpServerStatus;
+}
+
+/* ------------------------------------------------------------------ */
 /* Entity kinds (codebase / spec / links)                               */
 /* ------------------------------------------------------------------ */
 
-export type EntityKind = "codebase" | "spec" | "links";
+export type EntityKind = "codebase" | "spec" | "links" | "database";
 
 /**
  * Backend URL segment for an entity kind.
  *
  * The FastAPI routers (``api/routers/products.py``, ``docgen.py``) register
  * these sub-resources under the PLURAL segments (``codebases`` / ``specs`` /
- * ``links``). The UI stores the SINGULAR kind (``codebase`` / ``spec`` /
- * ``links``) in form state, so every API URL must go through this helper —
- * interpolating the raw kind directly produces 404s.
+ * ``links`` / ``databases``). The UI stores the SINGULAR kind
+ * (``codebase`` / ``spec`` / ``links`` / ``database``) in form state, so every
+ * API URL must go through this helper — interpolating the raw kind directly
+ * produces 404s.
  */
 export function entityPath(kind: EntityKind): string {
   switch (kind) {
@@ -186,6 +388,8 @@ export function entityPath(kind: EntityKind): string {
       return "specs";
     case "links":
       return "links";
+    case "database":
+      return "databases";
   }
 }
 
@@ -314,7 +518,9 @@ export function codebaseToRepoInfo(
     owner,
     repo,
     type,
-    token: codebase.token ?? null,
+    // The API no longer returns tokens (write-only): the backend resolves the
+    // stored encrypted token itself when cloning/pulling.
+    token: null,
     localPath: null,
     repoUrl: codebase.repo_url,
   };
@@ -344,7 +550,9 @@ export function normalizePages(pages: ArtifactPages): ArtifactPage[] {
 }
 
 /** A short, stable id for new client-created entities before the server roundtrip. */
-export function generateId(prefix: "prod" | "cb" | "spec" | "links" | "node"): string {
+export function generateId(
+  prefix: "prod" | "cb" | "spec" | "links" | "db" | "node",
+): string {
   const rand = Math.random().toString(36).slice(2, 8);
   return `${prefix}_${Date.now().toString(36)}${rand}`;
 }

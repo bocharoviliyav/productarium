@@ -3,7 +3,7 @@
 Covers:
 - ``replace_env_placeholders`` (dict / list / str / non-str / missing env var).
 - ``load_json_config`` (DEEPWIKI_CONFIG_DIR override, missing file, bad JSON).
-- ``load_generator_config`` / ``load_embedder_config`` (model_client injection).
+- ``load_generator_config`` / ``load_embedder_config`` (raw JSON passthrough).
 - ``load_repo_config`` / ``load_lang_config`` (malformed lang -> default).
 - ``get_model_config`` (default model, explicit model, missing providers).
 - ``get_embedder_config``.
@@ -40,7 +40,6 @@ from api.config import (
     load_repo_config,
     replace_env_placeholders,
 )
-from api.clients.openai_client import OpenAIClient
 
 
 # ---------------------------------------------------------------------------
@@ -123,11 +122,13 @@ class TestLoadJsonConfig:
 # ---------------------------------------------------------------------------
 
 class TestLoadGeneratorConfig:
-    def test_injects_model_client(self):
+    def test_returns_raw_generator_json(self):
         cfg = load_generator_config()
         assert "providers" in cfg
+        # No client class is injected anymore: the langchain ChatOpenAI
+        # factory (api.llm.client.build_chat_model) consumes these params.
         for provider_cfg in cfg["providers"].values():
-            assert provider_cfg["model_client"] is OpenAIClient
+            assert "model_client" not in provider_cfg
 
     def test_default_provider_present(self):
         cfg = load_generator_config()
@@ -135,10 +136,13 @@ class TestLoadGeneratorConfig:
 
 
 class TestLoadEmbedderConfig:
-    def test_injects_model_client(self):
+    def test_returns_raw_embedder_json(self):
         cfg = load_embedder_config()
         assert "embedder_openai_local" in cfg
-        assert cfg["embedder_openai_local"]["model_client"] is OpenAIClient
+        # No client class is injected anymore: the langchain
+        # OpenAIEmbeddings factory (api.tools.embedder.get_embedder)
+        # consumes these params.
+        assert "model_client" not in cfg["embedder_openai_local"]
 
     def test_retriever_and_splitter_present(self):
         cfg = load_embedder_config()
@@ -200,14 +204,16 @@ class TestConfigsDict:
 class TestGetModelConfig:
     def test_default_model(self):
         result = get_model_config()
-        assert result["model_client"] is OpenAIClient
+        # The client class is built by api.llm.client.build_chat_model,
+        # so the config carries model_kwargs only.
+        assert set(result.keys()) == {"model_kwargs"}
         assert "model" in result["model_kwargs"]
         # default model from generator.json
         assert result["model_kwargs"]["model"] == "qwen/qwen3.6-27b"
 
     def test_explicit_model_with_params(self):
         result = get_model_config("gemma3:12b")
-        assert result["model_client"] is OpenAIClient
+        assert set(result.keys()) == {"model_kwargs"}
         assert result["model_kwargs"]["model"] == "gemma3:12b"
         assert result["model_kwargs"]["temperature"] == 0.1
 
@@ -238,8 +244,8 @@ class TestGetModelConfig:
 class TestGetEmbedderConfig:
     def test_returns_embedder_config(self):
         cfg = get_embedder_config()
-        # The configs dict stores the raw embedder config (without model_client,
-        # which is injected by load_embedder_config into a separate copy).
+        # The configs dict stores the raw embedder config; the langchain
+        # OpenAIEmbeddings factory consumes it without client-class injection.
         assert "model_kwargs" in cfg or "batch_size" in cfg
 
     def test_returns_empty_when_missing(self, monkeypatch):

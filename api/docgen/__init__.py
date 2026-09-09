@@ -2,11 +2,11 @@
 
 Submodules:
 - ``_common``   — shared helpers (event loop, LLM wrapper, persistence, indexing).
-- ``codebase``  — codebase docgen (RLM long-context + standard-LLM fallback).
+- ``codebase``  — codebase docgen (deepagents orchestrator + subagents, standard-LLM
+  fallback, verification pipeline, adaptive small-context caps).
 - ``spec``      — OpenAPI/AsyncAPI docgen (stdlib render + LLM enrich).
-- ``wiki``      — sequential 7-section wiki generator (prompt dispatch + context).
 - ``summary``   — AI product summary over codebases/specs + knowledge nodes.
-- ``jobs``      — async 202 + poll job registry for codebase/spec doc generation.
+- ``jobs``      — async 202 + poll job registry with a live progress model.
 
 Each generate endpoint calls its generator directly (no polymorphic dispatcher).
 ``set_main_event_loop`` (re-exported from :mod:`api.docgen._common`) is called

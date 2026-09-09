@@ -12,7 +12,7 @@ Covers:
 - Router endpoint integration (create/get/tree/put/delete/verify) over an
   isolated SQLite DB via FastAPI TestClient with dependency overrides.
 
-No live LLM/Postgres/cognee is required: LLM and cognee indexing are mocked.
+No live LLM/Postgres/memory backend is required: LLM and memory indexing are mocked.
 """
 
 from __future__ import annotations
@@ -214,6 +214,11 @@ class TestKnowledgeRouterEndpoints:
         app = FastAPI()
         app.include_router(kr.router)
         app.dependency_overrides[kr.get_db] = _get_db
+        # Tests reload api.db, so require_product_access (in api.auth.deps) can
+        # hold a different get_db object than kr; override it too so the
+        # product-access dependency sees the same test engine.
+        import api.auth.deps as deps_mod
+        app.dependency_overrides[deps_mod.get_db] = _get_db
 
         # Fixed admin user so no session cookie / auth backend is required.
         def _current_user():

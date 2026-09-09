@@ -29,7 +29,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from api.auth.deps import require_admin
@@ -40,7 +40,7 @@ from api.auth.local import (
     hash_token,
 )
 from api.db import get_db
-from api.models import ApiTokenORM, UserORM
+from api.models import ApiTokenORM, ProductGrantORM, ProductORM, UserORM, USER_ROLES
 from api.schemas import (
     ApiTokenCreate,
     ApiTokenOut,
@@ -51,7 +51,6 @@ from api.schemas import (
 from api.config.settings import (
     _sanitize_api_key,
     delete_setting,
-    get_all_rlm_modes,
     get_confluence_creds,
     get_git_accounts,
     get_git_creds,
@@ -60,7 +59,15 @@ from api.config.settings import (
     list_settings,
     set_setting,
 )
-from api.prompts import PROMPTS_DIR, PROMPT_FILES, reload_prompt_file
+from api.prompts import (
+    PROMPT_FILES,
+    PROMPT_LANGUAGES,
+    PROMPTS_DIR,
+    get_generation_language,
+    prompts_dir,
+    reload_all_prompt_files,
+    reload_prompt_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,32 +80,24 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 _SECRET_SUFFIXES = (".api_key", ".token", ".password", ".secret")
 
 # Groups backed by the SettingORM key/value store (contract J).
-# ``rlm`` stores per-task LLM/RLM routing modes (rlm.<task>.mode) and is NOT a
-# secret group — its values are plain strings (auto/rlm/llm).
 # ``ssl`` stores TLS config (ssl.ca_bundle path + ssl.verify toggle) for reaching
 # a corporate AI gateway whose cert is signed by an internal CA; NOT secret.
-# ``cognee`` stores knowledge graph rate limiting & concurrency settings; NOT secret.
 # ``embedder`` stores embedder rate limiting & concurrency settings (pgvector
 # memory backend); NOT secret.
 # ``timeouts`` stores per-key timeout overrides (timeouts.<key>) resolved through
 # api.config.timeout (admin store > env var > default); NOT secret.
-# ``memory`` stores the active memory backend (memory.backend = pgvector|cognee);
+# ``memory`` stores the active memory backend (memory.backend = pgvector);
 # NOT secret.
 _SETTING_GROUPS = (
-    "models", "git", "confluence", "integrations", "rlm", "ssl", "cognee",
-    "embedder", "timeouts", "memory",
+    "models", "git", "confluence", "integrations", "ssl",
+    "embedder", "timeouts", "memory", "generation",
 )
 
 # Valid memory backend names (stored under ``memory.backend``).
-_MEMORY_BACKEND_VALUES = ("pgvector", "cognee")
+_MEMORY_BACKEND_VALUES = ("pgvector",)
 
 # Model "tasks" exposed in the admin Models section (contract J / plan D).
-_MODEL_TASKS = ("docgen", "expert", "summary", "cognee", "embedder")
-
-# Tasks that support an admin-configurable LLM/RLM routing mode.
-_RLM_TASKS = ("docgen", "expert", "summary")
-# Valid RLM mode values (stored under ``rlm.<task>.mode``).
-_RLM_MODE_VALUES = ("auto", "rlm", "llm")
+_MODEL_TASKS = ("docgen", "expert", "summary", "embedder")
 
 # Git hosts configurable in the admin Git section.
 _GIT_HOSTS = ("github", "gitlab")
@@ -222,29 +221,8 @@ class PromptUpdateRequest(BaseModel):
     content: str
 
 
-class CogneeReindexRequest(BaseModel):
+class MemoryReindexRequest(BaseModel):
     product_id: Optional[str] = None
-
-
-@router.post("/cognee/reindex")
-async def trigger_cognee_reindex(
-    body: Optional[CogneeReindexRequest] = None,
-    _admin: UserORM = Depends(require_admin),
-):
-    """Re-index the active memory backend (alias kept for backward compat).
-
-    Delegates to ``api.memory.reindex_product_memory`` so the admin
-    ``memory.backend`` switch governs this path too (pgvector by default,
-    cognee alt). The canonical new path is ``POST /api/admin/memory/reindex``.
-    """
-    pid = body.product_id if body else None
-    try:
-        from api.memory import reindex_product_memory
-        res = await reindex_product_memory(pid)
-        return res
-    except Exception as e:
-        logger.error("Admin memory reindex failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Reindex failed: {e}")
 
 
 def _memory_status_view() -> Dict[str, Any]:
@@ -287,7 +265,7 @@ def put_memory_settings(
 ) -> Dict[str, Any]:
     """Save memory settings (canonical path for the UI).
 
-    Accepts ``{"memory.backend": "pgvector"|"cognee"}``. Delegates validation +
+    Accepts ``{"memory.backend": "pgvector"}``. Delegates validation +
     sync to the generic ``put_group("memory", ...)`` path so the resolver cache
     is invalidated via ``sync_runtime_settings``.
     """
@@ -296,13 +274,13 @@ def put_memory_settings(
 
 @router.post("/memory/reindex")
 async def trigger_memory_reindex(
-    body: Optional[CogneeReindexRequest] = None,
+    body: Optional[MemoryReindexRequest] = None,
     _admin: UserORM = Depends(require_admin),
 ):
     """Rebuild the active memory backend index from source artifacts.
 
-    Delegates to ``api.memory.reindex_product_memory`` (pgvector by default,
-    cognee alt) so the admin ``memory.backend`` switch governs this path.
+    Delegates to ``api.memory.reindex_product_memory`` (pgvector) so the admin
+    ``memory.backend`` switch governs this path.
     """
     pid = body.product_id if body else None
     try:
@@ -310,7 +288,7 @@ async def trigger_memory_reindex(
         return await reindex_product_memory(pid)
     except Exception as e:
         logger.error("Admin memory reindex failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Reindex failed: {e}")
+        raise HTTPException(status_code=500, detail="Reindex failed")
 
 
 def _safe_prompt_filename(filename: str) -> Optional[str]:
@@ -328,21 +306,44 @@ def _safe_prompt_filename(filename: str) -> Optional[str]:
     return filename
 
 
+def _normalize_prompt_lang(lang: Optional[str]) -> str:
+    """Resolve the ``?lang=`` query param (default: active generation language)."""
+    normalized = (lang or "").strip().lower()
+    if normalized in PROMPT_LANGUAGES:
+        return normalized
+    return get_generation_language()
+
+
 @router.get("/prompts")
 def list_prompts(
+    lang: Optional[str] = Query(
+        None, description="Prompt language (ru|en); default: active generation language"
+    ),
     _admin: UserORM = Depends(require_admin),
 ) -> List[Dict[str, Any]]:
-    """List all prompt files in refs/prompts/ with their size and mtime."""
+    """List the editable prompt files of one language with size and mtime.
+
+    Only files registered in ``PROMPT_FILES`` are listed — ``README.md`` and
+    any other non-prompt file in ``refs/prompts/`` is excluded (README used
+    to appear in the listing and then fail with 400 on open because it is
+    not a registered prompt).
+    """
+    language = _normalize_prompt_lang(lang)
+    directory = prompts_dir(language)
     out: List[Dict[str, Any]] = []
     try:
-        if not os.path.isdir(PROMPTS_DIR):
-            return out
-        for fname in sorted(os.listdir(PROMPTS_DIR)):
-            if not fname.endswith(".md"):
-                continue
-            fpath = os.path.join(PROMPTS_DIR, fname)
+        for fname in sorted(PROMPT_FILES):
+            fpath = os.path.join(directory, fname)
             if not os.path.isfile(fpath):
-                continue
+                # Graceful fallback: a language copy may not exist yet
+                # (translation in flight) — stat the English original so
+                # the listing always covers the full inventory. GET
+                # /prompts/{filename} serves its content with language="en".
+                if language == "en":
+                    continue
+                fpath = os.path.join(prompts_dir("en"), fname)
+                if not os.path.isfile(fpath):
+                    continue
             try:
                 st = os.stat(fpath)
                 out.append({
@@ -360,47 +361,85 @@ def list_prompts(
 @router.get("/prompts/{filename}")
 def get_prompt(
     filename: str,
+    lang: Optional[str] = Query(
+        None, description="Prompt language (ru|en); default: active generation language"
+    ),
     _admin: UserORM = Depends(require_admin),
 ) -> Dict[str, Any]:
-    """Return the content of a single prompt file."""
+    """Return the content of a single prompt file (lang dir, en fallback)."""
     safe = _safe_prompt_filename(filename)
     if safe is None:
         raise HTTPException(status_code=400, detail="Invalid or unknown prompt filename.")
-    fpath = os.path.join(PROMPTS_DIR, safe)
+    language = _normalize_prompt_lang(lang)
+    fpath = os.path.join(prompts_dir(language), safe)
+    read_lang = language
+    if not os.path.isfile(fpath) and language != "en":
+        # Graceful fallback: the language copy may not exist yet (e.g. a
+        # prompt not yet translated) — offer the English body for editing.
+        fallback = os.path.join(prompts_dir("en"), safe)
+        if os.path.isfile(fallback):
+            fpath = fallback
+            read_lang = "en"
     if not os.path.isfile(fpath):
         raise HTTPException(status_code=404, detail="Prompt file not found.")
     try:
         with open(fpath, "r", encoding="utf-8") as f:
             content = f.read()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not read prompt file: {e}")
-    return {"filename": safe, "content": content}
+        logger.warning("get_prompt(%s) failed: %s", safe, e)
+        raise HTTPException(status_code=500, detail="Could not read prompt file")
+    return {"filename": safe, "content": content, "language": read_lang}
 
 
 @router.put("/prompts/{filename}")
 def update_prompt(
     filename: str,
     body: PromptUpdateRequest,
+    lang: Optional[str] = Query(
+        None, description="Prompt language (ru|en); default: active generation language"
+    ),
     _admin: UserORM = Depends(require_admin),
 ) -> Dict[str, Any]:
-    """Write new content to a prompt file and hot-reload it in memory."""
+    """Write new content to the prompt file of the requested language.
+
+    Always writes into the requested language's directory — creating the
+    copy when it does not exist yet (adapting an English-only prompt into
+    Russian, or vice versa). Then hot-reloads the ACTIVE language's
+    in-memory copy so the edit takes effect immediately when applicable.
+    """
     safe = _safe_prompt_filename(filename)
     if safe is None:
         raise HTTPException(status_code=400, detail="Invalid or unknown prompt filename.")
-    fpath = os.path.join(PROMPTS_DIR, safe)
-    if not os.path.isfile(fpath):
-        raise HTTPException(status_code=404, detail="Prompt file not found.")
+    language = _normalize_prompt_lang(lang)
+    directory = prompts_dir(language)
+    fpath = os.path.join(directory, safe)
     try:
+        os.makedirs(directory, exist_ok=True)
         with open(fpath, "w", encoding="utf-8") as f:
             f.write(body.content)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not write prompt file: {e}")
+        logger.warning("update_prompt(%s) failed: %s", safe, e)
+        raise HTTPException(status_code=500, detail="Could not write prompt file")
     # Invalidate the in-memory cache so the new text takes effect immediately.
     try:
         reload_prompt_file(safe)
     except Exception as e:  # pragma: no cover - non-fatal
         logger.warning("reload_prompt_file(%s) failed: %s", safe, e)
-    return {"success": True, "filename": safe}
+    return {"success": True, "filename": safe, "language": language}
+
+
+# --- Read-only OpenAPI schema for the admin API viewer (issue #4) ------------
+@router.get("/openapi")
+def get_openapi_schema(
+    request: Request,
+    _admin: UserORM = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Return the app's OpenAPI schema (rendered read-only via SpecViewer)."""
+    try:
+        return request.app.openapi()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error("openapi() generation failed: %s", e)
+        raise HTTPException(status_code=500, detail="Could not build OpenAPI schema")
 
 
 # --- GET /api/admin/{group} -------------------------------------------------
@@ -441,19 +480,6 @@ def get_group(
                     name = r["key"][len("integrations."):]
                     parsed[name] = get_integration_config(name)
             resp["resolved"] = parsed
-        elif group == "rlm":
-            # ``resolved`` is the effective per-task mode AFTER env fallback +
-            # fast-rlm availability check (so the UI shows the real routing,
-            # e.g. "llm" when fast-rlm is not installed even if stored="auto").
-            resp["resolved"] = get_all_rlm_modes()
-        elif group == "cognee":
-            from api.cognee import _cognee_rate_limiter
-            max_conc, delay_sec = _cognee_rate_limiter.get_rate_settings()
-            resp["resolved"] = {
-                "max_concurrency": str(max_conc),
-                "delay_seconds": str(delay_sec),
-                "rate_limit_rps": str(round(1.0 / delay_sec, 2)) if delay_sec > 0 else "0",
-            }
         elif group == "embedder":
             from api.tools.rate_limiter import _embedder_rate_limiter
             max_conc, delay_sec = _embedder_rate_limiter.get_rate_settings()
@@ -470,6 +496,9 @@ def get_group(
             # so they are already in ``settings`` above.
             from api.config.timeout import get_timeout_resolved_view
             resp["resolved"] = get_timeout_resolved_view()
+        elif group == "generation":
+            # ``resolved`` mirrors what generation pipelines will use next run.
+            resp["resolved"] = {"language": get_generation_language()}
         elif group == "memory":
             resp["resolved"] = _memory_status_view()
         return resp
@@ -517,18 +546,12 @@ def put_group(
         for key, value in body.items():
             if not isinstance(key, str) or not key.startswith(f"{group}."):
                 continue
-            # Validate RLM mode values so an invalid mode can't be persisted.
-            if group == "rlm" and key.endswith(".mode"):
-                v = (value or "").strip().lower() if isinstance(value, str) else value
-                if v not in _RLM_MODE_VALUES:
-                    logger.warning("Ignoring invalid RLM mode for %r: %r", key, value)
-                    continue
             encrypt = _is_secret_key(key)
             str_value = (
                 value if (value is None or isinstance(value, str)) else json.dumps(value)
             )
             # Validate optional per-model prompt-token budget so a non-numeric
-            # value can't be persisted (and later crash RLM). An empty value
+            # value can't be persisted (and later crash callers). An empty value
             # clears the override; otherwise it must be a non-negative int.
             if group == "models" and key.endswith(".max_prompt_tokens"):
                 normed = str_value.strip() if isinstance(str_value, str) else str(str_value)
@@ -583,25 +606,42 @@ def put_group(
                     logger.warning("Ignoring invalid memory.backend: %r", value)
                     continue
                 str_value = v
+            # Validate generation.language so an invalid name can't be
+            # persisted (the prompt loader would silently fall back to the
+            # lang.json default while the UI showed the typo as active).
+            if group == "generation" and key == "generation.language":
+                v = (value or "").strip().lower() if isinstance(value, str) else value
+                if v not in PROMPT_LANGUAGES:
+                    logger.warning("Ignoring invalid generation.language: %r", value)
+                    continue
+                str_value = v
             set_setting(key, str_value, encrypt=encrypt)
             saved.append(key)
 
-        # Trigger instant synchronization across all process subsystems and cognee
+        # Trigger instant synchronization across all process subsystems
         try:
             from api.config.abstraction import sync_runtime_settings
             sync_runtime_settings()
         except Exception as e:
             logger.warning("sync_runtime_settings after admin put_group failed: %s", e)
 
+        # A generation.language change switches the whole prompt file set:
+        # hot-reload every prompt from the new language's directory (no restart).
+        if group == "generation" and "generation.language" in saved:
+            try:
+                reload_all_prompt_files()
+            except Exception as e:  # pragma: no cover - non-fatal
+                logger.warning("reload_all_prompt_files after language change failed: %s", e)
+
         return {"group": group, "success": True, "saved": saved}
 
     if group == "users":
         user_id = body.get("user_id") if isinstance(body, dict) else None
         role = body.get("role") if isinstance(body, dict) else None
-        if not user_id or role not in ("user", "admin"):
+        if not user_id or role not in USER_ROLES:
             raise HTTPException(
                 status_code=400,
-                detail="Body must include {user_id, role} with role in (user, admin)",
+                detail=f"Body must include {{user_id, role}} with role in {USER_ROLES}",
             )
         u = db.get(UserORM, user_id)
         if u is None:
@@ -636,8 +676,10 @@ def create_user(
     username = body.username.strip()
     if not username:
         raise HTTPException(status_code=400, detail="Username is required.")
-    if body.role not in ("user", "admin"):
-        raise HTTPException(status_code=400, detail="role must be 'user' or 'admin'.")
+    if body.role not in USER_ROLES:
+        raise HTTPException(
+            status_code=400, detail=f"role must be one of {USER_ROLES}."
+        )
     if db.query(UserORM).filter(UserORM.username == username).first() is not None:
         raise HTTPException(status_code=409, detail="Username already taken.")
     temp_password = body.password or secrets.token_urlsafe(12)
@@ -662,6 +704,102 @@ def create_user(
         temp_password=temp_password,
         reset_token=reset_token,
     )
+
+
+# --- Per-product access grants (P0-2) -----------------------------------------
+_GRANT_LEVELS = ("ro", "rw")
+
+
+class GrantUpdate(BaseModel):
+    product_id: str
+    user_id: str
+    level: str  # ro | rw
+
+
+@router.get("/grants")
+def list_grants(
+    admin: UserORM = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> List[Dict[str, Any]]:
+    """List all per-product access grants (admin UI).
+
+    Each row carries the product/user display names so the admin panel can
+    render the matrix without extra lookups.
+    """
+    grants = db.query(ProductGrantORM).all()
+    products = {p.id: p.name for p in db.query(ProductORM.id, ProductORM.name).all()}
+    users = {u.id: u.username for u in db.query(UserORM.id, UserORM.username).all()}
+    return [
+        {
+            "product_id": g.product_id,
+            "user_id": g.user_id,
+            "level": g.level,
+            "granted_by": g.granted_by,
+            "created_at": g.created_at,
+            "product_name": products.get(g.product_id),
+            "username": users.get(g.user_id),
+        }
+        for g in grants
+    ]
+
+
+@router.put("/grants")
+def upsert_grant(
+    body: GrantUpdate,
+    admin: UserORM = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Create or update a per-product grant (level ro|rw)."""
+    if body.level not in _GRANT_LEVELS:
+        raise HTTPException(status_code=400, detail="level must be 'ro' or 'rw'.")
+    if db.get(ProductORM, body.product_id) is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    user = db.get(UserORM, body.user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.role == "admin":
+        raise HTTPException(
+            status_code=400,
+            detail="Admins already have full access; grants are redundant.",
+        )
+    grant = db.get(ProductGrantORM, {"product_id": body.product_id, "user_id": body.user_id})
+    if grant is None:
+        grant = ProductGrantORM(
+            product_id=body.product_id,
+            user_id=body.user_id,
+            level=body.level,
+            granted_by=admin.id,
+        )
+        db.add(grant)
+    else:
+        grant.level = body.level
+        grant.granted_by = admin.id
+    db.commit()
+    logger.info(
+        "Admin %r set grant %s -> %s (%s).",
+        admin.username, body.product_id, user.username, body.level,
+    )
+    return {
+        "product_id": grant.product_id,
+        "user_id": grant.user_id,
+        "level": grant.level,
+        "granted_by": grant.granted_by,
+    }
+
+
+@router.delete("/grants")
+def delete_grant(
+    product_id: str,
+    user_id: str,
+    admin: UserORM = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> Dict[str, str]:
+    """Remove a per-product grant."""
+    grant = db.get(ProductGrantORM, {"product_id": product_id, "user_id": user_id})
+    if grant is not None:
+        db.delete(grant)
+        db.commit()
+    return {"message": "Grant removed"}
 
 
 @router.post("/users/{user_id}/reset-token")
@@ -926,7 +1064,8 @@ def create_api_token(
         db.refresh(tok)
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to create token: {e}")
+        logger.error("create_api_token failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create token")
     return _token_out(tok, include_token=True, plaintext=raw)
 
 
@@ -949,5 +1088,6 @@ def delete_api_token(
         db.commit()
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to delete token: {e}")
+        logger.error("delete_api_token(%s) failed: %s", token_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to delete token")
     return {"success": True, "id": token_id}

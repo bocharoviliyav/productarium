@@ -1,7 +1,7 @@
 """Unit tests for ``api.expert.prompt``.
 
 Covers:
-- Tunables: ``RLM_MIN_CHARS``, ``KNOWLEDGE_MAX_CHARS``, ``STREAM_CHUNK_SIZE``.
+- Tunables: ``KNOWLEDGE_MAX_CHARS``, ``STREAM_CHUNK_SIZE``.
 - Loaded prompt bodies: ``EXPERT_SYSTEM_PROMPT`` / ``EXPERT_DOC_PROMPT`` non-empty.
 - ``_clean_llm_text``: fence stripping, ``<r>`` block stripping, line-number
   stripping inside code blocks, empty/None passthrough.
@@ -24,7 +24,6 @@ from api.expert.prompt import (
     EXPERT_DOC_PROMPT,
     EXPERT_SYSTEM_PROMPT,
     KNOWLEDGE_MAX_CHARS,
-    RLM_MIN_CHARS,
     STREAM_CHUNK_SIZE,
     _build_prompt,
     _chunk_text,
@@ -37,17 +36,8 @@ from api.expert.prompt import (
 # --------------------------------------------------------------------------- #
 class TestTunables:
     def test_tunables_are_positive_ints(self):
-        assert isinstance(RLM_MIN_CHARS, int) and RLM_MIN_CHARS > 0
         assert isinstance(KNOWLEDGE_MAX_CHARS, int) and KNOWLEDGE_MAX_CHARS > 0
         assert isinstance(STREAM_CHUNK_SIZE, int) and STREAM_CHUNK_SIZE > 0
-
-    def test_rlm_min_chars_matches_docgen_threshold(self):
-        # RLM is for long context only; 20k is the documented threshold.
-        assert RLM_MIN_CHARS == 20_000
-
-    def test_knowledge_cap_larger_than_rlm_threshold(self):
-        # The knowledge cap must allow prompts big enough to trigger RLM.
-        assert KNOWLEDGE_MAX_CHARS >= RLM_MIN_CHARS
 
     def test_stream_chunk_size_reasonable(self):
         # Small enough for incremental SSE, large enough to avoid per-char frames.

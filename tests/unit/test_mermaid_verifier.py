@@ -370,6 +370,41 @@ class TestRunRepairLoop:
         assert "A --> > B" not in patched
         assert patched.count("A --> B") == 2
 
+    def test_mutating_llm_terminates_within_global_budget(self, monkeypatch):
+        # P1-15: an LLM that returns a NEW broken body on every call used to
+        # earn a fresh per-body budget for each new hash (each mutated variant
+        # was re-enqueued under its own hash with a full budget) and could
+        # spin the drain forever. The per-block TOTAL iteration cap
+        # (max_attempts * 3) must terminate the loop with a failure marker.
+        monkeypatch.setenv("MERMAID_MAX_REPAIR_ATTEMPTS", "3")
+        mv = _reload()
+        broken = "flowchart TD\n  A --> > BROKEN0\n"
+        call_count = {"n": 0}
+
+        async def _fake_verify(body, timeout=None):
+            # EVERY body is broken: the original and every mutated suggestion.
+            return mv.VerifyResult(ok=False, error="Parse error")
+
+        monkeypatch.setattr(mv, "verify_diagram", _fake_verify)
+
+        async def llm(prompt):
+            call_count["n"] += 1
+            # A NEW broken body each call: unique suffix -> unique hash -> a
+            # fresh per-body budget every time without the global cap.
+            return f"```mermaid\nflowchart TD\n  A --> > BROKEN{call_count['n']}\n```"
+
+        md = f"```mermaid\n{broken}```\n"
+        patched, stats = asyncio.run(mv.run_repair_loop(md, llm))
+        # Terminated within the per-block total cap: max_attempts(3) * 3 = 9.
+        assert call_count["n"] <= 9
+        assert call_count["n"] >= 1
+        assert stats["broken"] == 1
+        assert stats["failed"] == 1
+        assert stats["fixed"] == 0
+        # Original broken body preserved in place with the error marker.
+        assert "BROKEN0" in patched
+        assert "Mermaid" in patched
+
 
 # ============================================================================
 # Integration test against the real Node validator (skipped if unavailable)

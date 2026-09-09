@@ -20,24 +20,55 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from api.auth.deps import get_current_user, require_product_access
 from api.db import get_db
-from api.docgen.jobs import create_job, get_job, submit_job
+from api.docgen.jobs import (
+    _progress_snapshot,
+    active_jobs_for_product,
+    create_or_get_job,
+    get_job,
+    submit_job,
+)
+from api.models import ProductORM, UserORM
 from api.repositories import product_repo
+from api.utils.rate_limit import enforce_user_rate_limit
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/products", tags=["docgen"])
+# Generation is an authenticated action: starting a (potentially expensive)
+# docgen job and polling its status both require a session (a no-op when
+# AUTH_PROVIDER=none).
+router = APIRouter(
+    prefix="/api/products",
+    tags=["docgen"],
+    dependencies=[Depends(get_current_user)],
+)
 
 
 class GenerateDocRequest(BaseModel):
     model: Optional[str] = None
-    language: Optional[str] = "ru"
+    # DEPRECATED no-op: the generation language is controlled by the admin
+    # ``generation.language`` setting (see api.prompts.get_generation_language)
+    # and resolved when the job starts. The field is kept so older clients
+    # sending it are not rejected.
+    language: Optional[str] = None
 
 
 def _start_generate(
     db: Session, product_id: str, entity_type: str, entity_id: str,
-    request_data: GenerateDocRequest,
+    request_data: GenerateDocRequest, user_id: str,
 ) -> JSONResponse:
+    # P1-17: per-user token bucket on the expensive generate operation.
+    # Checked before any DB work so an exhausted client is shed cheaply.
+    enforce_user_rate_limit(
+        user_id,
+        setting_key="rate.docgen.per_user_hour",
+        env_name="RATE_DOCGEN_PER_USER_HOUR",
+        default_per_minute=10,
+        window_seconds=3600.0,
+    )
+
+    # Access (rw) is enforced by the endpoint's require_product_access dep.
     p_orm = product_repo.load_product_orm(db, product_id)
     if p_orm is None:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -47,14 +78,27 @@ def _start_generate(
     if not entity:
         raise HTTPException(status_code=404, detail=f"{entity_type.capitalize()} not found")
 
-    job_id = create_job(product_id, entity_type, entity_id)
-    submit_job(
-        job_id, product_id, entity_type, entity_id,
-        request_data.model, request_data.language or "ru",
-    )
+    # Fork H3/H4: a repeated POST for an entity with an in-flight job re-attaches
+    # to that job (same 202 + job_id) instead of racing a duplicate generation.
+    job_id, is_new = create_or_get_job(product_id, entity_type, entity_id)
+    if is_new:
+        # ``language`` (deprecated request field) is passed through as-is;
+        # the worker resolves the effective language from the admin setting
+        # at job start (api.docgen.jobs._run_docgen_job_async).
+        submit_job(
+            job_id, product_id, entity_type, entity_id,
+            request_data.model, request_data.language,
+        )
+    job = get_job(job_id)
     return JSONResponse(
         status_code=202,
-        content={"job_id": job_id, "status": "queued", "entity_type": entity_type, "entity_id": entity_id},
+        content={
+            "job_id": job_id,
+            "status": (job or {}).get("status", "queued"),
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "reused": not is_new,
+        },
     )
 
 
@@ -62,14 +106,17 @@ def _start_generate(
 async def generate_codebase_docs(
     product_id: str, codebase_id: str,
     request_data: GenerateDocRequest, db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
+    user: UserORM = Depends(get_current_user),
 ):
-    return _start_generate(db, product_id, "codebase", codebase_id, request_data)
+    return _start_generate(db, product_id, "codebase", codebase_id, request_data, user.id)
 
 
 @router.get("/{product_id}/codebases/{codebase_id}/generate/status")
 async def get_codebase_docgen_status(
     product_id: str, codebase_id: str,
     job_id: str = Query(..., description="Docgen job id returned by the generate endpoint"),
+    _product: ProductORM = Depends(require_product_access("ro")),
 ):
     return _get_status(product_id, "codebase", codebase_id, job_id)
 
@@ -78,16 +125,34 @@ async def get_codebase_docgen_status(
 async def generate_spec_docs(
     product_id: str, spec_id: str,
     request_data: GenerateDocRequest, db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
+    user: UserORM = Depends(get_current_user),
 ):
-    return _start_generate(db, product_id, "spec", spec_id, request_data)
+    return _start_generate(db, product_id, "spec", spec_id, request_data, user.id)
 
 
 @router.get("/{product_id}/specs/{spec_id}/generate/status")
 async def get_spec_docgen_status(
     product_id: str, spec_id: str,
     job_id: str = Query(..., description="Docgen job id returned by the generate endpoint"),
+    _product: ProductORM = Depends(require_product_access("ro")),
 ):
     return _get_status(product_id, "spec", spec_id, job_id)
+
+
+@router.get("/{product_id}/docgen/active")
+async def get_active_docgen_jobs(
+    product_id: str, db: Session = Depends(get_db),
+):
+    """Active (queued/running) docgen jobs for the product.
+
+    Lets the UI restore in-flight generation animations after a page
+    reload/navigation (the job registry is in-memory and single-process: a
+    backend restart kills the jobs, so there is nothing durable to poll).
+    """
+    if product_repo.load_product_orm(db, product_id) is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return active_jobs_for_product(product_id)
 
 
 def _get_status(product_id: str, entity_type: str, entity_id: str, job_id: str) -> dict:
@@ -102,6 +167,7 @@ def _get_status(product_id: str, entity_type: str, entity_id: str, job_id: str) 
     return {
         "job_id": job["job_id"],
         "status": job["status"],
+        "progress": _progress_snapshot(job),
         "indexing_status": job.get("indexing_status", "idle"),
         "indexing_message": job.get("indexing_message", ""),
         "error": job.get("error"),

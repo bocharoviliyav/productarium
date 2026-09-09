@@ -4,7 +4,7 @@ Covers:
 - ORM<->Pydantic mappers: ``orm_to_product``, ``_codebase_orm_from_pydantic``,
   ``_spec_orm_from_pydantic``, ``_links_orm_from_pydantic``.
 - ``load_product_orm`` (found / not found).
-- ``list_products`` (empty / with children).
+- ``list_products_light`` (empty / counters / visibility / pagination).
 - ``upsert_product`` (insert, update, full child replace).
 - ``delete_product`` (existing / missing no-op).
 - Per-type add/delete for codebase/spec/links (including replace-on-duplicate).
@@ -28,12 +28,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from api.models import (
     CodebaseORM,
+    DatabaseORM,
     LinksORM,
     ProductORM,
     SpecORM,
 )
 from api.repositories import product_repo as pr
-from api.schemas import Codebase, Links, Product, Spec
+from api.schemas import Codebase, Database, Links, Product, ProductListItem, Spec
 
 
 # --------------------------------------------------------------------------- #
@@ -128,10 +129,18 @@ class TestFromPydanticMappers:
         assert orm.name == "Repo A"
         assert orm.repo_url == "https://github.com/example/repo"
         assert orm.repo_type == "github"
-        assert orm.token == "tok"
+        # P0-2: the payload token is WRITE-ONLY — the mapper persists only the
+        # caller-resolved stored (encrypted) value; a raw "tok" never lands.
+        assert orm.token is None
+        stored = pr._resolved_stored_token(c.token, None)
+        assert stored is not None and stored != "tok"  # Fernet ciphertext
+        orm2 = pr._codebase_orm_from_pydantic(c, stored_token=stored)
+        assert orm2.token == stored
+        assert pr.get_codebase_token(orm2) == "tok"
         assert orm.generated_docs is None
         assert orm.pages is None
-        assert orm.verified is False
+        # P0-5: verified is server-owned — not copied from the payload.
+        assert orm.verified is None
         assert orm.source == "manual"
 
     def test_codebase_orm_from_pydantic_source_defaults_to_manual(self):
@@ -151,7 +160,9 @@ class TestFromPydanticMappers:
         assert orm.name == "OpenAPI"
         assert orm.kind == "openapi"
         assert orm.content == "openapi: 3.0.0"
-        assert orm.verified is False
+        # P0-5: verified is server-owned — not copied from the payload
+        # (column default applies at flush, so it is None on the fresh ORM).
+        assert orm.verified is None
         assert orm.source == "manual"
 
     def test_spec_orm_from_pydantic_kind_defaults_to_openapi(self):
@@ -171,7 +182,8 @@ class TestFromPydanticMappers:
         assert orm.id == "links_1"
         assert orm.name == "Links A"
         assert orm.content is not None and "url" in orm.content
-        assert orm.verified is False
+        # P0-5: verified is server-owned — not copied from the payload.
+        assert orm.verified is None
         assert orm.source == "manual"
 
     def test_links_orm_from_pydantic_source_defaults_to_manual(self):
@@ -257,24 +269,74 @@ class TestLoadProductOrm:
 
 
 # --------------------------------------------------------------------------- #
-# list_products
+# list_products_light
 # --------------------------------------------------------------------------- #
-class TestListProducts:
+class TestListProductsLight:
     def test_empty(self, session):
-        assert pr.list_products(session) == []
+        assert pr.list_products_light(session) == ([], 0)
 
     def test_with_products(self, session):
         _seed_product(session, "prod_1")
         _seed_product(session, "prod_2")
-        result = pr.list_products(session)
-        assert len(result) == 2
-        ids = {p.id for p in result}
-        assert ids == {"prod_1", "prod_2"}
+        items, total = pr.list_products_light(session)
+        assert total == 2
+        assert {p.id for p in items} == {"prod_1", "prod_2"}
 
-    def test_returns_pydantic_models(self, session):
+    def test_returns_light_pydantic_models(self, session):
         _seed_product(session)
-        result = pr.list_products(session)
-        assert isinstance(result[0], Product)
+        items, _ = pr.list_products_light(session)
+        assert isinstance(items[0], ProductListItem)
+        assert items[0].id == "prod_1"
+
+    def test_counters_verified_vs_total(self, session):
+        _seed_product(session)
+        session.add(CodebaseORM(
+            id="cb_v", product_id="prod_1", name="V", source="manual",
+            verified=True, verified_by="admin",
+        ))
+        session.add(CodebaseORM(id="cb_u", product_id="prod_1", name="U", source="manual"))
+        session.add(SpecORM(id="spec_1", product_id="prod_1", name="S", kind="openapi", source="manual"))
+        session.add(LinksORM(id="links_1", product_id="prod_1", name="L", source="manual"))
+        session.commit()
+        items, total = pr.list_products_light(session)
+        assert total == 1
+        it = items[0]
+        assert it.codebases_count == 2
+        assert it.verified_codebases == 1
+        assert it.specs_count == 1
+        assert it.verified_specs == 0
+        assert it.links_count == 1
+        assert it.verified_links == 0
+
+    def test_visibility_filter(self, session):
+        _seed_product(session, "prod_1")
+        _seed_product(session, "prod_2")
+        items, total = pr.list_products_light(session, product_ids=["prod_2"])
+        assert total == 1
+        assert [i.id for i in items] == ["prod_2"]
+        # Empty visibility -> no query at all.
+        assert pr.list_products_light(session, product_ids=[]) == ([], 0)
+
+    def test_pagination_and_ordering(self, session):
+        for i in range(3):
+            session.add(ProductORM(
+                id=f"prod_{i}", name=f"W{i}", description="d",
+                created_at=datetime(2024, 1, 1, 0, 0, i),
+            ))
+        session.commit()
+
+        items, total = pr.list_products_light(session, limit=2)
+        assert total == 3
+        assert [i.id for i in items] == ["prod_0", "prod_1"]
+
+        items, total = pr.list_products_light(session, limit=2, offset=2)
+        assert total == 3
+        assert [i.id for i in items] == ["prod_2"]
+
+        # Offset beyond the end: empty page, total unchanged.
+        items, total = pr.list_products_light(session, limit=2, offset=10)
+        assert items == []
+        assert total == 3
 
 
 # --------------------------------------------------------------------------- #
@@ -644,3 +706,44 @@ class TestVerifyChild:
         _seed_product(session)
         with pytest.raises(ValueError, match="Entity not found"):
             pr.verify_child(session, "prod_1", "nope", "codebases", "user_1")
+
+
+# --------------------------------------------------------------------------- #
+# upsert_product — database verified state is server-owned (review #4)
+# --------------------------------------------------------------------------- #
+class TestUpsertDatabaseVerifiedOwnership:
+    def test_upsert_preserves_stored_verified_forces_false_for_new(self, session):
+        _seed_product(session)
+        verified_at = datetime(2026, 1, 1)
+        session.add(DatabaseORM(
+            id="db_1", product_id="prod_1", name="DB1", source="manual",
+            verified=True, verified_by="user_owner", verified_at=verified_at,
+        ))
+        session.commit()
+
+        product = _make_product()
+        product.databases = [
+            # Existing id: the client payload's verified triple is IGNORED,
+            # the stored one survives (round-trip PUT cannot re-grant or
+            # tamper with verification).
+            Database(
+                id="db_1", name="DB1 renamed",
+                verified=True, verified_by="user_evil",
+                verified_at=datetime(2026, 6, 6), source="manual",
+            ),
+            # New id: verified claims are forced off.
+            Database(
+                id="db_2", name="DB2",
+                verified=True, verified_by="user_evil", source="manual",
+            ),
+        ]
+        pr.upsert_product(session, product)
+
+        row1 = session.get(DatabaseORM, "db_1")
+        assert row1.verified is True
+        assert row1.verified_by == "user_owner"
+        assert row1.verified_at == verified_at
+        row2 = session.get(DatabaseORM, "db_2")
+        assert row2.verified is False
+        assert row2.verified_by is None
+        assert row2.verified_at is None

@@ -47,6 +47,9 @@ export default function KnowledgeNodePage() {
   const [verifiedBy, setVerifiedBy] = useState<string | null>(null);
 
   const fileRef = useRef<HTMLInputElement | null>(null);
+  // P2-28: latest dirty flag, readable from fetchAll/navigation without
+  // rebinding those callbacks on every keystroke.
+  const dirtyRef = useRef(false);
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -75,8 +78,13 @@ export default function KnowledgeNodePage() {
       }
       const n = (await nodeRes.json()) as KnowledgeNode;
       setNode(n);
-      setContent(n.content_md ?? "");
-      setDirty(false);
+      // P2-28: never clobber an unsaved draft — a refetch (tree mutation,
+      // window refocus) only resets the editor when it is clean. Switching
+      // nodes is confirmed in the tree's onSelect before navigating.
+      if (!dirtyRef.current) {
+        setContent(n.content_md ?? "");
+        setDirty(false);
+      }
       setVerified(Boolean(n.verified));
       setVerifiedBy(n.verified_by ?? null);
       if (prodRes.ok) {
@@ -90,6 +98,10 @@ export default function KnowledgeNodePage() {
       setLoading(false);
     }
   }, [productId, nodeId, router, notify, t, fmt]);
+
+  useEffect(() => {
+    dirtyRef.current = dirty;
+  }, [dirty]);
 
   useEffect(() => {
     fetchAll();
@@ -275,9 +287,21 @@ export default function KnowledgeNodePage() {
                 productId={productId}
                 selectedNodeId={nodeId}
                 onSelect={(n) => {
-                  if (n.node_type === "page") {
-                    router.push(`/products/${productId}/knowledge/${n.id}`);
+                  if (n.node_type !== "page" || n.id === nodeId) return;
+                  // P2-28: confirm before discarding unsaved edits.
+                  if (
+                    dirtyRef.current &&
+                    !window.confirm(
+                      t.unsavedChanges ??
+                        "You have unsaved changes. Discard them and open this page?",
+                    )
+                  ) {
+                    return;
                   }
+                  // Confirmed (or clean): clear the flag so the incoming
+                  // node's server content is applied by fetchAll.
+                  setDirty(false);
+                  router.push(`/products/${productId}/knowledge/${n.id}`);
                 }}
                 onMutate={fetchAll}
               />

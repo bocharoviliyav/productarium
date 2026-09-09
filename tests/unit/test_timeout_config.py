@@ -4,9 +4,10 @@ Covers:
 - Precedence: admin store (timeouts.<key>) > env var > default.
 - Invalid-value fallback at every precedence level (never raises).
 - Per-key floor enforcement (a typo can't make a timeout dangerously small).
-- docgen_indexing_drain default derives from cognee_cognify.
-- TIMEOUT_KEYS regression guard: every wrapper imported by the 17 routed
-  files maps to an entry in TIMEOUT_KEYS, so a new timeout can't be added to
+- docgen_indexing_drain resolves from its own registry entry (own default
+  + floor; no derivation from removed legacy keys).
+- TIMEOUT_KEYS regression guard: every wrapper imported by the routed files
+  maps to an entry in TIMEOUT_KEYS, so a new timeout can't be added to
   the codebase without being registered here (and thus surfaced in the admin
   panel + .env.example docs).
 """
@@ -25,28 +26,24 @@ from api.config.timeout import (
     _resolve_with_key,
     get_timeout_resolved_view,
     resolve_docgen_indexing_drain_seconds,
+    resolve_docgen_map_concurrency,
+    resolve_expert_stream_timeout,
     resolve_timeout,
     resolve_timeout_int,
     sync_timeout_env,
 )
 
 
-# Every wrapper name imported by the 17 routed files. Kept in sync with the
+# Every wrapper name imported by the routed files. Kept in sync with the
 # grep over api/ for `resolve_*_timeout` / `resolve_*_ms` / `resolve_*_attempts`.
 # If a new wrapper is added to the codebase, add it here AND to TIMEOUT_KEYS.
 WRAPPER_TO_KEY = {
     "resolve_llm_request_timeout": "llm_request",
     "resolve_llm_retry_max_time": "llm_retry_max_time",
-    "resolve_cognee_graph_extraction_timeout": "cognee_graph_extraction",
-    "resolve_cognee_cognify_timeout": "cognee_cognify",
-    "resolve_cognee_llm_connection_timeout": "cognee_llm_connection",
-    "resolve_cognee_init_timeout": "cognee_init",
-    "resolve_cognee_recall_timeout": "cognee_recall",
     "resolve_docgen_indexing_drain_seconds": "docgen_indexing_drain",
+    "resolve_docgen_map_concurrency": "docgen_map_concurrency",
+    "resolve_expert_stream_timeout": "expert_stream",
     "resolve_memory_query_timeout": "memory_query",
-    "resolve_rlm_api_timeout_ms": "rlm_api_ms",
-    "resolve_rlm_section_timeout": "rlm_section",
-    "resolve_rlm_expert_timeout": "rlm_expert",
     "resolve_model_list_timeout": "model_list",
     "resolve_integration_http_timeout": "integration_http",
     "resolve_git_file_content_timeout": "git_file_content",
@@ -54,6 +51,7 @@ WRAPPER_TO_KEY = {
     "resolve_mermaid_verify_timeout": "mermaid_verify",
     "resolve_mermaid_repair_timeout": "mermaid_repair",
     "resolve_mermaid_max_repair_attempts": "mermaid_max_repair_attempts",
+    "resolve_mermaid_repair_deadline": "mermaid_repair_deadline",
     "resolve_provider_test_timeout": "provider_test",
 }
 
@@ -95,7 +93,7 @@ class TestTimeoutConfig(unittest.TestCase):
     # Registry / structural invariants
     # ------------------------------------------------------------------
     def test_timeout_keys_has_every_wrapper_key(self):
-        """Every wrapper imported by the 17 routed files is in TIMEOUT_KEYS."""
+        """Every wrapper imported by the routed files is in TIMEOUT_KEYS."""
         keys = {k.key for k in TIMEOUT_KEYS}
         for wrapper, key in WRAPPER_TO_KEY.items():
             self.assertIn(
@@ -126,7 +124,7 @@ class TestTimeoutConfig(unittest.TestCase):
             for k in TIMEOUT_KEYS:
                 self.assertEqual(
                     _resolve_with_key(k.key),
-                    max(k.floor, k.default) if k.key != "docgen_indexing_drain" else _resolve_with_key("cognee_cognify"),
+                    max(k.floor, k.default),
                     f"default mismatch for {k.key}",
                 )
 
@@ -198,39 +196,72 @@ class TestTimeoutConfig(unittest.TestCase):
             self.assertEqual(resolve_timeout("llm_request"), 60.0)
 
     # ------------------------------------------------------------------
-    # docgen_indexing_drain derives from cognee_cognify
+    # docgen_indexing_drain (own registry entry: default 300, floor 5)
     # ------------------------------------------------------------------
-    def test_docgen_drain_derives_from_cognify_default(self):
+    def test_docgen_drain_default_when_nothing_set(self):
         env_vars = [k.env_var for k in TIMEOUT_KEYS]
         with _EnvGuard(env_vars, []):
-            # With nothing set, drain == cognify (both at default 7200).
-            self.assertEqual(
-                resolve_docgen_indexing_drain_seconds(),
-                resolve_timeout("cognee_cognify"),
-            )
+            self.assertEqual(resolve_docgen_indexing_drain_seconds(), 300.0)
 
-    def test_docgen_drain_tracks_cognify_env_override(self):
+    def test_docgen_drain_env_override(self):
         env_vars = [k.env_var for k in TIMEOUT_KEYS]
         with _EnvGuard(env_vars, []):
-            os.environ["COGNEE_COGNIFY_TIMEOUT"] = "10800"
-            self.assertEqual(resolve_docgen_indexing_drain_seconds(), 10800.0)
-
-    def test_docgen_drain_explicit_override_wins_over_cognify(self):
-        env_vars = [k.env_var for k in TIMEOUT_KEYS]
-        with _EnvGuard(env_vars, []):
-            os.environ["COGNEE_COGNIFY_TIMEOUT"] = "10800"
             os.environ["DOCGEN_INDEXING_DRAIN_SECONDS"] = "120"
             self.assertEqual(resolve_docgen_indexing_drain_seconds(), 120.0)
 
+    # ------------------------------------------------------------------
+    # docgen_map_concurrency (P1-24): bounded MAP-phase parallelism
+    # ------------------------------------------------------------------
+    def test_docgen_map_concurrency_default(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            self.assertEqual(resolve_docgen_map_concurrency(), 3)
+
+    def test_docgen_map_concurrency_env_override(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["DOCGEN_MAP_CONCURRENCY"] = "8"
+            self.assertEqual(resolve_docgen_map_concurrency(), 8)
+
+    def test_docgen_map_concurrency_floor_one(self):
+        # 0 / negative / garbage all clamp/fall back to at least 1
+        # (sequential), never to unlimited or zero.
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["DOCGEN_MAP_CONCURRENCY"] = "0"
+            self.assertEqual(resolve_docgen_map_concurrency(), 1)
+            os.environ["DOCGEN_MAP_CONCURRENCY"] = "garbage"
+            self.assertEqual(resolve_docgen_map_concurrency(), 3)
+
     def test_docgen_drain_explicit_override_below_floor_is_clamped(self):
         # An explicit DOCGEN_INDEXING_DRAIN_SECONDS below the drain floor (5)
-        # is clamped up to the floor. (Going through cognify can't exercise the
-        # drain floor in practice, because cognify's own floor of 300 is already
-        # well above the drain floor of 5.)
+        # is clamped up to the floor.
         env_vars = [k.env_var for k in TIMEOUT_KEYS]
         with _EnvGuard(env_vars, []):
             os.environ["DOCGEN_INDEXING_DRAIN_SECONDS"] = "1"
             self.assertEqual(resolve_docgen_indexing_drain_seconds(), 5.0)
+
+    # ------------------------------------------------------------------
+    # expert_stream (issue #9): wall-clock budget of one detached ask turn
+    # ------------------------------------------------------------------
+    def test_expert_stream_default_is_generous(self):
+        # Multi-minute answers are the norm for the detached expert turn —
+        # the default must stay at 1800s (30 min), not a per-request timeout.
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            self.assertEqual(resolve_expert_stream_timeout(), 1800.0)
+
+    def test_expert_stream_env_override(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["EXPERT_STREAM_TIMEOUT_SECONDS"] = "600"
+            self.assertEqual(resolve_expert_stream_timeout(), 600.0)
+
+    def test_expert_stream_floor_sixty_seconds(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["EXPERT_STREAM_TIMEOUT_SECONDS"] = "1"
+            self.assertEqual(resolve_expert_stream_timeout(), 60.0)
 
     # ------------------------------------------------------------------
     # sync_timeout_env exports admin-store overrides to env vars

@@ -1,13 +1,14 @@
 """Agent memory facade — backend-agnostic API over pluggable memory backends.
 
 Public functions delegate to the active backend resolved from the
-``memory.backend`` admin setting (``pgvector`` default, ``cognee`` alt):
+``memory.backend`` admin setting (pgvector is the sole supported backend
+since the LangChain migration removed cognee):
 - ``index_document`` — chunk + embed + store content for a product.
 - ``query_memory`` — semantic recall of top-k chunks as joined text.
 - ``clear_memory`` — drop all chunks for a product.
 - ``reindex_product_memory`` — rebuild from source artifacts for one/all products.
 - ``get_memory_backend`` / ``get_memory_backend_name`` — backend introspection.
-- ``init_memory`` — startup hook for the active backend (cognee migrations etc.).
+- ``init_memory`` — startup hook for the active backend.
 - ``reset_memory_backend_cache`` — invalidate the cached backend after a switch.
 
 All functions are async (except the introspection ones) and non-fatal: they
@@ -47,11 +48,31 @@ async def index_document(
     product_id: str,
     source_type: str = "codebase",
     source_id: Optional[str] = None,
+    source_path: Optional[str] = None,
 ) -> int:
-    """Index content for a product via the active backend. Non-fatal."""
+    """Index content for a product via the active backend. Non-fatal.
+
+    ``source_path`` (repo-relative path of the source file / document) is
+    optional citation provenance; backends store it on the chunks when their
+    schema supports it and silently ignore it otherwise.
+    """
     try:
         backend = get_memory_backend()
-        return await backend.index(content, product_id, source_type=source_type, source_id=source_id)
+        return await backend.index(
+            content, product_id,
+            source_type=source_type, source_id=source_id,
+            source_path=source_path,
+        )
+    except TypeError:
+        # Backends predating the source_path kwarg (defensive).
+        try:
+            return await backend.index(
+                content, product_id,
+                source_type=source_type, source_id=source_id,
+            )
+        except Exception as e:
+            logger.warning("memory.index_document failed for product %s: %s", product_id, e)
+            return 0
     except Exception as e:
         logger.warning("memory.index_document failed for product %s: %s", product_id, e)
         return 0
@@ -88,12 +109,11 @@ async def reindex_product_memory(product_id: Optional[str] = None) -> Dict[str, 
 
 
 async def init_memory() -> None:
-    """Startup hook for the active backend (e.g. cognee migrations).
+    """Startup hook for the active backend.
 
     Called from ``api.api.startup_event`` after ``init_db``. For the pgvector
     backend this is a no-op (the extension + HNSW index are created in
-    ``init_db``); for cognee it runs the (timeout-capped, non-fatal)
-    ``init_cognee``. Non-fatal.
+    ``init_db``). Non-fatal.
     """
     try:
         backend = get_memory_backend()

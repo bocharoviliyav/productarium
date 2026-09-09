@@ -1,17 +1,18 @@
 """Expert knowledge retrieval + fallback + product-name lookup + history rendering.
 
 Split out of the former ``api/expert_agent.py`` (Step 6). Owns:
-- ``_retrieve_product_knowledge``: cognee recall over the product-scoped dataset
-  ``prod_{product_id}`` with artifact-docs + live-Confluence fallbacks. Never
-  raises; returns "" when nothing is available.
+- ``_retrieve_product_knowledge``: semantic recall over the product-scoped
+  memory chunks with artifact-docs + live-Confluence fallbacks. Never raises;
+  returns "" when nothing is available.
 - ``_fallback_artifact_docs``: concatenates artifact ``generated_docs`` / page
-  content when cognee is empty (own short-lived DB session, non-fatal).
+  content when memory recall is empty (own short-lived DB session, non-fatal).
 - ``_product_name_by_id``: DB product-name lookup with id fallback (non-fatal).
 - ``_format_history``: render prior conversation turns as a history block.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List
 
@@ -37,7 +38,7 @@ def _product_name_by_id(product_id: str) -> str:
 
 
 def _fallback_artifact_docs(product_id: str) -> str:
-    """Concatenate codebase generated_docs + spec content when cognee is empty.
+    """Concatenate codebase generated_docs + spec content when memory recall is empty.
 
     Opens its own short-lived session (non-fatal: returns "" on any error or
     when the product/codebases/specs are missing).
@@ -92,9 +93,9 @@ def _fallback_artifact_docs(product_id: str) -> str:
 
 
 async def _retrieve_product_knowledge(product_id: str, query: str) -> str:
-    """Retrieve product knowledge via the active memory backend (pgvector default,
-    cognee alt); fall back to concatenated artifact docs or live Confluence.
-    Never raises; returns "" if nothing available.
+    """Retrieve product knowledge via the active memory backend (pgvector);
+    fall back to concatenated artifact docs or live Confluence. Never raises;
+    returns "" if nothing available.
     """
     try:
         from api.memory import query_memory
@@ -115,7 +116,8 @@ async def _retrieve_product_knowledge(product_id: str, query: str) -> str:
             "Expert: memory recall failed for product %r: %s", product_id, e
         )
 
-    fallback_docs = _fallback_artifact_docs(product_id)
+    # P1-13: sync DB reads / connector HTTP must not block the event loop.
+    fallback_docs = await asyncio.to_thread(_fallback_artifact_docs, product_id)
     if fallback_docs:
         return fallback_docs
 
@@ -124,13 +126,19 @@ async def _retrieve_product_knowledge(product_id: str, query: str) -> str:
         from api.integrations.registry import get_connector
         c_connector = get_connector("confluence")
         if c_connector and c_connector.is_configured():
-            spaces = c_connector.list_spaces()
+            spaces = await asyncio.to_thread(c_connector.list_spaces)
             if spaces:
                 sp_id = spaces[0].get("key") or spaces[0].get("id")
                 if sp_id:
-                    pulled = c_connector.pull(sp_id, opts={"recursive": False})
+                    pulled = await asyncio.to_thread(
+                        c_connector.pull, sp_id, opts={"recursive": False}
+                    )
                     if pulled and pulled.get("markdown"):
-                        return pulled["markdown"]
+                        # P0-8: third-party wiki content is untrusted — frame it
+                        # as data before it reaches the LLM prompt.
+                        from api.utils.llm_helpers import wrap_untrusted
+
+                        return wrap_untrusted(pulled["markdown"])
     except Exception as e:
         logger.debug("Expert live Confluence fallback skipped for %s: %s", product_id, e)
 

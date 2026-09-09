@@ -13,9 +13,7 @@ fastapi = ">=0.95.0"
 uvicorn = { extras = ["standard"], version = ">=0.21.1" }
 pydantic = ">=2.0.0"
 tiktoken = ">=0.5.0"
-adalflow = ">=0.1.0"
 numpy = ">=1.24.0"
-faiss-cpu = ">=1.7.4"
 requests = ">=2.28.0"
 jinja2 = ">=3.1.2"
 pyyaml = ">=6.0"
@@ -23,14 +21,29 @@ python-dotenv = ">=1.0.0"
 openai = ">=1.76.2"
 aiohttp = ">=3.8.4"
 websockets = ">=11.0.3"
-cognee = { version = "==1.2.2", extras = ["postgres-binary"] }
-fast-rlm = "*"
 sqlalchemy = ">=2.0"
 psycopg = { version = ">=3.1", extras = ["binary"] }
 # pgvector: direct dependency for the pgvector memory backend (cosine recall
-# over the knowledge_chunks table, HNSW index). Also transitive via cognee;
-# declared directly so the pgvector backend works even if cognee is removed.
+# over the knowledge_chunks table, HNSW index).
 pgvector = ">=0.3.0"
+
+# --- LangChain agent stack (Wave A foundation) ---
+# LLM client: single OpenAI-compatible path via langchain-openai (ChatOpenAI,
+# OpenAIEmbeddings) with the patched openai SDK retained below.
+langchain = ">=0.3"
+langchain-openai = ">=0.3"
+langchain-text-splitters = ">=0.3"
+# Orchestration for the agent waves (deep-research / docgen agents).
+langgraph = ">=0.4"
+# Persistent LangGraph checkpointer backends: Postgres in production, SQLite
+# as the degraded/test backend for the expert agent chat sessions (Wave B).
+langgraph-checkpoint-postgres = ">=2.0"
+langgraph-checkpoint-sqlite = ">=2.0"
+# deepagents: agentic docgen stack for the codebase documentation wave.
+deepagents = ">=0.1"
+# MCP integration (product-scoped MCP connectors, postgres/oracle MCP servers).
+langchain-mcp-adapters = ">=0.1"
+mcp = ">=1.0"
 
 # --- Productarium foundation: auth, settings, integrations ---
 # Auth: local (passlib bcrypt) + Keycloak (authlib OIDC) + JWT session cookies.
@@ -43,6 +56,8 @@ cryptography = ">=41.0.0"
 python-multipart = ">=0.0.6"
 # markitdown converts uploaded/ingested files (docx/pdf/pptx/html/xlsx) to MD.
 markitdown = ">=0.0.1"
+# tqdm: TTY progress bar for docgen jobs (disable=None -> no-op when piped).
+tqdm = ">=4.66"
 
 
 [build-system]

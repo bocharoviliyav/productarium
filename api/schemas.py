@@ -28,7 +28,11 @@ class Codebase(BaseModel):
     name: str
     repo_url: Optional[str] = None
     repo_type: Optional[str] = None
-    token: Optional[str] = None
+    # Write-only (P0-2): accepted on input, never serialized into responses.
+    # Empty/None on update = keep the stored token.
+    token: Optional[str] = Field(default=None, exclude=True)
+    # True when an (encrypted) access token is stored for this repo.
+    has_token: bool = False
     generated_docs: Optional[str] = None
     pages: Optional[Dict[str, Any]] = None
     verified: bool = False
@@ -58,6 +62,35 @@ class Links(BaseModel):
     source: str = "manual"
 
 
+class Database(BaseModel):
+    """Reverse-engineered database artifact (Wave E).
+
+    ``dsn`` is INPUT-ONLY (``exclude`` — it can never be serialized back):
+    on the legacy path it is masked on acceptance (``mask_dsn``) and only the
+    masked form is persisted / returned as ``dsn_masked``; on the preset path
+    (``db_type`` set) it is stored ONLY inside the dedicated preset MCP
+    server row's Fernet-encrypted env and never shown again after the
+    connection check passes. A round-trip (GET → PUT) echoes ``dsn_masked``
+    back safely.
+    """
+
+    id: str
+    name: str
+    # Write-only (like Codebase.token): accepted on input, excluded from
+    # every serialized response.
+    dsn: Optional[str] = Field(default=None, exclude=True)
+    # Preset database type (postgresql|mysql|…|oracle) or None (manual path).
+    db_type: Optional[str] = None
+    dsn_masked: Optional[str] = None
+    mcp_server_id: Optional[str] = None
+    generated_docs: Optional[str] = None
+    pages: Optional[Dict[str, Any]] = None
+    verified: bool = False
+    verified_by: Optional[str] = None
+    verified_at: Optional[datetime] = None
+    source: str = "manual"
+
+
 class Product(BaseModel):
     id: str
     name: str
@@ -67,13 +100,44 @@ class Product(BaseModel):
     codebases: List[Codebase] = []
     specs: List[Spec] = []
     links: List[Links] = []
+    databases: List[Database] = []
+
+
+class ProductListItem(BaseModel):
+    """Light product row for GET /api/products (P1-16, bare-list contract).
+
+    The listing endpoint keeps the baseline bare-JSON-array response shape
+    (backward compatibility: clients — and pinned tests — expect a plain
+    list). Rows are light: no child entities, no generated_docs/pages/
+    content payloads — children appear only as SQL-counted totals +
+    verified counts. Pagination travels in the ``limit``/``offset`` query
+    params; the filtered total is returned in the ``X-Total-Count`` header
+    (no envelope). The full object is served exclusively by
+    GET /api/products/{id}.
+    """
+    id: str
+    name: str
+    description: str = ""
+    summary: Optional[str] = None
+    owner_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    codebases_count: int = 0
+    specs_count: int = 0
+    links_count: int = 0
+    databases_count: int = 0
+    verified_codebases: int = 0
+    verified_specs: int = 0
+    verified_links: int = 0
+    verified_databases: int = 0
 
 
 # --- User -------------------------------------------------------------------
 class UserBase(BaseModel):
     username: str
     email: Optional[str] = None
-    role: str = "user"  # user|admin
+    # user|admin|manager|viewer_global (P0-2 role model)
+    role: str = "user"
     provider: str = "local"  # local|keycloak
 
 
@@ -123,7 +187,8 @@ class UserCreateAdmin(BaseModel):
     """Admin creates a local user (optionally with a temp password)."""
     username: str
     email: Optional[str] = None
-    role: str = "user"  # user|admin
+    # user|admin|manager|viewer_global (P0-2 role model)
+    role: str = "user"
     # Optional temp password; if omitted a random one is generated and returned.
     password: Optional[str] = None
     must_change_password: bool = True

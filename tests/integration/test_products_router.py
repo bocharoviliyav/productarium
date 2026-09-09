@@ -31,7 +31,14 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from api.models import CodebaseORM, LinksORM, ProductORM, SpecORM, UserORM
+from api.models import (
+    CodebaseORM,
+    DatabaseORM,
+    LinksORM,
+    ProductORM,
+    SpecORM,
+    UserORM,
+)
 from api.schemas import Codebase, Links, Product, Spec
 from api.routers import products as products_router_module
 from tests.conftest import build_test_client
@@ -130,6 +137,15 @@ def _seed_links(db_mod, pid: str = "prod_1", lid: str = "links_1") -> None:
         s.close()
 
 
+def _seed_database(db_mod, pid: str = "prod_1", dbid: str = "db_1") -> None:
+    s = db_mod.SessionLocal()
+    try:
+        s.add(DatabaseORM(id=dbid, product_id=pid, name="Main DB", source="manual"))
+        s.commit()
+    finally:
+        s.close()
+
+
 def _make_client(db_mod):
     return build_test_client(db_mod, [products_router_module], auth_none=True)
 
@@ -140,14 +156,19 @@ def _disable_reindex(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# GET /api/products
+# GET /api/products — light rows in the bare-list shape (P1-16 reworked)
 # --------------------------------------------------------------------------- #
 class TestListProducts:
+    """The response body stays a bare JSON array (backward-compatible
+    contract pinned by user tests); rows are light with SQL-counted totals,
+    the filtered total rides in the X-Total-Count header."""
+
     def test_empty(self, isolated_db):
         app, client = _make_client(isolated_db)
         r = client.get("/api/products")
         assert r.status_code == 200
         assert r.json() == []
+        assert r.headers["X-Total-Count"] == "0"
 
     def test_with_product(self, isolated_db):
         _seed_product(isolated_db)
@@ -157,6 +178,82 @@ class TestListProducts:
         data = r.json()
         assert len(data) == 1
         assert data[0]["id"] == "prod_1"
+        assert r.headers["X-Total-Count"] == "1"
+
+    def test_light_row_shape(self, isolated_db):
+        """Exactly the light field set — heavy child payloads never appear."""
+        _seed_product(isolated_db)
+        _seed_codebase(isolated_db)
+        _seed_spec(isolated_db)
+        _seed_links(isolated_db)
+        _seed_database(isolated_db)
+        app, client = _make_client(isolated_db)
+        r = client.get("/api/products")
+        assert r.status_code == 200
+        item = r.json()[0]
+        assert set(item.keys()) == {
+            "id", "name", "description", "summary", "owner_id",
+            "created_at", "updated_at",
+            "codebases_count", "specs_count", "links_count", "databases_count",
+            "verified_codebases", "verified_specs", "verified_links",
+            "verified_databases",
+        }
+        assert item["description"] == "desc"
+        assert item["codebases_count"] == 1
+        assert item["specs_count"] == 1
+        assert item["links_count"] == 1
+        assert item["databases_count"] == 1
+        # manual seeds are unverified -> all verified counters are 0
+        assert item["verified_codebases"] == 0
+        assert item["verified_specs"] == 0
+        assert item["verified_links"] == 0
+        assert item["verified_databases"] == 0
+
+    def test_verified_counters(self, isolated_db):
+        _seed_product(isolated_db)
+        s = isolated_db.SessionLocal()
+        try:
+            s.add(CodebaseORM(
+                id="cb_1", product_id="prod_1", name="Repo A",
+                source="manual", verified=True,
+            ))
+            s.add(CodebaseORM(
+                id="cb_2", product_id="prod_1", name="Repo B",
+                source="manual", verified=False,
+            ))
+            s.add(DatabaseORM(
+                id="db_1", product_id="prod_1", name="Main DB",
+                source="manual", verified=True,
+            ))
+            s.commit()
+        finally:
+            s.close()
+        app, client = _make_client(isolated_db)
+        r = client.get("/api/products")
+        item = r.json()[0]
+        assert item["codebases_count"] == 2
+        assert item["verified_codebases"] == 1
+        assert item["databases_count"] == 1
+        assert item["verified_databases"] == 1
+
+    def test_pagination_and_total_header(self, isolated_db):
+        for i in range(3):
+            _seed_product(isolated_db, pid=f"prod_{i}")
+        app, client = _make_client(isolated_db)
+        r = client.get("/api/products?limit=2&offset=0")
+        assert r.status_code == 200
+        assert [p["id"] for p in r.json()] == ["prod_0", "prod_1"]
+        assert r.headers["X-Total-Count"] == "3"
+        r2 = client.get("/api/products?limit=2&offset=2")
+        assert [p["id"] for p in r2.json()] == ["prod_2"]
+        assert r2.headers["X-Total-Count"] == "3"
+
+    @pytest.mark.parametrize(
+        "qs", ["?limit=0", "?limit=-1", "?limit=501", "?offset=-1"]
+    )
+    def test_bad_pagination_params_422(self, isolated_db, qs):
+        app, client = _make_client(isolated_db)
+        assert client.get(f"/api/products{qs}").status_code == 422
 
 
 # --------------------------------------------------------------------------- #
@@ -183,6 +280,69 @@ class TestCreateProduct:
         assert len(body["codebases"]) == 1
         assert len(body["specs"]) == 1
         assert len(body["links"]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Full-product upsert: database DSN masking + verified ownership (review #4)
+# --------------------------------------------------------------------------- #
+def _database_payload_db(dbid: str = "db_1", **overrides) -> dict:
+    payload = {
+        "id": dbid,
+        "name": "Main DB",
+        "dsn": "postgresql://app:sup3rs3cret@db.internal:5432/prod",
+        "mcp_server_id": None,
+        "generated_docs": None,
+        "pages": None,
+        "verified": False,
+        "verified_by": None,
+        "verified_at": None,
+        "source": "manual",
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestUpsertDatabaseDsnMasking:
+    def test_put_product_masks_dsn_with_special_chars(self, isolated_db):
+        # Review #4 HIGH: passwords containing '/' or '@' must be masked on
+        # the full-product upsert path too (PUT /api/products/{id}).
+        _seed_product(isolated_db)
+        app, client = _make_client(isolated_db)
+        payload = _product_payload()
+        payload["databases"] = [
+            _database_payload_db(dsn="postgresql://app:p@ss/w0rd@db:5432/prod")
+        ]
+        r = client.put("/api/products/prod_1", json=payload)
+        assert r.status_code == 200
+        db = r.json()["databases"][0]
+        assert db["dsn_masked"] == "postgresql://***REDACTED***@db:5432/prod"
+        assert "p@ss/w0rd" not in r.text
+
+    def test_put_product_passwordless_dsn_not_500(self, isolated_db):
+        _seed_product(isolated_db)
+        app, client = _make_client(isolated_db)
+        payload = _product_payload()
+        payload["databases"] = [
+            _database_payload_db(dsn="postgres://localhost:5432/db")
+        ]
+        r = client.put("/api/products/prod_1", json=payload)
+        assert r.status_code == 200
+        assert r.json()["databases"][0]["dsn_masked"] == "postgres://localhost:5432/db"
+
+    def test_put_product_forces_verified_false_for_new_database(self, isolated_db):
+        # Review #4: a NEW database cannot arrive verified through the
+        # full-product upsert.
+        _seed_product(isolated_db)
+        app, client = _make_client(isolated_db)
+        payload = _product_payload()
+        payload["databases"] = [
+            _database_payload_db(verified=True, verified_by="user_evil")
+        ]
+        r = client.put("/api/products/prod_1", json=payload)
+        assert r.status_code == 200
+        db = r.json()["databases"][0]
+        assert db["verified"] is False
+        assert db["verified_by"] is None
 
 
 # --------------------------------------------------------------------------- #
@@ -216,12 +376,13 @@ class TestUpdateProduct:
         assert r.status_code == 200
         assert r.json()["name"] == "Updated"
 
-    def test_update_upserts_missing(self, isolated_db):
-        # PUT uses upsert, so a non-existent product is created.
+    def test_update_missing_product_404(self, isolated_db):
+        # P0-2: PUT is guarded by require_product_access("rw") — a missing
+        # product is indistinguishable from an invisible one (404, no existence
+        # leak, no create-by-PUT). Creation is POST-only.
         app, client = _make_client(isolated_db)
         r = client.put("/api/products/prod_new", json=_product_payload("prod_new"))
-        assert r.status_code == 200
-        assert r.json()["id"] == "prod_new"
+        assert r.status_code == 404
 
 
 # --------------------------------------------------------------------------- #
@@ -237,10 +398,12 @@ class TestDeleteProduct:
         # Confirm gone.
         assert client.get("/api/products/prod_1").status_code == 404
 
-    def test_delete_missing_is_noop(self, isolated_db):
+    def test_delete_missing_is_404(self, isolated_db):
+        # P0-2: DELETE on a missing product returns 404 (no existence leak);
+        # it no longer returns a no-op 200.
         app, client = _make_client(isolated_db)
         r = client.delete("/api/products/missing")
-        assert r.status_code == 200
+        assert r.status_code == 404
 
 
 # --------------------------------------------------------------------------- #
@@ -544,10 +707,69 @@ class TestBuildDatabaseUrl:
         monkeypatch.setattr(db_mod, "DB_NAME", "n")
         assert db_mod._build_database_url().startswith("postgresql+psycopg://")
 
-    def test_non_postgres_falls_back_to_sqlite(self, monkeypatch):
+    def test_unsupported_provider_falls_back_to_memory(self, monkeypatch):
+        import api.db as db_mod
+        monkeypatch.setattr(db_mod, "DB_PROVIDER", "mysql")
+        assert db_mod._build_database_url() == "sqlite:///:memory:"
+
+    def test_sqlite_provider_explicit_path(self, monkeypatch, tmp_path):
+        import api.db as db_mod
+        db_file = tmp_path / "smoke.db"
+        monkeypatch.setattr(db_mod, "DB_PROVIDER", "sqlite")
+        monkeypatch.setattr(db_mod, "DB_NAME", str(db_file))
+        monkeypatch.setattr(db_mod, "DB_HOST", "localhost")
+        assert db_mod._build_database_url() == f"sqlite:///{db_file}"
+
+    def test_sqlite_provider_memory(self, monkeypatch):
         import api.db as db_mod
         monkeypatch.setattr(db_mod, "DB_PROVIDER", "sqlite")
+        monkeypatch.setattr(db_mod, "DB_NAME", ":memory:")
         assert db_mod._build_database_url() == "sqlite:///:memory:"
+
+    def test_sqlite_provider_bare_name_with_dir_host(self, monkeypatch, tmp_path):
+        import api.db as db_mod
+        monkeypatch.setattr(db_mod, "DB_PROVIDER", "sqlite")
+        monkeypatch.setattr(db_mod, "DB_NAME", "test.db")
+        monkeypatch.setattr(db_mod, "DB_HOST", str(tmp_path))
+        assert db_mod._build_database_url() == f"sqlite:///{tmp_path / 'test.db'}"
+
+    def test_sqlite_provider_bare_name_defaults_to_state_dir(self, monkeypatch, tmp_path):
+        import api.db as db_mod
+        monkeypatch.setattr(db_mod, "DB_PROVIDER", "sqlite")
+        monkeypatch.setattr(db_mod, "DB_NAME", "test.db")
+        monkeypatch.setattr(db_mod, "DB_HOST", "localhost")  # not a dir here
+        monkeypatch.setenv("PRODUCTARIUM_STATE_DIR", str(tmp_path))
+        assert db_mod._build_database_url() == f"sqlite:///{tmp_path / 'test.db'}"
+
+    def test_sqlite_provider_empty_name_defaults(self, monkeypatch, tmp_path):
+        import api.db as db_mod
+        monkeypatch.setattr(db_mod, "DB_PROVIDER", "sqlite")
+        monkeypatch.setattr(db_mod, "DB_NAME", "")
+        monkeypatch.setattr(db_mod, "DB_HOST", "localhost")
+        monkeypatch.setenv("PRODUCTARIUM_STATE_DIR", str(tmp_path))
+        assert db_mod._build_database_url() == f"sqlite:///{tmp_path / 'productarium.db'}"
+
+    def test_sqlite_rejects_parent_traversal(self, monkeypatch, tmp_path):
+        """A path-like DB_NAME containing '..' segments raises ValueError:
+        the SQLite file location is operator config, not a traversal
+        surface (review fix [8])."""
+        import api.db as db_mod
+        monkeypatch.setattr(db_mod, "DB_PROVIDER", "sqlite")
+        monkeypatch.setattr(db_mod, "DB_NAME", str(tmp_path / ".." / "escape.db"))
+        with pytest.raises(ValueError, match=r"\.\."):
+            db_mod._build_database_url()
+        # The relative traversal form is equally rejected.
+        monkeypatch.setattr(db_mod, "DB_NAME", "../escape.db")
+        with pytest.raises(ValueError, match=r"\.\."):
+            db_mod._build_database_url()
+
+    def test_sqlite_engine_connect_args_thread_safe(self, monkeypatch, tmp_path):
+        import api.db as db_mod
+        assert db_mod._engine_connect_args("sqlite:///foo.db") == {
+            "check_same_thread": False,
+            "timeout": 30,
+        }
+        assert db_mod._engine_connect_args("postgresql+psycopg://u:p@h/db") == {}
 
 
 # --------------------------------------------------------------------------- #

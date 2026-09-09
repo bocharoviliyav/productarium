@@ -10,7 +10,6 @@ Covers:
   ``get_confluence_creds`` / ``get_integration_config`` (read-through + env fallback).
 - ``_sanitize_api_key`` (quotes, Bearer prefix, whitespace).
 - ``_parse_int_setting`` (valid, empty, negative, non-numeric).
-- ``get_rlm_mode`` / ``get_all_rlm_modes`` (fast-rlm unavailable -> "llm").
 """
 
 from __future__ import annotations
@@ -175,8 +174,20 @@ class TestFernet:
 
     def test_persisted_key_path_default(self, monkeypatch):
         monkeypatch.delenv("DEEPWIKI_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("PRODUCTARIUM_STATE_DIR", raising=False)
         path = settings_mod._persisted_key_path()
         assert path.endswith(".adalflow/.settings_secret_key")
+
+    def test_persisted_key_path_prefers_state_dir(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("DEEPWIKI_CONFIG_DIR", raising=False)
+        state = tmp_path / "state"
+        monkeypatch.setenv("PRODUCTARIUM_STATE_DIR", str(state))
+        assert settings_mod._persisted_key_path() == str(state / ".settings_secret_key")
+
+    def test_persisted_key_path_config_dir_beats_state_dir(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("DEEPWIKI_CONFIG_DIR", str(tmp_path / "cfg"))
+        monkeypatch.setenv("PRODUCTARIUM_STATE_DIR", str(tmp_path / "state"))
+        assert settings_mod._persisted_key_path() == str(tmp_path / "cfg" / ".settings_secret_key")
 
     def test_bootstrap_secret_key_noop_when_env_set(self, monkeypatch):
         monkeypatch.setenv("SETTINGS_SECRET_KEY", "existing-key")
@@ -360,21 +371,22 @@ class TestGetConfluenceCreds:
         assert creds["base_url"] == "https://wiki.corp.com"
         assert creds["token"] == "conf-tok"
         assert creds["space"] == "ENG"
-        assert creds["mode"] == "direct"
 
     def test_store_overrides(self, monkeypatch, isolated_db):
         monkeypatch.setenv("CONFLUENCE_BASE_URL", "https://env.com")
+        monkeypatch.setenv("CONFLUENCE_USERNAME", "env-user")
         settings_mod.set_setting("confluence.base_url", "https://store.com", encrypt=False)
-        settings_mod.set_setting("confluence.mode", "mcp", encrypt=False)
+        settings_mod.set_setting("confluence.username", "store-user", encrypt=False)
         creds = settings_mod.get_confluence_creds()
         assert creds["base_url"] == "https://store.com"
-        assert creds["mode"] == "mcp"
+        assert creds["username"] == "store-user"
 
-    def test_mcp_defaults(self, isolated_db):
+    def test_no_mcp_keys(self, isolated_db):
+        """The legacy MCP-mode keys were removed with the old MCP client."""
         creds = settings_mod.get_confluence_creds()
-        # mcp_server defaults to "confluence"
-        assert creds["mcp_server"] == "confluence"
-        assert creds["mcp_tool"] is None
+        assert "mcp_server" not in creds
+        assert "mcp_tool" not in creds
+        assert "mode" not in creds
 
 
 class TestGetIntegrationConfig:
@@ -460,48 +472,3 @@ class TestParseIntSetting:
         assert settings_mod._parse_int_setting("0") == 0
 
 
-# ---------------------------------------------------------------------------
-# get_rlm_mode / get_all_rlm_modes
-# ---------------------------------------------------------------------------
-
-class TestRlmMode:
-    def test_returns_llm_when_fast_rlm_unavailable(self, monkeypatch, isolated_db):
-        # fast_rlm is not installed in the test env, so _FAST_RLM_AVAILABLE is False
-        creds = settings_mod.get_rlm_mode("docgen")
-        assert creds == "llm"
-
-    def test_get_all_rlm_modes(self, isolated_db):
-        modes = settings_mod.get_all_rlm_modes()
-        assert set(modes.keys()) == {"docgen", "expert", "summary"}
-        # All should be "llm" since fast-rlm is unavailable
-        for v in modes.values():
-            assert v == "llm"
-
-    def test_get_rlm_mode_env_default_when_fast_rlm_available(self, monkeypatch, isolated_db):
-        # Simulate fast-rlm being available
-        import api.rlm.runner as runner_mod
-        monkeypatch.setattr(runner_mod, "_FAST_RLM_AVAILABLE", True)
-        monkeypatch.setenv("RLM_DEFAULT_MODE", "auto")
-        # Clear any stored setting
-        settings_mod.set_setting("rlm.docgen.mode", "", encrypt=False)
-        assert settings_mod.get_rlm_mode("docgen") == "auto"
-
-    def test_get_rlm_mode_store_overrides_env(self, monkeypatch, isolated_db):
-        import api.rlm.runner as runner_mod
-        monkeypatch.setattr(runner_mod, "_FAST_RLM_AVAILABLE", True)
-        monkeypatch.setenv("RLM_DEFAULT_MODE", "auto")
-        settings_mod.set_setting("rlm.expert.mode", "llm", encrypt=False)
-        assert settings_mod.get_rlm_mode("expert") == "llm"
-
-    def test_get_rlm_mode_invalid_store_falls_back(self, monkeypatch, isolated_db):
-        import api.rlm.runner as runner_mod
-        monkeypatch.setattr(runner_mod, "_FAST_RLM_AVAILABLE", True)
-        monkeypatch.setenv("RLM_DEFAULT_MODE", "auto")
-        settings_mod.set_setting("rlm.summary.mode", "invalid_mode", encrypt=False)
-        assert settings_mod.get_rlm_mode("summary") == "auto"
-
-    def test_get_rlm_mode_invalid_env_falls_back_to_auto(self, monkeypatch, isolated_db):
-        import api.rlm.runner as runner_mod
-        monkeypatch.setattr(runner_mod, "_FAST_RLM_AVAILABLE", True)
-        monkeypatch.setenv("RLM_DEFAULT_MODE", "invalid")
-        assert settings_mod.get_rlm_mode("docgen") == "auto"

@@ -195,6 +195,34 @@ class TestDownloadRepo:
         assert clone_cmd[-2].startswith("https://")
         assert clone_cmd[-1] == local
 
+    def test_fresh_clone_with_token_strips_origin_url(self, tmp_path, monkeypatch):
+        from api.clients import git as git_mod
+
+        local = str(tmp_path / "repo")
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if "clone" in cmd:
+                os.makedirs(os.path.join(local, ".git"))
+            return _completed(stdout=b"cloned")
+
+        monkeypatch.setattr(git_mod.subprocess, "run", fake_run)
+        git_mod.download_repo(
+            "https://github.com/o/r", local, repo_type="github",
+            access_token="secret123",
+        )
+
+        # The clone itself uses the token-authed URL ...
+        clone_cmd = next(c for c in calls if "clone" in c)
+        assert "https://secret123@github.com/o/r" in clone_cmd
+        # ... but origin is immediately reset to the credential-free URL.
+        seturl_cmd = next(c for c in calls if "set-url" in c)
+        assert seturl_cmd == [
+            "git", "-C", local, "remote", "set-url", "origin",
+            "https://github.com/o/r",
+        ]
+
     def test_existing_repo_reuse_no_force(self, tmp_path, monkeypatch):
         from api.clients import git as git_mod
 
@@ -241,13 +269,21 @@ class TestDownloadRepo:
         # Inspect each subcommand by its verb rather than exact slice.
         fetch_cmd = next(c for c in calls if "fetch" in c)
         assert fetch_cmd[:3] == ["git", "-C", local]
-        assert "--depth=1" in fetch_cmd and "origin" in fetch_cmd
+        assert "--depth=1" in fetch_cmd
+        # Fetch by explicit authed URL: origin stays credential-free.
+        assert fetch_cmd[-1] == "https://tok@github.com/o/r"
         reset_cmd = next(c for c in calls if "reset" in c)
         assert reset_cmd[:3] == ["git", "-C", local]
         assert reset_cmd[-1] == "FETCH_HEAD"
         clean_cmd = next(c for c in calls if "clean" in c)
         assert clean_cmd[:3] == ["git", "-C", local]
         assert "-fdx" in clean_cmd
+        # Origin is reset to the credential-free URL after the refresh.
+        seturl_cmd = next(c for c in calls if "set-url" in c)
+        assert seturl_cmd == [
+            "git", "-C", local, "remote", "set-url", "origin",
+            "https://github.com/o/r",
+        ]
 
     def test_force_refresh_failure_re_clones(self, tmp_path, monkeypatch):
         from api.clients import git as git_mod
@@ -655,7 +691,7 @@ class TestGitConnectorExtractRepoName:
 
 
 class TestGitConnectorCloneDir:
-    def test_clone_dir_uses_adalflow_root(self, tmp_path, monkeypatch):
+    def test_clone_dir_uses_documents_root(self, tmp_path, monkeypatch):
         from api.integrations import _git_base
 
         class _Conn(_git_base.GitConnector):
@@ -668,30 +704,9 @@ class TestGitConnectorCloneDir:
         d = conn._clone_dir("https://github.com/o/repo")
         assert "repos" in d
         assert "o_repo" in d
-
-    def test_clone_dir_falls_back_to_expanduser(self, tmp_path, monkeypatch):
-        # When adalflow import fails, _clone_dir uses os.path.expanduser.
-        from api.integrations import _git_base
-        import builtins
-
-        class _Conn(_git_base.GitConnector):
-            repo_type = "gitlab"
-
-            def __init__(self, config=None):
-                self.config = dict(config or {})
-
-        real_import = builtins.__import__
-
-        def fake_import(name, *args, **kwargs):
-            if name == "adalflow.utils":
-                raise ImportError("no adalflow")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", fake_import)
-        conn = _Conn(config={})
-        d = conn._clone_dir("https://gitlab.com/g/p")
-        assert "repos" in d
-        assert "g_p" in d
+        # Root is the DEFAULT_REPO_ROOT from api.repositories.documents
+        from api.repositories.documents import DEFAULT_REPO_ROOT
+        assert d.startswith(DEFAULT_REPO_ROOT)
 
 
 class TestGitConnectorFileTree:

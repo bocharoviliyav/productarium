@@ -6,10 +6,9 @@ decomposition). Submodules:
   ``_resolve_expert_model``.
 - ``knowledge``: ``_retrieve_product_knowledge``, ``_fallback_artifact_docs``,
   ``_product_name_by_id``, ``_format_history``.
-- ``prompt``: tunables (``RLM_MIN_CHARS`` etc.), ``EXPERT_SYSTEM_PROMPT`` /
+- ``prompt``: tunables (``KNOWLEDGE_MAX_CHARS`` etc.), ``EXPERT_SYSTEM_PROMPT`` /
   ``EXPERT_DOC_PROMPT``, ``_clean_llm_text``, ``_chunk_text``, ``_build_prompt``.
-- ``generate``: ``_rlm_generate``, ``_generate_answer``, ``_stream_answer``,
-  ``_resolve_use_rlm``.
+- ``generate``: ``_generate_answer``, ``_stream_answer``.
 - ``chat``: ``run_expert_chat``, ``run_expert_doc``,
   ``_run_expert_chat_collect`` / ``_run_expert_chat_stream``.
 
@@ -30,8 +29,6 @@ from api.expert.chat import (  # noqa: F401
 )
 from api.expert.generate import (  # noqa: F401
     _generate_answer,
-    _resolve_use_rlm,
-    _rlm_generate,
     _stream_answer,
 )
 from api.expert.knowledge import (  # noqa: F401
@@ -52,7 +49,6 @@ from api.expert.prompt import (  # noqa: F401
     EXPERT_DOC_PROMPT,
     EXPERT_SYSTEM_PROMPT,
     KNOWLEDGE_MAX_CHARS,
-    RLM_MIN_CHARS,
     STREAM_CHUNK_SIZE,
     _build_prompt,
     _chunk_text,
@@ -67,6 +63,8 @@ from api.expert.types import (  # noqa: F401
     EVENT_RETRIEVING,
     EVENT_STATUS,
     EVENT_THINKING,
+    EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
     ExpertStreamEvent,
 )
 

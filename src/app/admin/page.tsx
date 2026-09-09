@@ -6,14 +6,16 @@ import {
   ArrowRight,
   ArrowsCounterClockwise,
   Brain,
+  Code,
   Copy,
   FileText,
   Gear,
   GitBranch,
   Globe,
   Key,
-  Lightning,
+  PencilSimple,
   Plug,
+  Plugs,
   Plus,
   Rocket,
   SealCheck,
@@ -32,6 +34,7 @@ import {
   Card,
   Input,
   Label,
+  Modal,
   SectionHeader,
   Select,
   Spinner as SpinnerIcon,
@@ -40,27 +43,52 @@ import {
   Textarea,
   cn,
 } from "@/components/ui";
-import type { ApiToken, User, UserCreateResult, UserRole } from "@/lib/types";
+import { McpStatusDot } from "@/components/mcp/McpStatusDot";
+import { SpecViewer } from "@/components/SpecViewer";
+import type {
+  ApiToken,
+  HttpIntegration,
+  HttpIntegrationTestResult,
+  McpServer,
+  McpTestResult,
+  McpTransport,
+  User,
+  UserCreateResult,
+  UserRole,
+} from "@/lib/types";
 import { useLanguage } from "@/contexts/LanguageContext";
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-type Section = "models" | "rlm" | "ssl" | "git" | "confluence" | "integrations" | "prompts" | "memory" | "timeouts" | "users" | "tokens";
+type Section =
+  | "models"
+  | "ssl"
+  | "git"
+  | "confluence"
+  | "integrations"
+  | "mcp"
+  | "prompts"
+  | "memory"
+  | "timeouts"
+  | "users"
+  | "tokens"
+  | "publicapi";
 
 const SECTIONS: { key: Section; icon: typeof Gear }[] = [
   { key: "models", icon: Rocket },
-  { key: "rlm", icon: Lightning },
   { key: "ssl", icon: Shield },
   { key: "git", icon: GitBranch },
   { key: "confluence", icon: Globe },
   { key: "integrations", icon: Plug },
+  { key: "mcp", icon: Plugs },
   { key: "prompts", icon: FileText },
   { key: "memory", icon: Brain },
   { key: "timeouts", icon: Wrench },
   { key: "users", icon: UserCircleGear },
   { key: "tokens", icon: Key },
+  { key: "publicapi", icon: Code },
 ];
 
 /**
@@ -185,7 +213,7 @@ function Field({
 /* Models section                                                      */
 /* ------------------------------------------------------------------ */
 
-type ModelTask = "docgen" | "expert" | "summary" | "cognee" | "embedder";
+type ModelTask = "docgen" | "expert" | "summary" | "embedder";
 
 interface ModelCfg {
   model: string;
@@ -194,9 +222,8 @@ interface ModelCfg {
   // UI-only: true when a key is already stored (redacted on the server).
   // Never sent on save.
   hasApiKey: boolean;
-  // Optional per-model prompt-token budget for RLM (models.<task>.max_prompt_tokens).
-  // Empty string = use the default (no override). Only consumed by the docgen
-  // RLM path, but surfaced for every task for generality.
+  // Optional per-model prompt-token budget (models.<task>.max_prompt_tokens).
+  // Empty string = use the default (no override).
   max_prompt_tokens: string;
   dimensions?: string;
 }
@@ -231,7 +258,6 @@ const MODEL_TASKS: ModelTask[] = [
   "docgen",
   "expert",
   "summary",
-  "cognee",
   "embedder",
 ];
 
@@ -430,7 +456,7 @@ function ModelsSection() {
                 />
                 <p className="mt-1 text-xs text-muted">
                   {tm.maxPromptTokensHint ??
-                    "Optional. RLM prompt-token limit for this model. Leave empty to use the default (200000). Only used by RLM (documentation generation)."}
+                    "Optional. Prompt-token limit for this model. Leave empty to use the default."}
                 </p>
               </div>
             </div>
@@ -464,195 +490,6 @@ function ModelsSection() {
           </Card>
         );
       })}
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* RLM / LLM routing section                                           */
-/* ------------------------------------------------------------------ */
-
-type RlmTask = "docgen" | "expert" | "summary";
-type RlmMode = "auto" | "rlm" | "llm";
-
-interface RlmSettingView {
-  value: string | null;
-  encrypted: boolean;
-  hasKey: boolean;
-}
-type RlmConfig = {
-  group: string;
-  settings: Record<string, RlmSettingView>;
-  resolved: Record<RlmTask, RlmMode>;
-};
-
-const RLM_TASKS: RlmTask[] = ["docgen", "expert", "summary"];
-
-const RLM_MODE_OPTIONS: RlmMode[] = ["auto", "rlm", "llm"];
-
-const RLM_TASK_LABEL_KEY: Record<RlmTask, "taskDocgen" | "taskExpert" | "taskSummary"> = {
-  docgen: "taskDocgen",
-  expert: "taskExpert",
-  summary: "taskSummary",
-};
-const RLM_TASK_HINT_KEY: Record<RlmTask, "taskDocgenHint" | "taskExpertHint" | "taskSummaryHint"> = {
-  docgen: "taskDocgenHint",
-  expert: "taskExpertHint",
-  summary: "taskSummaryHint",
-};
-const RLM_MODE_LABEL_KEY: Record<RlmMode, "modeAuto" | "modeRlm" | "modeLlm"> = {
-  auto: "modeAuto",
-  rlm: "modeRlm",
-  llm: "modeLlm",
-};
-const RLM_MODE_HINT_KEY: Record<RlmMode, "modeAutoHint" | "modeRlmHint" | "modeLlmHint"> = {
-  auto: "modeAutoHint",
-  rlm: "modeRlmHint",
-  llm: "modeLlmHint",
-};
-
-function RlmSection() {
-  const { getJson, putJson, notify } = useAdminApi();
-  const { messages, fmt } = useLanguage();
-  const t = messages?.admin ?? {};
-  const tr = t?.rlm ?? {};
-  const [draft, setDraft] = useState<Record<RlmTask, RlmMode>>({
-    docgen: "auto",
-    expert: "auto",
-    summary: "auto",
-  });
-  const [resolved, setResolved] = useState<Record<RlmTask, RlmMode> | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await getJson<RlmConfig>("/api/admin/rlm");
-      setResolved(data.resolved);
-      // Seed drafts from the stored value (if any), else from the effective
-      // resolved mode so the selector reflects the current routing.
-      const next = {} as Record<RlmTask, RlmMode>;
-      for (const task of ["docgen", "expert", "summary"] as RlmTask[]) {
-        const stored = data.settings[`rlm.${task}.mode`]?.value;
-        const v = (stored || data.resolved[task] || "auto").trim().toLowerCase();
-        next[task] = v === "rlm" || v === "llm" ? v : "auto";
-      }
-      setDraft(next);
-    } catch (e) {
-      notify({
-        tone: "error",
-        title: t.loadFailedTitle ?? "Load failed",
-        message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
-      });
-    } finally {
-      setLoading(false);
-    }
-  }, [getJson, notify, t]);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      const body: Record<string, string> = {};
-      for (const task of ["docgen", "expert", "summary"] as RlmTask[]) {
-        body[`rlm.${task}.mode`] = draft[task];
-      }
-      await putJson("/api/admin/rlm", body);
-      // Refresh so the resolved tag reflects the post-save effective mode
-      // (e.g. forced to "llm" if fast-rlm is not installed).
-      await load();
-      notify({ tone: "success", title: tr.savedToast ?? "Saved RLM routing modes." });
-    } catch (e) {
-      notify({
-        tone: "error",
-        title: t.saveFailedTitle ?? "Save failed",
-        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  if (loading) {
-    return (
-      <div className="flex items-center gap-2 text-sm text-muted">
-        <Spinner /> {tr.loading ?? "Loading RLM routing…"}
-      </div>
-    );
-  }
-
-  // fast-rlm unavailable: every resolved mode is forced to "llm" regardless of
-  // what is stored. Surface this clearly so the admin understands RLM can't run.
-  const rlmUnavailable = resolved
-    ? (Object.values(resolved) as RlmMode[]).every((m) => m === "llm")
-      : false;
-
-  return (
-    <div className="space-y-6">
-      <p className="text-[15px] text-muted">
-        {tr.intro ?? ""}
-      </p>
-      {rlmUnavailable && (
-        <Banner tone="warning">
-          {tr.unavailableBanner ?? ""}
-        </Banner>
-      )}
-      {RLM_TASKS.map((taskKey) => {
-        const effective = resolved?.[taskKey];
-        const draftMode = draft[taskKey];
-        const differs = !!effective && effective !== draftMode;
-        const label = tr?.[RLM_TASK_LABEL_KEY[taskKey]] ?? taskKey;
-        const hint = tr?.[RLM_TASK_HINT_KEY[taskKey]] ?? "";
-        return (
-          <Card key={taskKey} className="p-5">
-            <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <h3 className="font-editorial text-base tracking-tight text-ink">
-                  {label}
-                </h3>
-                <p className="mt-0.5 text-xs text-muted">{hint}</p>
-              </div>
-              {effective && (
-                <Tag tone={effective === "llm" ? "neutral" : "blue"}>
-                  {differs
-                    ? fmt(tr.effectiveDiffers ?? "effective: {mode} (draft: {draft})", { mode: effective, draft: draftMode })
-                    : fmt(tr.effective ?? "effective: {mode}", { mode: effective })}
-                </Tag>
-              )}
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              <div>
-                <Label>{tr.mode ?? "Mode"}</Label>
-                <Select
-                  value={draftMode}
-                  onChange={(e) =>
-                    setDraft((p) => ({
-                      ...p,
-                      [taskKey]: e.target.value as RlmMode,
-                    }))
-                  }
-                >
-                  {RLM_MODE_OPTIONS.map((opt) => (
-                    <option key={opt} value={opt}>
-                      {tr?.[RLM_MODE_LABEL_KEY[opt]] ?? opt} — {tr?.[RLM_MODE_HINT_KEY[opt]] ?? ""}
-                    </option>
-                  ))}
-                </Select>
-              </div>
-            </div>
-          </Card>
-        );
-      })}
-      <div className="flex items-center gap-2">
-        <Button size="sm" onClick={save} disabled={saving}>
-          {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />}
-          {tr.save ?? "Save"}
-        </Button>
-      </div>
     </div>
   );
 }
@@ -1170,68 +1007,223 @@ function SslSection() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Integrations section (JSON editor)                                  */
+/* Integrations section (HTTP GET integrations registry, issue #3)     */
 /* ------------------------------------------------------------------ */
 
+/** One editable row of the variables repeater (name/description/default). */
+interface HttpVarFormRow {
+  name: string;
+  description: string;
+  def: string;
+}
+
+interface HttpIntegrationFormState {
+  name: string;
+  description: string;
+  urlTemplate: string;
+  headersText: string;
+  variables: HttpVarFormRow[];
+  enabled: boolean;
+}
+
+const EMPTY_HTTP_FORM: HttpIntegrationFormState = {
+  name: "",
+  description: "",
+  urlTemplate: "",
+  headersText: "",
+  variables: [],
+  enabled: true,
+};
+
 function IntegrationsSection() {
-  const { getJson, putJson, postJson, notify } = useAdminApi();
-  const { messages } = useLanguage();
+  const { getJson, putJson, postJson, del, notify } = useAdminApi();
+  const { messages, fmt } = useLanguage();
   const t = messages?.admin ?? {};
+  const tc = messages?.common ?? {};
   const ti = t?.integrations ?? {};
-  const [text, setText] = useState("");
+
+  const [items, setItems] = useState<HttpIntegration[]>([]);
   const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [testingId, setTestingId] = useState<string | null>(null);
+
+  // Create / edit form state.
+  const [formOpen, setFormOpen] = useState(false);
+  const [editing, setEditing] = useState<HttpIntegration | null>(null);
+  const [form, setForm] = useState<HttpIntegrationFormState>(EMPTY_HTTP_FORM);
   const [saving, setSaving] = useState(false);
-  const [testing, setTesting] = useState(false);
+
+  // Last test result (status code + body preview in a modal).
+  const [testView, setTestView] = useState<{
+    item: HttpIntegration;
+    result: HttpIntegrationTestResult;
+  } | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await getJson<HttpIntegration[]>(
+        "/api/admin/integrations/http",
+      );
+      setItems(Array.isArray(data) ? data : []);
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.loadFailedTitle ?? "Load failed",
+        message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
+      });
+    } finally {
+      setLoading(false);
+    }
+  }, [getJson, notify, t]);
 
   useEffect(() => {
-    (async () => {
-      try {
-        const data = await getJson<unknown>("/api/admin/integrations");
-        setText(JSON.stringify(data ?? {}, null, 2));
-      } catch (e) {
+    void load();
+  }, [load]);
+
+  const openCreate = () => {
+    setEditing(null);
+    setForm(EMPTY_HTTP_FORM);
+    setFormOpen(true);
+  };
+
+  const openEdit = (it: HttpIntegration) => {
+    setEditing(it);
+    setForm({
+      name: it.name,
+      description: it.description ?? "",
+      urlTemplate: it.url_template,
+      // Secrets are masked on read — leave the header editor empty and only
+      // send values when typed ("type to replace" pattern).
+      headersText: "",
+      variables: (it.variables ?? []).map((v) => ({
+        name: v.name,
+        description: v.description ?? "",
+        def: v.default ?? "",
+      })),
+      enabled: it.enabled,
+    });
+    setFormOpen(true);
+  };
+
+  const setVar = (i: number, patch: Partial<HttpVarFormRow>) => {
+    setForm((p) => ({
+      ...p,
+      variables: p.variables.map((row, idx) =>
+        idx === i ? { ...row, ...patch } : row,
+      ),
+    }));
+  };
+
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (saving || !form.name.trim() || !form.urlTemplate.trim()) return;
+    let headers: Record<string, string> | undefined;
+    if (form.headersText.trim()) {
+      const { map, invalid } = parseKeyValueLines(form.headersText);
+      if (invalid.length) {
         notify({
           tone: "error",
-          title: t.loadFailedTitle ?? "Load failed",
-          message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
+          title: t.saveFailedTitle ?? "Save failed",
+          message: fmt(ti.invalidKeyValue ?? "Invalid {label} line: {line}", {
+            label: "headers",
+            line: invalid[0],
+          }),
         });
-      } finally {
-        setLoading(false);
+        return;
       }
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const save = async () => {
+      headers = map;
+    }
+    const variables = form.variables
+      .map((v) => ({
+        name: v.name.trim(),
+        description: v.description.trim() || null,
+        default: v.def.trim() || null,
+      }))
+      .filter((v) => v.name);
     setSaving(true);
     try {
-      const parsed = JSON.parse(text || "{}");
-      await putJson("/api/admin/integrations", parsed);
-      notify({ tone: "success", title: ti.savedToast ?? "Saved integrations config." });
+      const body: Record<string, unknown> = {
+        name: form.name.trim(),
+        description: form.description.trim() || null,
+        url_template: form.urlTemplate.trim(),
+        variables,
+        enabled: form.enabled,
+      };
+      if (headers) body.headers = headers;
+      if (editing) {
+        await putJson(`/api/admin/integrations/http/${editing.id}`, body);
+      } else {
+        await postJson("/api/admin/integrations/http", body);
+      }
+      setFormOpen(false);
+      await load();
+      notify({
+        tone: "success",
+        title: editing
+          ? (ti.savedToast ?? "Integration saved.")
+          : (ti.createdToast ?? "Integration created."),
+      });
     } catch (e) {
       notify({
         tone: "error",
         title: t.saveFailedTitle ?? "Save failed",
-        message: e instanceof Error ? e.message : (ti.invalidJson ?? "Invalid JSON"),
+        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
       });
     } finally {
       setSaving(false);
     }
   };
 
-  const test = async () => {
-    setTesting(true);
+  const toggleEnabled = async (it: HttpIntegration) => {
+    setBusyId(it.id);
+    // Optimistic flip; reverted on failure.
+    setItems((prev) =>
+      prev.map((x) => (x.id === it.id ? { ...x, enabled: !it.enabled } : x)),
+    );
     try {
-      const res = (await postJson("/api/admin/integrations/test", {})) as {
-        success?: boolean;
-        ok?: boolean;
-        message?: string;
-      };
-      const ok = Boolean(res.success ?? res.ok);
-      notify({
-        tone: ok ? "success" : "error",
-        title: ok ? (ti.okTitle ?? "OK") : (t.testFailedTitle ?? "Test failed"),
-        message: res.message || (ok ? (ti.ok ?? "OK") : (t.testFailed ?? "Test failed")),
+      await putJson(`/api/admin/integrations/http/${it.id}`, {
+        enabled: !it.enabled,
       });
+    } catch (e) {
+      setItems((prev) =>
+        prev.map((x) => (x.id === it.id ? { ...x, enabled: it.enabled } : x)),
+      );
+      notify({
+        tone: "error",
+        title: t.updateFailedTitle ?? "Update failed",
+        message: e instanceof Error ? e.message : (t.updateFailed ?? "Update failed"),
+      });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const remove = async (it: HttpIntegration) => {
+    if (!confirm(ti.deleteConfirm ?? "Delete this HTTP integration?")) return;
+    setBusyId(it.id);
+    try {
+      await del(`/api/admin/integrations/http/${it.id}`);
+      await load();
+      notify({ tone: "success", title: ti.deletedToast ?? "Integration deleted" });
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.failed ?? "Failed",
+        message: e instanceof Error ? e.message : (t.failed ?? "Failed"),
+      });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const test = async (it: HttpIntegration) => {
+    setTestingId(it.id);
+    try {
+      const res = (await postJson(
+        `/api/admin/integrations/http/${it.id}/test`,
+      )) as HttpIntegrationTestResult;
+      setTestView({ item: it, result: res });
     } catch (e) {
       notify({
         tone: "error",
@@ -1239,48 +1231,910 @@ function IntegrationsSection() {
         message: e instanceof Error ? e.message : (t.testFailed ?? "Test failed"),
       });
     } finally {
-      setTesting(false);
+      setTestingId(null);
     }
   };
 
   if (loading)
     return (
       <div className="flex items-center gap-2 text-sm text-muted">
-        <Spinner /> {ti.loading ?? "Loading…"}
+        <Spinner /> {ti.loading ?? "Loading integrations…"}
       </div>
     );
 
   return (
     <div className="space-y-6">
-      <p className="text-[15px] text-muted">
-        {ti.intro ?? ""}
-      </p>
-      <Card className="p-3">
-        <textarea
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          rows={16}
-          spellCheck={false}
-          className="w-full rounded-md border border-divider bg-surface-2 p-3 font-mono text-xs leading-relaxed text-ink focus:border-ink focus:outline-none"
-        />
-      </Card>
-      <div className="flex items-center gap-2">
-        <Button size="sm" onClick={save} disabled={saving}>
-          {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />} {ti.save ?? "Save"}
-        </Button>
-        <Button size="sm" variant="ghost" onClick={test} disabled={testing}>
-          {testing ? <SpinnerIcon /> : <Wrench size={14} weight="regular" />}{" "}
-          {ti.test ?? "Test"}
+      <p className="text-[15px] text-muted">{ti.intro ?? ""}</p>
+
+      <div className="flex items-center justify-end">
+        <Button size="sm" onClick={openCreate}>
+          <Plus size={14} weight="bold" />
+          {ti.addIntegration ?? "Add integration"}
         </Button>
       </div>
+
+      {items.length === 0 ? (
+        <p className="text-sm text-muted">{ti.noIntegrations ?? "No HTTP integrations yet."}</p>
+      ) : (
+        <Card className="overflow-hidden">
+          <table className="w-full text-sm">
+            <thead className="bg-surface-2 text-left text-xs uppercase tracking-wide text-muted">
+              <tr>
+                <th className="px-4 py-3 font-medium">{ti.tableHeaders?.name ?? "Name"}</th>
+                <th className="px-4 py-3 font-medium">{ti.tableHeaders?.url ?? "URL template"}</th>
+                <th className="px-4 py-3 font-medium">{ti.tableHeaders?.variables ?? "Variables"}</th>
+                <th className="px-4 py-3 font-medium">{ti.tableHeaders?.enabled ?? "Enabled"}</th>
+                <th className="px-4 py-3 text-right font-medium">{ti.tableHeaders?.actions ?? "Actions"}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-divider">
+              {items.map((it) => {
+                const headerKeys = Object.keys(it.headers_masked ?? {});
+                const varNames = (it.variables ?? []).map((v) => v.name);
+                return (
+                  <tr key={it.id} className="hover:bg-surface-2">
+                    <td className="px-4 py-3">
+                      <div className="font-medium text-ink">{it.name}</div>
+                      {it.description && (
+                        <div className="mt-0.5 text-xs text-muted">{it.description}</div>
+                      )}
+                      {headerKeys.length > 0 && (
+                        <div className="mt-0.5 font-mono text-[11px] text-muted">
+                          headers: {headerKeys.join(", ")}
+                        </div>
+                      )}
+                    </td>
+                    <td className="max-w-[320px] px-4 py-3">
+                      <div className="truncate font-mono text-xs text-muted">
+                        {it.url_template}
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      {varNames.length === 0 ? (
+                        <span className="text-xs text-muted">—</span>
+                      ) : (
+                        <div
+                          className="font-mono text-xs text-muted"
+                          title={varNames.join(", ")}
+                        >
+                          {varNames.map((n) => `{${n}}`).join(" ")}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      <Switch
+                        checked={it.enabled}
+                        onChange={() => toggleEnabled(it)}
+                        disabled={busyId === it.id}
+                        label={ti.toggleLabel ?? "Enable or disable this integration"}
+                      />
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <div className="inline-flex items-center gap-2">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => test(it)}
+                          disabled={testingId === it.id}
+                        >
+                          {testingId === it.id ? (
+                            <SpinnerIcon />
+                          ) : (
+                            <Wrench size={14} weight="regular" />
+                          )}
+                          {ti.test ?? "Test"}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="subtle"
+                          aria-label={tc.edit ?? "Edit"}
+                          title={tc.edit ?? "Edit"}
+                          className="!px-2"
+                          onClick={() => openEdit(it)}
+                        >
+                          <PencilSimple size={14} weight="regular" />
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="danger"
+                          aria-label={tc.delete ?? "Delete"}
+                          title={tc.delete ?? "Delete"}
+                          className="!px-2"
+                          onClick={() => remove(it)}
+                          disabled={busyId === it.id}
+                        >
+                          {busyId === it.id ? (
+                            <SpinnerIcon />
+                          ) : (
+                            <Trash size={14} weight="regular" />
+                          )}
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </Card>
+      )}
+
+      {/* Create / edit form */}
+      <Modal
+        open={formOpen}
+        onClose={() => setFormOpen(false)}
+        title={
+          editing
+            ? (ti.editIntegration ?? "Edit integration")
+            : (ti.addIntegration ?? "Add integration")
+        }
+        size="lg"
+        footer={null}
+      >
+        <form onSubmit={save} className="grid gap-4">
+          <div className="grid gap-4 md:grid-cols-[1fr_1fr]">
+            <div>
+              <Label>{ti.name ?? "Name"}</Label>
+              <Input
+                value={form.name}
+                onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))}
+                placeholder={ti.namePlaceholder ?? "e.g. grafana-search"}
+                maxLength={128}
+                required
+                autoFocus
+              />
+            </div>
+            <div>
+              <Label>{ti.description ?? "Description"}</Label>
+              <Input
+                value={form.description}
+                onChange={(e) =>
+                  setForm((p) => ({ ...p, description: e.target.value }))
+                }
+                maxLength={1024}
+              />
+            </div>
+          </div>
+
+          <div>
+            <Label>{ti.urlTemplate ?? "URL template"}</Label>
+            <Input
+              type="url"
+              value={form.urlTemplate}
+              onChange={(e) => setForm((p) => ({ ...p, urlTemplate: e.target.value }))}
+              placeholder={
+                ti.urlTemplatePlaceholder ?? "https://api.example.com/search?repo={product_name}"
+              }
+              pattern="https?://.+"
+              title="http:// or https:// only"
+              required
+              className="font-mono text-sm"
+            />
+            <p className="mt-1 text-xs text-muted">
+              {ti.urlTemplateHint ??
+                "Use {product_name} or declared variables as {placeholders}."}
+            </p>
+          </div>
+
+          <div>
+            <Label>{ti.headers ?? "Headers (key=value per line)"}</Label>
+            <Textarea
+              value={form.headersText}
+              onChange={(e) => setForm((p) => ({ ...p, headersText: e.target.value }))}
+              placeholder={
+                editing && Object.keys(editing.headers_masked ?? {}).length
+                  ? `${ti.secretsStored ?? "stored"}: ${Object.keys(editing.headers_masked ?? {}).join(", ")}`
+                  : "Authorization=Bearer …"
+              }
+              rows={3}
+              spellCheck={false}
+            />
+          </div>
+
+          <div>
+            <Label>{ti.variables ?? "Variables"}</Label>
+            <div className="flex flex-col gap-2">
+              {form.variables.map((row, i) => (
+                <div key={i} className="grid gap-2 md:grid-cols-[160px_1fr_1fr_36px]">
+                  <Input
+                    value={row.name}
+                    onChange={(e) => setVar(i, { name: e.target.value })}
+                    placeholder={ti.varName ?? "Name"}
+                    className="font-mono text-sm"
+                    maxLength={64}
+                  />
+                  <Input
+                    value={row.description}
+                    onChange={(e) => setVar(i, { description: e.target.value })}
+                    placeholder={ti.varDescription ?? "Description"}
+                    maxLength={512}
+                  />
+                  <Input
+                    value={row.def}
+                    onChange={(e) => setVar(i, { def: e.target.value })}
+                    placeholder={ti.varDefault ?? "Default"}
+                    maxLength={512}
+                  />
+                  <Button
+                    type="button"
+                    variant="danger"
+                    aria-label={tc.delete ?? "Delete"}
+                    title={tc.delete ?? "Delete"}
+                    className="!px-2"
+                    onClick={() =>
+                      setForm((p) => ({
+                        ...p,
+                        variables: p.variables.filter((_, idx) => idx !== i),
+                      }))
+                    }
+                  >
+                    <Trash size={14} weight="regular" />
+                  </Button>
+                </div>
+              ))}
+              <div>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() =>
+                    setForm((p) => ({
+                      ...p,
+                      variables: [...p.variables, { name: "", description: "", def: "" }],
+                    }))
+                  }
+                >
+                  <Plus size={14} weight="bold" />
+                  {ti.addVariable ?? "Add variable"}
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3 rounded-md border border-divider bg-surface-2 p-3">
+            <Switch
+              checked={form.enabled}
+              onChange={(next) => setForm((p) => ({ ...p, enabled: next }))}
+              label={ti.enabled ?? "Enabled"}
+            />
+            <span className="text-sm text-ink">{ti.enabled ?? "Enabled"}</span>
+          </div>
+
+          {editing && (
+            <p className="text-xs text-muted">{ti.secretsHint ?? ""}</p>
+          )}
+
+          <div className="flex items-center justify-end gap-2">
+            <Button type="button" variant="ghost" onClick={() => setFormOpen(false)}>
+              {tc.cancel ?? "Cancel"}
+            </Button>
+            <Button
+              type="submit"
+              disabled={saving || !form.name.trim() || !form.urlTemplate.trim()}
+            >
+              {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />}
+              {ti.save ?? "Save"}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Test result: status code + body preview */}
+      <Modal
+        open={Boolean(testView)}
+        onClose={() => setTestView(null)}
+        title={
+          testView
+            ? `${ti.testTitle ?? "Test"} — ${testView.item.name}`
+            : (ti.testTitle ?? "Test")
+        }
+        size="lg"
+        footer={null}
+      >
+        {testView && (
+          <div className="space-y-4">
+            <Banner tone={testView.result.ok ? "success" : "error"}>
+              {testView.result.ok
+                ? fmt(ti.testOk ?? "Status {status}.", {
+                    status: testView.result.status_code ?? "—",
+                  })
+                : (testView.result.detail || (ti.testFailed ?? "Request failed."))}
+            </Banner>
+            {testView.result.ok && testView.result.detail && (
+              <p className="text-sm text-muted">{testView.result.detail}</p>
+            )}
+            {testView.result.body_preview && (
+              <div>
+                <Label>{ti.preview ?? "Body preview"}</Label>
+                <pre className="max-h-72 overflow-auto rounded-md border border-divider bg-surface-2 p-3 font-mono text-xs leading-relaxed text-ink">
+                  {testView.result.body_preview}
+                </pre>
+              </div>
+            )}
+          </div>
+        )}
+      </Modal>
     </div>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* System prompts section (live-edit refs/prompts/*.md)                */
+/* MCP servers section (global registry, wave C)                      */
 /* ------------------------------------------------------------------ */
-/* Rate-limit card (shared by Cognee + Embedder)                      */
+
+interface McpFormState {
+  name: string;
+  transport: McpTransport;
+  url: string;
+  command: string;
+  argsText: string;
+  headersText: string;
+  envText: string;
+  enabled: boolean;
+}
+
+const EMPTY_MCP_FORM: McpFormState = {
+  name: "",
+  transport: "http",
+  url: "",
+  command: "",
+  argsText: "",
+  headersText: "",
+  envText: "",
+  enabled: true,
+};
+
+/** Parse `key=value` lines; returns the map plus any malformed raw lines. */
+function parseKeyValueLines(text: string): {
+  map: Record<string, string>;
+  invalid: string[];
+} {
+  const map: Record<string, string> = {};
+  const invalid: string[] = [];
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    const key = eq > 0 ? line.slice(0, eq).trim() : "";
+    if (!key) {
+      invalid.push(line);
+      continue;
+    }
+    map[key] = line.slice(eq + 1).trim();
+  }
+  return { map, invalid };
+}
+
+function McpSection() {
+  const { getJson, putJson, postJson, del, notify } = useAdminApi();
+  const { messages, fmt } = useLanguage();
+  const t = messages?.admin ?? {};
+  const tc = messages?.common ?? {};
+  const tm = t?.mcp ?? {};
+
+  const [servers, setServers] = useState<McpServer[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [testingId, setTestingId] = useState<string | null>(null);
+
+  // Create / edit form state.
+  const [formOpen, setFormOpen] = useState(false);
+  const [editing, setEditing] = useState<McpServer | null>(null);
+  const [form, setForm] = useState<McpFormState>(EMPTY_MCP_FORM);
+  const [saving, setSaving] = useState(false);
+
+  // Last test result (viewed in a modal: ok/detail + discovered tools).
+  const [testView, setTestView] = useState<{
+    server: McpServer;
+    result: McpTestResult;
+  } | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await getJson<McpServer[] | { servers: McpServer[] }>(
+        "/api/admin/mcp/servers",
+      );
+      setServers(Array.isArray(data) ? data : (data?.servers ?? []));
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.loadFailedTitle ?? "Load failed",
+        message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
+      });
+    } finally {
+      setLoading(false);
+    }
+  }, [getJson, notify, t]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const openCreate = () => {
+    setEditing(null);
+    setForm(EMPTY_MCP_FORM);
+    setFormOpen(true);
+  };
+
+  const openEdit = (s: McpServer) => {
+    setEditing(s);
+    setForm({
+      name: s.name,
+      transport: s.transport,
+      url: s.url ?? "",
+      command: s.command ?? "",
+      argsText: (s.args ?? []).join(", "),
+      // Secrets are masked on read — leave the header/env editors empty and
+      // only send values when typed ("type to replace" pattern).
+      headersText: "",
+      envText: "",
+      enabled: s.enabled,
+    });
+    setFormOpen(true);
+  };
+
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (saving || !form.name.trim()) return;
+    // Parse the key=value blocks; abort with a toast on malformed lines so
+    // garbage never reaches the backend.
+    let headers: Record<string, string> | undefined;
+    let env: Record<string, string> | undefined;
+    const blocks: Array<["headers" | "env", string]> = [
+      ["headers", form.headersText],
+      ["env", form.envText],
+    ];
+    for (const [label, text] of blocks) {
+      if (!text.trim()) continue;
+      const { map, invalid } = parseKeyValueLines(text);
+      if (invalid.length) {
+        notify({
+          tone: "error",
+          title: t.saveFailedTitle ?? "Save failed",
+          message: fmt(tm.invalidKeyValue ?? "Invalid {label} line: {line}", {
+            label,
+            line: invalid[0],
+          }),
+        });
+        return;
+      }
+      if (label === "headers") headers = map;
+      else env = map;
+    }
+    setSaving(true);
+    try {
+      const body: Record<string, unknown> = {
+        name: form.name.trim(),
+        transport: form.transport,
+        enabled: form.enabled,
+      };
+      if (form.transport === "http" || form.transport === "sse") {
+        body.url = form.url.trim();
+        if (headers) body.headers = headers;
+      } else {
+        body.command = form.command.trim();
+        body.args = form.argsText
+          .split(",")
+          .map((a) => a.trim())
+          .filter(Boolean);
+        if (env) body.env = env;
+      }
+      if (editing) {
+        await putJson(`/api/admin/mcp/servers/${editing.id}`, body);
+      } else {
+        await postJson("/api/admin/mcp/servers", body);
+      }
+      setFormOpen(false);
+      await load();
+      notify({
+        tone: "success",
+        title: editing
+          ? (tm.savedToast ?? "Server saved.")
+          : (tm.createdToast ?? "Server created."),
+      });
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.saveFailedTitle ?? "Save failed",
+        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const toggleEnabled = async (s: McpServer) => {
+    setBusyId(s.id);
+    // Optimistic flip; reverted on failure.
+    setServers((prev) =>
+      prev.map((x) => (x.id === s.id ? { ...x, enabled: !s.enabled } : x)),
+    );
+    try {
+      await putJson(`/api/admin/mcp/servers/${s.id}`, { enabled: !s.enabled });
+    } catch (e) {
+      setServers((prev) =>
+        prev.map((x) => (x.id === s.id ? { ...x, enabled: s.enabled } : x)),
+      );
+      notify({
+        tone: "error",
+        title: t.updateFailedTitle ?? "Update failed",
+        message: e instanceof Error ? e.message : (t.updateFailed ?? "Update failed"),
+      });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const remove = async (s: McpServer) => {
+    if (
+      !confirm(
+        tm.deleteConfirm ??
+          "Delete this MCP server? Product bindings are detached automatically.",
+      )
+    )
+      return;
+    setBusyId(s.id);
+    try {
+      await del(`/api/admin/mcp/servers/${s.id}`);
+      await load();
+      notify({ tone: "success", title: tm.deletedToast ?? "Server deleted" });
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.failed ?? "Failed",
+        message: e instanceof Error ? e.message : (t.failed ?? "Failed"),
+      });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const test = async (s: McpServer) => {
+    setTestingId(s.id);
+    try {
+      const res = (await postJson(
+        `/api/admin/mcp/servers/${s.id}/test`,
+      )) as McpTestResult;
+      setTestView({ server: s, result: res });
+      // The backend persists status/status_checked_at/status_error on test.
+      await load();
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.testFailedTitle ?? "Test failed",
+        message: e instanceof Error ? e.message : (t.testFailed ?? "Test failed"),
+      });
+    } finally {
+      setTestingId(null);
+    }
+  };
+
+  const statusLabel = (s: McpServer) =>
+    s.status === "ok"
+      ? (tm.statusOk ?? "ok")
+      : s.status === "error"
+        ? (tm.statusError ?? "error")
+        : (tm.statusUnknown ?? "unknown");
+
+  if (loading)
+    return (
+      <div className="flex items-center gap-2 text-sm text-muted">
+        <Spinner /> {tm.loading ?? "Loading MCP servers…"}
+      </div>
+    );
+
+  return (
+    <div className="space-y-6">
+      <p className="text-[15px] text-muted">{tm.intro ?? ""}</p>
+
+      <div className="flex items-center justify-end">
+        <Button size="sm" onClick={openCreate}>
+          <Plus size={14} weight="bold" />
+          {tm.addServer ?? "Add server"}
+        </Button>
+      </div>
+
+      {servers.length === 0 ? (
+        <p className="text-sm text-muted">{tm.noServers ?? "No MCP servers yet."}</p>
+      ) : (
+        <Card className="overflow-hidden">
+          <table className="w-full text-sm">
+            <thead className="bg-surface-2 text-left text-xs uppercase tracking-wide text-muted">
+              <tr>
+                <th className="px-4 py-3 font-medium">{tm.tableHeaders?.name ?? "Name"}</th>
+                <th className="px-4 py-3 font-medium">{tm.tableHeaders?.transport ?? "Transport"}</th>
+                <th className="px-4 py-3 font-medium">{tm.tableHeaders?.endpoint ?? "Endpoint"}</th>
+                <th className="px-4 py-3 font-medium">{tm.tableHeaders?.enabled ?? "Enabled"}</th>
+                <th className="px-4 py-3 font-medium">{tm.tableHeaders?.status ?? "Status"}</th>
+                <th className="px-4 py-3 text-right font-medium">{tm.tableHeaders?.actions ?? "Actions"}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-divider">
+              {servers.map((s) => {
+                const headerKeys = Object.keys(s.headers_masked ?? {});
+                const envKeys = Object.keys(s.env_masked ?? {});
+                const maskedMeta = [
+                  headerKeys.length
+                    ? `${tm.headersLabel ?? "headers"}: ${headerKeys.join(", ")}`
+                    : null,
+                  envKeys.length
+                    ? `${tm.envLabel ?? "env"}: ${envKeys.join(", ")}`
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ");
+                return (
+                  <tr key={s.id} className="hover:bg-surface-2">
+                    <td className="px-4 py-3">
+                      <div className="font-medium text-ink">{s.name}</div>
+                      {maskedMeta && (
+                        <div className="mt-0.5 font-mono text-[11px] text-muted">
+                          {maskedMeta}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      <Tag tone={s.transport === "http" ? "blue" : s.transport === "sse" ? "green" : "neutral"}>
+                        {s.transport}
+                      </Tag>
+                    </td>
+                    <td className="max-w-[280px] px-4 py-3">
+                      <div className="truncate font-mono text-xs text-muted">
+                        {s.transport !== "stdio"
+                          ? (s.url ?? "—")
+                          : [s.command, ...(s.args ?? [])].join(" ") || "—"}
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <Switch
+                        checked={s.enabled}
+                        onChange={() => toggleEnabled(s)}
+                        disabled={busyId === s.id}
+                        label={tm.toggleLabel ?? "Enable or disable this MCP server"}
+                      />
+                    </td>
+                    <td className="px-4 py-3">
+                      <span
+                        className="inline-flex items-center gap-1.5 text-xs text-muted"
+                        title={s.status_error || statusLabel(s)}
+                      >
+                        <McpStatusDot status={s.status} title={s.status_error || statusLabel(s)} />
+                        {statusLabel(s)}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <div className="inline-flex items-center gap-2">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => test(s)}
+                          disabled={testingId === s.id}
+                        >
+                          {testingId === s.id ? (
+                            <SpinnerIcon />
+                          ) : (
+                            <Wrench size={14} weight="regular" />
+                          )}
+                          {tm.test ?? "Test"}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="subtle"
+                          aria-label={tc.edit ?? "Edit"}
+                          title={tc.edit ?? "Edit"}
+                          className="!px-2"
+                          onClick={() => openEdit(s)}
+                        >
+                          <PencilSimple size={14} weight="regular" />
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="danger"
+                          aria-label={tc.delete ?? "Delete"}
+                          title={tc.delete ?? "Delete"}
+                          className="!px-2"
+                          onClick={() => remove(s)}
+                          disabled={busyId === s.id}
+                        >
+                          {busyId === s.id ? (
+                            <SpinnerIcon />
+                          ) : (
+                            <Trash size={14} weight="regular" />
+                          )}
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </Card>
+      )}
+
+      {/* Create / edit form */}
+      <Modal
+        open={formOpen}
+        onClose={() => setFormOpen(false)}
+        title={editing ? (tm.editServer ?? "Edit server") : (tm.addServer ?? "Add server")}
+        size="lg"
+        footer={null}
+      >
+        <form onSubmit={save} className="grid gap-4">
+          <div className="grid gap-4 md:grid-cols-[1fr_180px]">
+            <div>
+              <Label>{tm.name ?? "Name"}</Label>
+              <Input
+                value={form.name}
+                onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))}
+                placeholder={tm.namePlaceholder ?? "e.g. Context7 docs"}
+                maxLength={128}
+                required
+                autoFocus
+              />
+            </div>
+            <div>
+              <Label>{tm.transport ?? "Transport"}</Label>
+              <Select
+                value={form.transport}
+                onChange={(e) =>
+                  setForm((p) => ({ ...p, transport: e.target.value as McpTransport }))
+                }
+              >
+                <option value="http">{tm.transportHttp ?? "HTTP"}</option>
+                <option value="sse">{tm.transportSse ?? "SSE"}</option>
+                <option value="stdio">{tm.transportStdio ?? "Stdio"}</option>
+              </Select>
+            </div>
+          </div>
+
+          {form.transport !== "stdio" ? (
+            <>
+              <div>
+                <Label>{tm.url ?? "URL"}</Label>
+                <Input
+                  type="url"
+                  value={form.url}
+                  onChange={(e) => setForm((p) => ({ ...p, url: e.target.value }))}
+                  placeholder="https://mcp.example.com/mcp"
+                  pattern="https?://.+"
+                  title="http:// or https:// only"
+                  required
+                />
+              </div>
+              <div>
+                <Label>{tm.headers ?? "Headers (key=value per line)"}</Label>
+                <Textarea
+                  value={form.headersText}
+                  onChange={(e) => setForm((p) => ({ ...p, headersText: e.target.value }))}
+                  placeholder={
+                    editing && Object.keys(editing.headers_masked ?? {}).length
+                      ? `${tm.secretsStored ?? "stored"}: ${Object.keys(editing.headers_masked ?? {}).join(", ")}`
+                      : "Authorization=Bearer …"
+                  }
+                  rows={3}
+                  spellCheck={false}
+                />
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="grid gap-4 md:grid-cols-[200px_1fr]">
+                <div>
+                  <Label>{tm.command ?? "Command"}</Label>
+                  <Input
+                    value={form.command}
+                    onChange={(e) => setForm((p) => ({ ...p, command: e.target.value }))}
+                    placeholder="npx"
+                    required
+                  />
+                </div>
+                <div>
+                  <Label>{tm.args ?? "Arguments (comma-separated)"}</Label>
+                  <Input
+                    value={form.argsText}
+                    onChange={(e) => setForm((p) => ({ ...p, argsText: e.target.value }))}
+                    placeholder="-y, @modelcontextprotocol/server-everything"
+                    className="font-mono text-sm"
+                  />
+                </div>
+              </div>
+              <div>
+                <Label>{tm.env ?? "Environment (key=value per line)"}</Label>
+                <Textarea
+                  value={form.envText}
+                  onChange={(e) => setForm((p) => ({ ...p, envText: e.target.value }))}
+                  placeholder={
+                    editing && Object.keys(editing.env_masked ?? {}).length
+                      ? `${tm.secretsStored ?? "stored"}: ${Object.keys(editing.env_masked ?? {}).join(", ")}`
+                      : "API_KEY=…"
+                  }
+                  rows={3}
+                  spellCheck={false}
+                />
+              </div>
+            </>
+          )}
+
+          <div className="flex items-center gap-3 rounded-md border border-divider bg-surface-2 p-3">
+            <Switch
+              checked={form.enabled}
+              onChange={(next) => setForm((p) => ({ ...p, enabled: next }))}
+              label={tm.enabled ?? "Enabled"}
+            />
+            <span className="text-sm text-ink">{tm.enabled ?? "Enabled"}</span>
+          </div>
+
+          {editing && (
+            <p className="text-xs text-muted">{tm.secretsHint ?? ""}</p>
+          )}
+
+          <div className="flex items-center justify-end gap-2">
+            <Button type="button" variant="ghost" onClick={() => setFormOpen(false)}>
+              {tc.cancel ?? "Cancel"}
+            </Button>
+            <Button type="submit" disabled={saving || !form.name.trim()}>
+              {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />}
+              {tm.save ?? "Save"}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Test result: ok/detail + discovered tools */}
+      <Modal
+        open={Boolean(testView)}
+        onClose={() => setTestView(null)}
+        title={
+          testView
+            ? `${tm.testTitle ?? "Test"} — ${testView.server.name}`
+            : (tm.testTitle ?? "Test")
+        }
+        size="lg"
+        footer={null}
+      >
+        {testView && (
+          <div className="space-y-4">
+            <Banner tone={testView.result.ok ? "success" : "error"}>
+              {testView.result.ok
+                ? fmt(tm.testOk ?? "Connected. {n} tool(s) discovered.", {
+                    n: testView.result.tools.length,
+                  })
+                : (testView.result.detail || (tm.testFailed ?? "Connection failed."))}
+            </Banner>
+            {testView.result.ok && testView.result.detail && (
+              <p className="text-sm text-muted">{testView.result.detail}</p>
+            )}
+            <div>
+              <Label>{tm.toolsTitle ?? "Tools"}</Label>
+              {testView.result.tools.length === 0 ? (
+                <p className="text-sm text-muted">{tm.noTools ?? "No tools discovered."}</p>
+              ) : (
+                <ul className="flex flex-col gap-2">
+                  {testView.result.tools.map((tool) => (
+                    <li
+                      key={tool.name}
+                      className="rounded-md border border-divider bg-surface-2 px-3 py-2"
+                    >
+                      <div className="font-mono text-sm text-ink">{tool.name}</div>
+                      {tool.description && (
+                        <p className="mt-0.5 text-xs text-muted">{tool.description}</p>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        )}
+      </Modal>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Rate-limit card (Embedder)                                         */
 /* ------------------------------------------------------------------ */
 
 interface RateLimitGroupResponse {
@@ -1301,8 +2155,8 @@ interface RateLimitValues {
 
 /**
  * Render the three rate-limit fields (max concurrency / delay / RPS) plus a
- * save button. Shared by the Cognee (knowledge graph) and Embedder (pgvector
- * memory) rate-limit blocks inside the merged memory section.
+ * save button. Used by the Embedder (pgvector memory) rate-limit block inside
+ * the merged memory section.
  */
 function RateLimitCard({
   labels,
@@ -1373,31 +2227,21 @@ function MemorySection() {
   const { messages } = useLanguage();
   const t = messages?.admin ?? {};
   const tm = t?.memory ?? {};
-  const tcog = t?.cognee ?? {};
   const temb = t?.embedder ?? {};
 
-  const [backend, setBackend] = useState("pgvector");
-  const [validBackends, setValidBackends] = useState<string[]>(["pgvector", "cognee"]);
   const [available, setAvailable] = useState<boolean | null>(null);
   const [chunkCount, setChunkCount] = useState<number | null>(null);
   const [productCount, setProductCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
   const [reindexing, setReindexing] = useState(false);
   const [reindexProductId, setReindexProductId] = useState("");
 
-  // Rate-limit state (Cognee knowledge graph + embedder).
-  const [cogneeRl, setCogneeRl] = useState<RateLimitValues>({
-    maxConcurrency: "2",
-    delaySeconds: "0.5",
-    rateLimitRps: "2.0",
-  });
+  // Rate-limit state (embedder).
   const [embedderRl, setEmbedderRl] = useState<RateLimitValues>({
     maxConcurrency: "4",
     delaySeconds: "0.1",
     rateLimitRps: "10.0",
   });
-  const [savingCogneeRl, setSavingCogneeRl] = useState(false);
   const [savingEmbedderRl, setSavingEmbedderRl] = useState(false);
 
   const load = useCallback(async () => {
@@ -1405,26 +2249,13 @@ function MemorySection() {
     try {
       const data = await getJson<MemoryGroupResponse>("/api/admin/memory");
       const r = data?.resolved ?? {};
-      const s = data?.settings ?? {};
-      setBackend(s["memory.backend"]?.value ?? r.backend ?? "pgvector");
-      setValidBackends(r.valid_backends ?? ["pgvector", "cognee"]);
       setAvailable(typeof r.available === "boolean" ? r.available : null);
       setChunkCount(typeof r.chunk_count === "number" ? r.chunk_count : null);
       setProductCount(typeof r.product_count === "number" ? r.product_count : null);
 
-      // Load cognee + embedder rate-limit settings in parallel (they are
-      // separate setting groups on the backend).
-      const [cogneeData, embedderData] = await Promise.all([
-        getJson<RateLimitGroupResponse>("/api/admin/cognee"),
-        getJson<RateLimitGroupResponse>("/api/admin/embedder"),
-      ]);
-      const cr = cogneeData?.resolved ?? {};
-      const cs = cogneeData?.settings ?? {};
-      setCogneeRl({
-        maxConcurrency: cs["cognee.max_concurrency"]?.value ?? cr.max_concurrency ?? "2",
-        delaySeconds: cs["cognee.delay_seconds"]?.value ?? cr.delay_seconds ?? "0.5",
-        rateLimitRps: cs["cognee.rate_limit_rps"]?.value ?? cr.rate_limit_rps ?? "2.0",
-      });
+      // Load the embedder rate-limit settings (a separate setting group on
+      // the backend).
+      const embedderData = await getJson<RateLimitGroupResponse>("/api/admin/embedder");
       const er = embedderData?.resolved ?? {};
       const es = embedderData?.settings ?? {};
       setEmbedderRl({
@@ -1447,23 +2278,6 @@ function MemorySection() {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      await putJson("/api/admin/memory", { "memory.backend": backend });
-      await load();
-      notify({ tone: "success", title: tm.savedToast ?? "Memory backend saved." });
-    } catch (e) {
-      notify({
-        tone: "error",
-        title: t.saveFailedTitle ?? "Save failed",
-        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
 
   const reindex = async () => {
     setReindexing(true);
@@ -1491,28 +2305,6 @@ function MemorySection() {
       });
     } finally {
       setReindexing(false);
-    }
-  };
-
-  const saveCogneeRl = async () => {
-    setSavingCogneeRl(true);
-    try {
-      const body: Record<string, string> = {
-        "cognee.max_concurrency": cogneeRl.maxConcurrency.trim(),
-        "cognee.delay_seconds": cogneeRl.delaySeconds.trim(),
-        "cognee.rate_limit_rps": cogneeRl.rateLimitRps.trim(),
-      };
-      await putJson("/api/admin/cognee", body);
-      await load();
-      notify({ tone: "success", title: tcog.savedToast ?? "Saved Cognee rate limits." });
-    } catch (e) {
-      notify({
-        tone: "error",
-        title: t.saveFailedTitle ?? "Save failed",
-        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
-      });
-    } finally {
-      setSavingCogneeRl(false);
     }
   };
 
@@ -1550,44 +2342,8 @@ function MemorySection() {
     <div className="space-y-6">
       <p className="text-[15px] text-muted">
         {tm.intro ??
-          "Choose the agent memory backend. pgvector (default) is a fast direct vector store; cognee is the knowledge-graph alternative."}
+          "Agent memory: the pgvector direct store (Postgres + HNSW cosine recall)."}
       </p>
-
-      <Card className="p-5">
-        <SectionHeader
-          title={tm.backendHeader ?? "Active backend"}
-          subtitle={tm.backendSub ?? "Selects where indexed product knowledge is stored and recalled from."}
-        />
-        <div className="mt-4 flex flex-col gap-2">
-          {validBackends.map((b) => (
-            <label
-              key={b}
-              className="flex items-center gap-3 rounded-md border border-divider px-3 py-2 text-sm hover:bg-surface-2"
-            >
-              <input
-                type="radio"
-                name="memory-backend"
-                value={b}
-                checked={backend === b}
-                onChange={() => setBackend(b)}
-                className="h-4 w-4"
-              />
-              <span className="font-medium text-ink">{b}</span>
-              <span className="text-xs text-muted">
-                {b === "pgvector"
-                  ? (tm.pgvectorDesc ?? "Direct Postgres+pgvector chunk store with HNSW cosine recall (fast, no graph extraction).")
-                  : (tm.cogneeDesc ?? "cognee knowledge graph (LLM-extracted entities/relations; slower indexing).")}
-              </span>
-            </label>
-          ))}
-        </div>
-        <div className="mt-4 flex items-center gap-2">
-          <Button size="sm" onClick={save} disabled={saving}>
-            {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />}
-            {tm.save ?? "Save backend"}
-          </Button>
-        </div>
-      </Card>
 
       <Card className="p-5">
         <SectionHeader
@@ -1608,24 +2364,6 @@ function MemorySection() {
               {(tm.products ?? "products")}: {productCount}
             </Tag>
           )}
-        </div>
-      </Card>
-
-      <Card className="p-5">
-        <SectionHeader
-          title={tcog.title ?? "Cognee knowledge graph rate limits"}
-          subtitle={tcog.subtitle ?? "Controls LLM/embedding request throttling during graph extraction (cognify)."}
-        />
-        <div className="mt-4">
-          <RateLimitCard
-            labels={tcog}
-            values={cogneeRl}
-            onValuesChange={(patch) =>
-              setCogneeRl((prev) => ({ ...prev, ...patch }))
-            }
-            onSave={saveCogneeRl}
-            saving={savingCogneeRl}
-          />
         </div>
       </Card>
 
@@ -1687,25 +2425,28 @@ const TIMEOUT_FIELDS: { key: string; group: string }[] = [
   { key: "llm_retry_max_time", group: "LLM" },
   { key: "model_list", group: "LLM" },
   { key: "provider_test", group: "LLM" },
-  { key: "cognee_graph_extraction", group: "Cognee" },
-  { key: "cognee_cognify", group: "Cognee" },
-  { key: "cognee_llm_connection", group: "Cognee" },
-  { key: "cognee_init", group: "Cognee" },
-  { key: "cognee_recall", group: "Cognee" },
-  { key: "docgen_indexing_drain", group: "Cognee" },
+  { key: "docgen_map_concurrency", group: "LLM" },
+  { key: "expert_stream", group: "Expert" },
+  { key: "docgen_indexing_drain", group: "Memory" },
   { key: "memory_query", group: "Memory" },
-  { key: "rlm_api_ms", group: "RLM" },
-  { key: "rlm_section", group: "RLM" },
-  { key: "rlm_expert", group: "RLM" },
   { key: "integration_http", group: "Integrations" },
   { key: "git_file_content", group: "Integrations" },
   { key: "mcp_stdio_wait", group: "Integrations" },
   { key: "mermaid_verify", group: "Mermaid" },
   { key: "mermaid_repair", group: "Mermaid" },
   { key: "mermaid_max_repair_attempts", group: "Mermaid" },
+  { key: "mermaid_repair_deadline", group: "Mermaid" },
+  { key: "db_connect_check", group: "Databases" },
 ];
 
-const TIMEOUT_GROUPS = ["LLM", "Cognee", "Memory", "RLM", "Integrations", "Mermaid"] as const;
+const TIMEOUT_GROUPS = [
+  "LLM",
+  "Expert",
+  "Memory",
+  "Integrations",
+  "Mermaid",
+  "Databases",
+] as const;
 
 interface TimeoutResolvedEntry {
   value: string;
@@ -1868,6 +2609,8 @@ interface PromptFile {
   modified?: string;
 }
 
+type PromptLang = "ru" | "en";
+
 function PromptsSection() {
   const { getJson, putJson, notify } = useAdminApi();
   const { messages, fmt } = useLanguage();
@@ -1879,16 +2622,58 @@ function PromptsSection() {
   const [loadingList, setLoadingList] = useState(true);
   const [loadingFile, setLoadingFile] = useState(false);
   const [saving, setSaving] = useState(false);
+  // Generation language comes from the admin `generation.language` setting
+  // (resolved server-side at each docgen job start); the editor below edits
+  // the prompt copy of `editLang` (independent RU/EN toggle, defaults to the
+  // active generation language).
+  const [genLang, setGenLang] = useState<PromptLang>("ru");
+  const [editLang, setEditLang] = useState<PromptLang>("ru");
+  // Language the served file body actually came from — may differ from
+  // editLang when the copy doesn't exist yet and the English original is
+  // served as a fallback (PUT then creates the translated copy).
+  const [fileLang, setFileLang] = useState<PromptLang | null>(null);
+  const [genLangLoaded, setGenLangLoaded] = useState(false);
 
-  const loadList = useCallback(async () => {
+  // Fetch the active generation language once; defer the list load until it
+  // is known so we don't flash the wrong language's inventory.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await getJson<{ resolved?: { language?: string } }>(
+          "/api/admin/generation",
+        );
+        const lang: PromptLang = data?.resolved?.language === "en" ? "en" : "ru";
+        if (!cancelled) {
+          setGenLang(lang);
+          setEditLang(lang);
+        }
+      } catch {
+        // keep defaults (ru)
+      } finally {
+        if (!cancelled) setGenLangLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [getJson]);
+
+  const loadList = useCallback(async (lang: PromptLang) => {
     setLoadingList(true);
     try {
       const data = await getJson<PromptFile[] | { files: PromptFile[] }>(
-        "/api/admin/prompts",
+        `/api/admin/prompts?lang=${lang}`,
       );
       const list = Array.isArray(data) ? data : data?.files ?? [];
       setFiles(list);
-      if (list.length > 0 && !selected) setSelected(list[0].filename);
+      // P2-32: functional update — `selected` must NOT be a dep of loadList,
+      // otherwise every selection re-fetches the whole list (double fetch).
+      setSelected((prev) =>
+        prev && list.some((f) => f.filename === prev)
+          ? prev
+          : (list[0]?.filename ?? null),
+      );
     } catch (e) {
       notify({
         tone: "error",
@@ -1898,43 +2683,77 @@ function PromptsSection() {
     } finally {
       setLoadingList(false);
     }
-  }, [selected, getJson, notify, t]);
+  // P2-32: the list reloads on language switch; t only labels toasts.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [getJson, notify]);
 
   useEffect(() => {
-    void loadList();
-  }, [loadList]);
+    if (!genLangLoaded) return;
+    void loadList(editLang);
+  }, [editLang, genLangLoaded, loadList]);
 
-  const loadFile = useCallback(async (filename: string) => {
-    setLoadingFile(true);
-    setContent("");
+  const loadFile = useCallback(
+    async (filename: string, lang: PromptLang) => {
+      setLoadingFile(true);
+      setContent("");
+      try {
+        // Returns {content, language}; `language` reflects the directory the
+        // body was actually served from (en fallback when ru copy is absent).
+        const data = await getJson<{ content?: string; language?: string }>(
+          `/api/admin/prompts/${encodeURIComponent(filename)}?lang=${lang}`,
+        );
+        setContent(data?.content ?? "");
+        setFileLang(data?.language === "en" ? "en" : "ru");
+      } catch (e) {
+        notify({
+          tone: "error",
+          title: t.loadFailedTitle ?? "Load failed",
+          message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
+        });
+      } finally {
+        setLoadingFile(false);
+      }
+    },
+    [getJson, notify, t],
+  );
+
+  useEffect(() => {
+    if (selected && genLangLoaded) void loadFile(selected, editLang);
+  }, [selected, editLang, genLangLoaded, loadFile]);
+
+  // Switch the active generation language (persisted immediately; applies
+  // to the next generation run) and follow it in the editor.
+  const changeGenerationLanguage = async (lang: PromptLang) => {
+    if (lang === genLang) return;
+    const prev = genLang;
+    setGenLang(lang);
+    setEditLang(lang);
     try {
-      // File content endpoint returns {content} or raw text; reuse the shared
-      // 401 handling by going through getJson (which redirects on 401).
-      const data = await getJson<{ content?: string } | string>(
-        `/api/admin/prompts/${encodeURIComponent(filename)}`,
-      );
-      setContent(typeof data === "string" ? data : data.content ?? "");
+      await putJson("/api/admin/generation", { "generation.language": lang });
+      notify({
+        tone: "success",
+        title: fmt(tp.languageSavedToast ?? "Generation language: {lang}.", { lang }),
+      });
     } catch (e) {
+      setGenLang(prev);
       notify({
         tone: "error",
-        title: t.loadFailedTitle ?? "Load failed",
-        message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
+        title: t.saveFailedTitle ?? "Save failed",
+        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
       });
-    } finally {
-      setLoadingFile(false);
     }
-  }, [getJson, notify, t]);
-
-  useEffect(() => {
-    if (selected) void loadFile(selected);
-  }, [selected, loadFile]);
+  };
 
   const save = async () => {
     if (!selected) return;
     setSaving(true);
     try {
-      await putJson(`/api/admin/prompts/${encodeURIComponent(selected)}`, { content });
+      await putJson(
+        `/api/admin/prompts/${encodeURIComponent(selected)}?lang=${editLang}`,
+        { content },
+      );
       notify({ tone: "success", title: fmt(tp.savedToast ?? "Saved {file}.", { file: selected }) });
+      setFileLang(editLang);
     } catch (e) {
       notify({
         tone: "error",
@@ -1946,20 +2765,58 @@ function PromptsSection() {
     }
   };
 
-  if (loadingList) {
-    return (
-      <div className="flex items-center gap-2 text-sm text-muted">
-        <Spinner /> {tp.loadingList ?? "Loading prompts…"}
-      </div>
-    );
-  }
-
   return (
     <div className="space-y-6">
-      <p className="text-[15px] text-muted">
-        {tp.intro ?? ""}
-      </p>
-      {files.length === 0 ? (
+      {/* Generation language block (applies to the next generation run) */}
+      <Card className="p-4">
+        <div className="grid gap-3 md:grid-cols-[260px_1fr] md:items-center">
+          <div>
+            <Label>{tp.languageLabel ?? "Generation language"}</Label>
+            <p className="mt-1 text-xs text-muted">{tp.languageHint ?? ""}</p>
+          </div>
+          <div className="md:justify-self-end">
+            <Select
+              value={genLang}
+              onChange={(e) =>
+                void changeGenerationLanguage(e.target.value as PromptLang)
+              }
+            >
+              <option value="ru">{tp.langRu ?? "Русский"}</option>
+              <option value="en">{tp.langEn ?? "English"}</option>
+            </Select>
+          </div>
+        </div>
+      </Card>
+
+      <p className="text-[15px] text-muted">{tp.intro ?? ""}</p>
+
+      {/* Editor language toggle (which directory is being edited) */}
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-medium uppercase tracking-wide text-muted">
+          {tp.editorLangLabel ?? "Editing"}
+        </span>
+        {(["ru", "en"] as PromptLang[]).map((lang) => (
+          <button
+            key={lang}
+            type="button"
+            onClick={() => setEditLang(lang)}
+            className={cn(
+              "rounded-md px-2.5 py-1 font-mono text-xs transition-colors",
+              editLang === lang
+                ? "bg-surface-2 font-semibold text-ink"
+                : "text-muted hover:bg-surface-2 hover:text-ink",
+            )}
+          >
+            {lang.toUpperCase()}
+          </button>
+        ))}
+      </div>
+
+      {loadingList ? (
+        <div className="flex items-center gap-2 text-sm text-muted">
+          <Spinner /> {tp.loadingList ?? "Loading prompts…"}
+        </div>
+      ) : files.length === 0 ? (
         <p className="text-sm text-muted">{tp.noFiles ?? "No prompt files found."}</p>
       ) : (
         <div className="grid gap-4 md:grid-cols-[220px_1fr]">
@@ -1992,7 +2849,14 @@ function PromptsSection() {
             ) : (
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
-                  <span className="font-mono text-sm text-muted">{selected}</span>
+                  <span className="flex min-w-0 items-center gap-2 font-mono text-sm text-muted">
+                    <span className="truncate">{selected}</span>
+                    {fileLang && fileLang !== editLang && (
+                      <span className="shrink-0 rounded bg-surface-2 px-1.5 py-0.5 text-[11px] font-medium">
+                        {tp.fallbackBadge ?? "EN original"}
+                      </span>
+                    )}
+                  </span>
                   <Button size="sm" onClick={save} disabled={saving || !selected}>
                     {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />}
                     {tp.save ?? "Save"}
@@ -2010,6 +2874,59 @@ function PromptsSection() {
           </Card>
         </div>
       )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Public API section (read-only OpenAPI viewer, issue #4)              */
+/* ------------------------------------------------------------------ */
+
+function PublicApiSection() {
+  const { getJson, notify } = useAdminApi();
+  const { messages } = useLanguage();
+  const t = messages?.admin ?? {};
+  const tp = t?.publicapi ?? {};
+  const [schema, setSchema] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await getJson<Record<string, unknown>>("/api/admin/openapi");
+        if (!cancelled) setSchema(JSON.stringify(data, null, 2));
+      } catch (e) {
+        notify({
+          tone: "error",
+          title: t.loadFailedTitle ?? "Load failed",
+          message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
+        });
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  // Load once on mount; t only labels toasts.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [getJson, notify]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-muted">
+        <Spinner /> {tp.loading ?? "Loading schema…"}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <p className="text-[15px] text-muted">{tp.intro ?? ""}</p>
+      <Card className="p-4">
+        <SpecViewer content={schema} kind="openapi" />
+      </Card>
     </div>
   );
 }
@@ -2581,16 +3498,17 @@ function AdminShell() {
               {t?.sections?.[active.key] ?? active.key}
             </h2>
             {section === "models" && <ModelsSection />}
-            {section === "rlm" && <RlmSection />}
             {section === "ssl" && <SslSection />}
             {section === "git" && <GitSection />}
             {section === "confluence" && <ConfluenceSection />}
             {section === "integrations" && <IntegrationsSection />}
+            {section === "mcp" && <McpSection />}
             {section === "prompts" && <PromptsSection />}
             {section === "memory" && <MemorySection />}
             {section === "timeouts" && <TimeoutsSection />}
             {section === "users" && <UsersSection />}
             {section === "tokens" && <TokensSection />}
+            {section === "publicapi" && <PublicApiSection />}
           </div>
         </div>
       </main>

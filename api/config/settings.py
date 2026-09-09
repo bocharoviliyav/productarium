@@ -20,7 +20,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Optional, List, Dict, Any
+import threading
+import time
+from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -54,13 +56,14 @@ def _dev_fernet_key() -> str:
 def _persisted_key_path() -> str:
     """Filesystem location of the persisted Fernet key (used when env unset).
 
-    Honours DEEPWIKI_CONFIG_DIR when set (same override as the config loader);
-    otherwise defaults to ``~/.adalflow/.settings_secret_key`` so the key
-    survives container restarts (``~/.adalflow`` is the mounted data volume).
+    Precedence: ``DEEPWIKI_CONFIG_DIR`` (same override as the config loader) >
+    ``PRODUCTARIUM_STATE_DIR`` (the mounted state volume in docker-compose, so
+    the key survives container rebuilds) > ``~/.adalflow/.settings_secret_key``.
     """
-    base = os.environ.get("DEEPWIKI_CONFIG_DIR")
-    if base:
-        return os.path.join(base, ".settings_secret_key")
+    for env_var in ("DEEPWIKI_CONFIG_DIR", "PRODUCTARIUM_STATE_DIR"):
+        base = os.environ.get(env_var)
+        if base:
+            return os.path.join(base, ".settings_secret_key")
     return os.path.join(os.path.expanduser("~"), ".adalflow", ".settings_secret_key")
 
 
@@ -146,24 +149,90 @@ def _fernet() -> Optional["Fernet"]:
 
 
 # --- Core CRUD --------------------------------------------------------------
+# P1-13: short in-process TTL cache so hot read paths (per-request timeout
+# resolution via api.config.timeout, rate limits, embedder settings) stop doing
+# a synchronous DB round-trip on every call. Writes invalidate immediately;
+# stale reads are bounded by the TTL (default 5s, env-tunable).
+_SETTINGS_CACHE: Dict[str, Tuple[float, Any]] = {}
+_SETTINGS_CACHE_LOCK = threading.Lock()
+_SETTINGS_CACHE_MISS = object()  # sentinel: key present in cache as "not set"
+_SETTINGS_CACHE_TTL_SECONDS = 5.0
+
+
+def _settings_cache_ttl() -> float:
+    raw = os.environ.get("SETTINGS_CACHE_TTL_SECONDS")
+    if raw:
+        try:
+            val = float(str(raw).strip())
+            if val >= 0:
+                return val
+        except ValueError:
+            pass
+    return _SETTINGS_CACHE_TTL_SECONDS
+
+
+def clear_settings_cache() -> None:
+    """Drop all cached setting values (tests, admin "apply now" paths)."""
+    with _SETTINGS_CACHE_LOCK:
+        _SETTINGS_CACHE.clear()
+
+
+def _cache_get(key: str) -> Tuple[bool, Any]:
+    """Return (hit, value) from the TTL cache. value may be _SETTINGS_CACHE_MISS."""
+    now = time.monotonic()
+    with _SETTINGS_CACHE_LOCK:
+        entry = _SETTINGS_CACHE.get(key)
+        if entry is None:
+            return False, None
+        ts, value = entry
+        if now - ts > _settings_cache_ttl():
+            _SETTINGS_CACHE.pop(key, None)
+            return False, None
+        return True, value
+
+
+def _cache_put(key: str, value: Any) -> None:
+    with _SETTINGS_CACHE_LOCK:
+        _SETTINGS_CACHE[key] = (time.monotonic(), value)
+
+
+def _cache_drop(key: str) -> None:
+    with _SETTINGS_CACHE_LOCK:
+        _SETTINGS_CACHE.pop(key, None)
+
+
 def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
-    """Read a setting by key. Decrypts if the row is marked encrypted."""
+    """Read a setting by key. Decrypts if the row is marked encrypted.
+
+    Serves from a short TTL cache (P1-13): a hit (including a cached "key is
+    not set") skips the DB round-trip; ``set_setting`` / ``delete_setting``
+    invalidate the key immediately.
+    """
+    hit, cached = _cache_get(key)
+    if hit:
+        return default if cached is _SETTINGS_CACHE_MISS else cached
     try:
         from api.db import SessionLocal
         from api.models import SettingORM
         with SessionLocal() as db:
             row = db.get(SettingORM, key)
             if row is None:
+                _cache_put(key, _SETTINGS_CACHE_MISS)
                 return default
             if row.encrypted:
                 f = _fernet()
                 if f is None or not row.value:
+                    _cache_put(key, _SETTINGS_CACHE_MISS)
                     return default
                 try:
-                    return f.decrypt(row.value.encode("utf-8")).decode("utf-8")
+                    value = f.decrypt(row.value.encode("utf-8")).decode("utf-8")
+                    _cache_put(key, value)
+                    return value
                 except Exception as e:
                     logger.warning("Failed to decrypt setting %r: %s", key, e)
+                    _cache_put(key, _SETTINGS_CACHE_MISS)
                     return default
+            _cache_put(key, row.value)
             return row.value
     except Exception as e:
         logger.debug("get_setting(%r) failed (DB down?): %s", key, e)
@@ -200,13 +269,57 @@ def set_setting(key: str, value: Optional[str], encrypt: bool = False) -> None:
                 row.value = stored
                 row.encrypted = encrypted
             db.commit()
+        _cache_drop(key)  # P1-13: writes invalidate immediately
     except Exception as e:
         logger.warning("set_setting(%r) failed (DB down?): %s", key, e)
+        _cache_drop(key)
 
 
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     """Read a (possibly encrypted) secret. Alias for get_setting (which decrypts)."""
     return get_setting(key, default=default)
+
+
+# --- Standalone secret crypto (P0-2: git tokens on codebases) ----------------
+def encrypt_secret(plaintext: str) -> Optional[str]:
+    """Encrypt a standalone secret (e.g. a per-codebase git token).
+
+    Returns the Fernet ciphertext string, or None when crypto is unavailable —
+    callers decide whether to fall back to plaintext storage (never crash).
+    """
+    f = _fernet()
+    if f is None:
+        return None
+    try:
+        return f.encrypt(plaintext.encode("utf-8")).decode("utf-8")
+    except Exception as e:
+        logger.warning("encrypt_secret failed: %s", e)
+        return None
+
+
+def decrypt_secret(ciphertext: str) -> Optional[str]:
+    """Decrypt a secret produced by ``encrypt_secret``.
+
+    Returns the plaintext, or None when decryption fails (wrong key, corrupt
+    data, crypto unavailable) — never raises.
+    """
+    f = _fernet()
+    if f is None:
+        return None
+    try:
+        return f.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
+    except Exception as e:
+        logger.warning("decrypt_secret failed: %s", e)
+        return None
+
+
+def is_encrypted_secret(value: Optional[str]) -> bool:
+    """Heuristic: Fernet tokens always start with the versioned prefix 'gAAAA'.
+
+    Used by the lazy plaintext->ciphertext migration for codebase git tokens:
+    anything else is treated as legacy plaintext.
+    """
+    return bool(value) and value.startswith("gAAAA")
 
 
 def delete_setting(key: str) -> bool:
@@ -224,6 +337,8 @@ def delete_setting(key: str) -> bool:
     except Exception as e:
         logger.warning("delete_setting(%r) failed (DB down?): %s", key, e)
         return False
+    finally:
+        _cache_drop(key)  # P1-13: deletes invalidate immediately
 
 
 def list_settings(prefix: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -255,7 +370,7 @@ def _parse_int_setting(value: Optional[str]) -> Optional[int]:
 
     Used for ``models.<task>.max_prompt_tokens``: an empty/missing value keeps
     the caller's default, a non-numeric value is ignored (never raises) so a
-    junk value cannot crash RLM startup.
+    junk value cannot crash callers.
     """
     if value is None:
         return None
@@ -292,13 +407,14 @@ def _sanitize_api_key(value: Optional[str]) -> Optional[str]:
 
 
 def get_model_for_task(task: str) -> Dict[str, Optional[str]]:
-    """Resolve a model config for a task (docgen/expert/summary/cognee/embedder).
+    """Resolve a model config for a task (docgen/expert/summary/embedder).
 
     Reads keys ``models.<task>.{model,base_url,api_key}`` from the settings
     store, falling back to environment variables when unset. Also reads the
-    optional ``models.<task>.max_prompt_tokens`` (int) used by fast-rlm:
-    ``None`` when unset (callers keep the fast-rlm default); non-numeric stored
-    values are ignored (treated as unset) so a bad value never crashes callers.
+    optional ``models.<task>.max_prompt_tokens`` (int) used to cap prompt
+    budgets: ``None`` when unset (callers keep their default); non-numeric
+    stored values are ignored (treated as unset) so a bad value never crashes
+    callers.
 
     Every supported local server (LM Studio, llama.cpp, vLLM, ...)
     exposes an OpenAI-compatible ``/v1`` API, so a single defaults path covers
@@ -309,7 +425,7 @@ def get_model_for_task(task: str) -> Dict[str, Optional[str]]:
     # (LM Studio :1234, llama.cpp, vLLM, ...). The same defaults work for
     # every local server.
     default_base = os.environ.get("LOCAL_OPENAI_BASE_URL", "http://localhost:1234/v1")
-    default_model = os.environ.get("LOCAL_OPENAI_MODEL") or os.environ.get("RLM_MODEL_NAME") or os.environ.get("LLM_MODEL") or "qwen/qwen3.6-27b"
+    default_model = os.environ.get("LOCAL_OPENAI_MODEL") or os.environ.get("LLM_MODEL") or "qwen/qwen3.6-27b"
     default_key = os.environ.get("LOCAL_OPENAI_API_KEY") or os.environ.get("LLM_API_KEY") or "not-needed"
     return {
         "model": get_setting(p + "model") or default_model,
@@ -318,45 +434,6 @@ def get_model_for_task(task: str) -> Dict[str, Optional[str]]:
         "max_prompt_tokens": _parse_int_setting(get_setting(p + "max_prompt_tokens")),
         "dimensions": _parse_int_setting(get_setting(p + "dimensions")),
     }
-
-
-# --- RLM mode (per-task LLM/RLM routing) ------------------------------------
-# Valid modes:
-#   "auto" - use RLM when the context is large (>= RLM_MIN_CHARS), else LLM
-#   "rlm"  - always use RLM (falls back to LLM on RLM failure)
-#   "llm"  - never use RLM; always use the standard LLM directly
-_RLM_MODES = ("auto", "rlm", "llm")
-_RLM_TASKS = ("docgen", "expert", "summary")
-
-
-def get_rlm_mode(task: str) -> str:
-    """Resolve the LLM/RLM routing mode for a task (docgen/expert/summary).
-
-    Returns one of ``auto`` / ``rlm`` / ``llm``. Reads ``rlm.<task>.mode`` from
-    the settings store, falling back to ``RLM_DEFAULT_MODE`` (default ``auto``).
-    If fast-rlm is not installed (``_FAST_RLM_AVAILABLE`` is False in
-    ``api.rlm.runner``), ALWAYS returns ``llm`` so callers never try RLM when
-    it cannot work — this is the "guaranteed operation" baseline.
-    """
-    # Check fast-rlm availability WITHOUT importing rlm.runner at module load
-    # (it imports fast_rlm lazily; we read its flag defensively).
-    try:
-        from api.rlm.runner import _FAST_RLM_AVAILABLE  # lazy; avoids circular import
-        if not _FAST_RLM_AVAILABLE:
-            return "llm"
-    except Exception:  # pragma: no cover - import-safe
-        # If we can't even import the flag, assume RLM is unavailable.
-        return "llm"
-    raw = get_setting(f"rlm.{task}.mode")
-    if raw and raw.strip().lower() in _RLM_MODES:
-        return raw.strip().lower()
-    env_default = os.environ.get("RLM_DEFAULT_MODE", "auto").strip().lower()
-    return env_default if env_default in _RLM_MODES else "auto"
-
-
-def get_all_rlm_modes() -> Dict[str, str]:
-    """Return the resolved RLM mode for every task (for the admin UI)."""
-    return {task: get_rlm_mode(task) for task in _RLM_TASKS}
 
 
 def get_git_creds(host: str) -> Dict[str, Optional[str]]:
@@ -464,16 +541,17 @@ def resolve_git_token(
 
 
 def get_confluence_creds() -> Dict[str, Optional[str]]:
-    """Resolve Confluence configuration: {mode, base_url, token, username, space, mcp_server, mcp_tool}."""
-    mode = get_setting("confluence.mode") or os.environ.get("CONFLUENCE_MODE", "direct")
+    """Resolve Confluence configuration: {base_url, token, username, space}.
+
+    (The former ``mode``/``mcp_server``/``mcp_tool`` keys were removed together
+    with the legacy hand-written MCP client — external MCP servers are now
+    managed by the Wave C MCP platform, see ``api/mcp/``.)
+    """
     return {
-        "mode": mode.lower().strip(),
         "base_url": get_setting("confluence.base_url") or os.environ.get("CONFLUENCE_BASE_URL"),
         "token": get_secret("confluence.token") or os.environ.get("CONFLUENCE_TOKEN"),
         "username": get_setting("confluence.username") or os.environ.get("CONFLUENCE_USERNAME"),
         "space": get_setting("confluence.space") or os.environ.get("CONFLUENCE_SPACE"),
-        "mcp_server": get_setting("confluence.mcp_server") or os.environ.get("CONFLUENCE_MCP_SERVER", "confluence"),
-        "mcp_tool": get_setting("confluence.mcp_tool") or os.environ.get("CONFLUENCE_MCP_TOOL"),
     }
 
 

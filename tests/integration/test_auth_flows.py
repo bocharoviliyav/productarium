@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib
 from datetime import datetime
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -18,8 +19,19 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 # The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
-# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee stubs for every
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY for every
 # test in this module. No per-module duplicate is needed here.
+
+
+@pytest.fixture(autouse=True)
+def _reset_login_rate_limits():
+    """Clear the in-process login rate limiter around each test (see
+    test_auth_router for rationale: shared TestClient IP vs 10/min default)."""
+    from api.utils.rate_limit import reset_rate_limits
+
+    reset_rate_limits()
+    yield
+    reset_rate_limits()
 
 
 def _setup_db():

@@ -31,7 +31,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 # The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
-# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee stubs for every
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY for every
 # test in this module. No per-module duplicate is needed here.
 
 
@@ -405,7 +405,7 @@ class TestPublicAskPush501:
                 "/api/public/products/prod_1/ask", json={"query": "hi"}
             )
             assert resp.status_code == 501
-            assert "Expert agent not available" in resp.json()["detail"]
+            assert "Expert agent is not available" in resp.json()["detail"]
         finally:
             self._restore("api.expert.chat", saved)
             _importlib.import_module("api.expert.chat")
@@ -427,7 +427,7 @@ class TestPublicAskPush501:
                 json={"target": "confluence"},
             )
             assert resp.status_code == 501
-            assert "Integrations not available" in resp.json()["detail"]
+            assert "Integrations are not available" in resp.json()["detail"]
         finally:
             self._restore("api.integrations", saved)
             _importlib.import_module("api.integrations")

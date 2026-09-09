@@ -438,10 +438,52 @@ export function Modal({
   footer?: React.ReactNode;
   size?: "sm" | "md" | "lg" | "xl";
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const prevFocusRef = useRef<HTMLElement | null>(null);
+  // Callers routinely pass inline arrow callbacks, so `onClose` gets a new
+  // identity on every parent render. Keeping it in a ref lets the open
+  // effect below depend on [open] only — otherwise every parent state
+  // update (e.g. each keystroke in a modal form field) re-ran the effect
+  // and moved focus back to the first focusable element (the header close
+  // button), making typed input impossible (issue #1).
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
   useEffect(() => {
     if (!open) return;
+    const FOCUSABLE =
+      'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    // P2-30: move focus into the dialog on open, trap Tab inside it, and
+    // restore focus to the invoker element on close.
+    prevFocusRef.current = document.activeElement as HTMLElement | null;
+    const dialog = dialogRef.current;
+    if (dialog) {
+      const first = dialog.querySelector<HTMLElement>(FOCUSABLE);
+      (first ?? dialog).focus();
+    }
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        onCloseRef.current();
+        return;
+      }
+      if (e.key === "Tab" && dialogRef.current) {
+        const items = Array.from(
+          dialogRef.current.querySelectorAll<HTMLElement>(FOCUSABLE),
+        ).filter((el) => !el.hasAttribute("disabled"));
+        if (!items.length) return;
+        const first = items[0];
+        const last = items[items.length - 1];
+        const active = document.activeElement;
+        if (e.shiftKey && active === first) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && active === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
     };
     document.addEventListener("keydown", onKey);
     const prev = document.body.style.overflow;
@@ -449,8 +491,9 @@ export function Modal({
     return () => {
       document.removeEventListener("keydown", onKey);
       document.body.style.overflow = prev;
+      prevFocusRef.current?.focus?.();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   // Render into document.body via a portal so the dialog escapes any ancestor
   // stacking context (e.g. the .reveal class used by <Reveal>, which keeps
@@ -471,10 +514,12 @@ export function Modal({
         aria-hidden
       />
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
+        tabIndex={-1}
         className={cn(
-          "relative my-auto flex max-h-[90vh] w-full flex-col rounded-xl border border-divider bg-surface shadow-[0_8px_40px_rgba(0,0,0,0.18)]",
+          "relative my-auto flex max-h-[90vh] w-full flex-col rounded-xl border border-divider bg-surface shadow-[0_8px_40px_rgba(0,0,0,0.18)] outline-none",
           widths[size],
         )}
       >

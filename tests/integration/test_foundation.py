@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 # The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
-# isolated SQLite DB + stable SETTINGS_SECRET_KEY + cognee stubs for every
+# isolated SQLite DB + stable SETTINGS_SECRET_KEY for every
 # test in this module. No per-module duplicate is needed here.
 
 
@@ -258,38 +258,6 @@ class TestAuthTokens:
     def test_cookie_name_is_productarium_session(self):
         mods = _reload_modules()
         assert mods["tokens"].SESSION_COOKIE_NAME == "productarium_session"
-
-
-# --- Cognee bug fix ----------------------------------------------------------
-class TestCogneeSkipConnectionTest:
-    def test_skip_defaulted_to_true(self):
-        """api.cognee sets COGNEE_SKIP_CONNECTION_TEST=true."""
-        import api.cognee as cm
-        assert os.environ.get("COGNEE_SKIP_CONNECTION_TEST", "").lower() in (
-            "1", "true", "t", "yes",
-        )
-
-    def test_cognee_module_importable(self):
-        """api.cognee must import even if cognee has issues."""
-        import api.cognee as cm
-        # _COGNEE_AVAILABLE is defined (True if cognee installed, False otherwise).
-        assert hasattr(cm, "_COGNEE_AVAILABLE")
-        assert isinstance(cm._COGNEE_AVAILABLE, bool)
-
-    def test_add_and_index_document_does_not_raise(self):
-        """add_and_index_document must never raise, even when DB/cognee is down."""
-        import asyncio
-        import api.cognee as cm
-        # Should return None on missing-cognee OR log+return None on cognee error.
-        result = asyncio.run(cm.add_and_index_document("text", "ds"))
-        assert result is None
-
-    def test_query_cognee_returns_empty_on_failure(self):
-        import asyncio
-        import api.cognee as cm
-        out = asyncio.run(cm.query_cognee("q", "ds"))
-        # Empty string on any failure (including unavailable cognee).
-        assert out == ""
 
 
 # --- Schemas -----------------------------------------------------------------
