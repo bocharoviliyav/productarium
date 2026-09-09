@@ -179,6 +179,25 @@ async def _gather_mcp_tools(
         return []
 
 
+def _gather_http_integration_tools(
+    product_id: str,
+    session_factory: Optional[Any] = None,
+) -> List[Any]:
+    """Best-effort HTTP-integration tools (never raises).
+
+    Wraps :func:`api.integrations.http_tools.build_http_integration_tools` —
+    every enabled integration registered in the admin panel becomes one
+    agent tool by (sanitized) name (issue #3).
+    """
+    try:
+        from api.integrations.http_tools import build_http_integration_tools
+
+        return build_http_integration_tools(product_id, session_factory=session_factory)
+    except Exception as e:
+        logger.debug("http integration tools unavailable for product %s: %s", product_id, e)
+        return []
+
+
 def _product_name_by_id(product_id: str) -> str:
     """Look up a product name from the DB; fall back to the id. Non-fatal."""
     try:
@@ -339,10 +358,11 @@ async def run_agent_chat_stream(
     # finally below so repeated /ask calls never leak connections.
     chat = _build_expert_chat_model(model)
     try:
-        # MCP tools of the product's enabled bindings — best-effort; the kwarg
-        # is only passed when non-empty so monkeypatched builders without it
-        # (tests) keep working.
+        # MCP tools of the product's enabled bindings + HTTP-integration
+        # tools — best-effort; the kwarg is only passed when non-empty so
+        # monkeypatched builders without it (tests) keep working.
         mcp_tools = await _gather_mcp_tools(product_id, session_factory)
+        mcp_tools = mcp_tools + _gather_http_integration_tools(product_id, session_factory)
         agent = build_expert_agent(
             product_id,
             model=model,
@@ -496,6 +516,7 @@ async def run_agent_doc(
         try:
             tools = build_expert_tools(product_id, session_factory=session_factory)
             tools = tools + await _gather_mcp_tools(product_id, session_factory)
+            tools = tools + _gather_http_integration_tools(product_id, session_factory)
             system_prompt = _build_agent_system_prompt(
                 _expert_prompt.EXPERT_DOC_PROMPT, _legacy_name(product_id)
             )

@@ -102,17 +102,16 @@
     "addDatabase": "Add database",
     "databaseName": "Database name",
     "databaseNamePlaceholder": "e.g. Payments primary PG",
-    "dsn": "DSN",
-    "dsnPlaceholder": "postgresql://user:password@host:5432/dbname",
-    "dsnHint": "The DSN is stored server-side and never shown back — only a masked form is displayed.",
-    "mcpServer": "MCP server",
-    "mcpServerNone": "None",
-    "mcpServerEmpty": "No MCP servers are bound to this product yet — bind one below so its tools can introspect the database.",
-    "mcpServerOff": "off",
+    "dsn": "Connection string (DSN)",
+    "dbType": "Database type",
+    "dsnOnceNote": "The connection string is sent once: it is verified with a real connection through the built-in MCP server and stored encrypted — it cannot be shown or changed afterwards.",
+    "dbChecking": "Checking connection…",
+    "dbPresetsFailed": "Failed to load database types — reload the page.",
+    "dbPresetPoweredBy": "Built-in MCP server:",
     "databasesCount": "{n} database(s)",
-    "dbEmptySubtitle": "Add a database to reverse-engineer its schema into documentation via MCP tools.",
+    "dbEmptySubtitle": "Add a database — the built-in MCP server reverse-engineers its schema into documentation.",
     "noDatabasesTitle": "No databases yet",
-    "noDatabasesDesc": "Add a database (name + connection DSN) and optionally bind an MCP server, then reverse-engineer its schema into documentation.",
+    "noDatabasesDesc": "Pick a database type, enter the connection string and a name — the connection is verified through the built-in MCP server, then the schema is reverse-engineered into documentation.",
     "reverseEngineer": "Reverse-engineer",
     "reverseEngineering": "Reverse-engineering…",
     "genProgress": "{done}/{total} · {section}",
@@ -171,7 +170,28 @@
       "allowlistManualHint": "Tool names, comma-separated. Leave empty to expose all tools (the tool list is only discoverable by admins).",
       "allowlistManualPlaceholder": "tool names, comma-separated (empty = all)",
       "updateFailedTitle": "Update failed",
-      "updateFailed": "Update failed"
+      "updateFailed": "Update failed",
+      "createServer": "Create new server",
+      "createTitle": "New MCP server",
+      "createAndAttach": "Create & attach",
+      "createdAttachedTitle": "Server created & attached",
+      "createdAttached": "“{name}” is now available to the expert agent.",
+      "createFailedTitle": "Create failed",
+      "createFailed": "Create failed",
+      "invalidKeyValue": "Invalid {label} line: {line}",
+      "nameLabel": "Name",
+      "namePlaceholder": "e.g. Context7 docs",
+      "transport": "Transport",
+      "transportHttp": "HTTP",
+      "transportSse": "SSE",
+      "transportStdio": "Stdio",
+      "url": "URL",
+      "command": "Command",
+      "args": "Arguments (comma-separated)",
+      "headers": "Headers (key=value per line)",
+      "env": "Environment (key=value per line)",
+      "enabledLabel": "Enabled",
+      "cancel": "Cancel"
     }
   },
   "specEditor": {
@@ -233,10 +253,6 @@
     "saveDocument": "Save document",
     "specEditTitle": "Edit specification",
     "linksEditTitle": "Edit links",
-    "askExpertTitle": "Ask expert",
-    "askExpertSubtitle": "Product-scoped Q&A over all artifacts is available on the product page. Ask about this codebase, spec, or links in context.",
-    "openExpertChat": "Open expert chat",
-    "expertBadge": "expert",
     "savedTitle": "Saved",
     "savedMessage": "Documentation updated and re-indexed.",
     "saveFailedTitle": "Save failed",
@@ -300,7 +316,14 @@
     "uploadNoMarkdownTitle": "Upload succeeded",
     "uploadNoMarkdown": "No markdown was returned.",
     "uploadFailedTitle": "Upload failed",
-    "loadFailedMessage": "Failed to load knowledge tree"
+    "loadFailedMessage": "Failed to load knowledge tree",
+    "modeTitle": "Title",
+    "modeConfluence": "Confluence page (URL)",
+    "confluenceUrlLabel": "Page URL",
+    "confluenceUrlPlaceholder": "https://confluence.example.com/wiki/spaces/TEAM/pages/123456/Page+Title",
+    "confluenceHint": "The page (with children and attachments) is pulled into the knowledge base. Requires a configured Confluence connector.",
+    "pull": "Pull",
+    "pullFailed": "Pull failed"
   },
   "verified": {
     "verified": "Verified",
@@ -405,7 +428,8 @@
       "memory": "Agent memory",
       "timeouts": "Timeouts",
       "users": "Users",
-      "tokens": "API tokens"
+      "tokens": "API tokens",
+      "publicapi": "Public API"
     },
     "loadFailedTitle": "Load failed",
     "loadFailed": "Load failed",
@@ -482,14 +506,45 @@
       "reachable": "Reachable"
     },
     "integrations": {
-      "intro": "Raw integrations config (JSON). Each key maps to a connector registered on the backend.",
+      "intro": "HTTP integrations: templated GET endpoints exposed to agents as named tools. Declare {placeholders} in the URL template; the agent fills them per product when calling the tool.",
+      "loading": "Loading integrations…",
+      "noIntegrations": "No HTTP integrations yet.",
+      "addIntegration": "Add integration",
+      "editIntegration": "Edit integration",
+      "name": "Name",
+      "namePlaceholder": "e.g. grafana-search",
+      "description": "Description",
+      "urlTemplate": "URL template",
+      "urlTemplatePlaceholder": "https://api.example.com/search?repo={product_name}",
+      "urlTemplateHint": "Use {product_name} or declared variables as {placeholders}.",
+      "headers": "Headers (key=value per line)",
+      "variables": "Variables",
+      "varName": "Name",
+      "varDescription": "Description",
+      "varDefault": "Default",
+      "addVariable": "Add variable",
+      "enabled": "Enabled",
       "save": "Save",
       "test": "Test",
-      "loading": "Loading…",
-      "savedToast": "Saved integrations config.",
-      "okTitle": "OK",
-      "ok": "OK",
-      "invalidJson": "Invalid JSON"
+      "testTitle": "Test",
+      "testOk": "Status {status}.",
+      "testFailed": "Request failed: {detail}",
+      "preview": "Body preview",
+      "createdToast": "Integration created.",
+      "savedToast": "Integration saved.",
+      "deletedToast": "Integration deleted",
+      "deleteConfirm": "Delete this HTTP integration?",
+      "secretsHint": "Header values are stored encrypted and shown masked. Type new key=value lines to replace them; leave empty to keep the stored values.",
+      "secretsStored": "stored",
+      "invalidKeyValue": "Invalid {label} line: {line}",
+      "toggleLabel": "Enable or disable this integration",
+      "tableHeaders": {
+        "name": "Name",
+        "url": "URL template",
+        "variables": "Variables",
+        "enabled": "Enabled",
+        "actions": "Actions"
+      }
     },
     "mcp": {
       "intro": "Global registry of external MCP servers (HTTP / stdio). Bind them per product to extend the expert agent with their tools. Inbound MCP access is served at /api/mcp with an API token.",
@@ -501,6 +556,7 @@
       "namePlaceholder": "e.g. Context7 docs",
       "transport": "Transport",
       "transportHttp": "HTTP",
+      "transportSse": "SSE",
       "transportStdio": "Stdio",
       "url": "URL",
       "command": "Command",
@@ -538,12 +594,23 @@
       }
     },
     "prompts": {
-      "intro": "Edit the markdown prompt templates in refs/prompts/*.md on the fly — changes take effect on the next generation run.",
+      "intro": "Edit the markdown prompt templates (refs/prompts/ru and refs/prompts/en) on the fly — changes take effect on the next generation run. When a translation is missing, the English original is shown; saving creates the copy in the selected language.",
+      "languageLabel": "Generation language",
+      "languageHint": "The language documentation is generated in. Applies on the next generation run; the prompts of that language are edited below.",
+      "langRu": "Русский",
+      "langEn": "English",
+      "languageSavedToast": "Generation language: {lang}.",
+      "editorLangLabel": "Editing",
+      "fallbackBadge": "EN original",
       "loadingList": "Loading prompts…",
       "loadingFile": "Loading file…",
       "noFiles": "No prompt files found.",
       "save": "Save",
       "savedToast": "Saved {file}."
+    },
+    "publicapi": {
+      "intro": "The current public OpenAPI schema of the Productarium API (read-only).",
+      "loading": "Loading schema…"
     },
     "embedder": {
       "title": "Embedder rate limits",
@@ -588,15 +655,19 @@
       "default": "default",
       "groups": {
         "LLM": "LLM",
+        "Expert": "Expert",
         "Memory": "Memory",
         "Integrations": "Integrations",
-        "Mermaid": "Mermaid"
+        "Mermaid": "Mermaid",
+        "Databases": "Databases"
       },
       "labels": {
         "llm_request": "LLM request timeout",
         "llm_retry_max_time": "LLM retry max time",
         "model_list": "Model list / existence check",
         "provider_test": "Provider connection test",
+        "docgen_map_concurrency": "Docgen map-phase parallel LLM calls",
+        "expert_stream": "Expert ask turn budget (wall-clock)",
         "docgen_indexing_drain": "Docgen indexing drain",
         "memory_query": "Memory semantic query (pgvector cosine)",
         "integration_http": "Integration HTTP request",
@@ -604,13 +675,17 @@
         "mcp_stdio_wait": "MCP stdio wait",
         "mermaid_verify": "Mermaid diagram verification",
         "mermaid_repair": "Mermaid diagram repair",
-        "mermaid_max_repair_attempts": "Mermaid max repair attempts"
+        "mermaid_max_repair_attempts": "Mermaid max repair attempts",
+        "mermaid_repair_deadline": "Mermaid repair loop budget",
+        "db_connect_check": "Database preset connection check (MCP handshake)"
       },
       "hints": {
         "llm_request": "HTTP timeout for OpenAI-compatible clients.",
         "llm_retry_max_time": "Backoff retry budget for transient LLM errors.",
         "model_list": "HTTP timeout for model listing and existence checks.",
         "provider_test": "Timeout for the admin panel connection test.",
+        "docgen_map_concurrency": "Max parallel LLM calls in the docgen MAP phase; 1 = strictly sequential.",
+        "expert_stream": "Budget for one expert ask. The turn runs as a detached background task and survives client disconnects, so minutes are normal; on expiry the partial answer is saved.",
         "docgen_indexing_drain": "How long a docgen worker waits for background memory indexing before finishing the job.",
         "memory_query": "pgvector cosine-recall query timeout (embed query + ORDER BY embedding <=> :q LIMIT k). On timeout the backend returns an empty string and the expert falls back to artifact docs.",
         "integration_http": "HTTP timeout for integration connectors.",
@@ -618,7 +693,9 @@
         "mcp_stdio_wait": "Timeout for .wait() on the MCP stdio subprocess.",
         "mermaid_verify": "Per-diagram verification timeout via the Node validator.",
         "mermaid_repair": "Per-LLM-call timeout for repairing one diagram.",
-        "mermaid_max_repair_attempts": "Repair attempt budget per unique diagram body."
+        "mermaid_max_repair_attempts": "Repair attempt budget per unique diagram body.",
+        "mermaid_repair_deadline": "Wall-clock budget for the whole repair drain of one page.",
+        "db_connect_check": "Budget for the full MCP handshake when adding a preset database (launcher spawn + initialize + tools/list + one probe tool call). Generous default — the docker-fallback launcher may pull the image on the very first check."
       }
     },
     "users": {
@@ -731,7 +808,12 @@
     "planning": "Planning…",
     "researching": "Researching…",
     "researchingTool": "Researching: {tool}…",
-    "synthesizing": "Synthesizing…"
+    "synthesizing": "Synthesizing…",
+    "expertTitle": "Expert",
+    "stillGenerating": "An answer is still generating — re-attached to it",
+    "deleteSession": "Delete chat",
+    "deleteSessionConfirm": "Delete this chat with its whole history?",
+    "deleteSessionFailed": "Failed to delete the chat"
   },
   "mermaid": {
     "clickToFullscreen": "Click to view fullscreen",

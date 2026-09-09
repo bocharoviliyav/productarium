@@ -27,6 +27,7 @@ from api.config.timeout import (
     get_timeout_resolved_view,
     resolve_docgen_indexing_drain_seconds,
     resolve_docgen_map_concurrency,
+    resolve_expert_stream_timeout,
     resolve_timeout,
     resolve_timeout_int,
     sync_timeout_env,
@@ -41,6 +42,7 @@ WRAPPER_TO_KEY = {
     "resolve_llm_retry_max_time": "llm_retry_max_time",
     "resolve_docgen_indexing_drain_seconds": "docgen_indexing_drain",
     "resolve_docgen_map_concurrency": "docgen_map_concurrency",
+    "resolve_expert_stream_timeout": "expert_stream",
     "resolve_memory_query_timeout": "memory_query",
     "resolve_model_list_timeout": "model_list",
     "resolve_integration_http_timeout": "integration_http",
@@ -238,6 +240,28 @@ class TestTimeoutConfig(unittest.TestCase):
         with _EnvGuard(env_vars, []):
             os.environ["DOCGEN_INDEXING_DRAIN_SECONDS"] = "1"
             self.assertEqual(resolve_docgen_indexing_drain_seconds(), 5.0)
+
+    # ------------------------------------------------------------------
+    # expert_stream (issue #9): wall-clock budget of one detached ask turn
+    # ------------------------------------------------------------------
+    def test_expert_stream_default_is_generous(self):
+        # Multi-minute answers are the norm for the detached expert turn —
+        # the default must stay at 1800s (30 min), not a per-request timeout.
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            self.assertEqual(resolve_expert_stream_timeout(), 1800.0)
+
+    def test_expert_stream_env_override(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["EXPERT_STREAM_TIMEOUT_SECONDS"] = "600"
+            self.assertEqual(resolve_expert_stream_timeout(), 600.0)
+
+    def test_expert_stream_floor_sixty_seconds(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["EXPERT_STREAM_TIMEOUT_SECONDS"] = "1"
+            self.assertEqual(resolve_expert_stream_timeout(), 60.0)
 
     # ------------------------------------------------------------------
     # sync_timeout_env exports admin-store overrides to env vars

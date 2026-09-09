@@ -10,6 +10,9 @@ Covers:
 - ``_base()`` — trailing slash + ``/wiki`` stripping.
 - ``_get`` / ``_get_bytes`` — HTTP error + non-JSON handling.
 - ``_pages_to_markdown`` — heading hierarchy + page_id comments.
+- ``_extract_page_id`` — URL → page id normalization (friendly /pages/{id}
+  URLs, ?pageId= query form, errors, passthrough) and ``pull()`` accepting a
+  full Confluence page URL (issue #6).
 
 All HTTP calls are mocked via monkeypatching ``requests.get`` or the
 connector's own ``_get`` / ``_get_bytes`` methods. ``convert_to_markdown``
@@ -563,6 +566,51 @@ class TestPagesToMarkdown:
 
 
 # ===========================================================================
+# _extract_page_id — URL → page id normalization (issue #6)
+# ===========================================================================
+class TestExtractPageId:
+    def _extract(self, source_id):
+        from api.integrations.confluence import ConfluenceConnector
+
+        return ConfluenceConnector._extract_page_id(source_id)
+
+    def test_numeric_passthrough(self):
+        assert self._extract("12345") == "12345"
+
+    def test_numeric_strips_whitespace(self):
+        assert self._extract("  678  ") == "678"
+
+    def test_friendly_url_with_title(self):
+        url = "https://confluence.example.com/wiki/spaces/TEAM/pages/12345/My+Page"
+        assert self._extract(url) == "12345"
+
+    def test_friendly_url_bare_pages_path(self):
+        assert self._extract("https://host.example.com/pages/77") == "77"
+
+    def test_relative_url_supported(self):
+        assert self._extract("/wiki/spaces/KEY/pages/9") == "9"
+
+    def test_pageid_query_param(self):
+        # Server/DC viewpage URLs carry the id as ?pageId=...
+        assert self._extract("https://host/pages/viewpage.action?pageId=9999") == "9999"
+
+    def test_query_param_wins_over_path(self):
+        assert self._extract("/pages/5?pageId=9") == "9"
+
+    def test_url_without_id_raises(self):
+        with pytest.raises(ValueError, match="page id"):
+            self._extract("https://host.example.com/wiki/spaces/KEY")
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match="empty"):
+            self._extract("   ")
+
+    def test_non_numeric_non_url_passthrough(self):
+        # Legacy string ids pass through verbatim.
+        assert self._extract("ENG-legacy-id") == "ENG-legacy-id"
+
+
+# ===========================================================================
 # pull() — direct mode
 # ===========================================================================
 class TestConfluencePull:
@@ -679,3 +727,32 @@ class TestConfluencePull:
         result = c.pull("1")
         assert len(result["attachments"]) == 1
         assert result["attachments"][0]["markdown"] == "md-doc.pdf"
+
+    def test_pull_by_url_extracts_page_id(self, monkeypatch):
+        """pull() accepts a full Confluence URL and fetches that page (issue #6)."""
+        c = _connector()
+        urls: List[str] = []
+
+        def _get(url, **kw):
+            urls.append(url)
+            return _FakeResp(
+                200,
+                text='{"id":"100","title":"My Page","body":{"value":"<p>hi</p>"}}',
+                headers={"content-type": "application/json"},
+                json_data={"id": "100", "title": "My Page", "body": {"value": "<p>hi</p>"}},
+            )
+
+        monkeypatch.setattr("requests.get", _get)
+        result = c.pull(
+            "https://confluence.example.com/wiki/spaces/TEAM/pages/100/Title"
+        )
+        assert result["page_id"] == "100"
+        assert result["title"] == "My Page"
+        # The page was fetched by its extracted numeric id, not the raw URL.
+        assert urls[0].endswith("/wiki/api/v2/pages/100")
+
+    def test_pull_by_url_without_id_raises(self):
+        """A URL with no recognizable page id fails fast with a clear error."""
+        c = _connector()
+        with pytest.raises(ValueError, match="page id"):
+            c.pull("https://confluence.example.com/wiki/spaces/TEAM")

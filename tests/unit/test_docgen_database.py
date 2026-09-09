@@ -8,7 +8,8 @@ Covers:
 - ``_classify_introspection_tools`` (name-token heuristics).
 - ``_parse_names`` (JSON / dict shapes / quoted fallback / ERROR results).
 - ``_build_tool_args`` + ``_tool_arg_names`` ((schema, table) mapping).
-- ``_call_tool`` (dict→JSON, exceptions, timeout, result cap).
+- ``_call_tool`` (dict→JSON, content-block envelope unwrapping, exceptions,
+  timeout, result cap).
 - ``_render_skeleton`` (overview / schemas / tables).
 - ``_introspect`` (schemas → tables → definitions walk).
 - ``_tools_for_pinned_server`` (binding/allowlist/unreachable rules).
@@ -99,7 +100,7 @@ def _fake_entity(**overrides):
     entity = SimpleNamespace(
         id="db_1",
         name="Main DB",
-        dsn_masked="postgresql://app:***REDACTED***@db:5432/prod",
+        dsn_masked="postgresql://***REDACTED***@db:5432/prod",
         mcp_server_id=None,
         generated_docs=None,
         pages=None,
@@ -148,13 +149,17 @@ class TestMaskDsn:
         from api.docgen.verification import mask_dsn
 
         masked = mask_dsn("postgresql://app:hunter2@db:5432/prod")
-        assert masked == "postgresql://app:***REDACTED***@db:5432/prod"
+        assert masked == "postgresql://***REDACTED***@db:5432/prod"
         assert "hunter2" not in masked
+        assert "app" not in masked.replace("postgresql", "")  # user gone too
 
-    def test_user_without_password_kept(self):
+    def test_user_without_password_masked(self):
+        # The whole userinfo (user AND password) is the credential pair.
         from api.docgen.verification import mask_dsn
 
-        assert mask_dsn("oracle://app@db:1521/orcl") == "oracle://app@db:1521/orcl"
+        assert mask_dsn("oracle://app@db:1521/orcl") == (
+            "oracle://***REDACTED***@db:1521/orcl"
+        )
 
     def test_secret_query_param_masked(self):
         from api.docgen.verification import mask_dsn
@@ -192,7 +197,7 @@ class TestMaskDsn:
         from api.docgen.verification import mask_dsn
 
         masked = mask_dsn("postgresql://app:pa/ss/w0rd@db:5432/prod")
-        assert masked == "postgresql://app:***REDACTED***@db:5432/prod"
+        assert masked == "postgresql://***REDACTED***@db:5432/prod"
         assert "pa/ss" not in masked
 
     def test_password_with_at_masked(self):
@@ -201,7 +206,7 @@ class TestMaskDsn:
         from api.docgen.verification import mask_dsn
 
         masked = mask_dsn("postgresql://app:p@ssw0rd@db:5432/prod")
-        assert masked == "postgresql://app:***REDACTED***@db:5432/prod"
+        assert masked == "postgresql://***REDACTED***@db:5432/prod"
         assert "p@ssw0rd" not in masked
 
     def test_passwordless_url_dsn_unchanged(self):
@@ -210,7 +215,23 @@ class TestMaskDsn:
         from api.docgen.verification import mask_dsn
 
         assert mask_dsn("postgres://localhost:5432/db") == "postgres://localhost:5432/db"
-        assert mask_dsn("postgres://app@host/db") == "postgres://app@host/db"
+
+    def test_ezconnect_masked(self):
+        # Oracle EZConnect (scheme-less) used to fall through to the generic
+        # rules and could be stored RAW.
+        from api.docgen.verification import mask_dsn
+
+        assert mask_dsn("scott/tiger@//db-host:1521/XEPDB1") == (
+            "***REDACTED***@//db-host:1521/XEPDB1"
+        )
+        assert mask_dsn("scott/tiger@PROD_TNS") == "***REDACTED***@PROD_TNS"
+
+    def test_kv_dsn_without_at_not_ezconnect(self):
+        # A key/value DSN without '@' must keep the kv masking path.
+        from api.docgen.verification import mask_dsn
+
+        masked = mask_dsn("host=db password=hunter2 dbname=prod")
+        assert "hunter2" not in masked
 
     def test_ambiguous_multi_at_userinfo_masks_credentials(self):
         # Multiple '@' with no ':' separator: ambiguous userinfo — the whole
@@ -367,6 +388,246 @@ class TestClassifyTools:
 
 
 # ============================================================================
+# preset adapters (dbhub search_objects / oracle-mcp-server)
+# ===========================================================================
+class TestPresetAdapters:
+    def _dbhub_tools(self):
+        so = FakeTool(
+            "search_objects",
+            {"object_type": {}, "pattern": {}, "schema": {}, "detail_level": {}},
+            lambda a: json.dumps({
+                "object_type": "schema",
+                "count": 1,
+                "results": [{"name": "public", "schema": "public"}],
+            }) if a.get("object_type") == "schema" else json.dumps({
+                "count": 1,
+                "results": [{
+                    "name": a.get("pattern"), "schema": a.get("schema"),
+                    "column_count": 1, "row_count": 7,
+                    "columns": [{"name": "id", "type": "integer", "nullable": False}],
+                    "indexes": [{"name": "pk", "columns": ["id"], "unique": True, "primary": True}],
+                }],
+            }) if a.get("detail_level") == "full" else json.dumps({
+                "count": 1,
+                "results": [{"name": "users", "schema": "public"}],
+            }),
+        )
+        return [FakeTool("execute_sql", {"sql": {}}), so], so
+
+    def test_dbhub_roles_detected(self):
+        tools, _ = self._dbhub_tools()
+        roles = db_doc_mod.preset_adapter_roles(tools, db_type="postgresql")
+        assert roles is not None
+        assert roles["ddl"] == []
+        assert [t.name for t in roles["schemas"]] == ["search_objects[schemas]"]
+
+    def test_dbhub_walk_end_to_end(self):
+        tools, so = self._dbhub_tools()
+        roles = db_doc_mod.preset_adapter_roles(tools)
+        info = asyncio.run(db_doc_mod._introspect(roles))
+        assert info["schemas"] == ["public"]
+        assert list(info["tables"]) == ["public.users"]
+        assert "| id | integer | NO | - |" in info["tables"]["public.users"]["definition"]
+        assert "index pk (id) UNIQUE PRIMARY" in info["tables"]["public.users"]["definition"]
+        # The listing went through search_objects with the right payload.
+        assert {
+            "object_type": "table", "detail_level": "names",
+            "limit": db_doc_mod._SEARCH_OBJECTS_LIMIT, "schema": "public",
+        } in so.calls
+
+    def test_oracle_roles_detected_and_walked(self):
+        search = FakeTool(
+            "search_tables_schema", {"pattern": {}},
+            lambda a: json.dumps({
+                "tables": [{"table_name": "EMPLOYEES"}, {"table_name": "DEPARTMENTS"}],
+            }) if (a.get("pattern") == "%") else json.dumps({
+                "tables": [{"table_name": a.get("table_name"), "columns": "ID NUMBER"}],
+            }),
+        )
+        lookup = FakeTool(
+            "get_table_schema", {"table_name": {}},
+            lambda a: f"TABLE {a.get('table_name')}: ID NUMBER NOT NULL",
+        )
+        roles = db_doc_mod.preset_adapter_roles(
+            [FakeTool("get_database_vendor_info"), search, lookup], db_type="oracle"
+        )
+        assert roles is not None and roles["schemas"] == []
+        info = asyncio.run(db_doc_mod._introspect(roles))
+        assert info["schemas"] == []
+        assert set(info["tables"]) == {"EMPLOYEES", "DEPARTMENTS"}
+        assert "ID NUMBER NOT NULL" in info["tables"]["EMPLOYEES"]["definition"]
+        # Pattern listing + per-table lookup, arg names mapped at runtime.
+        assert {"pattern": "%"} in search.calls
+        assert {"table_name": "EMPLOYEES"} in lookup.calls
+
+    def test_oracle_describe_falls_back_to_search(self):
+        search = FakeTool(
+            "search_tables_schema", {"pattern": {}},
+            lambda a: json.dumps([{"table_name": "EMP"}]) if a.get("pattern") == "%" else json.dumps([{"table_name": "EMP", "columns": "ID"}]),
+        )
+        roles = db_doc_mod.preset_adapter_roles([search])
+        info = asyncio.run(db_doc_mod._introspect(roles))
+        assert {"pattern": "EMP"} in search.calls
+        assert info["tables"]["EMP"]["definition"]
+
+    def test_unknown_surface_returns_none(self):
+        assert db_doc_mod.preset_adapter_roles(
+            [FakeTool("execute_query"), FakeTool("health_check")], None
+        ) is None
+        assert db_doc_mod.preset_adapter_roles([], "postgresql") is None
+
+    def test_oracle_wins_over_dbhub_when_both_bound(self):
+        tools, _ = self._dbhub_tools()
+        tools.append(FakeTool("search_tables_schema", {"pattern": {}}))
+        roles = db_doc_mod.preset_adapter_roles(tools)
+        assert roles is not None
+        assert roles["tables"][0].name.startswith("search_tables_schema")
+
+    def test_render_search_full_passthrough_on_garbage(self):
+        assert db_doc_mod._render_search_full("not json") == "not json"
+        assert db_doc_mod._render_search_full("") == ""
+
+
+# ============================================================================
+# dbhub REAL result shapes (probed against @bytebase/dbhub 1.2.3 over a live
+# Postgres): the tool result arrives wrapped in MCP content blocks whose
+# ``text`` holds {"success": true, "data": {"results": [...]}}.
+# ============================================================================
+_DBHUB_SCHEMA_ENVELOPE = json.dumps({
+    "success": True,
+    "data": {
+        "object_type": "schema", "pattern": "%", "detail_level": "names",
+        "count": 1, "results": [{"name": "public"}], "truncated": False,
+    },
+})
+_DBHUB_TABLES_ENVELOPE = json.dumps({
+    "success": True,
+    "data": {
+        "object_type": "table", "pattern": "%", "detail_level": "names",
+        "count": 2,
+        "results": [
+            {"name": "Entity_name", "schema": "public"},
+            {"name": "EdgeType_name", "schema": "public"},
+        ],
+        "truncated": False,
+    },
+})
+_DBHUB_FULL_ENVELOPE = json.dumps({
+    "success": True,
+    "data": {
+        "object_type": "table", "pattern": "Entity_name",
+        "detail_level": "full", "count": 1,
+        "results": [{
+            "name": "Entity_name", "schema": "public",
+            "column_count": 2, "row_count": None,
+            "columns": [
+                {"name": "id", "type": "uuid", "nullable": False, "default": None},
+                {"name": "payload", "type": "json", "nullable": True, "default": None},
+            ],
+            "indexes": [{
+                "name": "Entity_name_pkey", "columns": "{id}",
+                "unique": True, "primary": True,
+            }],
+        }],
+        "truncated": False,
+    },
+})
+
+
+def _langchain_blocks(payload: str):
+    """What ``tool.ainvoke`` returns for dbhub: a content-block list."""
+    return [{
+        "type": "text",
+        "text": payload,
+        "id": "lc_0f2fccb8-245b-450a-8ba8-efdb5bca71bd",
+    }]
+
+
+def _call_tool_result(payload: str):
+    """What ``session.call_tool`` returns: a CallToolResult-like object."""
+    return SimpleNamespace(
+        content=[SimpleNamespace(type="text", text=payload, annotations=None, meta=None)],
+        isError=False,
+    )
+
+
+class TestDbhubRealShapes:
+    def _tools(self):
+        so = FakeTool(
+            "search_objects",
+            {"object_type": {}, "pattern": {}, "schema": {}, "detail_level": {}},
+            lambda a: (
+                _langchain_blocks(_DBHUB_SCHEMA_ENVELOPE)
+                if a.get("object_type") == "schema"
+                else _langchain_blocks(_DBHUB_FULL_ENVELOPE)
+                if a.get("detail_level") == "full"
+                else _langchain_blocks(_DBHUB_TABLES_ENVELOPE)
+            ),
+        )
+        return [FakeTool("execute_sql", {"sql": {}}), so], so
+
+    def test_walk_through_content_block_envelopes(self):
+        """Regression: the walk must reach the inner JSON, never shred the
+        envelope into fake "schemas" (type/text/{…}/id/lc_…)."""
+        tools, _ = self._tools()
+        roles = db_doc_mod.preset_adapter_roles(tools, db_type="postgresql")
+        info = asyncio.run(db_doc_mod._introspect(roles))
+        assert info["schemas"] == ["public"]
+        assert list(info["tables"]) == [
+            "public.Entity_name", "public.EdgeType_name",
+        ]
+        definition = info["tables"]["public.Entity_name"]["definition"]
+        assert "| id | uuid | NO | - |" in definition
+        assert "| payload | json | YES | - |" in definition
+        # Postgres index columns arrive as the array literal "{id}".
+        assert "index Entity_name_pkey (id) UNIQUE PRIMARY" in definition
+        # The envelope itself must be gone from the rendered definition.
+        assert "lc_0f2fccb8" not in definition
+        assert "success" not in definition
+
+    def test_call_tool_result_object_unwrapped(self):
+        tool = FakeTool("t", responses=_call_tool_result(_DBHUB_SCHEMA_ENVELOPE))
+        out = asyncio.run(db_doc_mod._call_tool(tool, {}))
+        assert db_doc_mod._parse_names(out, "schemas", "databases") == ["public"]
+
+    def test_toolmessage_like_wrapper_unwrapped(self):
+        wrapped = SimpleNamespace(content=_langchain_blocks(_DBHUB_TABLES_ENVELOPE))
+        tool = FakeTool("t", responses=wrapped)
+        out = asyncio.run(db_doc_mod._call_tool(tool, {}))
+        assert db_doc_mod._parse_names(out, "tables", "results", "rows") == [
+            "Entity_name", "EdgeType_name",
+        ]
+
+    def test_multi_block_results_joined(self):
+        blocks = _langchain_blocks('["public"]') + [{
+            "type": "text", "text": '["extra"]', "id": "lc_2",
+        }]
+        tool = FakeTool("t", responses=blocks)
+        out = asyncio.run(db_doc_mod._call_tool(tool, {}))
+        assert db_doc_mod._parse_names(out) == ["public", "extra"]
+
+    def test_unextractable_result_falls_back_to_string(self):
+        # An object with no .content/.text and no dict shape keeps the old
+        # json.dumps(default=str) fallback (str-repr), never crashes.
+        tool = FakeTool("t", responses=SimpleNamespace(payload=1))
+        out = asyncio.run(db_doc_mod._call_tool(tool, {}))
+        assert "payload=1" in out
+
+    def test_parse_names_dbhub_envelope_nested_results(self):
+        assert db_doc_mod._parse_names(
+            _DBHUB_SCHEMA_ENVELOPE, "schemas", "databases"
+        ) == ["public"]
+        assert db_doc_mod._parse_names(
+            _DBHUB_TABLES_ENVELOPE, "tables", "results", "rows"
+        ) == ["Entity_name", "EdgeType_name"]
+
+    def test_render_search_full_unwraps_envelope(self):
+        rendered = db_doc_mod._render_search_full(_DBHUB_FULL_ENVELOPE)
+        assert "table Entity_name (public) — 2 columns" in rendered
+        assert "success" not in rendered
+
+
+# ============================================================================
 # _parse_names
 # ============================================================================
 class TestParseNames:
@@ -515,7 +776,7 @@ class TestRenderSkeleton:
         }
         overview, schema_md, tables_md = db_doc_mod._render_skeleton(entity, info)
         assert "# Database: Main DB" in overview
-        assert "postgresql://app:***REDACTED***@db:5432/prod" in overview
+        assert "postgresql://***REDACTED***@db:5432/prod" in overview
         assert "**Tables introspected:** 2" in overview
         assert "`public` — 2 table(s)" in schema_md
         assert "### `public.users`" in tables_md

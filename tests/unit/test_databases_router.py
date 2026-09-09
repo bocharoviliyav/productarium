@@ -39,7 +39,7 @@ from tests.conftest import build_test_client
 
 
 RAW_DSN = "postgresql://app:sup3rs3cret@db.internal:5432/prod"
-MASKED_DSN = "postgresql://app:***REDACTED***@db.internal:5432/prod"
+MASKED_DSN = "postgresql://***REDACTED***@db.internal:5432/prod"
 
 
 # --------------------------------------------------------------------------- #
@@ -179,7 +179,7 @@ class TestAddDatabase:
         r = client.post("/api/products/prod_1/databases", json=payload)
         assert r.status_code == 200
         assert r.json()["databases"][0]["dsn_masked"] == (
-            "postgresql://app:***REDACTED***@db/x"
+            "postgresql://***REDACTED***@db/x"
         )
 
     def test_add_passwordless_dsn_not_500(self, isolated_db):
@@ -204,7 +204,7 @@ class TestAddDatabase:
         )
         assert r.status_code == 200
         assert r.json()["databases"][0]["dsn_masked"] == (
-            "postgresql://app:***REDACTED***@db:5432/prod"
+            "postgresql://***REDACTED***@db:5432/prod"
         )
         assert "p@ss/w0rd" not in r.text
 
@@ -404,7 +404,7 @@ class TestUpdateDatabaseMeta:
         )
         assert r.status_code == 200
         db = r.json()["databases"][0]
-        assert db["dsn_masked"] == "postgresql://app:***REDACTED***@other:5432/other"
+        assert db["dsn_masked"] == "postgresql://***REDACTED***@other:5432/other"
         assert "newpass" not in r.text
 
     def test_update_dsn_empty_clears(self, isolated_db):
@@ -426,7 +426,7 @@ class TestUpdateDatabaseMeta:
             json={"dsn": "postgres://app@host:5432/db"},
         )
         assert r.status_code == 200
-        assert r.json()["databases"][0]["dsn_masked"] == "postgres://app@host:5432/db"
+        assert r.json()["databases"][0]["dsn_masked"] == "postgres://***REDACTED***@host:5432/db"
 
     def test_update_pin_valid(self, isolated_db):
         _seed_product(isolated_db)
@@ -552,7 +552,11 @@ class TestGenerateDatabaseDocs:
         assert calls[0]["entity_type"] == "database"
         assert calls[0]["entity_id"] == "db_1"
         assert calls[0]["product_id"] == "prod_1"
-        assert calls[0]["language"] == "ru"
+        # ``language`` is a deprecated no-op request field: when not sent, the
+        # router forwards None and the WORKER resolves the effective language
+        # from the admin ``generation.language`` setting at job start
+        # (api.docgen.jobs._run_docgen_job_async).
+        assert calls[0]["language"] is None
 
         # The status endpoint mirrors the codebases contract.
         s = client.get(
@@ -640,3 +644,314 @@ class TestGenerateDatabaseDocs:
             params={"job_id": job_id},
         )
         assert r.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Preset flow (db_type: validate -> real MCP check -> server+binding+DB)
+# --------------------------------------------------------------------------- #
+PRESET_DSN = "postgresql://app:hunter2@db.internal:5432/prod"
+ORACLE_PRESET_DSN = "app/orapw@db.internal:1521/XEPDB1"
+
+
+def _preset_payload(dbid: str = "dbp_1", db_type: str = "postgresql",
+                    dsn: str = PRESET_DSN, **overrides) -> dict:
+    payload = {
+        "id": dbid,
+        "name": "Preset DB",
+        "db_type": db_type,
+        "dsn": dsn,
+        "source": "manual",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _mock_preset_ok(monkeypatch, error: Optional[BaseException] = None):
+    """Stub the REAL MCP connection check + launcher choice (hermetic).
+
+    Returns the list of (preset_key, dsn) pairs the check received."""
+    from api.mcp.presets import Launcher
+
+    calls = []
+
+    async def fake_check(spec, dsn):
+        calls.append((spec.key, dsn))
+        if error is not None:
+            raise error
+        return {"server_name": spec.server_name, "tools": [spec.probe_tool]}
+
+    monkeypatch.setattr(databases_router_module, "check_preset_connection", fake_check)
+    monkeypatch.setattr(
+        databases_router_module,
+        "choose_launcher",
+        lambda spec, dsn: Launcher("baked", "dbhub", ("--transport", "stdio")),
+    )
+    return calls
+
+
+class TestAddPresetDatabase:
+    def test_preset_add_creates_server_binding_and_db(self, isolated_db, monkeypatch):
+        from api.mcp.secrets import decrypt_secret_dict
+
+        _seed_product(isolated_db)
+        calls = _mock_preset_ok(monkeypatch)
+        app, client = _make_client(isolated_db)
+
+        r = client.post(
+            "/api/products/prod_1/databases", json=_preset_payload()
+        )
+        assert r.status_code == 200, r.text
+        # The check ran with the validated DSN.
+        assert calls == [("postgresql", PRESET_DSN)]
+
+        # Response: preset row, NO DSN anywhere (raw or masked).
+        db = r.json()["databases"][0]
+        assert db["db_type"] == "postgresql"
+        assert db["dsn_masked"] is None
+        assert db["source"] == "preset"
+        assert "hunter2" not in r.text
+
+        with isolated_db.SessionLocal() as s:
+            row = s.get(DatabaseORM, "dbp_1")
+            assert row is not None
+            assert row.db_type == "postgresql"
+            assert row.dsn_masked is None
+            assert row.source == "preset"
+            assert row.mcp_server_id
+
+            server = s.get(McpServerORM, row.mcp_server_id)
+            assert server is not None
+            assert server.name == "preset-postgresql-dbp_1"
+            assert server.preset_key == "postgresql"
+            assert server.transport == "stdio"
+            assert server.command == "dbhub"
+            assert server.args == ["--transport", "stdio"]
+            assert server.enabled is True
+            assert server.status == "ok"
+            assert server.status_checked_at is not None
+            # The DSN lives ONLY in the Fernet-encrypted env ciphertext.
+            assert "hunter2" not in (server.env or "")
+            stored_env = decrypt_secret_dict(server.env)
+            assert stored_env.get("DSN") == PRESET_DSN
+            assert stored_env.get("READONLY") == "true"
+
+            binding = (
+                s.query(ProductMcpServerORM)
+                .filter_by(product_id="prod_1", mcp_server_id=server.id)
+                .one_or_none()
+            )
+            assert binding is not None and binding.enabled is True
+
+    def test_preset_add_oracle(self, isolated_db, monkeypatch):
+        _seed_product(isolated_db)
+        _mock_preset_ok(monkeypatch)
+        app, client = _make_client(isolated_db)
+        r = client.post(
+            "/api/products/prod_1/databases",
+            json=_preset_payload(db_type="oracle", dsn=ORACLE_PRESET_DSN),
+        )
+        assert r.status_code == 200, r.text
+        db = r.json()["databases"][0]
+        assert db["db_type"] == "oracle"
+        assert db["dsn_masked"] is None
+        assert "orapw" not in r.text
+
+    def test_preset_add_unknown_type_400(self, isolated_db, monkeypatch):
+        _seed_product(isolated_db)
+        calls = _mock_preset_ok(monkeypatch)
+        app, client = _make_client(isolated_db)
+        r = client.post(
+            "/api/products/prod_1/databases",
+            json=_preset_payload(db_type="neo4j"),
+        )
+        assert r.status_code == 400
+        assert "Unknown database type" in r.json()["detail"]
+        assert calls == []
+        with isolated_db.SessionLocal() as s:
+            assert s.query(DatabaseORM).count() == 0
+
+    def test_preset_add_invalid_dsn_400_no_rows(self, isolated_db, monkeypatch):
+        _seed_product(isolated_db)
+        calls = _mock_preset_ok(monkeypatch)
+        app, client = _make_client(isolated_db)
+        r = client.post(
+            "/api/products/prod_1/databases",
+            json=_preset_payload(dsn="mysql://app:pw@db:3306/x"),
+        )
+        assert r.status_code == 400
+        assert calls == []  # validation rejects BEFORE the connection check
+        with isolated_db.SessionLocal() as s:
+            assert s.query(DatabaseORM).count() == 0
+            assert s.query(McpServerORM).count() == 0
+
+    def test_preset_add_connection_check_failed_400_no_rows(
+        self, isolated_db, monkeypatch
+    ):
+        from api.mcp.presets import PresetConnectionError
+
+        _seed_product(isolated_db)
+        _mock_preset_ok(
+            monkeypatch,
+            error=PresetConnectionError("Connection check failed (RuntimeError: boom)"),
+        )
+        app, client = _make_client(isolated_db)
+        r = client.post(
+            "/api/products/prod_1/databases", json=_preset_payload()
+        )
+        assert r.status_code == 400
+        assert "Connection check failed" in r.json()["detail"]
+        assert "hunter2" not in r.text
+        with isolated_db.SessionLocal() as s:
+            assert s.query(DatabaseORM).count() == 0
+            assert s.query(McpServerORM).count() == 0
+            assert s.query(ProductMcpServerORM).count() == 0
+
+    def test_preset_add_missing_product_404(self, isolated_db, monkeypatch):
+        _mock_preset_ok(monkeypatch)
+        app, client = _make_client(isolated_db)
+        r = client.post(
+            "/api/products/missing/databases", json=_preset_payload()
+        )
+        assert r.status_code == 404
+
+    def test_preset_repost_same_id_replaces_server(self, isolated_db, monkeypatch):
+        _seed_product(isolated_db)
+        _mock_preset_ok(monkeypatch)
+        app, client = _make_client(isolated_db)
+        r1 = client.post(
+            "/api/products/prod_1/databases", json=_preset_payload()
+        )
+        assert r1.status_code == 200
+        r2 = client.post(
+            "/api/products/prod_1/databases",
+            json=_preset_payload(dsn="postgresql://app:newpw@db.internal:5432/prod"),
+        )
+        assert r2.status_code == 200, r2.text
+        body = r2.json()
+        assert len(body["databases"]) == 1
+        assert "newpw" not in r2.text
+        with isolated_db.SessionLocal() as s:
+            assert s.query(DatabaseORM).filter_by(id="dbp_1").count() == 1
+            # Exactly one dedicated server row remains (the old one dropped).
+            servers = (
+                s.query(McpServerORM).filter_by(preset_key="postgresql").all()
+            )
+            assert len(servers) == 1
+            bindings = (
+                s.query(ProductMcpServerORM)
+                .filter_by(mcp_server_id=servers[0].id)
+                .all()
+            )
+            assert len(bindings) == 1
+
+    def test_legacy_add_skips_connection_check(self, isolated_db, monkeypatch):
+        _seed_product(isolated_db)
+        calls = _mock_preset_ok(monkeypatch)
+        app, client = _make_client(isolated_db)
+        r = client.post(
+            "/api/products/prod_1/databases", json=_database_payload()
+        )
+        assert r.status_code == 200
+        assert calls == []  # the legacy (no db_type) flow never spawns MCP
+
+
+class TestPresetDatabaseUpdates:
+    def _add_preset(self, isolated_db, monkeypatch, client):
+        _mock_preset_ok(monkeypatch)
+        r = client.post(
+            "/api/products/prod_1/databases", json=_preset_payload()
+        )
+        assert r.status_code == 200, r.text
+
+    def test_put_dsn_rejected_400(self, isolated_db, monkeypatch):
+        _seed_product(isolated_db)
+        app, client = _make_client(isolated_db)
+        self._add_preset(isolated_db, monkeypatch, client)
+        r = client.put(
+            "/api/products/prod_1/databases/dbp_1",
+            json={"dsn": "postgresql://x:y@h/db"},
+        )
+        assert r.status_code == 400
+        assert "immutable" in r.json()["detail"]
+
+    def test_put_mcp_pin_rejected_400(self, isolated_db, monkeypatch):
+        _seed_product(isolated_db)
+        app, client = _make_client(isolated_db)
+        self._add_preset(isolated_db, monkeypatch, client)
+        r = client.put(
+            "/api/products/prod_1/databases/dbp_1",
+            json={"mcp_server_id": "mcp_9"},
+        )
+        assert r.status_code == 400
+        assert "immutable" in r.json()["detail"]
+
+    def test_put_name_still_allowed(self, isolated_db, monkeypatch):
+        _seed_product(isolated_db)
+        app, client = _make_client(isolated_db)
+        self._add_preset(isolated_db, monkeypatch, client)
+        r = client.put(
+            "/api/products/prod_1/databases/dbp_1",
+            json={"name": "Renamed"},
+        )
+        assert r.status_code == 200
+        assert r.json()["databases"][0]["name"] == "Renamed"
+
+    def test_put_doc_edit_still_allowed(self, isolated_db, monkeypatch):
+        _seed_product(isolated_db)
+        _disable_reindex(monkeypatch)
+        app, client = _make_client(isolated_db)
+        self._add_preset(isolated_db, monkeypatch, client)
+        r = client.put(
+            "/api/products/prod_1/databases/dbp_1",
+            json={"generated_docs": "# hello"},
+        )
+        assert r.status_code == 200
+        assert r.json()["databases"][0]["generated_docs"] == "# hello"
+
+    def test_legacy_dsn_put_still_works(self, isolated_db, monkeypatch):
+        """The immutability guard must not touch LEGACY (non-preset) rows."""
+        _seed_product(isolated_db)
+        _seed_database(isolated_db)
+        app, client = _make_client(isolated_db)
+        r = client.put(
+            "/api/products/prod_1/databases/db_1",
+            json={"dsn": "postgresql://app:next@db.internal:5432/prod"},
+        )
+        assert r.status_code == 200
+
+
+class TestPresetDatabaseDelete:
+    def test_delete_drops_dedicated_server_and_binding(self, isolated_db, monkeypatch):
+        _seed_product(isolated_db)
+        _mock_preset_ok(monkeypatch)
+        app, client = _make_client(isolated_db)
+        r = client.post(
+            "/api/products/prod_1/databases", json=_preset_payload()
+        )
+        assert r.status_code == 200
+        with isolated_db.SessionLocal() as s:
+            server_id = s.get(DatabaseORM, "dbp_1").mcp_server_id
+
+        r = client.delete("/api/products/prod_1/databases/dbp_1")
+        assert r.status_code == 200
+        assert r.json()["databases"] == []
+        with isolated_db.SessionLocal() as s:
+            assert s.get(DatabaseORM, "dbp_1") is None
+            assert s.get(McpServerORM, server_id) is None
+            assert (
+                s.query(ProductMcpServerORM)
+                .filter_by(mcp_server_id=server_id)
+                .count()
+                == 0
+            )
+
+    def test_delete_legacy_keeps_registry_servers(self, isolated_db):
+        """Legacy rows: DELETE must NOT delete registry MCP server rows."""
+        _seed_product(isolated_db)
+        _seed_database(isolated_db)
+        _seed_mcp_server(isolated_db)
+        app, client = _make_client(isolated_db)
+        r = client.delete("/api/products/prod_1/databases/db_1")
+        assert r.status_code == 200
+        with isolated_db.SessionLocal() as s:
+            assert s.get(McpServerORM, "mcp_1") is not None

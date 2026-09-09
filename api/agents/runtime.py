@@ -83,11 +83,19 @@ async def _build_postgres_saver() -> Any:
         except Exception:  # pragma: no cover - defensive
             pass
         raise
-    pipe = conn.pipeline()
-    await pipe.__aenter__()
+    # psycopg >= 3.3 turned AsyncConnection.pipeline() into an async
+    # context manager whose __aenter__ returns the AsyncPipeline (older
+    # versions returned the pipeline directly and Pipeline.__aenter__
+    # returned self). Enter the CM explicitly and use its RESULT as the
+    # saver's pipe: langgraph-checkpoint-postgres awaits ``pipe.sync()`` in
+    # _cursor(), which only exists on the pipeline object — assigning the CM
+    # itself crashed every checkpoint write with "'_AsyncGeneratorContextManager'
+    # object has no attribute 'sync'". The CM is kept for __aexit__ teardown.
+    pipe_cm = conn.pipeline()
+    pipe = await pipe_cm.__aenter__()
     saver.pipe = pipe
     saver._productarium_conn = conn
-    saver._productarium_pipe = pipe
+    saver._productarium_pipe = pipe_cm
     return saver
 
 

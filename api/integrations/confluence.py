@@ -28,6 +28,7 @@ MCP client; external MCP servers are now managed by the Wave C MCP platform
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from api.integrations.base import IntegrationConnector
@@ -39,6 +40,11 @@ logger = logging.getLogger(__name__)
 _MAX_TREE_DEPTH = 3
 # Max child pages fetched per page (keeps pulls bounded).
 _MAX_CHILDREN = 50
+
+# Page id inside a friendly URL: .../pages/{id} or .../pages/{id}/Title.
+_URL_PAGES_RE = re.compile(r"/pages/(\d+)")
+# Page id as an explicit query parameter: ...?pageId={id} (Server/DC viewpage).
+_URL_PAGE_ID_QS_RE = re.compile(r"[?&]pageId=(\d+)")
 
 
 class ConfluenceConnector(IntegrationConnector):
@@ -281,19 +287,49 @@ class ConfluenceConnector(IntegrationConnector):
             parts.append("")
         return "\n".join(parts)
 
+    @staticmethod
+    def _extract_page_id(source_id: str) -> str:
+        """Normalize a pull source into a Confluence page id.
+
+        Accepts either a raw numeric page id or a full page URL (issue #6):
+
+        - ``https://host/wiki/spaces/KEY/pages/12345/Title``  (friendly URL)
+        - ``https://host/wiki/spaces/KEY/pages/12345``
+        - ``https://host/pages/viewpage.action?pageId=12345`` (Server/DC)
+
+        Anything else non-numeric is passed through verbatim (legacy callers
+        may still send string ids).
+        """
+        src = (source_id or "").strip()
+        if not src:
+            raise ValueError("Confluence page id or URL must not be empty.")
+        if src.isdigit():
+            return src
+        if "://" in src or src.startswith("/"):
+            match = _URL_PAGE_ID_QS_RE.search(src) or _URL_PAGES_RE.search(src)
+            if match:
+                return match.group(1)
+            raise ValueError(
+                "Could not find a page id in the Confluence URL "
+                "(expected /pages/{id}/… or ?pageId={id})."
+            )
+        return src
+
     def pull(self, source_id: str, opts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Pull a Confluence page (and optionally its descendants + attachments).
 
-        Returns a structured pages list with `id`, `title`, `html`, `parent_id`
-        for KnowledgeNode tree creation.
+        ``source_id`` may be a raw page id or a full page URL (see
+        :meth:`_extract_page_id`). Returns a structured pages list with `id`,
+        `title`, `html`, `parent_id` for KnowledgeNode tree creation.
         """
         if not self.is_configured():
             raise ValueError("Confluence base_url/token not configured.")
         opts = opts or {}
         recursive = bool(opts.get("recursive"))
-        pages = self._pull_page_tree(source_id, depth=0, recursive=recursive)
+        page_id = self._extract_page_id(source_id)
+        pages = self._pull_page_tree(page_id, depth=0, recursive=recursive)
         if not pages:
-            raise ValueError(f"Confluence page {source_id} not found.")
+            raise ValueError(f"Confluence page {page_id} not found.")
         markdown = self._pages_to_markdown(pages)
         attachments = self._convert_attachments(pages[0]["id"]) if not recursive else []
         root = pages[0]

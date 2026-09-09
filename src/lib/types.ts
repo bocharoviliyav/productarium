@@ -101,14 +101,20 @@ export interface Links {
 /**
  * A reverse-engineered database attached to a product (wave E).
  *
- * The raw DSN never leaves the server: reads return `dsn_masked` only.
- * `mcp_server_id` references the admin MCP registry entry whose tools are
- * used for the reverse-engineering flow; the backend may additionally serve
+ * The raw DSN never leaves the server. Preset databases (`db_type` set —
+ * the hardcoded UI flow) store the DSN only inside the dedicated preset
+ * MCP server row's encrypted env: no `dsn_masked` is persisted or shown
+ * anywhere. Legacy rows (no `db_type`) keep a masked form in `dsn_masked`,
+ * which the UI deliberately does NOT display either.
+ * `mcp_server_id` references the MCP registry entry whose tools are used
+ * for the reverse-engineering flow; the backend may additionally serve
  * `mcp_server_name` for display (tolerated, not required).
  */
 export interface Database {
   id: string;
   name: string;
+  /** Preset type key (postgresql|mysql|mariadb|sqlserver|sqlite|oracle) or null (legacy manual row). */
+  db_type?: string | null;
   dsn_masked?: string | null;
   mcp_server_id?: string | null;
   mcp_server_name?: string | null;
@@ -118,6 +124,33 @@ export interface Database {
   verified_by?: string | null;
   verified_at?: string | null;
   source?: ArtifactSource;
+}
+
+/* ------------------------------------------------------------------ */
+/* Database presets (GET /api/db-presets, api/mcp/presets.py)           */
+/* ------------------------------------------------------------------ */
+
+/** License attribution of the preset MCP server behind a database type. */
+export interface DbPresetServer {
+  name: string;
+  homepage: string;
+  license: string;
+  license_notice: string;
+}
+
+/**
+ * One hardcoded database preset served by GET /api/db-presets: the type
+ * selector entry for the add-database dialog. Static payload — no secrets,
+ * no DSNs; `dsn_example`/`dsn_hint` describe the accepted connection-string
+ * shape for the selected engine.
+ */
+export interface DbPreset {
+  key: string;
+  label: string;
+  engine: string;
+  dsn_example: string;
+  dsn_hint: string;
+  server: DbPresetServer;
 }
 
 export interface Product {
@@ -243,7 +276,7 @@ export interface SettingOut {
 /* MCP servers (admin registry + per-product bindings, wave C)         */
 /* ------------------------------------------------------------------ */
 
-export type McpTransport = "http" | "stdio";
+export type McpTransport = "http" | "sse" | "stdio";
 export type McpServerStatus = "ok" | "error" | "unknown";
 
 /**
@@ -272,6 +305,41 @@ export interface McpServer {
 export interface McpToolInfo {
   name: string;
   description?: string | null;
+}
+
+/* ------------------------------------------------------------------ */
+/* HTTP integrations (admin registry, issue #3)                        */
+/* ------------------------------------------------------------------ */
+
+/** One declared {placeholder} of an integration's URL template. */
+export interface HttpIntegrationVariable {
+  name: string;
+  description?: string | null;
+  default?: string | null;
+}
+
+/**
+ * Registry entry served by GET/POST/PUT /api/admin/integrations/http.
+ * Header values come back masked — secrets never leave the server.
+ */
+export interface HttpIntegration {
+  id: string;
+  name: string;
+  description?: string | null;
+  url_template: string;
+  headers_masked?: Record<string, string> | null;
+  variables?: HttpIntegrationVariable[] | null;
+  enabled: boolean;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+/** Result of POST /api/admin/integrations/http/{id}/test. */
+export interface HttpIntegrationTestResult {
+  ok: boolean;
+  status_code?: number | null;
+  detail?: string | null;
+  body_preview?: string | null;
 }
 
 /** Result of POST /api/admin/mcp/servers/{id}/test (health + discovery). */

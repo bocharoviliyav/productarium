@@ -174,7 +174,100 @@ function maybeReverse(messages: ChatMessage[]): ChatMessage[] {
     .map((m) => (m.createdAt ? Date.parse(m.createdAt) : Number.NaN))
     .filter((t) => !Number.isNaN(t));
   if (stamps.length < 2) return messages;
-  const ascending = stamps.every((t, i) => i === 0 || t >= stamps[i - 1]);
+  const ascending = stamps.every((t, i) => t >= stamps[i - 1]);
   if (ascending) return messages;
   return messages.slice().reverse();
+}
+
+/* ------------------------------------------------------------------ */
+/* Detached turns (issue #9: generation survives disconnects)         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A RUNNING ask turn of a session (GET …/active-turn). Null when the session
+ * has nothing generating. The UI re-attaches via the SSE stream endpoint
+ * using `turnId` to catch the buffered answer + live tail.
+ */
+export interface ActiveTurnInfo {
+  turnId: string;
+  sessionId: string | null;
+  status: string;
+  query: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+/** Normalize the active-turn descriptor (tolerates field spellings). */
+function normalizeActiveTurn(raw: Record<string, unknown>): ActiveTurnInfo | null {
+  const turnId = str(raw.turn_id) ?? str(raw.turnId) ?? str(raw.id);
+  if (!turnId) return null;
+  return {
+    turnId,
+    sessionId: str(raw.session_id) ?? str(raw.sessionId),
+    status: str(raw.status) ?? "running",
+    query: str(raw.query),
+    startedAt: normalizeDate(raw.started_at ?? raw.startedAt),
+    finishedAt: normalizeDate(raw.finished_at ?? raw.finishedAt),
+  };
+}
+
+/**
+ * Probe a session for a RUNNING turn (the re-attach check). Resolves to null
+ * on 404 / `null` body / parse issues — no running generation.
+ */
+export async function fetchActiveTurn(
+  productId: string,
+  sessionId: string,
+): Promise<ActiveTurnInfo | null> {
+  let res: Response;
+  try {
+    res = await fetch(
+      `/api/products/${encodeURIComponent(productId)}/chat/sessions/${encodeURIComponent(sessionId)}/active-turn`,
+      { credentials: "include", cache: "no-store" },
+    );
+  } catch {
+    return null;
+  }
+  if (!res.ok) return null;
+  const payload: unknown = await res.json().catch(() => null);
+  if (!isRecord(payload)) return null;
+  return normalizeActiveTurn(payload);
+}
+
+/**
+ * Stop a running turn (the Stop button). The partial answer is persisted
+ * server-side; resolves to the final turn status ("cancelled" on success).
+ */
+export async function cancelExpertTurn(
+  productId: string,
+  turnId: string,
+): Promise<string> {
+  const res = await fetch(
+    `/api/products/${encodeURIComponent(productId)}/ask/${encodeURIComponent(turnId)}/cancel`,
+    { method: "POST", credentials: "include" },
+  );
+  if (res.status === 404) return "unknown";
+  if (!res.ok) throw new ApiError(res.status, `Failed to cancel turn (${res.status})`);
+  const payload: unknown = await res.json().catch(() => null);
+  return isRecord(payload) && typeof payload.status === "string"
+    ? payload.status
+    : "cancelled";
+}
+
+/**
+ * Delete a chat session with its transcript (the trash button / Clear on a
+ * historical thread). A running turn is cancelled server-side first.
+ */
+export async function deleteChatSession(
+  productId: string,
+  sessionId: string,
+): Promise<void> {
+  const res = await fetch(
+    `/api/products/${encodeURIComponent(productId)}/chat/sessions/${encodeURIComponent(sessionId)}`,
+    { method: "DELETE", credentials: "include" },
+  );
+  if (res.status === 404) throw new ApiError(404, "Chat session not found");
+  if (!res.ok) {
+    throw new ApiError(res.status, `Failed to delete chat session (${res.status})`);
+  }
 }

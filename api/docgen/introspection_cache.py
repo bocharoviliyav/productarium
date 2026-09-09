@@ -45,7 +45,11 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 #: Payload format version — a bump invalidates every stored entry.
-CACHE_FORMAT_VERSION = 1
+#: v2: ``_call_tool`` now unwraps MCP content-block/TextContent envelopes and
+#: ``_parse_names``/``_render_search_full`` drill into inner result
+#: collections — v1 payloads may hold envelope-shredded garbage and must not
+#: be replayed.
+CACHE_FORMAT_VERSION = 2
 
 _CACHE_DIR_NAME = "introspection_cache"
 #: Default TTL: long enough to cover reruns/repairs of a multi-hour job,

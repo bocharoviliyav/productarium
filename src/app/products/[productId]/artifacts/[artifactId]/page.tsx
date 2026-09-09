@@ -5,7 +5,6 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import {
   ArrowLeft,
-  Chats,
   Database as DatabaseIcon,
   FileText,
   GitBranch,
@@ -369,14 +368,6 @@ export default function EntityDocsViewer() {
                       <span className="font-mono text-xs text-muted">
                         {entity.id}
                       </span>
-                      {isDatabase && databaseEntity?.dsn_masked && (
-                        <span
-                          className="max-w-[240px] truncate font-mono text-xs text-muted"
-                          title={databaseEntity.dsn_masked}
-                        >
-                          {databaseEntity.dsn_masked}
-                        </span>
-                      )}
                       {verified && (
                         <VerifiedBadge verified={verified} verifiedBy={verifiedBy} />
                       )}
@@ -487,7 +478,6 @@ export default function EntityDocsViewer() {
                     <SpecViewer content={spec?.content || ""} kind={spec?.kind} />
                   )}
                 </Card>
-                <ExpertCta t={t} productId={productId} />
               </div>
             )}
 
@@ -563,7 +553,6 @@ export default function EntityDocsViewer() {
                     <LinksViewer content={linksEntity?.content || ""} />
                   )}
                 </Card>
-                <ExpertCta t={t} productId={productId} />
               </div>
             )}
 
@@ -674,7 +663,6 @@ export default function EntityDocsViewer() {
                       </article>
                     )}
                   </Card>
-                  <ExpertCta t={t} productId={productId} />
                 </div>
               </div>
             )}
@@ -702,36 +690,4 @@ function findEntity(
   const d = (product.databases ?? []).find((x) => x.id === entityId);
   if (d) return { entity: d, kind: "database" };
   return { entity: undefined, kind: undefined };
-}
-
-/** Compact "Ask expert" CTA card reused across viewer layouts. */
-function ExpertCta({
-  t,
-  productId,
-}: {
-  t: Record<string, string> | undefined;
-  productId: string;
-}) {
-  return (
-    <Card className="p-6 md:p-8">
-      <SectionHeader
-        title={t?.askExpertTitle ?? "Ask expert"}
-        subtitle={t?.askExpertSubtitle ?? ""}
-        action={
-          <span className="inline-flex items-center gap-1.5 text-xs text-muted">
-            <Chats size={14} weight="regular" />
-            {t?.expertBadge ?? "expert"}
-          </span>
-        }
-      />
-      <div className="mt-4">
-        <Link href={`/products/${productId}`}>
-          <Button variant="subtle">
-            {t?.openExpertChat ?? "Open expert chat"}
-            <ArrowLeft size={14} weight="bold" className="rotate-180" />
-          </Button>
-        </Link>
-      </div>
-    </Card>
-  );
 }

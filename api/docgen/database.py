@@ -6,10 +6,15 @@ Documents a database artifact through the product's MCP servers:
    product's MCP tools (``api.mcp.manager``): when the artifact pins
    ``mcp_server_id`` the tools of THAT server are used (it must be bound+enabled
    to the product, same visibility as the expert agent), otherwise all bound
-   enabled servers contribute. Introspection tools are discovered by NAME
-   heuristics (``list_schemas`` / ``list_tables`` / ``describe_table`` /
-   ``get_table_ddl`` / …) because every MCP database server names them
-   differently. The walk is schemas → tables → per-table definitions, every
+   enabled servers contribute. KNOWN preset surfaces are handled by dedicated
+   adapters BEFORE the generic heuristics: dbhub's ``search_objects``
+   (schemas/tables listings + full per-table detail — uniform across
+   PostgreSQL/MySQL/MariaDB/SQL Server/SQLite) and oracle-mcp-server's
+   ``search_tables_schema``/``get_table_schema`` (arg names mapped at runtime).
+   Everything else falls back to NAME heuristics (``list_schemas`` /
+   ``list_tables`` / ``describe_table`` / ``get_table_ddl`` / …) because every
+   other MCP database server names them differently. The walk is schemas →
+   tables → per-table definitions, every
    call bounded by the manager's timeouts/caps (``MCP_TOOL_CALL_TIMEOUT_SECONDS``,
    ``MCP_TOOL_RESULT_MAX_CHARS``). The RESULT is cached on disk
    (``api.docgen.introspection_cache``, keyed by the MCP surface identity +
@@ -328,6 +333,54 @@ def _build_tool_args(
     return out
 
 
+def _block_text(block: Any) -> str:
+    """Text payload of ONE content block (MCP dict or object form)."""
+    if isinstance(block, str):
+        return block
+    if isinstance(block, dict):
+        text = block.get("text")
+        if isinstance(text, str):
+            return text
+        if "content" in block:
+            return _result_text(block["content"]) or ""
+        try:
+            return json.dumps(block, ensure_ascii=False, default=str)
+        except Exception:  # pragma: no cover - defensive
+            return str(block)
+    text = getattr(block, "text", None)  # mcp.types.TextContent and lookalikes
+    if isinstance(text, str):
+        return text
+    content = getattr(block, "content", None)  # ToolMessage-like wrapper
+    if content is not None:
+        return _result_text(content) or ""
+    return ""
+
+
+def _result_text(result: Any) -> Optional[str]:
+    """Best-effort TEXT of a tool result (``None`` = not text-extractable).
+
+    MCP tool results arrive in several shapes depending on the client stack:
+    a plain string, a ``CallToolResult`` (``.content`` block list), a block
+    list (``[{'type': 'text', 'text': …}, …]`` or its object form), or a
+    ToolMessage-like wrapper. Every text block is unwrapped and joined; the
+    caller's ``json.dumps`` fallback stays for non-text payloads.
+    """
+    if isinstance(result, str):
+        return result
+    if isinstance(result, (list, tuple)):
+        parts = [p for p in (_block_text(item).strip() for item in result) if p]
+        return "\n".join(parts) if parts else None
+    if isinstance(result, dict):
+        return _block_text(result) or None
+    content = getattr(result, "content", None)  # CallToolResult / ToolMessage
+    if content is not None:
+        return _result_text(content)
+    text = getattr(result, "text", None)
+    if isinstance(text, str):
+        return text
+    return None
+
+
 async def _call_tool(tool: Any, args: Dict[str, Any]) -> str:
     """One bounded MCP tool call: manager timeout + result cap; text result.
 
@@ -346,9 +399,8 @@ async def _call_tool(tool: Any, args: Dict[str, Any]) -> str:
     except Exception as e:  # pragma: no cover - depends on live server
         logger.warning("database docgen: MCP tool %r failed: %s", name, e)
         return f"ERROR: MCP tool {name!r} failed ({type(e).__name__})."
-    if isinstance(result, str):
-        text = result
-    else:
+    text = _result_text(result)
+    if text is None:
         try:
             text = json.dumps(result, ensure_ascii=False, default=str)
         except Exception:  # pragma: no cover - defensive
@@ -360,9 +412,306 @@ async def _call_tool(tool: Any, args: Dict[str, Any]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Preset MCP adapters (dbhub / oracle-mcp-server)
+# --------------------------------------------------------------------------- #
+class _AdaptedTool:
+    """Synthetic role tool: canonical (schema, table) surface over a real tool.
+
+    ``_introspect`` drives tools through ``_build_tool_args`` (name-token
+    mapping over ``tool.args``) + ``tool.ainvoke``; an adapter declares
+    CANONICAL arg names so the generic mapper fills them, then translates
+    the call into the underlying tool's real payload inside ``ainvoke``.
+    """
+
+    def __init__(self, name: str, description: str, declared_args: Dict[str, Any], invoke):
+        self.name = name
+        self.description = description
+        self.args = dict(declared_args)
+        self._invoke = invoke
+
+    async def ainvoke(self, tool_args: Dict[str, Any]) -> Any:
+        return await self._invoke(dict(tool_args or {}))
+
+
+#: dbhub ``search_objects`` result cap (server max is 1000).
+_SEARCH_OBJECTS_LIMIT = 1000
+
+
+def _render_search_full(text: str) -> str:
+    """Render dbhub ``search_objects`` ``detail_level=full`` JSON as text.
+
+    Keeps the evidence readable inside the per-table definition block:
+    a header line, a column table and index lines. Any parse failure
+    returns the raw text unchanged (best-effort by design).
+    """
+    try:
+        data = json.loads((text or "").strip())
+    except (ValueError, TypeError):
+        return text or ""
+    rows = _unwrap_name_collection(data, "results", "tables", "rows")
+    if not isinstance(rows, list) or not rows:
+        return text or ""
+    out: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        header = str(row.get("name") or "?")
+        if row.get("schema"):
+            header += f" ({row['schema']})"
+        meta = []
+        if isinstance(row.get("column_count"), int):
+            meta.append(f"{row['column_count']} columns")
+        if row.get("row_count") is not None:
+            meta.append(f"~{row['row_count']} rows")
+        out.append(f"table {header}" + (f" — {', '.join(meta)}" if meta else ""))
+        if row.get("comment"):
+            out.append(f"comment: {row['comment']}")
+        columns = row.get("columns")
+        if isinstance(columns, list) and columns:
+            out.append("| column | type | null | default |")
+            out.append("| --- | --- | --- | --- |")
+            for c in columns:
+                if not isinstance(c, dict):
+                    continue
+                out.append("| {} | {} | {} | {} |".format(
+                    c.get("name") or "?",
+                    c.get("type") or "?",
+                    "YES" if c.get("nullable") else "NO",
+                    "-" if c.get("default") is None else str(c.get("default")),
+                ))
+                if c.get("description"):
+                    out.append(f"  - comment: {c['description']}")
+        indexes = row.get("indexes")
+        if isinstance(indexes, list) and indexes:
+            for i in indexes:
+                if not isinstance(i, dict):
+                    continue
+                cols_raw = i.get("columns")
+                if isinstance(cols_raw, str):
+                    # Postgres array literal ("{id}") — strip the braces.
+                    cols_i = cols_raw.strip("{}")
+                else:
+                    cols_i = ", ".join(str(x) for x in (cols_raw or []))
+                flags = "UNIQUE" if i.get("unique") else ""
+                if i.get("primary"):
+                    flags = (flags + " PRIMARY").strip()
+                out.append(
+                    f"index {i.get('name') or '?'} ({cols_i})"
+                    + (f" {flags}" if flags else "")
+                )
+        out.append("")
+    return "\n".join(out).strip() if out else (text or "")
+
+
+def _build_dbhub_roles(tools: List[Any]) -> Optional[Dict[str, List[Any]]]:
+    """Roles over dbhub's ``search_objects`` (works for ALL five engines).
+
+    ``search_objects`` is dbhub's unified object browser (schemas / tables /
+    columns with pattern matching and detail levels) — a much better
+    introspection surface than ``execute_sql`` wrappers: no engine-specific
+    SQL, no injection surface, uniform JSON output. Returns ``None`` when
+    the tool list has no ``search_objects`` (not a dbhub surface).
+    """
+    search = next(
+        (t for t in tools if (getattr(t, "name", "") or "").lower() == "search_objects"),
+        None,
+    )
+    if search is None:
+        return None
+
+    async def _call(payload: Dict[str, Any]) -> str:
+        return await _call_tool(search, payload)
+
+    async def _list_schemas(_args: Dict[str, Any]) -> str:
+        # SQLite has no schemas — an empty listing is a normal outcome there.
+        return await _call({
+            "object_type": "schema",
+            "detail_level": "names",
+            "limit": _SEARCH_OBJECTS_LIMIT,
+        })
+
+    async def _list_tables(args: Dict[str, Any]) -> str:
+        payload: Dict[str, Any] = {
+            "object_type": "table",
+            "detail_level": "names",
+            "limit": _SEARCH_OBJECTS_LIMIT,
+        }
+        if args.get("schema"):
+            payload["schema"] = args["schema"]
+        return await _call(payload)
+
+    async def _describe(args: Dict[str, Any]) -> str:
+        payload: Dict[str, Any] = {
+            "object_type": "table",
+            "pattern": args.get("table") or "%",
+            "detail_level": "full",
+            "limit": 5,
+        }
+        if args.get("schema"):
+            payload["schema"] = args["schema"]
+        return _render_search_full(await _call(payload))
+
+    return {
+        "schemas": [_AdaptedTool(
+            "search_objects[schemas]",
+            "List database schemas via dbhub search_objects",
+            {}, _list_schemas,
+        )],
+        "tables": [_AdaptedTool(
+            "search_objects[tables]",
+            "List tables via dbhub search_objects",
+            {"schema": {"type": "string"}}, _list_tables,
+        )],
+        "describe": [_AdaptedTool(
+            "search_objects[describe]",
+            "Full table structure via dbhub search_objects",
+            {"schema": {"type": "string"}, "table": {"type": "string"}},
+            _describe,
+        )],
+        "ddl": [],
+    }
+
+
+def _oracle_arg_tokens(tool: Any) -> Dict[str, str]:
+    """Map semantic tokens onto the oracle tool's declared argument names."""
+    tokens: Dict[str, str] = {}
+    for arg in _tool_arg_names(tool):
+        low = arg.lower()
+        if "pattern" in low:
+            tokens.setdefault("pattern", arg)
+        elif "table" in low or low in ("name", "object_name"):
+            tokens.setdefault("table", arg)
+        elif "schema" in low or "owner" in low:
+            tokens.setdefault("schema", arg)
+    return tokens
+
+
+async def _call_oracle(
+    tool: Any,
+    *,
+    pattern: Optional[str] = None,
+    table: Optional[str] = None,
+    schema: Optional[str] = None,
+) -> str:
+    """One oracle-mcp-server call with runtime-mapped argument names."""
+    tokens = _oracle_arg_tokens(tool)
+    payload: Dict[str, Any] = {}
+    if pattern is not None:
+        if "pattern" in tokens:
+            payload[tokens["pattern"]] = pattern
+        elif "table" in tokens:
+            payload[tokens["table"]] = pattern
+        else:
+            declared = _tool_arg_names(tool)
+            if declared:
+                payload[declared[0]] = pattern
+    if table is not None and "table" in tokens:
+        payload[tokens["table"]] = table
+    if schema is not None and "schema" in tokens:
+        payload[tokens["schema"]] = schema
+    return await _call_tool(tool, payload)
+
+
+def _build_oracle_roles(tools: List[Any]) -> Optional[Dict[str, List[Any]]]:
+    """Roles over oracle-mcp-server's schema tools (single connected schema).
+
+    The server caches the connected schema (``TARGET_SCHEMA`` or the user's
+    schema), so no schemas role is exposed — the walk runs in the default
+    scope. Table listing prefers ``search_tables_schema`` (pattern ``%``);
+    per-table definitions use ``get_table_schema`` (falling back to an exact
+    ``search_tables_schema`` lookup). Returns ``None`` when none of the three
+    known tools is present.
+    """
+    by_name = {(getattr(t, "name", "") or "").lower(): t for t in tools}
+    search = by_name.get("search_tables_schema")
+    lookup = by_name.get("get_table_schema")
+    multi = by_name.get("get_tables_schema")
+    if search is None and lookup is None and multi is None:
+        return None
+    lister = search if search is not None else multi
+
+    async def _list_tables(args: Dict[str, Any]) -> str:
+        if search is not None:
+            return await _call_oracle(search, pattern="%")
+        return await _call_oracle(multi)  # bulk dump; names parsed best-effort
+
+    async def _describe(args: Dict[str, Any]) -> str:
+        table = args.get("table")
+        if lookup is not None:
+            return await _call_oracle(lookup, table=table)
+        if search is not None:
+            return await _call_oracle(search, pattern=table)
+        return "ERROR: no per-table oracle schema tool available"
+
+    lister_name = getattr(lister, "name", "oracle_tool")
+    describer_name = getattr(
+        lookup if lookup is not None else search, "name", "oracle_tool"
+    )
+    return {
+        "schemas": [],
+        "tables": [_AdaptedTool(
+            f"{lister_name}[tables]",
+            "List oracle tables via oracle-mcp-server",
+            {}, _list_tables,
+        )],
+        "describe": [_AdaptedTool(
+            f"{describer_name}[describe]",
+            "Table schema via oracle-mcp-server",
+            {"table": {"type": "string"}}, _describe,
+        )],
+        "ddl": [],
+    }
+
+
+def preset_adapter_roles(
+    tools: List[Any], db_type: Optional[str] = None
+) -> Optional[Dict[str, List[Any]]]:
+    """Roles for KNOWN preset tool surfaces (dbhub / oracle-mcp-server).
+
+    Returns ``None`` when the tool list matches no known surface — the caller
+    then falls back to the generic name heuristics. ``db_type`` (the preset
+    flow's engine key) is accepted for future per-engine dispatch but the
+    adapters key off ACTUAL tool names, so a manually registered dbhub or
+    oracle-mcp-server works identically to the preset flow. Oracle wins over
+    dbhub when both surfaces are bound (the walk documents one surface).
+    """
+    if not tools:
+        return None
+    roles = _build_oracle_roles(tools)
+    if roles is not None:
+        return roles
+    return _build_dbhub_roles(tools)
+
+
+# --------------------------------------------------------------------------- #
 # Result parsing (JSON / dict shapes / quoted-string fallback)
 # --------------------------------------------------------------------------- #
 _NAME_KEYS = ("name", "schema_name", "table_name", "tableName", "object_name", "qualname")
+
+
+def _unwrap_name_collection(data: Any, *collection_keys: str) -> Any:
+    """Drill into result envelopes down to the actual name collection.
+
+    Follows explicit collection keys (``tables`` / ``results`` / …) at any
+    depth and the dbhub envelope ``{"success": true, "data": {…}}``; a dict
+    holding exactly ONE list (e.g. ``{"public": ["t1", …]}`` keyed by
+    schema) unwraps to that list. Bounded drill — anything else is returned
+    unchanged.
+    """
+    for _ in range(3):
+        if not isinstance(data, dict):
+            return data
+        for key in collection_keys:
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+        inner = data.get("data")
+        if isinstance(inner, dict):
+            data = inner
+            continue
+        lists = [v for v in data.values() if isinstance(v, list)]
+        return lists[0] if len(lists) == 1 else data
+    return data
 
 
 def _parse_names(text: str, *collection_keys: str) -> List[str]:
@@ -375,15 +724,7 @@ def _parse_names(text: str, *collection_keys: str) -> List[str]:
     except (ValueError, TypeError):
         pass
     if isinstance(data, dict):
-        for key in collection_keys:
-            value = data.get(key)
-            if isinstance(value, list):
-                data = value
-                break
-        else:
-            # Some servers return {"public": ["t1", ...], ...} keyed by schema.
-            lists = [v for v in data.values() if isinstance(v, list)]
-            data = lists[0] if len(lists) == 1 else data
+        data = _unwrap_name_collection(data, *collection_keys)
     names: List[str] = []
     if isinstance(data, list):
         for item in data:
@@ -699,8 +1040,14 @@ async def generate_database_docs(
                 "MCP server before generating documentation."
             )
 
-        # 2) Classify + deterministic introspection walk.
-        roles = _classify_introspection_tools(tools)
+        # 2) Classify + deterministic introspection walk. Known preset
+        # surfaces (dbhub / oracle-mcp-server) get dedicated adapters before
+        # the generic name heuristics — the heuristics misclassify their
+        # tools (``search_objects`` matches nothing, ``get_tables_schema``
+        # would be misused as a table lister).
+        roles = preset_adapter_roles(tools, db_type=getattr(entity, "db_type", None))
+        if roles is None:
+            roles = _classify_introspection_tools(tools)
         if not (roles["tables"] or roles["describe"] or roles["ddl"]):
             available = ", ".join(sorted(filter(None, (
                 getattr(t, "name", "") for t in tools
@@ -873,4 +1220,5 @@ __all__ = [
     "build_database_doc_prompt",
     "classify_introspection_tools",
     "generate_database_docs",
+    "preset_adapter_roles",
 ]

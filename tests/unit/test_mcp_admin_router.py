@@ -472,6 +472,59 @@ class TestUpdateMcpServer:
         assert r.status_code == 400
 
 
+class TestPresetServerRowsReadOnly:
+    """System-managed preset rows (databases preset flow): GET/test work,
+    PUT/DELETE are 400 — their lifecycle belongs to the owning database."""
+
+    def _seed(self, db_mod, server_id="mcp_preset1"):
+        from api.models import McpServerORM
+        from api.mcp.secrets import encrypt_secret_dict
+
+        with db_mod.SessionLocal() as db:
+            db.add(McpServerORM(
+                id=server_id,
+                name="preset-postgresql-dbp_1",
+                preset_key="postgresql",
+                transport="stdio",
+                command="dbhub",
+                args=["--transport", "stdio"],
+                env=encrypt_secret_dict({
+                    "DSN": "postgresql://app:pw@db.internal:5432/x",
+                    "READONLY": "true",
+                }),
+                enabled=True,
+                status="ok",
+            ))
+            db.commit()
+        return server_id
+
+    def test_list_serves_preset_key(self, isolated_db, monkeypatch):
+        server_id = self._seed(isolated_db)
+        app, client, _ = _build_client(isolated_db, _mod(), monkeypatch)
+        rows = client.get("/api/admin/mcp/servers").json()
+        row = next(r for r in rows if r["id"] == server_id)
+        assert row["preset_key"] == "postgresql"
+        # The encrypted DSN is masked in the admin view.
+        assert "db.internal" not in str(row.get("env_masked"))
+
+    def test_put_rejected_400_row_untouched(self, isolated_db, monkeypatch):
+        server_id = self._seed(isolated_db)
+        app, client, _ = _build_client(isolated_db, _mod(), monkeypatch)
+        r = client.put(
+            f"/api/admin/mcp/servers/{server_id}", json={"enabled": False}
+        )
+        assert r.status_code == 400
+        assert "preset" in r.json()["detail"].lower()
+        assert _stored_row(isolated_db, server_id).enabled is True
+
+    def test_delete_rejected_400_row_still_there(self, isolated_db, monkeypatch):
+        server_id = self._seed(isolated_db)
+        app, client, _ = _build_client(isolated_db, _mod(), monkeypatch)
+        r = client.delete(f"/api/admin/mcp/servers/{server_id}")
+        assert r.status_code == 400
+        assert _stored_row(isolated_db, server_id) is not None
+
+
 # --- delete ---------------------------------------------------------------------
 class TestDeleteMcpServer:
     def test_delete_200_then_404(self, isolated_db, monkeypatch):

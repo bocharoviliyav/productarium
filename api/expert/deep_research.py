@@ -208,22 +208,23 @@ async def _gather_research_tools(
     from api.agents.tools import build_expert_tools
 
     tools = list(build_expert_tools(product_id, session_factory=session_factory))
+    taken_names = {getattr(t, "name", "") for t in tools}
     try:
-        from api.agents.expert import _gather_mcp_tools
+        from api.agents.expert import _gather_http_integration_tools, _gather_mcp_tools
 
-        mcp_tools = await _gather_mcp_tools(product_id, session_factory)
-        taken_names = {getattr(t, "name", "") for t in tools}
-        for tool in mcp_tools or []:
+        extra = await _gather_mcp_tools(product_id, session_factory)
+        extra = (extra or []) + _gather_http_integration_tools(product_id, session_factory)
+        for tool in extra:
             name = getattr(tool, "name", "")
             if name and name in taken_names:
                 logger.warning(
-                    "deep research: MCP tool %r shadows a built-in tool; dropping",
+                    "deep research: external tool %r shadows a built-in tool; dropping",
                     name,
                 )
                 continue
             tools.append(tool)
     except Exception as e:  # pragma: no cover - best-effort by contract
-        logger.debug("deep research: mcp tools unavailable: %s", e)
+        logger.debug("deep research: external tools unavailable: %s", e)
     return tools
 
 

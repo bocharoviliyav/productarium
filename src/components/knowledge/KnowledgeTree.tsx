@@ -257,6 +257,12 @@ export function KnowledgeTree({
   const [renameNode, setRenameNode] = useState<KnowledgeNode | null>(null);
   const [renameTitle, setRenameTitle] = useState("");
 
+  // Confluence connector availability (probed once from /api/integrations).
+  const [confluenceReady, setConfluenceReady] = useState(false);
+  // Add-node modal source mode: manual title vs a Confluence page URL (#6).
+  const [addMode, setAddMode] = useState<"title" | "confluence">("title");
+  const [addUrl, setAddUrl] = useState("");
+
   // Drop-to-root indicator (the area above the tree clears parent_id).
   const [isRootDropTarget, setIsRootDropTarget] = useState(false);
 
@@ -296,6 +302,30 @@ export function KnowledgeTree({
     void fetchTree();
   }, [fetchTree]);
 
+  // Probe the Confluence connector once — the add modal offers the "pull page
+  // by URL" mode only when an admin has configured the connector.
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch("/api/integrations", {
+          credentials: "include",
+          cache: "no-store",
+        });
+        if (!res.ok) return;
+        const data = (await res.json()) as Array<{
+          name?: string;
+          configured?: boolean;
+        }>;
+        const confluence = Array.isArray(data)
+          ? data.find((c) => c?.name === "confluence")
+          : undefined;
+        setConfluenceReady(Boolean(confluence?.configured));
+      } catch {
+        // Best-effort probe — fall back to the manual title mode only.
+      }
+    })();
+  }, []);
+
   const tree = useMemo(() => {
     // If the response is already nested (nodes carry children), use it;
     // otherwise build from the flat parent_id list.
@@ -320,10 +350,47 @@ export function KnowledgeTree({
     setAddParent(parent);
     setAddTitle("");
     setAddType(type);
+    setAddMode("title");
+    setAddUrl("");
     setAddOpen(true);
   };
 
+  // Confluence mode (issue #6): pull a page by URL into the knowledge base.
+  // The backend parses the URL into a page id and creates the node(s) itself.
+  const submitConfluencePull = async () => {
+    const url = addUrl.trim();
+    if (!url) return;
+    setBusy("add");
+    try {
+      const res = await fetch(
+        `/api/products/${productId}/knowledge/from-integration`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ connector: "confluence", source_id: url }),
+        },
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.detail || `Pull failed (${res.status})`);
+      }
+      setAddOpen(false);
+      await fetchTree();
+      onMutate?.();
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.treeTitle ?? "Knowledge tree",
+        message: e instanceof Error ? e.message : (t.pullFailed ?? "Pull failed"),
+      });
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const submitAdd = async () => {
+    if (addMode === "confluence") return submitConfluencePull();
     const title = addTitle.trim();
     if (!title) return;
     setBusy("add");
@@ -549,23 +616,79 @@ export function KnowledgeTree({
             <Button variant="ghost" onClick={() => setAddOpen(false)}>
               {t.cancel ?? "Cancel"}
             </Button>
-            <Button onClick={submitAdd} disabled={busy === "add" || !addTitle.trim()}>
+            <Button
+              onClick={submitAdd}
+              disabled={
+                busy === "add" ||
+                (addMode === "confluence" ? !addUrl.trim() : !addTitle.trim())
+              }
+            >
               {busy === "add" ? <Spinner /> : <Plus size={14} weight="bold" />}
-              {t.create ?? "Create"}
+              {addMode === "confluence" ? (t.pull ?? "Pull") : (t.create ?? "Create")}
             </Button>
           </>
         }
       >
         <div className="grid gap-4">
-          <div>
-            <Label>{t.titleLabel ?? "Title"}</Label>
-            <Input
-              value={addTitle}
-              onChange={(e) => setAddTitle(e.target.value)}
-              placeholder={t.titlePlaceholder ?? "e.g. Architecture overview"}
-              autoFocus
-            />
-          </div>
+          {/* Root page adds may instead pull a Confluence page by URL (#6). */}
+          {confluenceReady && !addParent && addType === "page" && (
+            <div className="flex gap-1 rounded-md border border-divider bg-surface-2 p-1">
+              <button
+                type="button"
+                onClick={() => setAddMode("title")}
+                className={cn(
+                  "flex-1 rounded px-3 py-1.5 text-sm transition-colors",
+                  addMode === "title"
+                    ? "bg-surface text-ink shadow-sm"
+                    : "text-muted hover:text-ink",
+                )}
+              >
+                {t.modeTitle ?? "Title"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setAddMode("confluence")}
+                className={cn(
+                  "flex-1 rounded px-3 py-1.5 text-sm transition-colors",
+                  addMode === "confluence"
+                    ? "bg-surface text-ink shadow-sm"
+                    : "text-muted hover:text-ink",
+                )}
+              >
+                {t.modeConfluence ?? "Confluence page (URL)"}
+              </button>
+            </div>
+          )}
+
+          {addMode === "confluence" ? (
+            <div>
+              <Label>{t.confluenceUrlLabel ?? "Page URL"}</Label>
+              <Input
+                type="url"
+                value={addUrl}
+                onChange={(e) => setAddUrl(e.target.value)}
+                placeholder={
+                  t.confluenceUrlPlaceholder ??
+                  "https://confluence.example.com/wiki/spaces/TEAM/pages/123456/Page+Title"
+                }
+                autoFocus
+              />
+              <p className="mt-1.5 text-xs text-muted">
+                {t.confluenceHint ??
+                  "The page (with children and attachments) is pulled into the knowledge base."}
+              </p>
+            </div>
+          ) : (
+            <div>
+              <Label>{t.titleLabel ?? "Title"}</Label>
+              <Input
+                value={addTitle}
+                onChange={(e) => setAddTitle(e.target.value)}
+                placeholder={t.titlePlaceholder ?? "e.g. Architecture overview"}
+                autoFocus
+              />
+            </div>
+          )}
         </div>
       </Modal>
 

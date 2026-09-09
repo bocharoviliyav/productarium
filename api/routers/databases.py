@@ -10,26 +10,43 @@ Endpoints (prefix ``/api/products``, tags ``databases``):
     Start the MCP reverse-engineering flow (202 + job_id; poll via status).
 - ``GET    /api/products/{product_id}/databases/{database_id}/generate/status?job_id=``
 
+Two add flows (``POST``):
+
+- **Preset flow** (``db_type`` in the payload — the hardcoded UI path):
+  validate the DSN against the preset registry → REAL MCP connection check
+  (launcher spawn + handshake + tools/list + one probe tool call,
+  ``api/mcp/presets.py``) → on success atomically create a DEDICATED
+  system-managed ``McpServerORM`` row (stdio, launcher fixed forever, DSN
+  only in the Fernet-encrypted env, ``preset_key`` set) + the product
+  binding + the ``DatabaseORM`` row with ``dsn_masked=None`` (the DSN is
+  never stored or shown anywhere else). Preset databases are immutable in
+  their connection settings (``dsn``/``mcp_server_id`` PUTs are rejected);
+  deleting the database deletes the dedicated server row + bindings too.
+- **Legacy flow** (no ``db_type``): unchanged behavior for API clients.
+
 Secret hygiene: a raw ``dsn`` in the request body is masked via
 ``api.docgen.verification.mask_dsn`` BEFORE persistence; only ``dsn_masked``
 is stored, logged, or returned (the raw DSN never reaches the ORM, the job
 registry, or the response body).
 
-``mcp_server_id`` (optional) pins the registry MCP server whose introspection
-tools the reverse-engineering flow uses. When provided it must reference an
-existing server that is BOUND and ENABLED for this product (the same
-visibility rule the expert agent applies); NULL means "all bound enabled
-servers".
+``mcp_server_id`` (optional, legacy flow) pins the registry MCP server whose
+introspection tools the reverse-engineering flow uses. When provided it must
+reference an existing server that is BOUND and ENABLED for this product
+(the same visibility rule the expert agent applies); NULL means "all bound
+enabled servers". Preset databases always pin their dedicated server.
 """
 
 from __future__ import annotations
 
 import logging
+import secrets as pysecrets
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from api.auth.deps import get_current_user
@@ -41,7 +58,18 @@ from api.docgen.jobs import (
     get_job,
     submit_job,
 )
+from api.mcp.manager import get_mcp_manager
+from api.mcp.presets import (
+    PresetConnectionError,
+    PresetError,
+    check_preset_connection,
+    choose_launcher,
+    get_preset,
+    validate_dsn,
+)
+from api.mcp.secrets import encrypt_secret_dict
 from api.models import (
+    DatabaseORM,
     McpServerORM,
     ProductMcpServerORM,
     ProductORM,
@@ -100,7 +128,9 @@ class DatabaseUpdate(BaseModel):
 
 class GenerateDatabaseDocsRequest(BaseModel):
     model: Optional[str] = None
-    language: Optional[str] = "ru"
+    # DEPRECATED no-op: the generation language is controlled by the admin
+    # ``generation.language`` setting and resolved when the job starts.
+    language: Optional[str] = None
 
 
 def _validate_mcp_server_pin(db: Session, product_id: str, mcp_server_id: str) -> None:
@@ -137,6 +167,10 @@ def _validate_mcp_server_pin(db: Session, product_id: str, mcp_server_id: str) -
 async def add_database(
     product_id: str, database: Database, db: Session = Depends(get_db)
 ):
+    if database.db_type:
+        product = await _add_preset_database(product_id, database, db)
+        _assert_no_raw_dsn(product, database.dsn)
+        return product
     if database.mcp_server_id:
         _validate_mcp_server_pin(db, product_id, database.mcp_server_id)
     # Verified state is server-owned: a client cannot grant verification at
@@ -155,10 +189,124 @@ async def add_database(
     return product
 
 
+async def _add_preset_database(
+    product_id: str, database: Database, db: Session
+) -> Product:
+    """The hardcoded preset flow: DSN → real MCP check → server+binding+DB.
+
+    The connection check runs BEFORE any DB write (a failed check must not
+    leave rows behind), then everything is created atomically in one commit
+    under the database entity lock. The raw DSN is used only in memory: it
+    goes into the dedicated server row's Fernet-encrypted env and nowhere
+    else — the DatabaseORM row gets ``dsn_masked=None``.
+    """
+    spec = get_preset(database.db_type)
+    if spec is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown database type {database.db_type!r} "
+                   "(see GET /api/db-presets)",
+        )
+    try:
+        dsn = validate_dsn(spec, database.dsn or "")
+    except PresetError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        await check_preset_connection(spec, dsn)
+    except PresetConnectionError as e:
+        # Sanitized already (no DSN); full detail is in the server log.
+        raise HTTPException(status_code=400, detail=str(e))
+
+    launcher = choose_launcher(spec, dsn)
+    env = spec.build_env(dsn, docker=(launcher.kind == "docker"))
+    server_id = f"mcp_{pysecrets.token_hex(16)}"
+    binding_id = f"pmb_{pysecrets.token_hex(16)}"
+
+    try:
+        with product_repo._entity_lock("database", database.id):
+            p_orm = product_repo.load_product_orm(db, product_id)
+            if p_orm is None:
+                raise HTTPException(status_code=404, detail="Product not found")
+            existing = next(
+                (d for d in p_orm.databases if d.id == database.id), None
+            )
+            if existing is not None:
+                _drop_preset_server(db, existing)
+                p_orm.databases.remove(existing)
+                db.flush()
+            db.add(McpServerORM(
+                id=server_id,
+                name=f"preset-{spec.key}-{database.id}",
+                preset_key=spec.key,
+                transport="stdio",
+                command=launcher.command,
+                args=list(launcher.args),
+                env=encrypt_secret_dict(env),
+                enabled=True,
+                # The connection check just proved this server works.
+                status="ok",
+                status_checked_at=datetime.utcnow(),
+            ))
+            db.add(ProductMcpServerORM(
+                id=binding_id,
+                product_id=product_id,
+                mcp_server_id=server_id,
+                enabled=True,
+            ))
+            p_orm.databases.append(DatabaseORM(
+                id=database.id,
+                product_id=product_id,
+                name=database.name,
+                db_type=spec.key,
+                dsn_masked=None,
+                mcp_server_id=server_id,
+                generated_docs=None,
+                pages=None,
+                verified=False,
+                verified_by=None,
+                verified_at=None,
+                source="preset",
+            ))
+            db.commit()
+        db.refresh(p_orm)
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Database id conflict")
+    get_mcp_manager().invalidate(server_id)
+    return product_repo.orm_to_product(p_orm)
+
+
+def _drop_preset_server(db: Session, database_row: DatabaseORM) -> None:
+    """Delete the DEDICATED preset server row (+ bindings) of a preset DB.
+
+    No-op for legacy databases (no ``db_type`` / no pinned preset server).
+    """
+    server_id = getattr(database_row, "mcp_server_id", None)
+    if not server_id:
+        return
+    server = db.query(McpServerORM).filter(McpServerORM.id == server_id).first()
+    if server is not None and server.preset_key:
+        # Drop the FK reference first so the unit-of-work deletes the
+        # databases row (or the whole server) without relying on the
+        # DB-level ON DELETE SET NULL.
+        database_row.mcp_server_id = None
+        db.delete(server)  # product bindings cascade (ORM + FK ON DELETE)
+        get_mcp_manager().invalidate(server_id)
+
+
 @router.delete("/{product_id}/databases/{database_id}", response_model=Product)
 async def delete_database(
     product_id: str, database_id: str, db: Session = Depends(get_db)
 ):
+    p_orm = product_repo.load_product_orm(db, product_id)
+    if p_orm is not None:
+        existing = next(
+            (d for d in p_orm.databases if d.id == database_id), None
+        )
+        if existing is not None:
+            _drop_preset_server(db, existing)
     try:
         return product_repo.delete_database(db, product_id, database_id)
     except EntityBusyError as e:
@@ -181,7 +329,13 @@ async def update_database(
     product's memory backend (``source_type="database"``). Otherwise the
     request is a metadata update: name / DSN (masked on acceptance; only
     ``dsn_masked`` persists) / MCP server pin (``""`` clears it).
+
+    Preset databases (``db_type`` set) are IMMUTABLE in their connection
+    settings: ``dsn`` and ``mcp_server_id`` PUTs are rejected with 400 —
+    the connection was validated at creation and is fixed forever; delete
+    + re-add is the only way to change it. Name and doc edits stay allowed.
     """
+    _reject_preset_connection_changes(db, product_id, database_id, body)
     if body.wants_doc_update():
         try:
             product, indexed_text = product_repo.update_database_content(
@@ -219,6 +373,34 @@ async def update_database(
         raise HTTPException(status_code=404, detail="Database not found")
     _assert_no_raw_dsn(product, body.dsn)
     return product
+
+
+def _reject_preset_connection_changes(
+    db: Session, product_id: str, database_id: str, body: "DatabaseUpdate"
+) -> None:
+    """400 when a preset database's connection settings are being changed.
+
+    Doc-edit shapes and ``name`` are fine; any attempt to touch ``dsn`` or
+    ``mcp_server_id`` (including clearing the pin) is rejected.
+    """
+    if body.dsn is None and body.mcp_server_id is None:
+        return
+    row = (
+        db.query(DatabaseORM)
+        .filter(
+            DatabaseORM.product_id == product_id,
+            DatabaseORM.id == database_id,
+        )
+        .first()
+    )
+    if row is not None and row.db_type:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Preset database connection settings are immutable; "
+                "delete and re-add the database to change them"
+            ),
+        )
 
 
 def _reindex(
@@ -318,13 +500,16 @@ async def generate_database_docs(
     # (same 202 + job_id) instead of racing a second reverse-engineering run.
     job_id, is_new = create_or_get_job(product_id, "database", database_id)
     if is_new:
+        # ``language`` (deprecated request field) is passed through as-is;
+        # the worker resolves the effective language from the admin setting
+        # at job start (api.docgen.jobs._run_docgen_job_async).
         submit_job(
             job_id,
             product_id,
             "database",
             database_id,
             request_data.model,
-            request_data.language or "ru",
+            request_data.language,
         )
     job = get_job(job_id)
     return JSONResponse(

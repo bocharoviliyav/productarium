@@ -182,14 +182,21 @@ def mask_secrets(text: str) -> Tuple[str, List[str]]:
 # --------------------------------------------------------------------------- #
 # (a1) Guard: DSN credentials (database connection strings)
 # --------------------------------------------------------------------------- #
-# ``scheme://[user[:password]@]host[:port][/name][?params]`` — only the
-# password (and any secret-looking query param VALUE) is masked; scheme,
-# user, host, port, database name and non-secret params stay visible because
-# they are useful, non-secret documentation context.
+# ``scheme://[user[:password]@]host[:port][/name][?params]`` — the WHOLE
+# userinfo (``user:password@``) is masked, not just the password: a username
+# is part of the credential pair and is useless documentation context
+# compared to the leak risk. Scheme, host, port, database name and non-secret
+# params stay visible.
 _DSN_SCHEME_RE = re.compile(
     r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<rest>.+)$",
     re.DOTALL,
 )
+
+# Oracle EZConnect (scheme-less): ``user/password@//host:1521/service`` or
+# ``user/password@tnsalias``. Previously these fell through to the generic
+# ``mask_secrets`` (8+ char floor, assignment-shaped) and could be stored
+# RAW — the exact leak this guard exists to prevent.
+_EZCONNECT_MIN_CREDS = 1
 
 # Non-URL (key/value) DSNs (libpq ``host=... password=... dbname=...``):
 # the generic ``mask_secrets`` assignment rules require 8+ char values and
@@ -207,28 +214,21 @@ def _mask_kv_dsn(text: str) -> str:
 
 
 def _mask_url_dsn_userinfo(text: str) -> Optional[str]:
-    """Mask the password inside a URL-style DSN's userinfo — RIGHT-to-left.
+    """Mask the WHOLE userinfo of a URL-style DSN — split RIGHT-to-left.
 
     The userinfo necessarily ends at the LAST ``@`` (an RFC 3986 authority
     cannot contain a raw one), so passwords containing ``@`` or ``/`` are
     captured whole. A left-to-right match would cut the userinfo at the
     first ``@`` and leak the password tail — or fail to match at all when
     the password contains ``/`` and mask NOTHING (review #4, HIGH).
+    Both the user AND the password are replaced with the mask (the user is
+    half of the credential pair; scheme/host/port/db stay visible).
     Returns ``None`` when the text is not a URL-style DSN with userinfo.
     """
     m = _DSN_SCHEME_RE.match(text)
     if m is None or "@" not in m.group("rest"):
         return None
-    creds_raw, _, tail = m.group("rest").rpartition("@")
-    user, sep, password = creds_raw.partition(":")
-    if sep and password and SECRET_MASK not in password:
-        creds = f"{user}:{SECRET_MASK}"
-    elif "@" in creds_raw and ":" not in creds_raw:
-        # Multiple '@' with no password separator: ambiguous userinfo —
-        # mask the whole credentials block instead of guessing a split.
-        creds = SECRET_MASK
-    else:
-        creds = creds_raw
+    _creds_raw, _, tail = m.group("rest").rpartition("@")
     # Mask only the REMAINDER (host/db/query params) so the generic
     # url_credentials pattern cannot re-mask (and mangle) our own
     # already-masked credentials — keeps the function idempotent.
@@ -236,17 +236,35 @@ def _mask_url_dsn_userinfo(text: str) -> Optional[str]:
     # Query-param passwords (``?password=hunter2``) shorter than the
     # generic 8-char assignment floor get the targeted kv rule too.
     tail = _mask_kv_dsn(tail)
-    return f"{m.group('scheme')}{creds}@{tail}"
+    return f"{m.group('scheme')}{SECRET_MASK}@{tail}"
+
+
+def _mask_ezconnect_dsn(text: str) -> Optional[str]:
+    """Mask an Oracle EZConnect DSN (scheme-less ``user/pass@//host:1521/svc``).
+
+    Everything before the LAST ``@`` is the credential pair and is masked
+    whole; the connect descriptor (host/port/service or TNS alias) stays
+    visible. Returns ``None`` for texts that are not EZConnect-shaped
+    (contain ``://`` or no ``@`` at all).
+    """
+    if "://" in text:
+        return None
+    creds_raw, sep, tail = text.rpartition("@")
+    if not sep or len(creds_raw) < _EZCONNECT_MIN_CREDS:
+        return None
+    return f"{SECRET_MASK}@{tail}"
 
 
 def mask_dsn(dsn: str) -> str:
     """Mask the secret part of a connection DSN; keep the useful context.
 
     - ``postgres://app:hunter2@db:5432/prod`` →
-      ``postgres://app:***REDACTED***@db:5432/prod``
+      ``postgres://***REDACTED***@db:5432/prod`` (the WHOLE userinfo — the
+      username is part of the credential pair)
     - passwords containing ``@`` or ``/`` are masked whole (the userinfo is
       split at the LAST ``@``)
-    - credentials without a password keep the user (``oracle://app@host``)
+    - Oracle EZConnect ``scott/tiger@//db:1521/XEPDB1`` →
+      ``***REDACTED***@//db:1521/XEPDB1``
     - non-URL DSNs (key/value strings) go through :func:`mask_secrets`
     - the result is additionally run through :func:`mask_secrets` so tokens
       in query params (``?password=…``) cannot survive either.
@@ -260,6 +278,9 @@ def mask_dsn(dsn: str) -> str:
         masked_url = _mask_url_dsn_userinfo(text)
         if masked_url is not None:
             return masked_url
+        masked_ez = _mask_ezconnect_dsn(text)
+        if masked_ez is not None:
+            return masked_ez
         masked, _findings = mask_secrets(text)
         return _mask_kv_dsn(masked)
     except Exception:  # pragma: no cover - regex cannot realistically raise

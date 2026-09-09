@@ -1,15 +1,20 @@
 """Integration tests for the Wave B expert chat router (SSE + sessions).
 
 Covers the fixed SSE contract over the LangGraph agent stream:
-- event sequence: ``status: retrieving`` first, ``tool_call`` / ``tool_result``
-  frames, ``status: thinking`` + ``reasoning``, ``status: answering`` +
-  ``content`` deltas, terminating ``data: [DONE]``;
-- new-session announcement (``session_id`` frame + ``X-Session-Id`` header);
+- event sequence: the ``turn_id`` announcement FIRST, then for NEW sessions
+  the ``session_id`` announcement, then ``status: retrieving`` / ``tool_call``
+  / ``tool_result`` frames, ``status: thinking`` + ``reasoning``, ``status:
+  answering`` + ``content`` deltas, terminating ``data: [DONE]``;
 - session continuation via ``session_id`` (no second announcement);
 - transcript persistence across two turns (query / tool rows / answer);
 - ``GET /chat/sessions`` and ``GET /chat/sessions/{id}/messages`` (CRUD,
   404 on another product's session, 401 without auth);
-- error frame when the agent stream raises; [DONE] always terminates.
+- error frame when the agent stream raises; [DONE] always terminates;
+- DETACHED TURNS (issue #9): the generation runs in a background task —
+  it survives a client disconnect, supports SSE re-attach replay, explicit
+  cancel (partial answer persisted), one-running-turn-per-session 409 with
+  ``X-Turn-Id``, heartbeat ``: ping`` comments, and session DELETE (cancels
+  the running turn, wipes the transcript).
 
 The agent stream is faked via monkeypatching ``run_agent_chat_stream`` on
 the router module (the documented test seam), so no LLM is required.
@@ -17,9 +22,12 @@ the router module (the documented test seam), so no LLM is required.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
+import time
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -69,6 +77,48 @@ def _ev(event_type: str, content) -> "ExpertStreamEvent":
     return ExpertStreamEvent(event_type, content)
 
 
+def _turn_of(frames) -> str:
+    """The turn id announced by the FIRST frame of an /ask response."""
+    assert isinstance(frames[0], dict) and "turn_id" in frames[0], frames[:2]
+    return frames[0]["turn_id"]
+
+
+def _session_of(frames) -> str:
+    """The session id announced right after the turn frame (new sessions)."""
+    for f in frames:
+        if isinstance(f, dict) and "session_id" in f:
+            return f["session_id"]
+    raise AssertionError(f"no session_id frame in {frames[:3]}")
+
+
+def _slow_stream(events, delay: float):
+    """A fake stream that sleeps ``delay``s before every event (turns take
+    wall-clock time — needed for disconnect/cancel/409 race tests)."""
+    async def _stream(product_id, query, session_id=None, history=None,
+                      model=None, seed_history=False, **kwargs):
+        for ev in events:
+            await asyncio.sleep(delay)
+            yield ev
+
+    return _stream
+
+
+def _drain_frames(text: str) -> list:
+    """Parse SSE ``data:`` frames from a raw (partial) response body chunk."""
+    out = []
+    for line in text.splitlines():
+        if line.startswith("data: "):
+            payload = line[len("data: "):]
+            if payload == "[DONE]":
+                out.append("[DONE]")
+            else:
+                try:
+                    out.append(json.loads(payload))
+                except ValueError:
+                    pass
+    return out
+
+
 @pytest.fixture
 def client(isolated_db, monkeypatch):
     """TestClient over the expert router with auth disabled."""
@@ -108,9 +158,11 @@ class TestSseContract:
         statuses = [f["status"] for f in frames if isinstance(f, dict) and "status" in f]
         assert statuses == ["retrieving", "thinking", "answering"]
 
-        # The session announcement is the FIRST frame (before statuses).
-        assert isinstance(frames[0], dict) and "session_id" in frames[0]
-        session_id = frames[0]["session_id"]
+        # The turn announcement is the FIRST frame; a NEW session is
+        # announced second (before any statuses).
+        turn_id = _turn_of(frames)
+        assert turn_id
+        session_id = _session_of(frames)
         assert session_id
 
         tool_calls = [f["tool_call"] for f in frames if isinstance(f, dict) and "tool_call" in f]
@@ -188,7 +240,7 @@ class TestSessionLifecycle:
         resp = client.post("/api/products/prod_1/ask", json={"query": "q1"})
         assert resp.status_code == 200
         frames = _frames(resp)
-        session_id = frames[0]["session_id"]
+        session_id = _session_of(frames)
 
         # Session appears in the listing.
         listing = client.get("/api/products/prod_1/chat/sessions").json()
@@ -217,7 +269,7 @@ class TestSessionLifecycle:
         ]
         monkeypatch.setattr(expert_router, "run_agent_chat_stream", _fake_stream(events))
         resp = client.post("/api/products/prod_1/ask", json={"query": "read spec"})
-        session_id = _frames(resp)[0]["session_id"]
+        session_id = _session_of(_frames(resp))
 
         messages = client.get(
             f"/api/products/prod_1/chat/sessions/{session_id}/messages"
@@ -237,7 +289,7 @@ class TestSessionLifecycle:
         events = [_ev("content", "a1")]
         monkeypatch.setattr(expert_router, "run_agent_chat_stream", _fake_stream(events))
         resp = client.post("/api/products/prod_1/ask", json={"query": "q1"})
-        session_id = _frames(resp)[0]["session_id"]
+        session_id = _session_of(_frames(resp))
 
         events2 = [_ev("content", "a2")]
         monkeypatch.setattr(expert_router, "run_agent_chat_stream", _fake_stream(events2))
@@ -276,7 +328,7 @@ class TestSessionLifecycle:
         monkeypatch.setattr(expert_router, "run_agent_chat_stream", _fake_stream([_ev("content", "x")]))
 
         r1 = client.post("/api/products/prod_1/ask", json={"query": "q1"})
-        s1 = _frames(r1)[0]["session_id"]
+        s1 = _session_of(_frames(r1))
         client.post("/api/products/prod_2/ask", json={"query": "q2"})
 
         assert [s["id"] for s in client.get("/api/products/prod_1/chat/sessions").json()] == [s1]
@@ -291,7 +343,7 @@ class TestSessionLifecycle:
         _seed_product(isolated_db)
         monkeypatch.setattr(expert_router, "run_agent_chat_stream", _fake_stream([]))
         resp = client.post("/api/products/prod_1/ask", json={"query": "q"})
-        session_id = _frames(resp)[0]["session_id"]
+        session_id = _session_of(_frames(resp))
         messages = client.get(
             f"/api/products/prod_1/chat/sessions/{session_id}/messages"
         ).json()
@@ -448,3 +500,421 @@ class TestAuth:
         assert client.get(
             "/api/products/prod_1/chat/sessions/x/messages"
         ).status_code == 401
+
+
+# --- Detached turns (issue #9) ------------------------------------------------
+class _AsgiCall:
+    """Hand-driven ASGI request for mid-stream SSE scenarios.
+
+    httpx's ``ASGITransport`` buffers the whole response before returning it,
+    so incremental reads / mid-generation disconnects cannot be simulated
+    with it. This driver runs the app coroutine directly on the test loop:
+    ``receive()`` hands over the request body once and then blocks until
+    ``disconnect()`` is called — the ASGI ``http.disconnect`` signal that
+    starlette's ``StreamingResponse`` races against, cancelling the SSE
+    generator while the DETACHED turn task keeps running. Every ASGI ``send``
+    message is appended to ``messages`` so the streamed body can be inspected
+    while the request is still in flight.
+    """
+
+    def __init__(self, app, method: str, path: str, json_body=None):
+        self._app = app
+        body = b"" if json_body is None else json.dumps(json_body).encode()
+        headers = []
+        if json_body is not None:
+            headers = [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ]
+        self._scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": method,
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "headers": headers,
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "client": ("testclient", 50000),
+            "root_path": "",
+        }
+        self._body = body
+        self._request_sent = False
+        self._disconnected = asyncio.Event()
+        self.messages: list = []
+
+    async def receive(self):
+        if not self._request_sent:
+            self._request_sent = True
+            return {"type": "http.request", "body": self._body, "more_body": False}
+        # A client that stays connected: block until the test walks away.
+        # (The await is cancelled by the app itself once the response ends.)
+        await self._disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(self, message):
+        self.messages.append(message)
+
+    def disconnect(self) -> None:
+        """Simulate the client going away mid-stream."""
+        self._disconnected.set()
+
+    async def run(self) -> None:
+        await self._app(self._scope, self.receive, self.send)
+
+    @property
+    def status_code(self) -> Optional[int]:
+        for m in self.messages:
+            if m["type"] == "http.response.start":
+                return m["status"]
+        return None
+
+    def header(self, name: str) -> Optional[str]:
+        target = name.lower().encode()
+        for m in self.messages:
+            if m["type"] == "http.response.start":
+                for k, v in m.get("headers", []):
+                    if k.lower() == target:
+                        return v.decode()
+        return None
+
+    def body_text(self) -> str:
+        return "".join(
+            m.get("body", b"").decode("utf-8", "replace")
+            for m in self.messages
+            if m["type"] == "http.response.body"
+        )
+
+    async def wait_for_body(self, needle: str, timeout: float = 5.0) -> None:
+        """Block until ``needle`` appears in the body streamed so far."""
+        deadline = time.monotonic() + timeout
+        while needle not in self.body_text():
+            assert time.monotonic() < deadline, f"{needle!r} never streamed"
+            await asyncio.sleep(0.005)
+
+
+class TestDetachedTurns:
+    """issue #9: an ask is a background task that outlives the request.
+
+    The generation survives a client disconnect (starlette cancels the SSE
+    generator; the turn task does not), supports re-attach replay, explicit
+    cancel with a persisted partial answer, one-running-turn-per-session
+    (409 + ``X-Turn-Id``), heartbeat comments, and session DELETE that
+    cancels the running turn and wipes the transcript.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_rate_limits(self):
+        from api.utils.rate_limit import reset_rate_limits
+
+        reset_rate_limits()
+        yield
+        reset_rate_limits()
+
+    def test_turn_survives_client_disconnect(self, client, monkeypatch, isolated_db):
+        import api.expert.turns as turns_mod
+        import api.routers.expert as expert_router
+
+        _seed_product(isolated_db)
+        events = [
+            _ev("status", "retrieving"),
+            _ev("content", "part-"),
+            _ev("content", "tail"),
+        ]
+        monkeypatch.setattr(
+            expert_router, "run_agent_chat_stream", _slow_stream(events, 0.2)
+        )
+
+        async def scenario():
+            ask = _AsgiCall(client.app, "POST", "/api/products/prod_1/ask",
+                            {"query": "q"})
+            ask_task = asyncio.create_task(ask.run())
+            # Wait for the FIRST agent event, then walk away mid-generation.
+            await ask.wait_for_body('"status"')
+            text = ask.body_text()
+            assert "tail" not in text  # disconnected before the last event
+            turn_id = _turn_of(_drain_frames(text))
+            session_id = _session_of(_drain_frames(text))
+
+            ask.disconnect()
+            await ask_task  # the SSE generator is cancelled; the turn is not
+
+            turn = turns_mod.get_turn(turn_id)
+            assert turn is not None
+            deadline = time.monotonic() + 10.0
+            while not turn.finished:
+                assert time.monotonic() < deadline, "turn never finished"
+                await asyncio.sleep(0.01)
+            assert turn.status == "completed"
+            assert len(turn.events) == len(events)
+            return session_id
+
+        session_id = asyncio.run(scenario())
+
+        # "completed" flips only AFTER the transcript is durable.
+        messages = client.get(
+            f"/api/products/prod_1/chat/sessions/{session_id}/messages"
+        ).json()
+        assert [m["role"] for m in messages] == ["user", "assistant"]
+        assert messages[1]["content"] == "part-tail"
+
+    def test_reattach_replays_finished_turn(self, client, monkeypatch, isolated_db):
+        import api.routers.expert as expert_router
+
+        _seed_product(isolated_db)
+        events = [_ev("status", "answering"), _ev("content", "done answer")]
+        monkeypatch.setattr(expert_router, "run_agent_chat_stream", _fake_stream(events))
+
+        resp = client.post("/api/products/prod_1/ask", json={"query": "q"})
+        assert resp.status_code == 200
+        frames = _frames(resp)
+        turn_id = _turn_of(frames)
+        session_id = _session_of(frames)
+
+        # Re-attach to the FINISHED turn: pure replay, [DONE]-terminated.
+        attach = client.get(f"/api/products/prod_1/ask/stream/{turn_id}")
+        assert attach.status_code == 200
+        replay = _frames(attach)
+        assert replay[-1] == "[DONE]"
+        # No announcement frames on re-attach — only the streamed events.
+        assert all("turn_id" not in f for f in replay if isinstance(f, dict))
+        assert all("session_id" not in f for f in replay if isinstance(f, dict))
+        assert [
+            f["status"] for f in replay
+            if isinstance(f, dict) and "status" in f
+        ] == ["answering"]
+        content = "".join(
+            f["content"] for f in replay
+            if isinstance(f, dict) and "content" in f
+        )
+        assert content == "done answer"
+
+        # Unknown turns are a plain 404 (attach and cancel alike).
+        assert client.get(
+            "/api/products/prod_1/ask/stream/turn_nope"
+        ).status_code == 404
+        assert client.post(
+            "/api/products/prod_1/ask/turn_nope/cancel"
+        ).status_code == 404
+
+        # No RUNNING turn remains for the session.
+        probe = client.get(
+            f"/api/products/prod_1/chat/sessions/{session_id}/active-turn"
+        )
+        assert probe.status_code == 200
+        assert probe.json() is None
+
+    def test_active_turn_probe_and_409_while_running(
+        self, client, monkeypatch, isolated_db
+    ):
+        import api.routers.expert as expert_router
+
+        _seed_product(isolated_db)
+        events = [
+            _ev("status", "retrieving"),
+            _ev("content", "the "),
+            _ev("content", "answer"),
+        ]
+        monkeypatch.setattr(
+            expert_router, "run_agent_chat_stream", _slow_stream(events, 0.15)
+        )
+
+        async def scenario():
+            ask = _AsgiCall(client.app, "POST", "/api/products/prod_1/ask",
+                            {"query": "q"})
+            ask_task = asyncio.create_task(ask.run())
+            await ask.wait_for_body("session_id")
+            session_id = ask.header("x-session-id")
+            turn_id = _turn_of(_drain_frames(ask.body_text()))
+
+            # The running turn is discoverable (the re-attach probe).
+            probe = _AsgiCall(
+                client.app, "GET",
+                f"/api/products/prod_1/chat/sessions/{session_id}/active-turn",
+            )
+            await probe.run()
+            assert probe.status_code == 200
+            descriptor = json.loads(probe.body_text())
+            assert descriptor["turn_id"] == turn_id
+            assert descriptor["status"] == "running"
+
+            # A second ask into the same session → 409 + the running id.
+            busy = _AsgiCall(client.app, "POST", "/api/products/prod_1/ask",
+                             {"query": "again", "session_id": session_id})
+            await busy.run()
+            assert busy.status_code == 409
+            assert busy.header("x-turn-id") == turn_id
+
+            # The rejected ask persisted nothing (busy precedes the user row);
+            # the running turn has not persisted its answer yet either.
+            msgs = _AsgiCall(
+                client.app, "GET",
+                f"/api/products/prod_1/chat/sessions/{session_id}/messages",
+            )
+            await msgs.run()
+            assert [m["role"] for m in json.loads(msgs.body_text())] == ["user"]
+
+            # Re-attach while still running: replay + live tail + [DONE].
+            attach = _AsgiCall(client.app, "GET",
+                               f"/api/products/prod_1/ask/stream/{turn_id}")
+            attach_task = asyncio.create_task(attach.run())
+            await ask_task
+            await attach_task
+            replay = _drain_frames(attach.body_text())
+            assert replay[-1] == "[DONE]"
+            content = "".join(
+                f["content"] for f in replay
+                if isinstance(f, dict) and "content" in f
+            )
+            assert content == "the answer"
+
+        asyncio.run(scenario())
+
+    def test_cancel_running_turn_persists_partial_answer(
+        self, client, monkeypatch, isolated_db
+    ):
+        import api.routers.expert as expert_router
+
+        _seed_product(isolated_db)
+
+        async def _stream(product_id, query, **kwargs):
+            yield _ev("content", "part1")
+            await asyncio.sleep(30.0)
+            yield _ev("content", "part2")
+
+        monkeypatch.setattr(expert_router, "run_agent_chat_stream", _stream)
+
+        async def scenario():
+            ask = _AsgiCall(client.app, "POST", "/api/products/prod_1/ask",
+                            {"query": "q"})
+            ask_task = asyncio.create_task(ask.run())
+            await ask.wait_for_body("part1")
+            turn_id = _turn_of(_drain_frames(ask.body_text()))
+
+            cancel = _AsgiCall(client.app, "POST",
+                               f"/api/products/prod_1/ask/{turn_id}/cancel")
+            await cancel.run()
+            assert cancel.status_code == 200
+            assert json.loads(cancel.body_text()) == {
+                "turn_id": turn_id,
+                "status": "cancelled",
+            }
+
+            # The orphaned stream still terminates cleanly with [DONE].
+            await ask_task
+            assert _drain_frames(ask.body_text())[-1] == "[DONE]"
+            return ask.header("x-session-id")
+
+        session_id = asyncio.run(scenario())
+
+        # The partial answer made it into the transcript.
+        messages = client.get(
+            f"/api/products/prod_1/chat/sessions/{session_id}/messages"
+        ).json()
+        assert [m["role"] for m in messages] == ["user", "assistant"]
+        assert messages[1]["content"] == "part1"
+
+    def test_subscribe_emits_heartbeat_comments(
+        self, client, monkeypatch, isolated_db
+    ):
+        import api.expert.turns as turns_mod
+        import api.routers.expert as expert_router
+
+        _seed_product(isolated_db)
+
+        async def _stream(product_id, query, **kwargs):
+            await asyncio.sleep(0.3)
+            yield _ev("content", "late")
+
+        monkeypatch.setattr(expert_router, "run_agent_chat_stream", _stream)
+        monkeypatch.setattr(turns_mod, "HEARTBEAT_SECONDS", 0.05)
+
+        async def scenario():
+            ask = _AsgiCall(client.app, "POST", "/api/products/prod_1/ask",
+                            {"query": "q"})
+            await ask.run()
+            text = ask.body_text()
+            # Idle waits emit SSE comments (proxy keep-alive).
+            assert text.count(": ping") >= 2
+            assert _drain_frames(text)[-1] == "[DONE]"
+
+        asyncio.run(scenario())
+
+    def test_delete_session_removes_transcript(self, client, monkeypatch, isolated_db):
+        import api.routers.expert as expert_router
+
+        _seed_product(isolated_db)
+        monkeypatch.setattr(
+            expert_router, "run_agent_chat_stream",
+            _fake_stream([_ev("content", "answer")]),
+        )
+
+        resp = client.post("/api/products/prod_1/ask", json={"query": "hello"})
+        session_id = _session_of(_frames(resp))
+
+        deleted = client.delete(f"/api/products/prod_1/chat/sessions/{session_id}")
+        assert deleted.status_code == 200
+        assert deleted.json() == {"deleted": session_id, "cancelled_turns": []}
+
+        assert client.get("/api/products/prod_1/chat/sessions").json() == []
+        assert client.get(
+            f"/api/products/prod_1/chat/sessions/{session_id}/messages"
+        ).status_code == 404
+        # Idempotency: deleting again is a 404, not an error.
+        assert client.delete(
+            f"/api/products/prod_1/chat/sessions/{session_id}"
+        ).status_code == 404
+
+    def test_delete_session_cancels_running_turn(
+        self, client, monkeypatch, isolated_db
+    ):
+        import api.expert.turns as turns_mod
+        import api.routers.expert as expert_router
+        from api.models import ChatMessageORM
+
+        _seed_product(isolated_db)
+        monkeypatch.setattr(
+            expert_router, "run_agent_chat_stream",
+            _slow_stream([_ev("content", "never")], 30.0),
+        )
+
+        async def scenario():
+            ask = _AsgiCall(client.app, "POST", "/api/products/prod_1/ask",
+                            {"query": "q"})
+            ask_task = asyncio.create_task(ask.run())
+            await ask.wait_for_body("turn_id")
+            turn_id = _turn_of(_drain_frames(ask.body_text()))
+            session_id = ask.header("x-session-id")
+
+            delete = _AsgiCall(client.app, "DELETE",
+                               f"/api/products/prod_1/chat/sessions/{session_id}")
+            await delete.run()
+            assert delete.status_code == 200
+            assert json.loads(delete.body_text()) == {
+                "deleted": session_id,
+                "cancelled_turns": [turn_id],
+            }
+
+            # The turn is forgotten entirely — no late writes can follow.
+            assert turns_mod.get_turn(turn_id) is None
+            assert turns_mod.active_for_session(session_id) is None
+
+            msgs = _AsgiCall(
+                client.app, "GET",
+                f"/api/products/prod_1/chat/sessions/{session_id}/messages",
+            )
+            await msgs.run()
+            assert msgs.status_code == 404
+
+            # The orphaned stream still terminates — no hang.
+            await ask_task
+            return session_id
+
+        session_id = asyncio.run(scenario())
+
+        with isolated_db.SessionLocal() as db:
+            assert db.query(ChatMessageORM).filter(
+                ChatMessageORM.session_id == session_id
+            ).count() == 0

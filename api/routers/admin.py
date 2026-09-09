@@ -29,7 +29,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from api.auth.deps import require_admin
@@ -59,7 +59,15 @@ from api.config.settings import (
     list_settings,
     set_setting,
 )
-from api.prompts import PROMPTS_DIR, PROMPT_FILES, reload_prompt_file
+from api.prompts import (
+    PROMPT_FILES,
+    PROMPT_LANGUAGES,
+    PROMPTS_DIR,
+    get_generation_language,
+    prompts_dir,
+    reload_all_prompt_files,
+    reload_prompt_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +90,7 @@ _SECRET_SUFFIXES = (".api_key", ".token", ".password", ".secret")
 # NOT secret.
 _SETTING_GROUPS = (
     "models", "git", "confluence", "integrations", "ssl",
-    "embedder", "timeouts", "memory",
+    "embedder", "timeouts", "memory", "generation",
 )
 
 # Valid memory backend names (stored under ``memory.backend``).
@@ -298,21 +306,44 @@ def _safe_prompt_filename(filename: str) -> Optional[str]:
     return filename
 
 
+def _normalize_prompt_lang(lang: Optional[str]) -> str:
+    """Resolve the ``?lang=`` query param (default: active generation language)."""
+    normalized = (lang or "").strip().lower()
+    if normalized in PROMPT_LANGUAGES:
+        return normalized
+    return get_generation_language()
+
+
 @router.get("/prompts")
 def list_prompts(
+    lang: Optional[str] = Query(
+        None, description="Prompt language (ru|en); default: active generation language"
+    ),
     _admin: UserORM = Depends(require_admin),
 ) -> List[Dict[str, Any]]:
-    """List all prompt files in refs/prompts/ with their size and mtime."""
+    """List the editable prompt files of one language with size and mtime.
+
+    Only files registered in ``PROMPT_FILES`` are listed — ``README.md`` and
+    any other non-prompt file in ``refs/prompts/`` is excluded (README used
+    to appear in the listing and then fail with 400 on open because it is
+    not a registered prompt).
+    """
+    language = _normalize_prompt_lang(lang)
+    directory = prompts_dir(language)
     out: List[Dict[str, Any]] = []
     try:
-        if not os.path.isdir(PROMPTS_DIR):
-            return out
-        for fname in sorted(os.listdir(PROMPTS_DIR)):
-            if not fname.endswith(".md"):
-                continue
-            fpath = os.path.join(PROMPTS_DIR, fname)
+        for fname in sorted(PROMPT_FILES):
+            fpath = os.path.join(directory, fname)
             if not os.path.isfile(fpath):
-                continue
+                # Graceful fallback: a language copy may not exist yet
+                # (translation in flight) — stat the English original so
+                # the listing always covers the full inventory. GET
+                # /prompts/{filename} serves its content with language="en".
+                if language == "en":
+                    continue
+                fpath = os.path.join(prompts_dir("en"), fname)
+                if not os.path.isfile(fpath):
+                    continue
             try:
                 st = os.stat(fpath)
                 out.append({
@@ -330,13 +361,25 @@ def list_prompts(
 @router.get("/prompts/{filename}")
 def get_prompt(
     filename: str,
+    lang: Optional[str] = Query(
+        None, description="Prompt language (ru|en); default: active generation language"
+    ),
     _admin: UserORM = Depends(require_admin),
 ) -> Dict[str, Any]:
-    """Return the content of a single prompt file."""
+    """Return the content of a single prompt file (lang dir, en fallback)."""
     safe = _safe_prompt_filename(filename)
     if safe is None:
         raise HTTPException(status_code=400, detail="Invalid or unknown prompt filename.")
-    fpath = os.path.join(PROMPTS_DIR, safe)
+    language = _normalize_prompt_lang(lang)
+    fpath = os.path.join(prompts_dir(language), safe)
+    read_lang = language
+    if not os.path.isfile(fpath) and language != "en":
+        # Graceful fallback: the language copy may not exist yet (e.g. a
+        # prompt not yet translated) — offer the English body for editing.
+        fallback = os.path.join(prompts_dir("en"), safe)
+        if os.path.isfile(fallback):
+            fpath = fallback
+            read_lang = "en"
     if not os.path.isfile(fpath):
         raise HTTPException(status_code=404, detail="Prompt file not found.")
     try:
@@ -345,23 +388,33 @@ def get_prompt(
     except Exception as e:
         logger.warning("get_prompt(%s) failed: %s", safe, e)
         raise HTTPException(status_code=500, detail="Could not read prompt file")
-    return {"filename": safe, "content": content}
+    return {"filename": safe, "content": content, "language": read_lang}
 
 
 @router.put("/prompts/{filename}")
 def update_prompt(
     filename: str,
     body: PromptUpdateRequest,
+    lang: Optional[str] = Query(
+        None, description="Prompt language (ru|en); default: active generation language"
+    ),
     _admin: UserORM = Depends(require_admin),
 ) -> Dict[str, Any]:
-    """Write new content to a prompt file and hot-reload it in memory."""
+    """Write new content to the prompt file of the requested language.
+
+    Always writes into the requested language's directory — creating the
+    copy when it does not exist yet (adapting an English-only prompt into
+    Russian, or vice versa). Then hot-reloads the ACTIVE language's
+    in-memory copy so the edit takes effect immediately when applicable.
+    """
     safe = _safe_prompt_filename(filename)
     if safe is None:
         raise HTTPException(status_code=400, detail="Invalid or unknown prompt filename.")
-    fpath = os.path.join(PROMPTS_DIR, safe)
-    if not os.path.isfile(fpath):
-        raise HTTPException(status_code=404, detail="Prompt file not found.")
+    language = _normalize_prompt_lang(lang)
+    directory = prompts_dir(language)
+    fpath = os.path.join(directory, safe)
     try:
+        os.makedirs(directory, exist_ok=True)
         with open(fpath, "w", encoding="utf-8") as f:
             f.write(body.content)
     except Exception as e:
@@ -372,7 +425,21 @@ def update_prompt(
         reload_prompt_file(safe)
     except Exception as e:  # pragma: no cover - non-fatal
         logger.warning("reload_prompt_file(%s) failed: %s", safe, e)
-    return {"success": True, "filename": safe}
+    return {"success": True, "filename": safe, "language": language}
+
+
+# --- Read-only OpenAPI schema for the admin API viewer (issue #4) ------------
+@router.get("/openapi")
+def get_openapi_schema(
+    request: Request,
+    _admin: UserORM = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Return the app's OpenAPI schema (rendered read-only via SpecViewer)."""
+    try:
+        return request.app.openapi()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error("openapi() generation failed: %s", e)
+        raise HTTPException(status_code=500, detail="Could not build OpenAPI schema")
 
 
 # --- GET /api/admin/{group} -------------------------------------------------
@@ -429,6 +496,9 @@ def get_group(
             # so they are already in ``settings`` above.
             from api.config.timeout import get_timeout_resolved_view
             resp["resolved"] = get_timeout_resolved_view()
+        elif group == "generation":
+            # ``resolved`` mirrors what generation pipelines will use next run.
+            resp["resolved"] = {"language": get_generation_language()}
         elif group == "memory":
             resp["resolved"] = _memory_status_view()
         return resp
@@ -536,6 +606,15 @@ def put_group(
                     logger.warning("Ignoring invalid memory.backend: %r", value)
                     continue
                 str_value = v
+            # Validate generation.language so an invalid name can't be
+            # persisted (the prompt loader would silently fall back to the
+            # lang.json default while the UI showed the typo as active).
+            if group == "generation" and key == "generation.language":
+                v = (value or "").strip().lower() if isinstance(value, str) else value
+                if v not in PROMPT_LANGUAGES:
+                    logger.warning("Ignoring invalid generation.language: %r", value)
+                    continue
+                str_value = v
             set_setting(key, str_value, encrypt=encrypt)
             saved.append(key)
 
@@ -545,6 +624,14 @@ def put_group(
             sync_runtime_settings()
         except Exception as e:
             logger.warning("sync_runtime_settings after admin put_group failed: %s", e)
+
+        # A generation.language change switches the whole prompt file set:
+        # hot-reload every prompt from the new language's directory (no restart).
+        if group == "generation" and "generation.language" in saved:
+            try:
+                reload_all_prompt_files()
+            except Exception as e:  # pragma: no cover - non-fatal
+                logger.warning("reload_all_prompt_files after language change failed: %s", e)
 
         return {"group": group, "success": True, "saved": saved}
 

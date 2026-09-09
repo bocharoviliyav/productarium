@@ -25,6 +25,12 @@ Security:
 - All string inputs are length-capped (Pydantic ``Field`` + manual dict caps).
 - Errors from the health-check are short + sanitized; full tracebacks stay in
   the server log.
+
+Preset rows (``preset_key`` set) are SYSTEM-MANAGED: they are created and
+owned by the databases preset flow (``api/routers/databases.py`` +
+``api/mcp/presets.py``) and cannot be modified or deleted here — ``PUT`` and
+``DELETE`` return 400 pointing at the owning database. ``GET`` and ``/test``
+(health-check) stay available for observability.
 """
 
 from __future__ import annotations
@@ -112,6 +118,9 @@ class McpServerUpdate(BaseModel):
 class McpServerOut(BaseModel):
     id: str
     name: str
+    # Preset key for system-managed rows (databases preset flow); None = a
+    # regular admin-registered server.
+    preset_key: Optional[str] = None
     transport: str
     url: Optional[str] = None
     command: Optional[str] = None
@@ -259,9 +268,11 @@ def _validate_transport_config(
     args: Optional[List[str]],
 ) -> Dict[str, Any]:
     """Cross-field validation for one (transport, url, command, args) combo."""
-    if transport not in ("http", "stdio"):
-        raise HTTPException(status_code=400, detail="transport must be 'http' or 'stdio'")
-    if transport == "http":
+    if transport not in ("http", "sse", "stdio"):
+        raise HTTPException(
+            status_code=400, detail="transport must be 'http', 'sse' or 'stdio'"
+        )
+    if transport in ("http", "sse"):
         if command is not None:
             raise HTTPException(status_code=400, detail="command is only valid for stdio transport")
         if args is not None:
@@ -269,7 +280,7 @@ def _validate_transport_config(
         return {"url": _validate_url(url or "")}
     # stdio
     if url is not None:
-        raise HTTPException(status_code=400, detail="url is only valid for http transport")
+        raise HTTPException(status_code=400, detail="url is only valid for http/sse transport")
     return {
         "command": _validate_command(command or ""),
         "args": _validate_args(args or []),
@@ -283,6 +294,7 @@ def _server_out(s: McpServerORM) -> McpServerOut:
     return McpServerOut(
         id=s.id,
         name=s.name,
+        preset_key=getattr(s, "preset_key", None),
         transport=s.transport,
         url=s.url,
         command=s.command,
@@ -303,6 +315,26 @@ def _load_server(db: Session, server_id: str) -> McpServerORM:
     if server is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
     return server
+
+
+def _reject_preset_write(server: McpServerORM, action: str) -> None:
+    """400 for write operations on SYSTEM-MANAGED preset server rows.
+
+    Preset rows belong to the databases preset flow: their command/args/env
+    are validated against the preset registry at connect time, so letting an
+    admin edit them here would either break the exact-match policy or open a
+    way to run an arbitrary command under a preset key. Lifecycle is managed
+    solely by adding/deleting the owning database.
+    """
+    if getattr(server, "preset_key", None):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"This MCP server is system-managed (preset "
+                f"'{server.preset_key}') and cannot be {action}; delete or "
+                "re-add the corresponding database instead"
+            ),
+        )
 
 
 def _commit_or_conflict(db: Session, *, conflict_detail: str) -> None:
@@ -378,6 +410,7 @@ async def update_mcp_server(
     _admin: Any = Depends(require_admin),
 ):
     server = _load_server(db, server_id)
+    _reject_preset_write(server, "updated")
     fields = body.model_fields_set
 
     if "transport" in fields and body.transport is not None and body.transport != server.transport:
@@ -453,6 +486,7 @@ async def delete_mcp_server(
     _admin: Any = Depends(require_admin),
 ):
     server = _load_server(db, server_id)
+    _reject_preset_write(server, "deleted")
     db.delete(server)  # bindings cascade (ORM cascade + FK ON DELETE CASCADE)
     _commit_or_conflict(db, conflict_detail="MCP server conflict")
     get_mcp_manager().invalidate(server_id)

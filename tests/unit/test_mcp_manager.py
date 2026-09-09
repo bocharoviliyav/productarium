@@ -338,6 +338,82 @@ class TestStdioPolicy:
             )
 
 
+class TestPresetStdioPolicy:
+    """Preset MCP rows bypass the interpreter ban (dbhub needs Node, oracle
+    needs a venv python) but must match the registry EXACTLY instead."""
+
+    PG_DSN = "postgresql://app:hunter2@db.internal:5432/prod"
+
+    def _preset_server(self, **kw):
+        from api.mcp.presets import PRESETS
+        from api.mcp.secrets import encrypt_secret_dict
+
+        env = PRESETS["postgresql"].build_env(self.PG_DSN, docker=False)
+        base = dict(
+            transport="stdio",
+            url=None,
+            command="dbhub",
+            args=["--transport", "stdio"],
+            env=encrypt_secret_dict(env),
+            preset_key="postgresql",
+        )
+        base.update(kw)
+        return _server(**base)
+
+    def test_registry_row_passes_and_decrypts(self):
+        conn = manager_mod.build_connection(self._preset_server())
+        assert conn == {
+            "transport": "stdio",
+            "command": "dbhub",
+            "args": ["--transport", "stdio"],
+            "env": {"READONLY": "true", "DSN": self.PG_DSN},
+        }
+
+    def test_tampered_command_refused(self):
+        # "dbhub" is not on the interpreter ban list — the REGISTRY exact
+        # match is what rejects this row, not the ban.
+        with pytest.raises(ValueError, match="tampered"):
+            manager_mod.build_connection(
+                self._preset_server(command="/bin/sh", args=["-c", "id"])
+            )
+
+    def test_tampered_env_refused(self):
+        from api.mcp.secrets import encrypt_secret_dict
+
+        env = {"DSN": self.PG_DSN, "READONLY": "true", "EXTRA": "x"}
+        with pytest.raises(ValueError, match="tampered"):
+            manager_mod.build_connection(
+                self._preset_server(env=encrypt_secret_dict(env))
+            )
+
+    def test_unknown_preset_key_refused(self):
+        with pytest.raises(ValueError, match="unknown preset key"):
+            manager_mod.build_connection(self._preset_server(preset_key="neo4j"))
+
+    def test_oracle_docker_row_passes(self, monkeypatch):
+        import api.mcp.presets as presets_mod
+        from api.mcp.secrets import encrypt_secret_dict
+
+        monkeypatch.setenv("PRODUCTARIUM_STATE_DIR", "/tmp/preset-test-state")
+        dsn = "app/pw@db.internal:1521/XEPDB1"
+        launcher = presets_mod.launcher_variants(presets_mod.ORACLE, dsn)[1]
+        conn = manager_mod.build_connection(
+            _server(
+                transport="stdio",
+                url=None,
+                command=launcher.command,
+                args=list(launcher.args),
+                env=encrypt_secret_dict(
+                    presets_mod.ORACLE.build_env(dsn, docker=True)
+                ),
+                preset_key="oracle",
+            )
+        )
+        assert conn["command"] == "docker"
+        assert conn["env"]["ORACLE_CONNECTION_STRING"] == dsn
+        assert conn["env"]["READ_ONLY_MODE"] == "1"
+
+
 # --- bounded tool wrapper (timeout + result cap) --------------------------------------
 class TestBoundedToolWrapper:
     def _structured(self, name, coro):

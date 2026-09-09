@@ -47,7 +47,11 @@ router = APIRouter(
 
 class GenerateDocRequest(BaseModel):
     model: Optional[str] = None
-    language: Optional[str] = "ru"
+    # DEPRECATED no-op: the generation language is controlled by the admin
+    # ``generation.language`` setting (see api.prompts.get_generation_language)
+    # and resolved when the job starts. The field is kept so older clients
+    # sending it are not rejected.
+    language: Optional[str] = None
 
 
 def _start_generate(
@@ -78,9 +82,12 @@ def _start_generate(
     # to that job (same 202 + job_id) instead of racing a duplicate generation.
     job_id, is_new = create_or_get_job(product_id, entity_type, entity_id)
     if is_new:
+        # ``language`` (deprecated request field) is passed through as-is;
+        # the worker resolves the effective language from the admin setting
+        # at job start (api.docgen.jobs._run_docgen_job_async).
         submit_job(
             job_id, product_id, entity_type, entity_id,
-            request_data.model, request_data.language or "ru",
+            request_data.model, request_data.language,
         )
     job = get_job(job_id)
     return JSONResponse(

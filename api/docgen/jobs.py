@@ -352,9 +352,15 @@ def submit_job(
     entity_type: str,
     entity_id: str,
     model: Optional[str],
-    language: str,
+    language: Optional[str],
 ) -> None:
-    """Submit the job to the worker thread pool."""
+    """Submit the job to the worker thread pool.
+
+    ``language`` may be None/invalid (the deprecated request field): the
+    worker resolves the effective language from the admin
+    ``generation.language`` setting when the job STARTS, so a switch in the
+    admin panel applies to jobs that were still queued.
+    """
     _docgen_executor.submit(
         _run_docgen_job,
         job_id, product_id, entity_type, entity_id, model, language,
@@ -411,6 +417,14 @@ async def _run_docgen_job_async(
     job["indexing_status"] = "idle"
     job["indexing_message"] = "Генерация документации..."
     job["started_at"] = time.time()
+    # The generation language is an admin-managed setting: resolve it HERE
+    # (job start), not at request time, so queued jobs honor the latest
+    # ``generation.language``. The deprecated request field is ignored when
+    # it does not name a supported language.
+    from api.prompts import PROMPT_LANGUAGES, get_generation_language
+
+    if language not in PROMPT_LANGUAGES:
+        language = get_generation_language()
     # First phase transition is emitted by the generate_* pipeline itself
     # (cloning for codebase, planning for spec/database).
     progress_cb = _progress_reporter(job_id)

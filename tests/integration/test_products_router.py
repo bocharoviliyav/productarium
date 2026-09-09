@@ -315,7 +315,7 @@ class TestUpsertDatabaseDsnMasking:
         r = client.put("/api/products/prod_1", json=payload)
         assert r.status_code == 200
         db = r.json()["databases"][0]
-        assert db["dsn_masked"] == "postgresql://app:***REDACTED***@db:5432/prod"
+        assert db["dsn_masked"] == "postgresql://***REDACTED***@db:5432/prod"
         assert "p@ss/w0rd" not in r.text
 
     def test_put_product_passwordless_dsn_not_500(self, isolated_db):

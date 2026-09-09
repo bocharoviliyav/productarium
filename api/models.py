@@ -329,13 +329,18 @@ class DatabaseORM(Base):
     verification) writes ``generated_docs`` (the full markdown blob) and
     ``pages`` (the JSON page tree rendered by the viewer).
 
-    Secrets: the connection DSN is accepted from the client, masked via
-    ``api.docgen.verification.mask_dsn`` and ONLY the masked form
-    (``dsn_masked``) is persisted — the raw DSN is never stored, logged, or
-    returned. ``mcp_server_id`` optionally pins the registry MCP server whose
-    introspection tools the flow uses (NULL = all of the product's bound
-    enabled servers); the FK is SET NULL so deleting the server row does not
-    cascade into the documented database.
+    Secrets: the connection DSN is accepted from the client and — on the
+    preset path (``db_type`` set, ``api/mcp/presets.py``) — is NEVER
+    persisted at all: it lives only in the dedicated preset MCP server row's
+    Fernet-encrypted ``env``, and ``dsn_masked`` stays NULL. On the legacy
+    path it is masked via ``api.docgen.verification.mask_dsn`` and only the
+    masked form (``dsn_masked``) is persisted; the raw DSN is never stored,
+    logged, or returned. ``mcp_server_id`` optionally pins the registry MCP
+    server whose introspection tools the flow uses (NULL = all of the
+    product's bound enabled servers); the FK is SET NULL so deleting the
+    server row does not cascade into the documented database — EXCEPT for
+    preset servers, which the databases router deletes explicitly together
+    with the database row.
     """
 
     __tablename__ = "databases"
@@ -348,6 +353,9 @@ class DatabaseORM(Base):
         index=True,
     )
     name: Mapped[str] = mapped_column(String(256), nullable=False)
+    # Preset database type (postgresql|mysql|mariadb|sqlserver|sqlite|oracle)
+    # when the DB was added via the preset flow; NULL = legacy manual path.
+    db_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     # Masked connection DSN (secret part replaced with ***REDACTED***).
     dsn_masked: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # Optional pin to a registered MCP server (introspection source).
@@ -626,8 +634,9 @@ class McpServerORM(Base):
     MCP (Model Context Protocol) servers whose tools can be attached to
     products (Wave C).
 
-    ``transport`` is either ``http`` (streamable HTTP endpoint at ``url``) or
-    ``stdio`` (subprocess launched from ``command`` + ``args``).
+    ``transport`` is either ``http`` (streamable HTTP endpoint at ``url``),
+    ``sse`` (legacy SSE endpoint at ``url``) or ``stdio`` (subprocess launched
+    from ``command`` + ``args``).
 
     Secrets: ``headers`` (http) and ``env`` (stdio) hold Fernet-ENCRYPTED JSON
     ciphertext (see ``api/mcp/secrets.py``) — never plaintext, never returned
@@ -642,6 +651,12 @@ class McpServerORM(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    # Preset key (postgresql|mysql|mariadb|sqlserver|sqlite|oracle) for
+    # SYSTEM-MANAGED rows created by the databases preset flow
+    # (``api/mcp/presets.py``); NULL = a regular admin-registered server.
+    # Preset rows are immutable via the admin API and validated at connect
+    # time by exact registry match instead of the interpreter ban.
+    preset_key: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     # 'http' | 'stdio'
     transport: Mapped[str] = mapped_column(String(16), nullable=False)
     url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
@@ -721,6 +736,49 @@ class ProductMcpServerORM(Base):
         return (
             f"<ProductMcpServerORM id={self.id!r} product_id={self.product_id!r} "
             f"mcp_server_id={self.mcp_server_id!r}>"
+        )
+
+
+class HttpIntegrationORM(Base):
+    """ORM model for the ``http_integrations`` table — admin registry of
+    templated read-only GET integrations exposed to agents as named tools
+    (issue #3).
+
+    Each row is one HTTP GET endpoint: ``url_template`` may carry
+    ``{placeholders}`` matching the declared ``variables`` (plus the implicit
+    ``{product_name}``). ``headers`` holds a Fernet-ENCRYPTED ciphertext
+    string (see ``api/mcp/secrets.py``) — never plaintext, never returned to
+    API clients (responses expose a masked key-only view).
+
+    ``variables`` is a JSON list of ``{name, description, default}`` dicts;
+    the agent-facing tool parameters are generated from it.
+    """
+
+    __tablename__ = "http_integrations"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    url_template: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Fernet ciphertext string (api/mcp/secrets.encrypt_secret_dict).
+    headers: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # JSON list[{name, description, default}] — the tool parameter contract.
+    variables: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return (
+            f"<HttpIntegrationORM id={self.id!r} name={self.name!r} "
+            f"enabled={self.enabled!r}>"
         )
 
 

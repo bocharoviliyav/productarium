@@ -27,15 +27,73 @@ import {
   Card,
   IconButton,
   Input,
+  Label,
   Modal,
   SectionHeader,
+  Select,
   Spinner,
   Switch,
   Tag,
+  Textarea,
   cn,
 } from "@/components/ui";
 import { McpStatusDot } from "@/components/mcp/McpStatusDot";
-import type { McpServer, McpServerBinding, McpToolInfo } from "@/lib/types";
+import type {
+  McpServer,
+  McpServerBinding,
+  McpToolInfo,
+  McpTransport,
+} from "@/lib/types";
+
+/** Transport tag tone (shared by the binding rows and the attach picker). */
+function transportTone(transport: string) {
+  if (transport === "http") return "blue" as const;
+  if (transport === "sse") return "green" as const;
+  return "neutral" as const;
+}
+
+/** Parse `key=value` lines; returns the map plus any malformed raw lines. */
+function parseKeyValueLines(text: string): {
+  map: Record<string, string>;
+  invalid: string[];
+} {
+  const map: Record<string, string> = {};
+  const invalid: string[] = [];
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    const key = eq > 0 ? line.slice(0, eq).trim() : "";
+    if (!key) {
+      invalid.push(line);
+      continue;
+    }
+    map[key] = line.slice(eq + 1).trim();
+  }
+  return { map, invalid };
+}
+
+interface CreateServerFormState {
+  name: string;
+  transport: McpTransport;
+  url: string;
+  headersText: string;
+  command: string;
+  argsText: string;
+  envText: string;
+  enabled: boolean;
+}
+
+const EMPTY_CREATE_FORM: CreateServerFormState = {
+  name: "",
+  transport: "http",
+  url: "",
+  headersText: "",
+  command: "",
+  argsText: "",
+  envText: "",
+  enabled: true,
+};
 
 /* ------------------------------------------------------------------ */
 /* Allowed-tools editor (chips for admins, manual input otherwise)      */
@@ -195,6 +253,10 @@ export function McpServersPanel({ productId }: { productId: string }) {
   const [attachOpen, setAttachOpen] = useState(false);
   const [registryLoading, setRegistryLoading] = useState(false);
   const [attachingId, setAttachingId] = useState<string | null>(null);
+  // "Create new server" mode inside the attach modal (issue #7).
+  const [createMode, setCreateMode] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [createForm, setCreateForm] = useState<CreateServerFormState>(EMPTY_CREATE_FORM);
   const [toolsByServer, setToolsByServer] = useState<Record<string, McpToolInfo[]>>({});
   // Requested-but-unloaded servers (failed discovery) fall back to the manual
   // allowlist input instead of spinning forever.
@@ -440,6 +502,98 @@ export function McpServersPanel({ productId }: { productId: string }) {
     }
   };
 
+  // Create a server in the global registry and bind it to this product in one
+  // shot (issue #7 — no more dead end when every registry server is bound).
+  const createAndAttach = async () => {
+    const isHttp = createForm.transport !== "stdio";
+    if (!createForm.name.trim() || (isHttp ? !createForm.url.trim() : !createForm.command.trim()))
+      return;
+    let headers: Record<string, string> | undefined;
+    let env: Record<string, string> | undefined;
+    const blocks: Array<["headers" | "env", string]> = [
+      ["headers", createForm.headersText],
+      ["env", createForm.envText],
+    ];
+    for (const [label, text] of blocks) {
+      if (!text.trim()) continue;
+      const { map, invalid } = parseKeyValueLines(text);
+      if (invalid.length) {
+        notify({
+          tone: "error",
+          title: tm.createFailedTitle ?? "Create failed",
+          message: fmt(tm.invalidKeyValue ?? "Invalid {label} line: {line}", {
+            label,
+            line: invalid[0],
+          }),
+        });
+        return;
+      }
+      if (label === "headers") headers = map;
+      else env = map;
+    }
+    setCreating(true);
+    try {
+      const body: Record<string, unknown> = {
+        name: createForm.name.trim(),
+        transport: createForm.transport,
+        enabled: createForm.enabled,
+      };
+      if (isHttp) {
+        body.url = createForm.url.trim();
+        if (headers) body.headers = headers;
+      } else {
+        body.command = createForm.command.trim();
+        body.args = createForm.argsText
+          .split(",")
+          .map((a) => a.trim())
+          .filter(Boolean);
+        if (env) body.env = env;
+      }
+      const res = await fetch("/api/admin/mcp/servers", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}));
+        throw new Error((e as any)?.detail || `status ${res.status}`);
+      }
+      const server = (await res.json()) as McpServer;
+      setRegistry((prev) => [...(prev ?? []), server]);
+      const attachRes = await fetch(`/api/products/${productId}/mcp`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mcp_server_id: server.id, enabled: true }),
+      });
+      if (!attachRes.ok) {
+        const e = await attachRes.json().catch(() => ({}));
+        throw new Error((e as any)?.detail || `status ${attachRes.status}`);
+      }
+      const binding = (await attachRes.json()) as McpServerBinding;
+      setBindings((prev) => [...prev, binding]);
+      setAttachOpen(false);
+      setCreateMode(false);
+      notify({
+        tone: "success",
+        title: tm.createdAttachedTitle ?? "Server created & attached",
+        message: fmt(
+          tm.createdAttached ?? "“{name}” is now available to the expert agent.",
+          { name: server.name },
+        ),
+      });
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: tm.createFailedTitle ?? "Create failed",
+        message: e instanceof Error ? e.message : (tm.createFailed ?? "Create failed"),
+      });
+    } finally {
+      setCreating(false);
+    }
+  };
+
   const canAttach = isAdmin && !registryDenied;
   const boundServerIds = new Set(bindings.map((b) => b.mcp_server_id));
   const candidates = (registry ?? []).filter((s) => !boundServerIds.has(s.id));
@@ -516,7 +670,7 @@ export function McpServersPanel({ productId }: { productId: string }) {
                       >
                         <span className="flex flex-wrap items-center gap-2">
                           <span className="truncate text-sm font-medium text-ink">{b.name}</span>
-                          <Tag tone={b.transport === "http" ? "blue" : "neutral"}>{b.transport}</Tag>
+                          <Tag tone={transportTone(b.transport)}>{b.transport}</Tag>
                           {!b.enabled && <Tag tone="yellow">{tm.disabled ?? "off"}</Tag>}
                         </span>
                         <span className="mt-0.5 block text-xs text-muted">{counterText(b)}</span>
@@ -574,49 +728,214 @@ export function McpServersPanel({ productId }: { productId: string }) {
         )}
       </div>
 
-      {/* Attach picker — global registry */}
+      {/* Attach picker — global registry, with an inline "create new server" mode */}
       <Modal
         open={attachOpen}
-        onClose={() => setAttachOpen(false)}
-        title={tm.attachTitle ?? "Attach MCP server"}
+        onClose={() => {
+          setAttachOpen(false);
+          setCreateMode(false);
+        }}
+        title={
+          createMode
+            ? (tm.createTitle ?? "New MCP server")
+            : (tm.attachTitle ?? "Attach MCP server")
+        }
         footer={null}
       >
-        {registryLoading ? (
+        {createMode ? (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void createAndAttach();
+            }}
+            className="grid gap-4"
+          >
+            <div className="grid gap-4 md:grid-cols-[1fr_180px]">
+              <div>
+                <Label>{tm.nameLabel ?? "Name"}</Label>
+                <Input
+                  value={createForm.name}
+                  onChange={(e) =>
+                    setCreateForm((p) => ({ ...p, name: e.target.value }))
+                  }
+                  placeholder={tm.namePlaceholder ?? "e.g. Context7 docs"}
+                  maxLength={128}
+                  required
+                  autoFocus
+                />
+              </div>
+              <div>
+                <Label>{tm.transport ?? "Transport"}</Label>
+                <Select
+                  value={createForm.transport}
+                  onChange={(e) =>
+                    setCreateForm((p) => ({
+                      ...p,
+                      transport: e.target.value as McpTransport,
+                    }))
+                  }
+                >
+                  <option value="http">{tm.transportHttp ?? "HTTP"}</option>
+                  <option value="sse">{tm.transportSse ?? "SSE"}</option>
+                  <option value="stdio">{tm.transportStdio ?? "Stdio"}</option>
+                </Select>
+              </div>
+            </div>
+
+            {createForm.transport !== "stdio" ? (
+              <>
+                <div>
+                  <Label>{tm.url ?? "URL"}</Label>
+                  <Input
+                    type="url"
+                    value={createForm.url}
+                    onChange={(e) =>
+                      setCreateForm((p) => ({ ...p, url: e.target.value }))
+                    }
+                    placeholder="https://mcp.example.com/mcp"
+                    pattern="https?://.+"
+                    title="http:// or https:// only"
+                    required
+                  />
+                </div>
+                <div>
+                  <Label>{tm.headers ?? "Headers (key=value per line)"}</Label>
+                  <Textarea
+                    value={createForm.headersText}
+                    onChange={(e) =>
+                      setCreateForm((p) => ({ ...p, headersText: e.target.value }))
+                    }
+                    placeholder="Authorization=Bearer …"
+                    rows={3}
+                    spellCheck={false}
+                  />
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="grid gap-4 md:grid-cols-[200px_1fr]">
+                  <div>
+                    <Label>{tm.command ?? "Command"}</Label>
+                    <Input
+                      value={createForm.command}
+                      onChange={(e) =>
+                        setCreateForm((p) => ({ ...p, command: e.target.value }))
+                      }
+                      placeholder="npx"
+                      required
+                    />
+                  </div>
+                  <div>
+                    <Label>{tm.args ?? "Arguments (comma-separated)"}</Label>
+                    <Input
+                      value={createForm.argsText}
+                      onChange={(e) =>
+                        setCreateForm((p) => ({ ...p, argsText: e.target.value }))
+                      }
+                      placeholder="-y, @modelcontextprotocol/server-everything"
+                      className="font-mono text-sm"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <Label>{tm.env ?? "Environment (key=value per line)"}</Label>
+                  <Textarea
+                    value={createForm.envText}
+                    onChange={(e) =>
+                      setCreateForm((p) => ({ ...p, envText: e.target.value }))
+                    }
+                    placeholder="API_KEY=…"
+                    rows={3}
+                    spellCheck={false}
+                  />
+                </div>
+              </>
+            )}
+
+            <div className="flex items-center gap-3 rounded-md border border-divider bg-surface-2 p-3">
+              <Switch
+                checked={createForm.enabled}
+                onChange={(next) =>
+                  setCreateForm((p) => ({ ...p, enabled: next }))
+                }
+                label={tm.enabledLabel ?? "Enabled"}
+              />
+              <span className="text-sm text-ink">{tm.enabledLabel ?? "Enabled"}</span>
+            </div>
+
+            <div className="flex items-center justify-end gap-2">
+              <Button type="button" variant="ghost" onClick={() => setCreateMode(false)}>
+                {tm.cancel ?? "Cancel"}
+              </Button>
+              <Button
+                type="submit"
+                disabled={
+                  creating ||
+                  !createForm.name.trim() ||
+                  (createForm.transport !== "stdio"
+                    ? !createForm.url.trim()
+                    : !createForm.command.trim())
+                }
+              >
+                {creating ? <Spinner /> : <Plus size={14} weight="bold" />}
+                {tm.createAndAttach ?? "Create & attach"}
+              </Button>
+            </div>
+          </form>
+        ) : registryLoading ? (
           <div className="flex items-center gap-2 text-sm text-muted">
             <Spinner /> {tm.registryLoading ?? "Loading registry…"}
           </div>
         ) : registry === null ? (
           <p className="text-sm text-muted">{tm.registryFailed ?? "Failed to load the MCP server registry."}</p>
         ) : candidates.length === 0 ? (
-          <p className="text-sm text-muted">{tm.noCandidates ?? "All registry servers are already bound."}</p>
+          <div className="text-sm text-muted">
+            <p>{tm.noCandidates ?? "All registry servers are already bound."}</p>
+            <div className="mt-3">
+              <Button size="sm" onClick={() => setCreateMode(true)}>
+                <Plus size={14} weight="bold" />
+                {tm.createServer ?? "Create new server"}
+              </Button>
+            </div>
+          </div>
         ) : (
-          <ul className="flex flex-col gap-2">
-            {candidates.map((s) => (
-              <li key={s.id}>
-                <button
-                  type="button"
-                  onClick={() => attach(s)}
-                  disabled={attachingId === s.id}
-                  className="flex w-full items-center gap-3 rounded-md border border-divider bg-surface px-3 py-2.5 text-left transition-colors hover:bg-surface-2 disabled:opacity-60"
-                >
-                  {attachingId === s.id ? <Spinner /> : <McpStatusDot status={s.status} />}
-                  <span className="min-w-0 flex-1">
-                    <span className="flex items-center gap-2">
-                      <span className="truncate text-sm font-medium text-ink">{s.name}</span>
-                      <Tag tone={s.transport === "http" ? "blue" : "neutral"}>{s.transport}</Tag>
-                      {!s.enabled && <Tag tone="yellow">{tm.disabled ?? "off"}</Tag>}
-                    </span>
-                    {(s.url || s.command) && (
-                      <span className="mt-0.5 block truncate font-mono text-xs text-muted">
-                        {s.transport === "http" ? s.url : [s.command, ...(s.args ?? [])].join(" ")}
+          <>
+            <ul className="flex flex-col gap-2">
+              {candidates.map((s) => (
+                <li key={s.id}>
+                  <button
+                    type="button"
+                    onClick={() => attach(s)}
+                    disabled={attachingId === s.id}
+                    className="flex w-full items-center gap-3 rounded-md border border-divider bg-surface px-3 py-2.5 text-left transition-colors hover:bg-surface-2 disabled:opacity-60"
+                  >
+                    {attachingId === s.id ? <Spinner /> : <McpStatusDot status={s.status} />}
+                    <span className="min-w-0 flex-1">
+                      <span className="flex items-center gap-2">
+                        <span className="truncate text-sm font-medium text-ink">{s.name}</span>
+                        <Tag tone={transportTone(s.transport)}>{s.transport}</Tag>
+                        {!s.enabled && <Tag tone="yellow">{tm.disabled ?? "off"}</Tag>}
                       </span>
-                    )}
-                  </span>
-                  <Plus size={14} weight="bold" className="shrink-0 text-muted" />
-                </button>
-              </li>
-            ))}
-          </ul>
+                      {(s.url || s.command) && (
+                        <span className="mt-0.5 block truncate font-mono text-xs text-muted">
+                          {s.transport !== "stdio"
+                            ? s.url
+                            : [s.command, ...(s.args ?? [])].join(" ")}
+                        </span>
+                      )}
+                    </span>
+                    <Plus size={14} weight="bold" className="shrink-0 text-muted" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <div className="mt-4 border-t border-divider pt-4">
+              <Button size="sm" variant="subtle" onClick={() => setCreateMode(true)}>
+                <Plus size={14} weight="bold" />
+                {tm.createServer ?? "Create new server"}
+              </Button>
+            </div>
+          </>
         )}
       </Modal>
     </section>

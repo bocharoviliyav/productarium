@@ -464,6 +464,15 @@ All dependencies use licenses that permit commercial use. The vast majority are 
 
 **Weak copyleft (LGPL-3.0-only):** psycopg (psycopg 3 with the `[binary]` extra). Used as a separate, unmodified library linked at runtime. Under LGPL-3.0-only, you may use and distribute psycopg in connection with Productarium, including commercially, provided that the psycopg library itself remains under LGPL-3.0-only, its source is available, and recipients can relink Productarium against a modified/updated version of psycopg.
 
+### Bundled Database MCP Servers
+
+The docker image bundles two third-party MCP servers for the preset database flow (PostgreSQL/MySQL/MariaDB/SQL Server/SQLite + Oracle out of the box, `api/mcp/presets.py`):
+
+- **dbhub** (MIT © 2025 Bytebase) — installed globally via npm; docker fallback image `bytebase/dbhub`.
+- **oracle-mcp-server** (MIT © 2025 MCP Oracle DB Context Contributors) — baked as a `uv` venv from the pinned commit `37ce2ead`; docker fallback image `dmeppiel/oracle-mcp-server`.
+
+Both are unmodified upstream distributions launched as stdio subprocesses; full license texts are carried in [NOTICE.md](NOTICE.md).
+
 **No strong copyleft (GPL/AGPL):** no dependency of Productarium is distributed under a strong copyleft license.
 
 ---

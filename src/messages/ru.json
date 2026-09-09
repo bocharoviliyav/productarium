@@ -102,17 +102,16 @@
     "addDatabase": "Добавить базу данных",
     "databaseName": "Название базы данных",
     "databaseNamePlaceholder": "напр. Payments primary PG",
-    "dsn": "DSN",
-    "dsnPlaceholder": "postgresql://user:password@host:5432/dbname",
-    "dsnHint": "DSN хранится на сервере и никогда не показывается обратно — отображается только маскированная форма.",
-    "mcpServer": "MCP-сервер",
-    "mcpServerNone": "Нет",
-    "mcpServerEmpty": "К этому продукту ещё не привязан ни один MCP-сервер — привяжите его ниже, чтобы его тулы могли интроспектировать базу.",
-    "mcpServerOff": "выкл",
+    "dsn": "Строка подключения (DSN)",
+    "dbType": "Тип базы данных",
+    "dsnOnceNote": "Строка подключения отправляется один раз: проверим её реальным соединением через встроенный MCP-сервер и сохраним зашифрованной — показать или изменить её после этого будет нельзя.",
+    "dbChecking": "Проверяем соединение…",
+    "dbPresetsFailed": "Не удалось загрузить типы баз данных — обновите страницу.",
+    "dbPresetPoweredBy": "Встроенный MCP-сервер:",
     "databasesCount": "{n} баз(ы) данных",
-    "dbEmptySubtitle": "Добавьте базу данных, чтобы реверс-инжинирингом получить её схему в документацию через MCP-тулы.",
+    "dbEmptySubtitle": "Добавьте базу данных — предустановленный MCP-сервер реверс-инжинирингом получит её схему в документацию.",
     "noDatabasesTitle": "Баз данных пока нет",
-    "noDatabasesDesc": "Добавьте базу данных (название + DSN подключения) и опционально привяжите MCP-сервер, затем реверс-инжинирингом получите документацию схемы.",
+    "noDatabasesDesc": "Выберите тип базы, укажите строку подключения и название — соединение проверяется через встроенный MCP-сервер, затем схема реверс-инжинирингом превращается в документацию.",
     "reverseEngineer": "Реверс-инжиниринг",
     "reverseEngineering": "Реверс-инжиниринг…",
     "genProgress": "{done}/{total} · {section}",
@@ -171,7 +170,28 @@
       "allowlistManualHint": "Имена тулов через запятую. Оставьте пустым, чтобы разрешить все тулы (список тулов могут обнаружить только администраторы).",
       "allowlistManualPlaceholder": "имена тулов через запятую (пусто = все)",
       "updateFailedTitle": "Не удалось обновить",
-      "updateFailed": "Не удалось обновить"
+      "updateFailed": "Не удалось обновить",
+      "createServer": "Создать новый сервер",
+      "createTitle": "Новый MCP-сервер",
+      "createAndAttach": "Создать и привязать",
+      "createdAttachedTitle": "Сервер создан и привязан",
+      "createdAttached": "«{name}» теперь доступен агенту-эксперту.",
+      "createFailedTitle": "Не удалось создать",
+      "createFailed": "Не удалось создать",
+      "invalidKeyValue": "Некорректная строка {label}: {line}",
+      "nameLabel": "Название",
+      "namePlaceholder": "напр. Context7 docs",
+      "transport": "Транспорт",
+      "transportHttp": "HTTP",
+      "transportSse": "SSE",
+      "transportStdio": "Stdio",
+      "url": "URL",
+      "command": "Команда",
+      "args": "Аргументы (через запятую)",
+      "headers": "Заголовки (key=value, построчно)",
+      "env": "Переменные окружения (key=value, построчно)",
+      "enabledLabel": "Включён",
+      "cancel": "Отмена"
     }
   },
   "specEditor": {
@@ -233,10 +253,6 @@
     "saveDocument": "Сохранить документ",
     "specEditTitle": "Редактировать спецификацию",
     "linksEditTitle": "Редактировать ссылки",
-    "askExpertTitle": "Спросить эксперта",
-    "askExpertSubtitle": "Вопросы по всем артефактам в контексте продукта доступны на странице продукта. Задайте вопрос об этой кодовой базе, спецификации или ссылках в контексте.",
-    "openExpertChat": "Открыть чат с экспертом",
-    "expertBadge": "эксперт",
     "savedTitle": "Сохранено",
     "savedMessage": "Документация обновлена и переиндексирована.",
     "saveFailedTitle": "Не удалось сохранить",
@@ -300,7 +316,14 @@
     "uploadNoMarkdownTitle": "Загрузка выполнена",
     "uploadNoMarkdown": "Markdown не возвращён.",
     "uploadFailedTitle": "Не удалось загрузить",
-    "loadFailedMessage": "Не удалось загрузить базу знаний"
+    "loadFailedMessage": "Не удалось загрузить базу знаний",
+    "modeTitle": "Название",
+    "modeConfluence": "Страница Confluence (URL)",
+    "confluenceUrlLabel": "Ссылка на страницу",
+    "confluenceUrlPlaceholder": "https://confluence.example.com/wiki/spaces/TEAM/pages/123456/Page+Title",
+    "confluenceHint": "Страница (с дочерними страницами и вложениями) выгружается в базу знаний. Требуется настроенный коннектор Confluence.",
+    "pull": "Выгрузить",
+    "pullFailed": "Не удалось выгрузить"
   },
   "verified": {
     "verified": "Проверено",
@@ -405,7 +428,8 @@
       "memory": "Память агента",
       "timeouts": "Таймауты",
       "users": "Пользователи",
-      "tokens": "API-токены"
+      "tokens": "API-токены",
+      "publicapi": "Публичный API"
     },
     "loadFailedTitle": "Не удалось загрузить",
     "loadFailed": "Не удалось загрузить",
@@ -482,14 +506,45 @@
       "reachable": "Доступен"
     },
     "integrations": {
-      "intro": "Сырая конфигурация интеграций (JSON). Каждый ключ соответствует коннектору, зарегистрированному на бэкенде.",
+      "intro": "HTTP-интеграции: шаблонные GET-эндпоинты, доступные агентам как именованные тулы. Объявляйте {placeholders} в шаблоне URL; агент заполняет их при вызове тула.",
+      "loading": "Загрузка интеграций…",
+      "noIntegrations": "HTTP-интеграций пока нет.",
+      "addIntegration": "Добавить интеграцию",
+      "editIntegration": "Редактировать интеграцию",
+      "name": "Название",
+      "namePlaceholder": "напр. grafana-search",
+      "description": "Описание",
+      "urlTemplate": "Шаблон URL",
+      "urlTemplatePlaceholder": "https://api.example.com/search?repo={product_name}",
+      "urlTemplateHint": "Используйте {product_name} или объявленные переменные как {placeholders}.",
+      "headers": "Заголовки (key=value, построчно)",
+      "variables": "Переменные",
+      "varName": "Название",
+      "varDescription": "Описание",
+      "varDefault": "Значение по умолчанию",
+      "addVariable": "Добавить переменную",
+      "enabled": "Включена",
       "save": "Сохранить",
       "test": "Проверить",
-      "loading": "Загрузка…",
-      "savedToast": "Конфигурация интеграций сохранена.",
-      "okTitle": "ОК",
-      "ok": "ОК",
-      "invalidJson": "Неверный JSON"
+      "testTitle": "Проверка",
+      "testOk": "Статус {status}.",
+      "testFailed": "Запрос не удался: {detail}",
+      "preview": "Превью ответа",
+      "createdToast": "Интеграция создана.",
+      "savedToast": "Интеграция сохранена.",
+      "deletedToast": "Интеграция удалена",
+      "deleteConfirm": "Удалить эту HTTP-интеграцию?",
+      "secretsHint": "Значения заголовков хранятся зашифрованными и показываются замаскированными. Введите новые строки key=value, чтобы заменить их; оставьте пустым, чтобы сохранить текущие значения.",
+      "secretsStored": "сохранены",
+      "invalidKeyValue": "Некорректная строка {label}: {line}",
+      "toggleLabel": "Включить или отключить эту интеграцию",
+      "tableHeaders": {
+        "name": "Название",
+        "url": "Шаблон URL",
+        "variables": "Переменные",
+        "enabled": "Включена",
+        "actions": "Действия"
+      }
     },
     "mcp": {
       "intro": "Глобальный реестр внешних MCP-серверов (HTTP / stdio). Привязывайте их к продуктам, чтобы расширить агента-эксперта их тулами. Входящий MCP-доступ обслуживается на /api/mcp по API-токену.",
@@ -501,6 +556,7 @@
       "namePlaceholder": "напр. Context7 docs",
       "transport": "Транспорт",
       "transportHttp": "HTTP",
+      "transportSse": "SSE",
       "transportStdio": "Stdio",
       "url": "URL",
       "command": "Команда",
@@ -538,12 +594,23 @@
       }
     },
     "prompts": {
-      "intro": "Редактируйте markdown-шаблоны промптов в refs/prompts/*.md на лету — изменения применяются при следующей генерации.",
+      "intro": "Редактируйте markdown-шаблоны промптов (refs/prompts/ru и refs/prompts/en) на лету — изменения применяются при следующей генерации. Если перевода ещё нет, показывается английский оригинал; сохранение создаст копию на выбранном языке.",
+      "languageLabel": "Язык генерации",
+      "languageHint": "Язык, на котором генерируется документация. Применяется при следующем запуске генерации; промпты этого языка редактируются ниже.",
+      "langRu": "Русский",
+      "langEn": "English",
+      "languageSavedToast": "Язык генерации: {lang}.",
+      "editorLangLabel": "Редактирование",
+      "fallbackBadge": "EN-оригинал",
       "loadingList": "Загрузка промптов…",
       "loadingFile": "Загрузка файла…",
       "noFiles": "Файлы промптов не найдены.",
       "save": "Сохранить",
       "savedToast": "Сохранён {file}."
+    },
+    "publicapi": {
+      "intro": "Текущая публичная OpenAPI-схема API Productarium (только чтение).",
+      "loading": "Загрузка схемы…"
     },
     "embedder": {
       "title": "Ограничения эмбеддера",
@@ -588,15 +655,19 @@
       "default": "по умолчанию",
       "groups": {
         "LLM": "LLM",
+        "Expert": "Эксперт",
         "Memory": "Память",
         "Integrations": "Интеграции",
-        "Mermaid": "Mermaid"
+        "Mermaid": "Mermaid",
+        "Databases": "Базы данных"
       },
       "labels": {
         "llm_request": "Таймаут LLM-запроса",
         "llm_retry_max_time": "Бюджет ретраев LLM",
         "model_list": "Листинг/проверка моделей",
         "provider_test": "Тест подключения провайдера",
+        "docgen_map_concurrency": "Параллельных LLM-вызовов docgen (MAP-фаза)",
+        "expert_stream": "Бюджет одного хода эксперта (wall-clock)",
         "docgen_indexing_drain": "Docgen indexing drain",
         "memory_query": "Семантический запрос памяти (pgvector cosine)",
         "integration_http": "HTTP-запрос интеграций",
@@ -604,13 +675,17 @@
         "mcp_stdio_wait": "Ожидание stdio MCP",
         "mermaid_verify": "Проверка диаграммы Mermaid",
         "mermaid_repair": "Ремонт диаграммы Mermaid",
-        "mermaid_max_repair_attempts": "Макс. попыток ремонта Mermaid"
+        "mermaid_max_repair_attempts": "Макс. попыток ремонта Mermaid",
+        "mermaid_repair_deadline": "Общий бюджет цикла ремонта Mermaid",
+        "db_connect_check": "Проверка подключения пресетной БД (MCP-хендшейк)"
       },
       "hints": {
         "llm_request": "HTTP-таймаут запроса к OpenAI-совместимым клиентам.",
         "llm_retry_max_time": "Бюджет backoff-ретраев при транзиентных ошибках LLM.",
         "model_list": "HTTP-таймаут для листинга и проверки существования моделей.",
         "provider_test": "Таймаут теста подключения на панели администратора.",
+        "docgen_map_concurrency": "Максимум параллельных LLM-вызовов в MAP-фазе докгенерации; 1 — строго последовательно.",
+        "expert_stream": "Бюджет одного вопроса эксперту. Ход выполняется фоновой задачей и переживает отключение клиента, поэтому минуты — норма; по истечении частичный ответ сохраняется.",
         "docgen_indexing_drain": "How long a docgen worker waits for background memory indexing before finishing the job.",
         "memory_query": "Таймаут cosine-запроса pgvector-бэкенда (embed + ORDER BY embedding <=> :q). При таймауте бэкенд возвращает пустую строку, эксперт откатывается к документам артефактов.",
         "integration_http": "HTTP-таймаут для коннекторов интеграций.",
@@ -618,7 +693,9 @@
         "mcp_stdio_wait": "Таймаут ожидания .wait() stdio-сабпроцесса MCP.",
         "mermaid_verify": "Таймаут проверки одной диаграммы через Node-валидатор.",
         "mermaid_repair": "Таймаут LLM-вызова ремонта одной диаграммы.",
-        "mermaid_max_repair_attempts": "Бюджет попыток ремонта на уникальную диаграмму."
+        "mermaid_max_repair_attempts": "Бюджет попыток ремонта на уникальную диаграмму.",
+        "mermaid_repair_deadline": "Общий wall-clock бюджет ремонта всех диаграмм одной страницы.",
+        "db_connect_check": "Бюджет полного MCP-хендшейка при добавлении пресетной БД (запуск лаунчера + initialize + tools/list + пробный вызов инструмента). Завышенный запас — при первом запуске docker-фолбэк может тянуть образ."
       }
     },
     "users": {
@@ -731,7 +808,12 @@
     "planning": "Планирование…",
     "researching": "Исследование…",
     "researchingTool": "Исследование: {tool}…",
-    "synthesizing": "Синтез…"
+    "synthesizing": "Синтез…",
+    "expertTitle": "Эксперт",
+    "stillGenerating": "Ответ ещё генерируется — подключились к нему",
+    "deleteSession": "Удалить чат",
+    "deleteSessionConfirm": "Удалить этот чат вместе со всей историей?",
+    "deleteSessionFailed": "Не удалось удалить чат"
   },
   "mermaid": {
     "clickToFullscreen": "Нажмите, чтобы открыть на весь экран",

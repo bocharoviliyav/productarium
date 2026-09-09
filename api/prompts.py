@@ -1,21 +1,28 @@
 """Module containing all prompts used in the DeepWiki project.
 
-Prompt BODIES live externally in ``refs/prompts/*.md`` and are loaded at module
-import time by :func:`load_prompt_file`. This module keeps only the abstract,
+Prompt BODIES live externally in ``refs/prompts/<lang>/<name>.md`` (one file
+per prompt per language: ``ru`` and ``en``) and are loaded at module import
+time by :func:`load_prompt_file`. This module keeps only the abstract,
 code-level scaffolding: the canonical wiki section list, language/detail-level
 helpers, the loader, and the :data:`SECTION_PROMPTS` registry that maps section
 ids to the parsed section contracts.
 
 The seven wiki section contracts live in ONE file —
-``refs/prompts/docgen_sections.md`` — as ``<section id="...">...</section>``
+``refs/prompts/<lang>/docgen_sections.md`` — as ``<section id="...">...</section>``
 blocks parsed by :func:`_parse_section_blocks` into :data:`SECTION_PROMPTS`.
 
+The ACTIVE language is resolved by :func:`get_generation_language`: the
+``generation.language`` admin setting (``ru`` | ``en``) wins, falling back to
+the ``lang.json`` default. Switching it via the admin panel hot-reloads every
+prompt through :func:`reload_all_prompt_files` — no restart needed.
+
 Each prompt constant below is a short fallback used only if the corresponding
-``refs/prompts/<name>.md`` file is missing. Do NOT inline prompt bodies here —
-edit the matching ``refs/prompts/<name>.md`` file instead.
+file is missing. Do NOT inline prompt bodies here — edit the matching
+``refs/prompts/<lang>/<name>.md`` file instead.
 
 Inventory invariant: the keys of :data:`PROMPT_FILES` are exactly the
-``*.md`` files in ``refs/prompts/`` (minus ``README.md``). A test enforces
+``*.md`` files in each of ``refs/prompts/ru/`` and ``refs/prompts/en/``
+(``refs/prompts/README.md`` is documentation, not a prompt). A test enforces
 it — adding or deleting a prompt file without updating the registry (or
 vice versa) fails the suite.
 """
@@ -23,7 +30,7 @@ vice versa) fails the suite.
 import logging
 import os
 import re
-from typing import Dict
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +139,39 @@ def _default_language() -> str:
         return "ru"
 
 
+#: Supported prompt/generation languages (one ``refs/prompts/<lang>/`` dir each).
+PROMPT_LANGUAGES = ("ru", "en")
+
+#: Admin settings-store key that overrides the generation language (ru | en).
+GENERATION_LANGUAGE_SETTING = "generation.language"
+
+
+def _normalize_language(language: Optional[str]) -> str:
+    """Map any input to a supported language code (default: active language)."""
+    if language in PROMPT_LANGUAGES:
+        return language  # type: ignore[return-value]
+    return get_generation_language()
+
+
+def get_generation_language() -> str:
+    """Resolve the active prompt/generation language.
+
+    Precedence: the ``generation.language`` admin setting (set in the admin
+    panel's prompts section) > ``lang.json`` default. The settings store is
+    non-fatal (DB down / import time -> falls through to the lang.json value).
+    """
+    try:
+        from api.config.settings import get_setting
+
+        stored = (get_setting(GENERATION_LANGUAGE_SETTING) or "").strip().lower()
+        if stored in PROMPT_LANGUAGES:
+            return stored
+    except Exception:  # pragma: no cover - settings store is non-fatal
+        pass
+    fallback = _default_language().strip().lower()
+    return fallback if fallback in PROMPT_LANGUAGES else "ru"
+
+
 def _wrap_prompt(prompt: str, language: str = "ru") -> str:
     """Wrap a generation prompt with language and detail-level instructions."""
     language_name = LANGUAGE_NAMES.get(language, language)
@@ -149,7 +189,7 @@ def _maybe_wrap(filename: str, content: str) -> str:
     """
     if filename in _UNWRAPPED_PROMPTS or "{language_name}" in content:
         return content
-    return _wrap_prompt(content, _default_language())
+    return _wrap_prompt(content, get_generation_language())
 
 
 # Forward declarations; populated by the dynamic-load block below.
@@ -181,6 +221,33 @@ PROMPTS_DIR = os.path.join(
     "refs",
     "prompts",
 )
+
+
+def prompts_dir(language: Optional[str] = None) -> str:
+    """Directory holding the prompt files for ``language`` (default: active).
+
+    ``refs/prompts/ru`` / ``refs/prompts/en`` — one file per
+    :data:`PROMPT_FILES` key in each. ``PROMPTS_DIR`` itself only keeps
+    ``README.md`` (documentation, never editable via the admin panel).
+    """
+    lang = _normalize_language(language)
+    return os.path.join(PROMPTS_DIR, lang)
+
+
+def _resolve_prompt_path(filename: str, language: Optional[str] = None) -> str:
+    """First existing path for ``filename``: the language dir, then ``en``.
+
+    Returns the language-dir path even when it does not exist, so callers can
+    log a meaningful "missing" target and fall back to their fallback text.
+    """
+    lang = _normalize_language(language)
+    primary = os.path.join(PROMPTS_DIR, lang, filename)
+    if os.path.exists(primary) or lang == "en":
+        return primary
+    fallback = os.path.join(PROMPTS_DIR, "en", filename)
+    if os.path.exists(fallback):
+        return fallback
+    return primary
 
 # Minimal fallback used only when docgen_sections.md is missing: one short
 # block per canonical section id so the pipeline can still run.
@@ -269,17 +336,20 @@ def _parse_subpage_blocks(text: str) -> Dict[str, str]:
     return out
 
 
-def load_prompt_file(filename: str, fallback: str) -> str:
-    """Load a prompt template from ``refs/prompts/<filename>``.
+def load_prompt_file(
+    filename: str, fallback: str, language: Optional[str] = None
+) -> str:
+    """Load a prompt template from ``refs/prompts/<lang>/<filename>``.
 
-    Returns the file content (stripped + wrapped) if it exists, otherwise
-    ``fallback`` (also wrapped, unless it carries ``{language_name}``).
-    Generation prompts are automatically prepended with language and
-    detail-level instructions via ``_maybe_wrap``.
+    ``language`` defaults to the active generation language (see
+    :func:`get_generation_language`); when the file is missing there, the
+    English copy is used before ``fallback``. Returns the file content
+    (stripped + wrapped); generation prompts are automatically prepended with
+    language and detail-level instructions via ``_maybe_wrap``.
     """
     content = fallback
     try:
-        path = os.path.join(PROMPTS_DIR, filename)
+        path = _resolve_prompt_path(filename, language)
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read().strip()
@@ -379,11 +449,12 @@ def _load_subpages_registry() -> None:
             )
 
 
-def reload_prompt_file(filename: str) -> bool:
+def reload_prompt_file(filename: str, language: Optional[str] = None) -> bool:
     """Re-read a prompt file from disk and update the in-memory constant.
 
     Looks up ``filename`` in :data:`PROMPT_FILES` to find the module attribute
-    that holds the loaded text, reads the file fresh from ``refs/prompts/``,
+    that holds the loaded text, reads the file fresh from the active
+    language's dir (or ``language`` when given; English copy as fallback),
     and updates the module-level constant. When the file is
     ``docgen_sections.md`` the :data:`SECTION_PROMPTS` registry is re-parsed
     as well. Returns True on success, False if the file is unknown or missing.
@@ -392,7 +463,7 @@ def reload_prompt_file(filename: str) -> bool:
     if not attr_name:
         logger.warning("reload_prompt_file: unknown prompt file %r", filename)
         return False
-    path = os.path.join(PROMPTS_DIR, filename)
+    path = _resolve_prompt_path(filename, language)
     if not os.path.exists(path):
         logger.warning("reload_prompt_file: file not found %r", path)
         return False
@@ -426,8 +497,30 @@ def reload_prompt_file(filename: str) -> bool:
     return True
 
 
-# Load every external template. refs/prompts/*.md is the source of truth; the
-# fallbacks above are used only if a file is missing.
+def reload_all_prompt_files(language: Optional[str] = None) -> None:
+    """Reload EVERY prompt file (used when the generation language changes).
+
+    Iterates :data:`PROMPT_FILES` and routes each through
+    :func:`reload_prompt_file`, which also re-parses the section/subpage
+    registries and refreshes ``api.expert.prompt``. Files missing on disk keep
+    their current in-memory value (last good copy), so a partial translation
+    set never blanks a prompt.
+    """
+    reloaded = 0
+    for filename in PROMPT_FILES:
+        if reload_prompt_file(filename, language=language):
+            reloaded += 1
+    logger.info(
+        "reload_all_prompt_files: refreshed %d/%d prompts (language=%r)",
+        reloaded,
+        len(PROMPT_FILES),
+        _normalize_language(language),
+    )
+
+
+# Load every external template. refs/prompts/<lang>/*.md is the source of
+# truth; the fallbacks above are used only if a file is missing. Calls-time
+# loaders (spec/summary/expert) read the file fresh with the active language.
 DOCGEN_SECTIONS_PROMPT = load_prompt_file("docgen_sections.md", _SECTIONS_FALLBACK)
 DOCGEN_SUBPAGES_PROMPT = load_prompt_file("docgen_subpages.md", _SUBPAGES_FALLBACK)
 DOCGEN_DECOMPOSER_PROMPT = load_prompt_file("docgen_decomposer.md", _DECOMPOSER_FALLBACK)

@@ -43,7 +43,7 @@ import {
 import {
   type Codebase,
   type Database,
-  type McpServerBinding,
+  type DbPreset,
   type Product,
   type Spec,
   entityPath,
@@ -106,18 +106,20 @@ export default function ProductDetailPage() {
   const [linkUrl, setLinkUrl] = useState("");
   const [linkDesc, setLinkDesc] = useState("");
 
-  // Database ("reverse-engineered") add modal — wave E. The DSN is captured in
-  // a password input and NEVER rendered back: the API only returns
-  // `dsn_masked`, which the card displays instead.
+  // Database ("reverse-engineered") add modal — the hardcoded preset flow.
+  // The DSN is typed into a VISIBLE input (the user must be able to check it
+  // for typos) and sent exactly once: the backend validates it against the
+  // preset registry, proves it with a REAL MCP connection check, then stores
+  // it encrypted inside the dedicated preset server row. It is never
+  // returned or displayed afterwards — not even in masked form.
   const [showDatabaseModal, setShowDatabaseModal] = useState(false);
+  // Preset key (postgresql|mysql|…|oracle) from GET /api/db-presets.
+  const [dbType, setDbType] = useState("");
   const [dbName, setDbName] = useState("");
   const [dbDsn, setDbDsn] = useState("");
-  // Registry server id of the optional bound MCP server used for
-  // reverse-engineering ("" = none).
-  const [dbMcpServerId, setDbMcpServerId] = useState("");
-  // Bound MCP servers for the picker — loaded lazily when the modal opens
-  // (null = not loaded yet; [] = none bound / endpoint unavailable).
-  const [mcpBindings, setMcpBindings] = useState<McpServerBinding[] | null>(null);
+  // Preset catalog — static, fetched once on mount. null = not loaded yet;
+  // [] = endpoint unavailable (the modal shows a hint and blocks submit).
+  const [dbPresets, setDbPresets] = useState<DbPreset[] | null>(null);
 
   // In-flight docgen jobs keyed by entity id — replaces the single
   // `generatingId` so several entities can generate at once and the state
@@ -293,6 +295,37 @@ export default function ProductDetailPage() {
     };
   }, [productId]);
 
+  // Preset catalog (GET /api/db-presets): powers the database type selector
+  // in the add modal and the engine tags on the database cards. Static
+  // payload — fetched once on mount; failures degrade to an empty catalog
+  // (the modal shows a hint and blocks submit).
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch("/api/db-presets", {
+          credentials: "include",
+          cache: "no-store",
+        });
+        if (!res.ok) throw new Error(String(res.status));
+        const data = await res.json();
+        if (!cancelled && Array.isArray(data)) setDbPresets(data as DbPreset[]);
+      } catch {
+        if (!cancelled) setDbPresets([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Default the type selector to the first preset once the catalog arrives.
+  useEffect(() => {
+    if (dbPresets?.length && !dbType) setDbType(dbPresets[0].key);
+  }, [dbPresets, dbType]);
+
+  const selectedDbPreset = dbPresets?.find((p) => p.key === dbType) ?? null;
+
   const resetCodebaseForm = () => {
     setCbName("");
     setCbRepoUrl("");
@@ -309,44 +342,24 @@ export default function ProductDetailPage() {
   const resetDatabaseForm = () => {
     setDbName("");
     setDbDsn("");
-    setDbMcpServerId("");
+    // `dbType` deliberately persists across opens — the user's preferred
+    // engine is sticky; it is re-defaulted only before the first pick.
   };
 
-  // Open the database modal and (once) fetch the product's MCP bindings for
-  // the optional server picker. Degrades to an empty picker when the MCP
-  // endpoints are unavailable (404/offline).
-  const openDatabaseModal = async () => {
-    setShowDatabaseModal(true);
-    if (mcpBindings !== null) return;
-    try {
-      const res = await fetch(`/api/products/${productId}/mcp`, {
-        credentials: "include",
-        cache: "no-store",
-      });
-      if (!res.ok) {
-        setMcpBindings([]);
-        return;
-      }
-      const data = await res.json();
-      setMcpBindings(Array.isArray(data) ? (data as McpServerBinding[]) : []);
-    } catch {
-      setMcpBindings([]);
-    }
-  };
-
-  // Add a database via the section-header modal: name + DSN (password input;
-  // the raw DSN is sent once and comes back masked) + optional bound MCP
-  // server whose tools drive the reverse-engineering flow.
+  // Add a database via the section-header modal (the hardcoded preset
+  // flow): type (from GET /api/db-presets) + visible DSN + name. The POST
+  // runs the real MCP connection check server-side and can take a while —
+  // the submit button switches to a "checking connection" state.
   const handleAddDatabase = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!product || !dbName.trim() || !dbDsn.trim() || isSaving) return;
+    if (!product || !dbName.trim() || !dbDsn.trim() || !dbType || isSaving) return;
     setIsSaving(true);
     try {
       const body = {
         id: generateId("db"),
         name: dbName.trim(),
+        db_type: dbType,
         dsn: dbDsn.trim(),
-        mcp_server_id: dbMcpServerId || null,
         source: "manual" as const,
       };
       const res = await fetch(`/api/products/${product.id}/databases`, {
@@ -482,7 +495,9 @@ export default function ProductDetailPage() {
           method: "POST",
           credentials: "include",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ language: "en" }),
+          // Generation language is governed by the admin `generation.language`
+          // setting (resolved at job start) — no per-request override.
+          body: JSON.stringify({}),
         },
       );
       const data = await res.json().catch(() => ({}));
@@ -814,7 +829,10 @@ export default function ProductDetailPage() {
               </form>
             </Modal>
 
-            {/* Database add modal — opened from the Databases section header */}
+            {/* Database add modal — the hardcoded preset flow. Type (from
+                GET /api/db-presets) drives the DSN example/hint; the DSN is
+                visible (type="text") so typos can be caught, and is sent
+                exactly once. */}
             <Modal
               open={showDatabaseModal}
               onClose={() => setShowDatabaseModal(false)}
@@ -823,56 +841,80 @@ export default function ProductDetailPage() {
             >
               <form onSubmit={handleAddDatabase} className="grid gap-5">
                 <div>
+                  <Label>{t.dbType ?? "Database type"}</Label>
+                  <Select
+                    value={dbType}
+                    onChange={(e) => setDbType(e.target.value)}
+                    disabled={!dbPresets?.length}
+                  >
+                    {(dbPresets ?? []).map((p) => (
+                      <option key={p.key} value={p.key}>
+                        {p.label}
+                      </option>
+                    ))}
+                  </Select>
+                  {dbPresets !== null && dbPresets.length === 0 && (
+                    <p className="mt-1.5 text-xs text-muted">
+                      {t.dbPresetsFailed ?? ""}
+                    </p>
+                  )}
+                </div>
+                <div>
+                  <Label>{t.dsn ?? "DSN"}</Label>
+                  <Input
+                    type="text"
+                    value={dbDsn}
+                    onChange={(e) => setDbDsn(e.target.value)}
+                    placeholder={selectedDbPreset?.dsn_example ?? ""}
+                    required
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="font-mono"
+                  />
+                  {selectedDbPreset?.dsn_hint && (
+                    <p className="mt-1.5 font-mono text-xs text-muted">
+                      {selectedDbPreset.dsn_hint}
+                    </p>
+                  )}
+                  <p className="mt-1 text-xs text-muted">
+                    {t.dsnOnceNote ?? ""}
+                  </p>
+                </div>
+                <div>
                   <Label>{t.databaseName ?? "Database name"}</Label>
                   <Input
                     value={dbName}
                     onChange={(e) => setDbName(e.target.value)}
                     placeholder={t.databaseNamePlaceholder ?? ""}
                     required
-                    autoFocus
                   />
                 </div>
-                <div>
-                  <Label>{t.dsn ?? "DSN"}</Label>
-                  <Input
-                    type="password"
-                    value={dbDsn}
-                    onChange={(e) => setDbDsn(e.target.value)}
-                    placeholder={t.dsnPlaceholder ?? ""}
-                    required
-                    autoComplete="off"
-                  />
-                  <p className="mt-1.5 text-xs text-muted">
-                    {t.dsnHint ?? ""}
+                {selectedDbPreset && (
+                  <p className="text-xs text-muted">
+                    {t.dbPresetPoweredBy ?? "Built-in MCP server:"}{" "}
+                    <a
+                      href={selectedDbPreset.server.homepage}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline decoration-divider underline-offset-2 transition-colors hover:text-ink"
+                    >
+                      {selectedDbPreset.server.name}
+                    </a>{" "}
+                    · {selectedDbPreset.server.license}
                   </p>
-                </div>
-                <div>
-                  <Label>{t.mcpServer ?? "MCP server"}</Label>
-                  <Select
-                    value={dbMcpServerId}
-                    onChange={(e) => setDbMcpServerId(e.target.value)}
-                  >
-                    <option value="">{t.mcpServerNone ?? "None"}</option>
-                    {(mcpBindings ?? []).map((b) => (
-                      <option key={b.id} value={b.mcp_server_id}>
-                        {b.name}
-                        {b.enabled ? "" : ` · ${t.mcpServerOff ?? "off"}`}
-                      </option>
-                    ))}
-                  </Select>
-                  {mcpBindings !== null && mcpBindings.length === 0 && (
-                    <p className="mt-1.5 text-xs text-muted">
-                      {t.mcpServerEmpty ?? ""}
-                    </p>
-                  )}
-                </div>
+                )}
                 <div className="flex items-center justify-end gap-2">
                   <Button type="button" variant="ghost" onClick={() => setShowDatabaseModal(false)}>
                     {tc.cancel ?? "Cancel"}
                   </Button>
-                  <Button type="submit" disabled={isSaving || !dbName.trim() || !dbDsn.trim()}>
+                  <Button
+                    type="submit"
+                    disabled={isSaving || !dbType || !dbName.trim() || !dbDsn.trim()}
+                  >
                     {isSaving ? <Spinner /> : <Plus size={16} weight="bold" />}
-                    {t.saveArtifact ?? "Save"}
+                    {isSaving
+                      ? (t.dbChecking ?? "Checking connection…")
+                      : (t.saveArtifact ?? "Save")}
                   </Button>
                 </div>
               </form>
@@ -1082,7 +1124,7 @@ export default function ProductDetailPage() {
                       <Button
                         variant="primary"
                         size="sm"
-                        onClick={() => void openDatabaseModal()}
+                        onClick={() => setShowDatabaseModal(true)}
                       >
                         <Plus size={14} weight="bold" />
                         {t.addDatabase ?? "Add database"}
@@ -1097,7 +1139,7 @@ export default function ProductDetailPage() {
                         title={t.noDatabasesTitle ?? "No databases yet"}
                         description={t.noDatabasesDesc ?? ""}
                         action={
-                          <Button onClick={() => void openDatabaseModal()}>
+                          <Button onClick={() => setShowDatabaseModal(true)}>
                             <Plus size={16} weight="bold" />
                             {t.addDatabase ?? "Add database"}
                           </Button>
@@ -1130,6 +1172,11 @@ export default function ProductDetailPage() {
                                       </h3>
                                       <div className="mt-1 flex flex-wrap items-center gap-2">
                                         <Tag tone="blue">{tArt?.database?.label ?? "Database"}</Tag>
+                                        {d.db_type && (
+                                          <Tag tone="neutral">
+                                            {dbPresets?.find((p) => p.key === d.db_type)?.label ?? d.db_type}
+                                          </Tag>
+                                        )}
                                         {d.mcp_server_name && (
                                           <Tag tone="neutral">{d.mcp_server_name}</Tag>
                                         )}
@@ -1157,13 +1204,6 @@ export default function ProductDetailPage() {
                                   <p className="mt-4 flex items-center gap-2 font-mono text-xs text-muted">
                                     <Spinner className="h-3.5 w-3.5" />
                                     {genProgressText(gen)}
-                                  </p>
-                                )}
-
-                                {/* Masked DSN only — the raw DSN never comes back. */}
-                                {d.dsn_masked && (
-                                  <p className="mt-4 truncate font-mono text-xs text-muted">
-                                    {d.dsn_masked}
                                   </p>
                                 )}
 

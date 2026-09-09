@@ -6,6 +6,7 @@ import {
   ArrowRight,
   ArrowsCounterClockwise,
   Brain,
+  Code,
   Copy,
   FileText,
   Gear,
@@ -43,8 +44,11 @@ import {
   cn,
 } from "@/components/ui";
 import { McpStatusDot } from "@/components/mcp/McpStatusDot";
+import { SpecViewer } from "@/components/SpecViewer";
 import type {
   ApiToken,
+  HttpIntegration,
+  HttpIntegrationTestResult,
   McpServer,
   McpTestResult,
   McpTransport,
@@ -69,7 +73,8 @@ type Section =
   | "memory"
   | "timeouts"
   | "users"
-  | "tokens";
+  | "tokens"
+  | "publicapi";
 
 const SECTIONS: { key: Section; icon: typeof Gear }[] = [
   { key: "models", icon: Rocket },
@@ -83,6 +88,7 @@ const SECTIONS: { key: Section; icon: typeof Gear }[] = [
   { key: "timeouts", icon: Wrench },
   { key: "users", icon: UserCircleGear },
   { key: "tokens", icon: Key },
+  { key: "publicapi", icon: Code },
 ];
 
 /**
@@ -1001,68 +1007,223 @@ function SslSection() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Integrations section (JSON editor)                                  */
+/* Integrations section (HTTP GET integrations registry, issue #3)     */
 /* ------------------------------------------------------------------ */
 
+/** One editable row of the variables repeater (name/description/default). */
+interface HttpVarFormRow {
+  name: string;
+  description: string;
+  def: string;
+}
+
+interface HttpIntegrationFormState {
+  name: string;
+  description: string;
+  urlTemplate: string;
+  headersText: string;
+  variables: HttpVarFormRow[];
+  enabled: boolean;
+}
+
+const EMPTY_HTTP_FORM: HttpIntegrationFormState = {
+  name: "",
+  description: "",
+  urlTemplate: "",
+  headersText: "",
+  variables: [],
+  enabled: true,
+};
+
 function IntegrationsSection() {
-  const { getJson, putJson, postJson, notify } = useAdminApi();
-  const { messages } = useLanguage();
+  const { getJson, putJson, postJson, del, notify } = useAdminApi();
+  const { messages, fmt } = useLanguage();
   const t = messages?.admin ?? {};
+  const tc = messages?.common ?? {};
   const ti = t?.integrations ?? {};
-  const [text, setText] = useState("");
+
+  const [items, setItems] = useState<HttpIntegration[]>([]);
   const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [testingId, setTestingId] = useState<string | null>(null);
+
+  // Create / edit form state.
+  const [formOpen, setFormOpen] = useState(false);
+  const [editing, setEditing] = useState<HttpIntegration | null>(null);
+  const [form, setForm] = useState<HttpIntegrationFormState>(EMPTY_HTTP_FORM);
   const [saving, setSaving] = useState(false);
-  const [testing, setTesting] = useState(false);
+
+  // Last test result (status code + body preview in a modal).
+  const [testView, setTestView] = useState<{
+    item: HttpIntegration;
+    result: HttpIntegrationTestResult;
+  } | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await getJson<HttpIntegration[]>(
+        "/api/admin/integrations/http",
+      );
+      setItems(Array.isArray(data) ? data : []);
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.loadFailedTitle ?? "Load failed",
+        message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
+      });
+    } finally {
+      setLoading(false);
+    }
+  }, [getJson, notify, t]);
 
   useEffect(() => {
-    (async () => {
-      try {
-        const data = await getJson<unknown>("/api/admin/integrations");
-        setText(JSON.stringify(data ?? {}, null, 2));
-      } catch (e) {
+    void load();
+  }, [load]);
+
+  const openCreate = () => {
+    setEditing(null);
+    setForm(EMPTY_HTTP_FORM);
+    setFormOpen(true);
+  };
+
+  const openEdit = (it: HttpIntegration) => {
+    setEditing(it);
+    setForm({
+      name: it.name,
+      description: it.description ?? "",
+      urlTemplate: it.url_template,
+      // Secrets are masked on read — leave the header editor empty and only
+      // send values when typed ("type to replace" pattern).
+      headersText: "",
+      variables: (it.variables ?? []).map((v) => ({
+        name: v.name,
+        description: v.description ?? "",
+        def: v.default ?? "",
+      })),
+      enabled: it.enabled,
+    });
+    setFormOpen(true);
+  };
+
+  const setVar = (i: number, patch: Partial<HttpVarFormRow>) => {
+    setForm((p) => ({
+      ...p,
+      variables: p.variables.map((row, idx) =>
+        idx === i ? { ...row, ...patch } : row,
+      ),
+    }));
+  };
+
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (saving || !form.name.trim() || !form.urlTemplate.trim()) return;
+    let headers: Record<string, string> | undefined;
+    if (form.headersText.trim()) {
+      const { map, invalid } = parseKeyValueLines(form.headersText);
+      if (invalid.length) {
         notify({
           tone: "error",
-          title: t.loadFailedTitle ?? "Load failed",
-          message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
+          title: t.saveFailedTitle ?? "Save failed",
+          message: fmt(ti.invalidKeyValue ?? "Invalid {label} line: {line}", {
+            label: "headers",
+            line: invalid[0],
+          }),
         });
-      } finally {
-        setLoading(false);
+        return;
       }
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const save = async () => {
+      headers = map;
+    }
+    const variables = form.variables
+      .map((v) => ({
+        name: v.name.trim(),
+        description: v.description.trim() || null,
+        default: v.def.trim() || null,
+      }))
+      .filter((v) => v.name);
     setSaving(true);
     try {
-      const parsed = JSON.parse(text || "{}");
-      await putJson("/api/admin/integrations", parsed);
-      notify({ tone: "success", title: ti.savedToast ?? "Saved integrations config." });
+      const body: Record<string, unknown> = {
+        name: form.name.trim(),
+        description: form.description.trim() || null,
+        url_template: form.urlTemplate.trim(),
+        variables,
+        enabled: form.enabled,
+      };
+      if (headers) body.headers = headers;
+      if (editing) {
+        await putJson(`/api/admin/integrations/http/${editing.id}`, body);
+      } else {
+        await postJson("/api/admin/integrations/http", body);
+      }
+      setFormOpen(false);
+      await load();
+      notify({
+        tone: "success",
+        title: editing
+          ? (ti.savedToast ?? "Integration saved.")
+          : (ti.createdToast ?? "Integration created."),
+      });
     } catch (e) {
       notify({
         tone: "error",
         title: t.saveFailedTitle ?? "Save failed",
-        message: e instanceof Error ? e.message : (ti.invalidJson ?? "Invalid JSON"),
+        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
       });
     } finally {
       setSaving(false);
     }
   };
 
-  const test = async () => {
-    setTesting(true);
+  const toggleEnabled = async (it: HttpIntegration) => {
+    setBusyId(it.id);
+    // Optimistic flip; reverted on failure.
+    setItems((prev) =>
+      prev.map((x) => (x.id === it.id ? { ...x, enabled: !it.enabled } : x)),
+    );
     try {
-      const res = (await postJson("/api/admin/integrations/test", {})) as {
-        success?: boolean;
-        ok?: boolean;
-        message?: string;
-      };
-      const ok = Boolean(res.success ?? res.ok);
-      notify({
-        tone: ok ? "success" : "error",
-        title: ok ? (ti.okTitle ?? "OK") : (t.testFailedTitle ?? "Test failed"),
-        message: res.message || (ok ? (ti.ok ?? "OK") : (t.testFailed ?? "Test failed")),
+      await putJson(`/api/admin/integrations/http/${it.id}`, {
+        enabled: !it.enabled,
       });
+    } catch (e) {
+      setItems((prev) =>
+        prev.map((x) => (x.id === it.id ? { ...x, enabled: it.enabled } : x)),
+      );
+      notify({
+        tone: "error",
+        title: t.updateFailedTitle ?? "Update failed",
+        message: e instanceof Error ? e.message : (t.updateFailed ?? "Update failed"),
+      });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const remove = async (it: HttpIntegration) => {
+    if (!confirm(ti.deleteConfirm ?? "Delete this HTTP integration?")) return;
+    setBusyId(it.id);
+    try {
+      await del(`/api/admin/integrations/http/${it.id}`);
+      await load();
+      notify({ tone: "success", title: ti.deletedToast ?? "Integration deleted" });
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.failed ?? "Failed",
+        message: e instanceof Error ? e.message : (t.failed ?? "Failed"),
+      });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const test = async (it: HttpIntegration) => {
+    setTestingId(it.id);
+    try {
+      const res = (await postJson(
+        `/api/admin/integrations/http/${it.id}/test`,
+      )) as HttpIntegrationTestResult;
+      setTestView({ item: it, result: res });
     } catch (e) {
       notify({
         tone: "error",
@@ -1070,40 +1231,329 @@ function IntegrationsSection() {
         message: e instanceof Error ? e.message : (t.testFailed ?? "Test failed"),
       });
     } finally {
-      setTesting(false);
+      setTestingId(null);
     }
   };
 
   if (loading)
     return (
       <div className="flex items-center gap-2 text-sm text-muted">
-        <Spinner /> {ti.loading ?? "Loading…"}
+        <Spinner /> {ti.loading ?? "Loading integrations…"}
       </div>
     );
 
   return (
     <div className="space-y-6">
-      <p className="text-[15px] text-muted">
-        {ti.intro ?? ""}
-      </p>
-      <Card className="p-3">
-        <textarea
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          rows={16}
-          spellCheck={false}
-          className="w-full rounded-md border border-divider bg-surface-2 p-3 font-mono text-xs leading-relaxed text-ink focus:border-ink focus:outline-none"
-        />
-      </Card>
-      <div className="flex items-center gap-2">
-        <Button size="sm" onClick={save} disabled={saving}>
-          {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />} {ti.save ?? "Save"}
-        </Button>
-        <Button size="sm" variant="ghost" onClick={test} disabled={testing}>
-          {testing ? <SpinnerIcon /> : <Wrench size={14} weight="regular" />}{" "}
-          {ti.test ?? "Test"}
+      <p className="text-[15px] text-muted">{ti.intro ?? ""}</p>
+
+      <div className="flex items-center justify-end">
+        <Button size="sm" onClick={openCreate}>
+          <Plus size={14} weight="bold" />
+          {ti.addIntegration ?? "Add integration"}
         </Button>
       </div>
+
+      {items.length === 0 ? (
+        <p className="text-sm text-muted">{ti.noIntegrations ?? "No HTTP integrations yet."}</p>
+      ) : (
+        <Card className="overflow-hidden">
+          <table className="w-full text-sm">
+            <thead className="bg-surface-2 text-left text-xs uppercase tracking-wide text-muted">
+              <tr>
+                <th className="px-4 py-3 font-medium">{ti.tableHeaders?.name ?? "Name"}</th>
+                <th className="px-4 py-3 font-medium">{ti.tableHeaders?.url ?? "URL template"}</th>
+                <th className="px-4 py-3 font-medium">{ti.tableHeaders?.variables ?? "Variables"}</th>
+                <th className="px-4 py-3 font-medium">{ti.tableHeaders?.enabled ?? "Enabled"}</th>
+                <th className="px-4 py-3 text-right font-medium">{ti.tableHeaders?.actions ?? "Actions"}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-divider">
+              {items.map((it) => {
+                const headerKeys = Object.keys(it.headers_masked ?? {});
+                const varNames = (it.variables ?? []).map((v) => v.name);
+                return (
+                  <tr key={it.id} className="hover:bg-surface-2">
+                    <td className="px-4 py-3">
+                      <div className="font-medium text-ink">{it.name}</div>
+                      {it.description && (
+                        <div className="mt-0.5 text-xs text-muted">{it.description}</div>
+                      )}
+                      {headerKeys.length > 0 && (
+                        <div className="mt-0.5 font-mono text-[11px] text-muted">
+                          headers: {headerKeys.join(", ")}
+                        </div>
+                      )}
+                    </td>
+                    <td className="max-w-[320px] px-4 py-3">
+                      <div className="truncate font-mono text-xs text-muted">
+                        {it.url_template}
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      {varNames.length === 0 ? (
+                        <span className="text-xs text-muted">—</span>
+                      ) : (
+                        <div
+                          className="font-mono text-xs text-muted"
+                          title={varNames.join(", ")}
+                        >
+                          {varNames.map((n) => `{${n}}`).join(" ")}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      <Switch
+                        checked={it.enabled}
+                        onChange={() => toggleEnabled(it)}
+                        disabled={busyId === it.id}
+                        label={ti.toggleLabel ?? "Enable or disable this integration"}
+                      />
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <div className="inline-flex items-center gap-2">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => test(it)}
+                          disabled={testingId === it.id}
+                        >
+                          {testingId === it.id ? (
+                            <SpinnerIcon />
+                          ) : (
+                            <Wrench size={14} weight="regular" />
+                          )}
+                          {ti.test ?? "Test"}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="subtle"
+                          aria-label={tc.edit ?? "Edit"}
+                          title={tc.edit ?? "Edit"}
+                          className="!px-2"
+                          onClick={() => openEdit(it)}
+                        >
+                          <PencilSimple size={14} weight="regular" />
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="danger"
+                          aria-label={tc.delete ?? "Delete"}
+                          title={tc.delete ?? "Delete"}
+                          className="!px-2"
+                          onClick={() => remove(it)}
+                          disabled={busyId === it.id}
+                        >
+                          {busyId === it.id ? (
+                            <SpinnerIcon />
+                          ) : (
+                            <Trash size={14} weight="regular" />
+                          )}
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </Card>
+      )}
+
+      {/* Create / edit form */}
+      <Modal
+        open={formOpen}
+        onClose={() => setFormOpen(false)}
+        title={
+          editing
+            ? (ti.editIntegration ?? "Edit integration")
+            : (ti.addIntegration ?? "Add integration")
+        }
+        size="lg"
+        footer={null}
+      >
+        <form onSubmit={save} className="grid gap-4">
+          <div className="grid gap-4 md:grid-cols-[1fr_1fr]">
+            <div>
+              <Label>{ti.name ?? "Name"}</Label>
+              <Input
+                value={form.name}
+                onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))}
+                placeholder={ti.namePlaceholder ?? "e.g. grafana-search"}
+                maxLength={128}
+                required
+                autoFocus
+              />
+            </div>
+            <div>
+              <Label>{ti.description ?? "Description"}</Label>
+              <Input
+                value={form.description}
+                onChange={(e) =>
+                  setForm((p) => ({ ...p, description: e.target.value }))
+                }
+                maxLength={1024}
+              />
+            </div>
+          </div>
+
+          <div>
+            <Label>{ti.urlTemplate ?? "URL template"}</Label>
+            <Input
+              type="url"
+              value={form.urlTemplate}
+              onChange={(e) => setForm((p) => ({ ...p, urlTemplate: e.target.value }))}
+              placeholder={
+                ti.urlTemplatePlaceholder ?? "https://api.example.com/search?repo={product_name}"
+              }
+              pattern="https?://.+"
+              title="http:// or https:// only"
+              required
+              className="font-mono text-sm"
+            />
+            <p className="mt-1 text-xs text-muted">
+              {ti.urlTemplateHint ??
+                "Use {product_name} or declared variables as {placeholders}."}
+            </p>
+          </div>
+
+          <div>
+            <Label>{ti.headers ?? "Headers (key=value per line)"}</Label>
+            <Textarea
+              value={form.headersText}
+              onChange={(e) => setForm((p) => ({ ...p, headersText: e.target.value }))}
+              placeholder={
+                editing && Object.keys(editing.headers_masked ?? {}).length
+                  ? `${ti.secretsStored ?? "stored"}: ${Object.keys(editing.headers_masked ?? {}).join(", ")}`
+                  : "Authorization=Bearer …"
+              }
+              rows={3}
+              spellCheck={false}
+            />
+          </div>
+
+          <div>
+            <Label>{ti.variables ?? "Variables"}</Label>
+            <div className="flex flex-col gap-2">
+              {form.variables.map((row, i) => (
+                <div key={i} className="grid gap-2 md:grid-cols-[160px_1fr_1fr_36px]">
+                  <Input
+                    value={row.name}
+                    onChange={(e) => setVar(i, { name: e.target.value })}
+                    placeholder={ti.varName ?? "Name"}
+                    className="font-mono text-sm"
+                    maxLength={64}
+                  />
+                  <Input
+                    value={row.description}
+                    onChange={(e) => setVar(i, { description: e.target.value })}
+                    placeholder={ti.varDescription ?? "Description"}
+                    maxLength={512}
+                  />
+                  <Input
+                    value={row.def}
+                    onChange={(e) => setVar(i, { def: e.target.value })}
+                    placeholder={ti.varDefault ?? "Default"}
+                    maxLength={512}
+                  />
+                  <Button
+                    type="button"
+                    variant="danger"
+                    aria-label={tc.delete ?? "Delete"}
+                    title={tc.delete ?? "Delete"}
+                    className="!px-2"
+                    onClick={() =>
+                      setForm((p) => ({
+                        ...p,
+                        variables: p.variables.filter((_, idx) => idx !== i),
+                      }))
+                    }
+                  >
+                    <Trash size={14} weight="regular" />
+                  </Button>
+                </div>
+              ))}
+              <div>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() =>
+                    setForm((p) => ({
+                      ...p,
+                      variables: [...p.variables, { name: "", description: "", def: "" }],
+                    }))
+                  }
+                >
+                  <Plus size={14} weight="bold" />
+                  {ti.addVariable ?? "Add variable"}
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3 rounded-md border border-divider bg-surface-2 p-3">
+            <Switch
+              checked={form.enabled}
+              onChange={(next) => setForm((p) => ({ ...p, enabled: next }))}
+              label={ti.enabled ?? "Enabled"}
+            />
+            <span className="text-sm text-ink">{ti.enabled ?? "Enabled"}</span>
+          </div>
+
+          {editing && (
+            <p className="text-xs text-muted">{ti.secretsHint ?? ""}</p>
+          )}
+
+          <div className="flex items-center justify-end gap-2">
+            <Button type="button" variant="ghost" onClick={() => setFormOpen(false)}>
+              {tc.cancel ?? "Cancel"}
+            </Button>
+            <Button
+              type="submit"
+              disabled={saving || !form.name.trim() || !form.urlTemplate.trim()}
+            >
+              {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />}
+              {ti.save ?? "Save"}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Test result: status code + body preview */}
+      <Modal
+        open={Boolean(testView)}
+        onClose={() => setTestView(null)}
+        title={
+          testView
+            ? `${ti.testTitle ?? "Test"} — ${testView.item.name}`
+            : (ti.testTitle ?? "Test")
+        }
+        size="lg"
+        footer={null}
+      >
+        {testView && (
+          <div className="space-y-4">
+            <Banner tone={testView.result.ok ? "success" : "error"}>
+              {testView.result.ok
+                ? fmt(ti.testOk ?? "Status {status}.", {
+                    status: testView.result.status_code ?? "—",
+                  })
+                : (testView.result.detail || (ti.testFailed ?? "Request failed."))}
+            </Banner>
+            {testView.result.ok && testView.result.detail && (
+              <p className="text-sm text-muted">{testView.result.detail}</p>
+            )}
+            {testView.result.body_preview && (
+              <div>
+                <Label>{ti.preview ?? "Body preview"}</Label>
+                <pre className="max-h-72 overflow-auto rounded-md border border-divider bg-surface-2 p-3 font-mono text-xs leading-relaxed text-ink">
+                  {testView.result.body_preview}
+                </pre>
+              </div>
+            )}
+          </div>
+        )}
+      </Modal>
     </div>
   );
 }
@@ -1259,7 +1709,7 @@ function McpSection() {
         transport: form.transport,
         enabled: form.enabled,
       };
-      if (form.transport === "http") {
+      if (form.transport === "http" || form.transport === "sse") {
         body.url = form.url.trim();
         if (headers) body.headers = headers;
       } else {
@@ -1425,13 +1875,13 @@ function McpSection() {
                       )}
                     </td>
                     <td className="px-4 py-3">
-                      <Tag tone={s.transport === "http" ? "blue" : "neutral"}>
+                      <Tag tone={s.transport === "http" ? "blue" : s.transport === "sse" ? "green" : "neutral"}>
                         {s.transport}
                       </Tag>
                     </td>
                     <td className="max-w-[280px] px-4 py-3">
                       <div className="truncate font-mono text-xs text-muted">
-                        {s.transport === "http"
+                        {s.transport !== "stdio"
                           ? (s.url ?? "—")
                           : [s.command, ...(s.args ?? [])].join(" ") || "—"}
                       </div>
@@ -1533,12 +1983,13 @@ function McpSection() {
                 }
               >
                 <option value="http">{tm.transportHttp ?? "HTTP"}</option>
+                <option value="sse">{tm.transportSse ?? "SSE"}</option>
                 <option value="stdio">{tm.transportStdio ?? "Stdio"}</option>
               </Select>
             </div>
           </div>
 
-          {form.transport === "http" ? (
+          {form.transport !== "stdio" ? (
             <>
               <div>
                 <Label>{tm.url ?? "URL"}</Label>
@@ -1974,6 +2425,8 @@ const TIMEOUT_FIELDS: { key: string; group: string }[] = [
   { key: "llm_retry_max_time", group: "LLM" },
   { key: "model_list", group: "LLM" },
   { key: "provider_test", group: "LLM" },
+  { key: "docgen_map_concurrency", group: "LLM" },
+  { key: "expert_stream", group: "Expert" },
   { key: "docgen_indexing_drain", group: "Memory" },
   { key: "memory_query", group: "Memory" },
   { key: "integration_http", group: "Integrations" },
@@ -1982,9 +2435,18 @@ const TIMEOUT_FIELDS: { key: string; group: string }[] = [
   { key: "mermaid_verify", group: "Mermaid" },
   { key: "mermaid_repair", group: "Mermaid" },
   { key: "mermaid_max_repair_attempts", group: "Mermaid" },
+  { key: "mermaid_repair_deadline", group: "Mermaid" },
+  { key: "db_connect_check", group: "Databases" },
 ];
 
-const TIMEOUT_GROUPS = ["LLM", "Memory", "Integrations", "Mermaid"] as const;
+const TIMEOUT_GROUPS = [
+  "LLM",
+  "Expert",
+  "Memory",
+  "Integrations",
+  "Mermaid",
+  "Databases",
+] as const;
 
 interface TimeoutResolvedEntry {
   value: string;
@@ -2147,6 +2609,8 @@ interface PromptFile {
   modified?: string;
 }
 
+type PromptLang = "ru" | "en";
+
 function PromptsSection() {
   const { getJson, putJson, notify } = useAdminApi();
   const { messages, fmt } = useLanguage();
@@ -2158,12 +2622,48 @@ function PromptsSection() {
   const [loadingList, setLoadingList] = useState(true);
   const [loadingFile, setLoadingFile] = useState(false);
   const [saving, setSaving] = useState(false);
+  // Generation language comes from the admin `generation.language` setting
+  // (resolved server-side at each docgen job start); the editor below edits
+  // the prompt copy of `editLang` (independent RU/EN toggle, defaults to the
+  // active generation language).
+  const [genLang, setGenLang] = useState<PromptLang>("ru");
+  const [editLang, setEditLang] = useState<PromptLang>("ru");
+  // Language the served file body actually came from — may differ from
+  // editLang when the copy doesn't exist yet and the English original is
+  // served as a fallback (PUT then creates the translated copy).
+  const [fileLang, setFileLang] = useState<PromptLang | null>(null);
+  const [genLangLoaded, setGenLangLoaded] = useState(false);
 
-  const loadList = useCallback(async () => {
+  // Fetch the active generation language once; defer the list load until it
+  // is known so we don't flash the wrong language's inventory.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await getJson<{ resolved?: { language?: string } }>(
+          "/api/admin/generation",
+        );
+        const lang: PromptLang = data?.resolved?.language === "en" ? "en" : "ru";
+        if (!cancelled) {
+          setGenLang(lang);
+          setEditLang(lang);
+        }
+      } catch {
+        // keep defaults (ru)
+      } finally {
+        if (!cancelled) setGenLangLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [getJson]);
+
+  const loadList = useCallback(async (lang: PromptLang) => {
     setLoadingList(true);
     try {
       const data = await getJson<PromptFile[] | { files: PromptFile[] }>(
-        "/api/admin/prompts",
+        `/api/admin/prompts?lang=${lang}`,
       );
       const list = Array.isArray(data) ? data : data?.files ?? [];
       setFiles(list);
@@ -2183,45 +2683,77 @@ function PromptsSection() {
     } finally {
       setLoadingList(false);
     }
-  // P2-32: the list loads once on mount (or explicit refresh); t only labels toasts.
+  // P2-32: the list reloads on language switch; t only labels toasts.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [getJson, notify]);
 
   useEffect(() => {
-    void loadList();
-  }, [loadList]);
+    if (!genLangLoaded) return;
+    void loadList(editLang);
+  }, [editLang, genLangLoaded, loadList]);
 
-  const loadFile = useCallback(async (filename: string) => {
-    setLoadingFile(true);
-    setContent("");
-    try {
-      // File content endpoint returns {content} or raw text; reuse the shared
-      // 401 handling by going through getJson (which redirects on 401).
-      const data = await getJson<{ content?: string } | string>(
-        `/api/admin/prompts/${encodeURIComponent(filename)}`,
-      );
-      setContent(typeof data === "string" ? data : data.content ?? "");
-    } catch (e) {
-      notify({
-        tone: "error",
-        title: t.loadFailedTitle ?? "Load failed",
-        message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
-      });
-    } finally {
-      setLoadingFile(false);
-    }
-  }, [getJson, notify, t]);
+  const loadFile = useCallback(
+    async (filename: string, lang: PromptLang) => {
+      setLoadingFile(true);
+      setContent("");
+      try {
+        // Returns {content, language}; `language` reflects the directory the
+        // body was actually served from (en fallback when ru copy is absent).
+        const data = await getJson<{ content?: string; language?: string }>(
+          `/api/admin/prompts/${encodeURIComponent(filename)}?lang=${lang}`,
+        );
+        setContent(data?.content ?? "");
+        setFileLang(data?.language === "en" ? "en" : "ru");
+      } catch (e) {
+        notify({
+          tone: "error",
+          title: t.loadFailedTitle ?? "Load failed",
+          message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
+        });
+      } finally {
+        setLoadingFile(false);
+      }
+    },
+    [getJson, notify, t],
+  );
 
   useEffect(() => {
-    if (selected) void loadFile(selected);
-  }, [selected, loadFile]);
+    if (selected && genLangLoaded) void loadFile(selected, editLang);
+  }, [selected, editLang, genLangLoaded, loadFile]);
+
+  // Switch the active generation language (persisted immediately; applies
+  // to the next generation run) and follow it in the editor.
+  const changeGenerationLanguage = async (lang: PromptLang) => {
+    if (lang === genLang) return;
+    const prev = genLang;
+    setGenLang(lang);
+    setEditLang(lang);
+    try {
+      await putJson("/api/admin/generation", { "generation.language": lang });
+      notify({
+        tone: "success",
+        title: fmt(tp.languageSavedToast ?? "Generation language: {lang}.", { lang }),
+      });
+    } catch (e) {
+      setGenLang(prev);
+      notify({
+        tone: "error",
+        title: t.saveFailedTitle ?? "Save failed",
+        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
+      });
+    }
+  };
 
   const save = async () => {
     if (!selected) return;
     setSaving(true);
     try {
-      await putJson(`/api/admin/prompts/${encodeURIComponent(selected)}`, { content });
+      await putJson(
+        `/api/admin/prompts/${encodeURIComponent(selected)}?lang=${editLang}`,
+        { content },
+      );
       notify({ tone: "success", title: fmt(tp.savedToast ?? "Saved {file}.", { file: selected }) });
+      setFileLang(editLang);
     } catch (e) {
       notify({
         tone: "error",
@@ -2233,20 +2765,58 @@ function PromptsSection() {
     }
   };
 
-  if (loadingList) {
-    return (
-      <div className="flex items-center gap-2 text-sm text-muted">
-        <Spinner /> {tp.loadingList ?? "Loading prompts…"}
-      </div>
-    );
-  }
-
   return (
     <div className="space-y-6">
-      <p className="text-[15px] text-muted">
-        {tp.intro ?? ""}
-      </p>
-      {files.length === 0 ? (
+      {/* Generation language block (applies to the next generation run) */}
+      <Card className="p-4">
+        <div className="grid gap-3 md:grid-cols-[260px_1fr] md:items-center">
+          <div>
+            <Label>{tp.languageLabel ?? "Generation language"}</Label>
+            <p className="mt-1 text-xs text-muted">{tp.languageHint ?? ""}</p>
+          </div>
+          <div className="md:justify-self-end">
+            <Select
+              value={genLang}
+              onChange={(e) =>
+                void changeGenerationLanguage(e.target.value as PromptLang)
+              }
+            >
+              <option value="ru">{tp.langRu ?? "Русский"}</option>
+              <option value="en">{tp.langEn ?? "English"}</option>
+            </Select>
+          </div>
+        </div>
+      </Card>
+
+      <p className="text-[15px] text-muted">{tp.intro ?? ""}</p>
+
+      {/* Editor language toggle (which directory is being edited) */}
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-medium uppercase tracking-wide text-muted">
+          {tp.editorLangLabel ?? "Editing"}
+        </span>
+        {(["ru", "en"] as PromptLang[]).map((lang) => (
+          <button
+            key={lang}
+            type="button"
+            onClick={() => setEditLang(lang)}
+            className={cn(
+              "rounded-md px-2.5 py-1 font-mono text-xs transition-colors",
+              editLang === lang
+                ? "bg-surface-2 font-semibold text-ink"
+                : "text-muted hover:bg-surface-2 hover:text-ink",
+            )}
+          >
+            {lang.toUpperCase()}
+          </button>
+        ))}
+      </div>
+
+      {loadingList ? (
+        <div className="flex items-center gap-2 text-sm text-muted">
+          <Spinner /> {tp.loadingList ?? "Loading prompts…"}
+        </div>
+      ) : files.length === 0 ? (
         <p className="text-sm text-muted">{tp.noFiles ?? "No prompt files found."}</p>
       ) : (
         <div className="grid gap-4 md:grid-cols-[220px_1fr]">
@@ -2279,7 +2849,14 @@ function PromptsSection() {
             ) : (
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
-                  <span className="font-mono text-sm text-muted">{selected}</span>
+                  <span className="flex min-w-0 items-center gap-2 font-mono text-sm text-muted">
+                    <span className="truncate">{selected}</span>
+                    {fileLang && fileLang !== editLang && (
+                      <span className="shrink-0 rounded bg-surface-2 px-1.5 py-0.5 text-[11px] font-medium">
+                        {tp.fallbackBadge ?? "EN original"}
+                      </span>
+                    )}
+                  </span>
                   <Button size="sm" onClick={save} disabled={saving || !selected}>
                     {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />}
                     {tp.save ?? "Save"}
@@ -2297,6 +2874,59 @@ function PromptsSection() {
           </Card>
         </div>
       )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Public API section (read-only OpenAPI viewer, issue #4)              */
+/* ------------------------------------------------------------------ */
+
+function PublicApiSection() {
+  const { getJson, notify } = useAdminApi();
+  const { messages } = useLanguage();
+  const t = messages?.admin ?? {};
+  const tp = t?.publicapi ?? {};
+  const [schema, setSchema] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await getJson<Record<string, unknown>>("/api/admin/openapi");
+        if (!cancelled) setSchema(JSON.stringify(data, null, 2));
+      } catch (e) {
+        notify({
+          tone: "error",
+          title: t.loadFailedTitle ?? "Load failed",
+          message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
+        });
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  // Load once on mount; t only labels toasts.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [getJson, notify]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-muted">
+        <Spinner /> {tp.loading ?? "Loading schema…"}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <p className="text-[15px] text-muted">{tp.intro ?? ""}</p>
+      <Card className="p-4">
+        <SpecViewer content={schema} kind="openapi" />
+      </Card>
     </div>
   );
 }
@@ -2878,6 +3508,7 @@ function AdminShell() {
             {section === "timeouts" && <TimeoutsSection />}
             {section === "users" && <UsersSection />}
             {section === "tokens" && <TokensSection />}
+            {section === "publicapi" && <PublicApiSection />}
           </div>
         </div>
       </main>

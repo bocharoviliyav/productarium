@@ -95,10 +95,15 @@ class TestImportsAndPrompts:
 
         assert isinstance(mod.router, APIRouter)
         assert mod.router.prefix == "/api/products"
-        # Both endpoints exist on the router (paths include the router prefix).
+        # Every endpoint exists on the router (paths include the router prefix).
         paths = {r.path for r in mod.router.routes}
         assert "/api/products/{product_id}/ask" in paths
         assert "/api/products/{product_id}/ask/doc" in paths
+        # Detached-turn endpoints (issue #9).
+        assert "/api/products/{product_id}/ask/stream/{turn_id}" in paths
+        assert "/api/products/{product_id}/ask/{turn_id}/cancel" in paths
+        assert "/api/products/{product_id}/chat/sessions/{session_id}/active-turn" in paths
+        assert "/api/products/{product_id}/chat/sessions/{session_id}" in paths
 
     def test_prompts_loaded_from_refs(self):
         import api.expert as ea

@@ -11,11 +11,22 @@
  * /api/products/{id}/ask/doc and saves the returned .md file.
  *
  * Chat history: sessions are persisted server-side. On mount the component
- * lists GET /api/products/{id}/chat/sessions; picking a session loads
+ * lists GET /api/products/{id}/chat/sessions and resumes the latest one
+ * (history + a possible RUNNING answer); picking a session loads
  * GET .../chat/sessions/{sessionId}/messages. Sends carry the active
  * session_id (a brand-new chat sends none). The id of a newly created
  * session is read BOTH from the X-Session-Id response header AND from an
  * early SSE {"session_id": ...} frame — whichever arrives first wins.
+ *
+ * Detached turns (issue #9): the backend generates the answer in a
+ * background task keyed by turn_id — aborting the local SSE view (Stop,
+ * switching sessions, navigating away) NEVER kills the generation. The
+ * leading {"turn_id": ...} frame is remembered; on mount / session select
+ * the component probes GET .../chat/sessions/{id}/active-turn and re-
+ * attaches via GET /ask/stream/{turn_id} (replay + live tail). Stop then
+ * means "cancel server-side" (POST /ask/{turn_id}/cancel, partial answer
+ * kept); a 409 on ask (one running turn per session) auto-attaches to the
+ * running turn via the X-Turn-Id header.
  *
  * UX features (hand-built, no external chat libraries):
  * - Phase-aware loader: "Retrieving knowledge…" / "Thinking…" / "Generating…"
@@ -58,11 +69,15 @@ import {
   makeToolEvent,
   readExpertStream,
   type ExpertPhase,
+  type ExpertSseEvent,
   type ToolEvent,
   type TurnPhase,
 } from "@/lib/expertChat";
 import {
   ApiError,
+  cancelExpertTurn,
+  deleteChatSession,
+  fetchActiveTurn,
   fetchChatMessages,
   fetchChatSessions,
   type ChatMessage as ChatHistoryMessage,
@@ -160,6 +175,12 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
   const lastQuestionRef = useRef<string>("");
   // Track whether the user has scrolled up — pause auto-scroll if so.
   const userScrolledUpRef = useRef(false);
+  // The RUNNING detached turn (its id from the leading SSE frame / active-
+  // turn probe) — used by Stop to cancel the generation server-side.
+  const activeTurnIdRef = useRef<string | null>(null);
+  // Run token: every send/attach captures the current value; a superseded
+  // loop's finally block must not clobber the newer run's UI state.
+  const runTokenRef = useRef(0);
 
   // --- Chat sessions (persistent history) -------------------------------
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -199,48 +220,11 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
     void loadSessions();
   }, [loadSessions]);
 
+  // Unmount: detach the LOCAL SSE view only — the server-side generation
+  // keeps running and is re-attached on the next visit (issue #9).
   useEffect(() => {
     return () => abortRef.current?.abort();
   }, []);
-
-  /** Select an existing session and load its persisted history. */
-  const selectSession = useCallback(
-    async (sessionId: string) => {
-      if (streaming) abortRef.current?.abort();
-      setActiveSessionId(sessionId);
-      activeSessionIdRef.current = sessionId;
-      setTurns([]);
-      setSessionsLoading(true);
-      try {
-        const history = await fetchChatMessages(productId, sessionId);
-        setTurns(historyToTurns(history));
-        // Auto-scroll to the newest history message.
-        userScrolledUpRef.current = false;
-      } catch (e) {
-        if (e instanceof ApiError && e.status === 401) {
-          router.replace(`/login?next=/products/${productId}`);
-          return;
-        }
-        notify({
-          tone: "error",
-          title: t.historyFailedTitle ?? "History",
-          message: e instanceof Error ? e.message : "Failed to load history",
-        });
-      } finally {
-        setSessionsLoading(false);
-      }
-    },
-    [streaming, productId, router, notify, t.historyFailedTitle],
-  );
-
-  /** Start a brand-new chat (unsent — the session is created on first ask). */
-  const newChat = useCallback(() => {
-    if (streaming) abortRef.current?.abort();
-    setActiveSessionId(null);
-    activeSessionIdRef.current = null;
-    setTurns([]);
-    setInput("");
-  }, [streaming]);
 
   // --- Auto-scroll: only scroll down if the user hasn't scrolled up.
   const scrollToBottom = useCallback(() => {
@@ -388,6 +372,175 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
     sessionsAvailableRef.current = true;
   }, []);
 
+  /** Apply one decoded SSE event to the current assistant turn. */
+  const applyStreamEvent = useCallback(
+    (event: ExpertSseEvent) => {
+      switch (event.kind) {
+        case "turn":
+          // Leading /ask frame — remember the detached-turn handle for Stop.
+          activeTurnIdRef.current = event.turnId;
+          break;
+        case "session":
+          adoptSessionId(event.sessionId);
+          break;
+        case "status":
+          setPhase(event.phase);
+          break;
+        case "reasoning":
+          appendReasoning(event.text);
+          break;
+        case "content":
+          appendContent(event.text);
+          setPhase("answering");
+          break;
+        case "tool_call":
+          addToolCall(event.call.name, event.call.args);
+          break;
+        case "tool_result":
+          addToolResult(event.result.name, event.result.content);
+          break;
+        case "error":
+          setTurnError(event.message);
+          break;
+      }
+    },
+    [
+      adoptSessionId,
+      setPhase,
+      appendReasoning,
+      appendContent,
+      addToolCall,
+      addToolResult,
+      setTurnError,
+    ],
+  );
+
+  /**
+   * Attach to a RUNNING detached turn (replay + live tail). Used on mount /
+   * session select (active-turn probe) and after a 409 ask (X-Turn-Id).
+   * Supersedes any previous view loop via the run token.
+   */
+  const attachToTurn = useCallback(
+    async (turnId: string) => {
+      abortRef.current?.abort();
+      const token = ++runTokenRef.current;
+      activeTurnIdRef.current = turnId;
+      userScrolledUpRef.current = false;
+      setStreaming(true);
+      // Ensure there is an assistant bubble to stream into (the user row is
+      // already in the loaded history for a resumed session).
+      setTurns((prev) => {
+        const last = prev[prev.length - 1];
+        if (last && last.role === "assistant" && last.streaming) return prev;
+        return [...prev, { role: "assistant", ...EMPTY_TURN }];
+      });
+
+      const controller = new AbortController();
+      abortRef.current = controller;
+      try {
+        const res = await fetch(
+          `/api/products/${productId}/ask/stream/${encodeURIComponent(turnId)}`,
+          {
+            headers: { Accept: "text/event-stream" },
+            credentials: "include",
+            signal: controller.signal,
+          },
+        );
+        if (res.status === 401) {
+          router.replace(`/login?next=/products/${productId}`);
+          return;
+        }
+        if (!res.ok) {
+          throw new Error(`Re-attach failed (${res.status})`);
+        }
+        for await (const event of readExpertStream(res)) {
+          applyStreamEvent(event);
+        }
+      } catch (e) {
+        if ((e as Error)?.name !== "AbortError") {
+          // Local detach failure only — the server-side generation keeps
+          // running and the answer will land in the session history. Keep
+          // the partial view; no scary error row.
+          void e;
+        }
+      } finally {
+        if (runTokenRef.current !== token) return; // superseded
+        finishTurn();
+        setStreaming(false);
+        abortRef.current = null;
+        activeTurnIdRef.current = null;
+        if (activeSessionIdRef.current !== null) void loadSessions();
+      }
+    },
+    [productId, router, applyStreamEvent, finishTurn, loadSessions],
+  );
+
+  /**
+   * Select an existing session: load its history, then probe for a RUNNING
+   * answer and re-attach (issue #9 — the generation survived the switch).
+   */
+  const selectSession = useCallback(
+    async (sessionId: string) => {
+      abortRef.current?.abort(); // detach the local view only
+      setActiveSessionId(sessionId);
+      activeSessionIdRef.current = sessionId;
+      setTurns([]);
+      setSessionsLoading(true);
+      try {
+        const history = await fetchChatMessages(productId, sessionId);
+        if (activeSessionIdRef.current !== sessionId) return; // switched away
+        setTurns(historyToTurns(history));
+        // Auto-scroll to the newest history message.
+        userScrolledUpRef.current = false;
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 401) {
+          router.replace(`/login?next=/products/${productId}`);
+          return;
+        }
+        notify({
+          tone: "error",
+          title: t.historyFailedTitle ?? "History",
+          message: e instanceof Error ? e.message : "Failed to load history",
+        });
+      } finally {
+        setSessionsLoading(false);
+      }
+      // Re-attach probe: an answer may still be generating for this session.
+      if (activeSessionIdRef.current !== sessionId) return;
+      const active = await fetchActiveTurn(productId, sessionId);
+      if (active && activeSessionIdRef.current === sessionId) {
+        void attachToTurn(active.turnId);
+      }
+    },
+    [productId, router, notify, t.historyFailedTitle, attachToTurn],
+  );
+
+  /** Start a brand-new chat (unsent — the session is created on first ask). */
+  const newChat = useCallback(() => {
+    // Detach the local view only: any RUNNING generation keeps going on the
+    // server and stays reachable via the session pill.
+    abortRef.current?.abort();
+    setActiveSessionId(null);
+    activeSessionIdRef.current = null;
+    setTurns([]);
+    setInput("");
+  }, []);
+
+  // On mount, resume the latest session once (history + possible RUNNING
+  // answer). loadSessions above picks the id; this effect loads its content.
+  const initialResumeRef = useRef(false);
+  useEffect(() => {
+    if (
+      initialResumeRef.current ||
+      sessionsLoading ||
+      sessions.length === 0 ||
+      activeSessionId === null
+    )
+      return;
+    initialResumeRef.current = true;
+    void selectSession(activeSessionId);
+  }, [sessions, sessionsLoading, activeSessionId, selectSession]);
+
   const send = useCallback(async () => {
     const q = input.trim();
     if (!q || streaming) return;
@@ -402,6 +555,8 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
     setStreaming(true);
     setInput("");
 
+    abortRef.current?.abort();
+    const token = ++runTokenRef.current;
     const controller = new AbortController();
     abortRef.current = controller;
 
@@ -436,6 +591,26 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
         router.replace(`/login?next=/products/${productId}`);
         return;
       }
+      if (res.status === 409) {
+        // One running turn per session: the answer is still generating —
+        // drop the optimistic bubbles and re-attach to the running turn.
+        const busyTurnId = res.headers.get("X-Turn-Id");
+        setTurns(turns);
+        if (busyTurnId) {
+          notify({
+            tone: "info",
+            title: t.expertTitle ?? "Expert",
+            message: t.stillGenerating ?? "An answer is still generating — re-attached to it",
+          });
+          await attachToTurn(busyTurnId);
+          return;
+        }
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(
+          (detail as { detail?: string })?.detail ||
+            "An expert answer is still generating for this chat",
+        );
+      }
       if (res.status === 429) {
         // Per-user rate limit (P1-17): human message + Retry-After.
         const detail = await res.json().catch(() => ({}));
@@ -461,44 +636,23 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
       if (headerSession) adoptSessionId(headerSession);
 
       for await (const event of readExpertStream(res)) {
-        switch (event.kind) {
-          case "session":
-            // Session id variant 2: early SSE frame.
-            adoptSessionId(event.sessionId);
-            break;
-          case "status":
-            setPhase(event.phase);
-            break;
-          case "reasoning":
-            appendReasoning(event.text);
-            break;
-          case "content":
-            appendContent(event.text);
-            setPhase("answering");
-            break;
-          case "tool_call":
-            addToolCall(event.call.name, event.call.args);
-            break;
-          case "tool_result":
-            addToolResult(event.result.name, event.result.content);
-            break;
-          case "error":
-            setTurnError(event.message);
-            break;
-        }
+        applyStreamEvent(event);
       }
     } catch (e) {
       if ((e as Error)?.name === "AbortError") {
-        // user stopped — keep partial output
+        // Local view detached (Stop / switch / unmount) — the server-side
+        // generation keeps running; keep the partial output as is.
       } else {
         const msg = e instanceof Error ? e.message : "Expert chat failed";
         notify({ tone: "error", title: "Expert chat failed", message: msg });
         setTurnError(msg);
       }
     } finally {
+      if (runTokenRef.current !== token) return; // superseded by attach/select
       finishTurn();
       setStreaming(false);
       abortRef.current = null;
+      activeTurnIdRef.current = null;
       // Refresh the session strip (titles/timestamps) after the turn.
       if (activeSessionIdRef.current !== null) void loadSessions();
     }
@@ -510,25 +664,100 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
     deepResearch,
     notify,
     router,
-    appendContent,
-    appendReasoning,
-    setPhase,
-    addToolCall,
-    addToolResult,
+    applyStreamEvent,
     setTurnError,
     finishTurn,
     adoptSessionId,
+    attachToTurn,
     loadSessions,
+    t.expertTitle,
+    t.stillGenerating,
   ]);
 
+  /**
+   * Stop = cancel the RUNNING turn SERVER-side (partial answer kept), then
+   * detach the local view. With no turn handle (legacy backend) it degrades
+   * to the old local abort.
+   */
   const stop = useCallback(() => {
+    const turnId = activeTurnIdRef.current;
     abortRef.current?.abort();
-  }, []);
+    if (turnId) {
+      cancelExpertTurn(productId, turnId).catch(() => undefined);
+    }
+  }, [productId]);
 
+  /**
+   * Clear: a HISTORICAL thread (active session) is DELETED server-side with
+   * its transcript (any running turn is cancelled by the backend); a fresh
+   * unsaved chat is just reset locally.
+   */
   const clear = useCallback(() => {
+    const sessionId = activeSessionIdRef.current;
+    if (!sessionId) {
+      setTurns([]);
+      setInput("");
+      return;
+    }
+    abortRef.current?.abort();
     setTurns([]);
     setInput("");
-  }, []);
+    setActiveSessionId(null);
+    activeSessionIdRef.current = null;
+    deleteChatSession(productId, sessionId)
+      .then(() => {
+        setSessions((prev) => prev.filter((s) => s.id !== sessionId));
+        void loadSessions();
+      })
+      .catch((e) => {
+        notify({
+          tone: "error",
+          title: t.historyFailedTitle ?? "History",
+          message:
+            e instanceof Error
+              ? e.message
+              : (t.deleteSessionFailed ?? "Failed to delete the chat"),
+        });
+        // The session row may still exist — reselect it so the user is not
+        // left in a detached state.
+        setActiveSessionId(sessionId);
+        activeSessionIdRef.current = sessionId;
+        void selectSession(sessionId);
+      });
+  }, [productId, notify, loadSessions, selectSession, t.historyFailedTitle, t.deleteSessionFailed]);
+
+  /**
+   * Delete a session from the strip (trash button). Deleting the ACTIVE
+   * session resets the view to a fresh unsaved chat. The backend cancels
+   * any running turn of the session.
+   */
+  const removeSession = useCallback(
+    (sessionId: string) => {
+      if (activeSessionIdRef.current === sessionId) {
+        abortRef.current?.abort();
+        setActiveSessionId(null);
+        activeSessionIdRef.current = null;
+        setTurns([]);
+        setInput("");
+      }
+      deleteChatSession(productId, sessionId)
+        .then(() => {
+          setSessions((prev) => prev.filter((s) => s.id !== sessionId));
+          void loadSessions();
+        })
+        .catch((e) => {
+          notify({
+            tone: "error",
+            title: t.historyFailedTitle ?? "History",
+            message:
+              e instanceof Error
+                ? e.message
+                : (t.deleteSessionFailed ?? "Failed to delete the chat"),
+          });
+        });
+    },
+    [productId, notify, loadSessions, t.historyFailedTitle, t.deleteSessionFailed],
+  );
 
   const toggleReasoning = useCallback(
     (idx: number) => {
@@ -618,9 +847,13 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
             newChat: t.newChat ?? "New chat",
             sessionFallback: t.sessionFallback ?? "Session",
             loading: t.sessionsLoading ?? "",
+            deleteTitle: t.deleteSession ?? "Delete chat",
+            deleteConfirm:
+              t.deleteSessionConfirm ?? "Delete this chat with its whole history?",
           }}
           onSelect={(id) => void selectSession(id)}
           onNewChat={newChat}
+          onDelete={removeSession}
         />
       )}
 

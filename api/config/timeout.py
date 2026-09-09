@@ -109,6 +109,20 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         unit="parallel calls",
         group="LLM",
     ),
+    # --- Expert chat (detached ask turns, api/expert/turns.py) ----------
+    # Wall-clock budget for ONE expert ask turn (regular agent or deep
+    # research) including retrieval, tool calls, and streaming. The turn is
+    # a detached background task: on expiry the partial answer is persisted
+    # and subscribers get an error frame (issue #9 — such turns legitimately
+    # run for minutes on a local LLM).
+    TimeoutKey(
+        key="expert_stream",
+        env_var="EXPERT_STREAM_TIMEOUT_SECONDS",
+        default=1800.0,
+        floor=60.0,
+        label="Expert ask turn budget (wall-clock)",
+        group="Expert",
+    ),
     # --- Memory backend (pgvector recall) -------------------------------
     TimeoutKey(
         key="memory_query",
@@ -192,6 +206,19 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         floor=3.0,
         label="Provider connection test",
         group="LLM",
+    ),
+    # --- Database presets (api/mcp/presets.py) --------------------------
+    # Wall-clock budget for the preset connection check: a REAL MCP
+    # handshake (launcher spawn + initialize + tools/list + one probe tool
+    # call). The default is generous because the docker-fallback launcher
+    # may pull the server image on the very first check.
+    TimeoutKey(
+        key="db_connect_check",
+        env_var="DB_CONNECT_CHECK_SECONDS",
+        default=180.0,
+        floor=5.0,
+        label="Database preset connection check (MCP handshake)",
+        group="Databases",
     ),
 ]
 
@@ -306,6 +333,16 @@ def resolve_docgen_map_concurrency() -> int:
     return resolve_timeout_int("docgen_map_concurrency")
 
 
+def resolve_expert_stream_timeout() -> float:
+    """Wall-clock budget for one detached expert ask turn (seconds).
+
+    Bounds the background task in ``api/expert/turns.py`` (regular agent or
+    deep research). On expiry the turn is cancelled, the partial answer is
+    persisted, and subscribers receive an error frame.
+    """
+    return resolve_timeout("expert_stream")
+
+
 def resolve_memory_query_timeout() -> float:
     """pgvector cosine-recall query timeout (seconds).
 
@@ -368,6 +405,15 @@ def resolve_provider_test_timeout() -> float:
     return resolve_timeout("provider_test")
 
 
+def resolve_db_connect_check_timeout() -> float:
+    """Wall-clock budget for the preset DB connection check (seconds).
+
+    Bounds the full MCP handshake (launcher spawn + initialize + tools/list
+    + one probe tool call) in ``api/mcp/presets.check_preset_connection``.
+    """
+    return resolve_timeout("db_connect_check")
+
+
 def sync_timeout_env() -> None:
     """Export admin-store timeout overrides to their canonical env vars.
 
@@ -424,6 +470,7 @@ __all__ = [
     "resolve_timeout_int",
     "resolve_llm_request_timeout",
     "resolve_llm_retry_max_time",
+    "resolve_expert_stream_timeout",
     "resolve_docgen_indexing_drain_seconds",
     "resolve_docgen_map_concurrency",
     "resolve_memory_query_timeout",
@@ -436,6 +483,7 @@ __all__ = [
     "resolve_mermaid_max_repair_attempts",
     "resolve_mermaid_repair_deadline",
     "resolve_provider_test_timeout",
+    "resolve_db_connect_check_timeout",
     "sync_timeout_env",
     "get_timeout_resolved_view",
 ]

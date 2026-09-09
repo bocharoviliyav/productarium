@@ -3,21 +3,27 @@
  *
  * Implements the FIXED chat streaming contract shared with the backend:
  *
+ *   data: {"turn_id": "<id>"}              (first frame — the re-attach handle)
+ *   data: {"session_id": "<id>"}           (new sessions, right after turn_id)
  *   data: {"status": "retrieving"|"thinking"|"answering"}
  *   data: {"reasoning": "<model thoughts>"}
  *   data: {"content": "<answer chunk>"}
  *   data: {"tool_call": {"name": "<tool>", "args": {...}}}
  *   data: {"tool_result": {"name": "<tool>", "content": "<result summary>"}}
  *   data: {"error": "<message>"}
+ *   : ping                               (idle heartbeat comments — ignored)
  *   data: [DONE]
  *
  * The parser is deliberately tolerant:
  * - unknown JSON frames are ignored (forward compatibility),
  * - a bare `[DONE]` payload terminates the stream,
+ * - SSE comment lines (`: ping` heartbeats) are ignored,
  * - non-JSON payload lines are surfaced as raw content deltas (legacy
  *   backends that stream plain text keep working),
  * - `{"delta"|"text": ...}` frames are treated as content,
- * - an early `{"session_id": ...}` frame carries the new chat session id.
+ * - an early `{"session_id": ...}` frame carries the new chat session id,
+ * - the leading `{"turn_id": ...}` frame carries the detached-turn handle
+ *   (generation survives disconnects; the UI re-attaches with it).
  */
 
 /**
@@ -52,6 +58,7 @@ export interface ExpertToolResult {
 
 /** Union of all decoded SSE frames from the expert stream. */
 export type ExpertSseEvent =
+  | { kind: "turn"; turnId: string }
   | { kind: "status"; phase: ExpertPhase }
   | { kind: "reasoning"; text: string }
   | { kind: "content"; text: string }
@@ -99,6 +106,9 @@ export function parseExpertSsePayload(payload: string): ExpertSseEvent | null {
   }
   if (typeof obj.session_id === "string" && obj.session_id) {
     return { kind: "session", sessionId: obj.session_id };
+  }
+  if (typeof obj.turn_id === "string" && obj.turn_id) {
+    return { kind: "turn", turnId: obj.turn_id };
   }
   const toolCall = obj.tool_call;
   if (isRecord(toolCall) && typeof toolCall.name === "string" && toolCall.name) {

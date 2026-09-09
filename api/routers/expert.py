@@ -3,15 +3,22 @@
 Endpoints (prefix ``/api/products``, tags ``expert``):
 
 - ``POST /api/products/{product_id}/ask``
-    Stream an expert-chat answer as Server-Sent Events (SSE) from the
-    LangGraph agent (``run_agent_chat_stream`` → ``astream_events``).
-    Optional ``session_id`` in the body continues a persistent session;
-    when absent (and the product exists) a new session is created and its
-    id is announced first thing in the stream via
-    ``data: {"session_id": "<id>"}`` and mirrored in the ``X-Session-Id``
-    response header. The user query, tool-call summaries, and the final
-    assistant answer are persisted to the session transcript (best-effort;
-    never breaks the stream).
+    Start a DETACHED expert ask turn (``api.expert.turns.start_turn``) and
+    stream it as Server-Sent Events. The generation is a background task
+    keyed by ``turn_id`` — a client disconnect (navigation, proxy timeout)
+    never cancels it; the answer is persisted to the session transcript
+    regardless (issue #9). The first SSE frame announces the turn
+    (``data: {"turn_id": "<id>"}``), followed by ``data: {"session_id":
+    "<id>"}`` for NEW sessions (also mirrored in the ``X-Session-Id``
+    header). A second ask into a session with a running turn → 409 with the
+    running ``X-Turn-Id`` response header (the client may re-attach).
+- ``GET /api/products/{product_id}/ask/stream/{turn_id}``
+    Re-attach to a turn: replay the buffered events, then stream the live
+    tail, terminating with ``[DONE]`` — same contract as ``/ask`` minus the
+    turn/session announcement frames.
+- ``POST /api/products/{product_id}/ask/{turn_id}/cancel``
+    Explicitly stop a running turn (the UI Stop button); the partial answer
+    is persisted to the transcript.
 - ``POST /api/products/{product_id}/ask/doc``
     Generate a self-contained Markdown document and return it as a
     downloadable file (``Content-Disposition: attachment``).
@@ -19,10 +26,15 @@ Endpoints (prefix ``/api/products``, tags ``expert``):
     List the product's chat sessions (newest first).
 - ``GET /api/products/{product_id}/chat/sessions/{session_id}/messages``
     Return the stored transcript of a session.
+- ``GET /api/products/{product_id}/chat/sessions/{session_id}/active-turn``
+    The RUNNING turn of a session (or ``null``) — the re-attach probe.
+- ``DELETE /api/products/{product_id}/chat/sessions/{session_id}``
+    Delete a session with its transcript; a running turn is cancelled.
 
-SSE event contract (fixed; see ``api.agents.expert``):
+SSE event contract (fixed; see ``api.agents.expert`` + ``api.expert.turns``):
 
-    data: {"session_id": "<id>"}          (first frame for NEW sessions)
+    data: {"turn_id": "<id>"}             (first frame, /ask only)
+    data: {"session_id": "<id>"}          (second frame for NEW sessions)
     data: {"status": "retrieving"|"thinking"|"answering"}
     data: {"reasoning": "<model thoughts>"}
     data: {"content": "<answer chunk>"}
@@ -31,11 +43,15 @@ SSE event contract (fixed; see ``api.agents.expert``):
     data: {"error": "<message>"}
     data: [DONE]
 
+Idle subscriber waits emit ``: ping`` SSE comments (heartbeats) so proxies
+with idle timeouts (e.g. the Next.js rewrite proxy) do not reap the stream.
+
 All endpoints require an authenticated session (``get_current_user``). The
 agent machinery lives in ``api.agents.expert``; this router only does request
-parsing, SSE framing, session persistence, and file-response packaging.
+parsing, turn wiring, session persistence, and file-response packaging.
 ``run_agent_chat_stream`` / ``run_agent_doc`` are imported as module
-attributes so tests can monkeypatch them on this module.
+attributes so tests can monkeypatch them on this module (the runner is
+passed into ``start_turn`` BY VALUE at request time, so the seam holds).
 
 Threading note: the async ``/ask`` handlers never touch the request-scoped
 ``db`` session (FastAPI runs sync dependencies on a worker thread while the
@@ -48,30 +64,34 @@ request-scoped session normally (same execution context).
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import secrets
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
+from typing import Iterator, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from api.agents.expert import run_agent_chat_stream, run_agent_doc
 from api.expert.deep_research import run_deep_research_stream
 from api.auth.deps import get_current_user
 from api.db import get_db
-from api.expert.types import (
-    EVENT_CONTENT,
-    EVENT_TOOL_CALL,
-    EVENT_TOOL_RESULT,
-    ExpertStreamEvent,
+from api.expert.turns import (
+    MAX_QUERY_CHARS,
+    ActiveTurn,
+    TurnBusyError,
+    active_for_session,
+    cancel_turn,
+    cancel_turns_for_session,
+    get_turn,
+    sse_payload,
+    start_turn,
+    subscribe,
 )
 from api.models import ChatMessageORM, ChatSessionORM, ProductORM, UserORM
 from api.utils.rate_limit import enforce_user_rate_limit
@@ -82,35 +102,11 @@ router = APIRouter(prefix="/api/products", tags=["expert"])
 
 #: Max characters of the query used to title a new chat session.
 _SESSION_TITLE_LIMIT = 120
-#: Max characters of a tool summary persisted to the transcript.
-_TOOL_ROW_LIMIT = 4000
-#: Max characters accepted for one query / history message / transcript row.
-#: Oversized bodies are rejected with 422 before any agent or DB work.
-MAX_QUERY_CHARS = 32_000
+#: ``MAX_QUERY_CHARS`` (the query/history/transcript row cap) is re-exported
+#: from ``api.expert.turns`` above — pydantic rejects oversized bodies with
+#: 422 before any agent or DB work.
 #: Max client-provided history messages per request.
 MAX_HISTORY_ITEMS = 50
-
-
-def _sse(payload: Dict[str, Any]) -> str:
-    """Format one SSE ``data:`` frame with a JSON payload."""
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-def _format_sse(event: ExpertStreamEvent) -> str:
-    """Map an expert stream event to an SSE ``data:`` frame.
-
-    Produces a typed frame (``{status}`` / ``{reasoning}`` / ``{content}`` /
-    ``{tool_call}`` / ``{tool_result}`` / ``{error}``) keyed by the event
-    type. ``tool_call`` / ``tool_result`` events carry a JSON payload in
-    ``event.content`` which is re-serialized as a nested JSON object.
-    """
-    if event.type in (EVENT_TOOL_CALL, EVENT_TOOL_RESULT):
-        try:
-            payload = json.loads(event.content)
-        except (ValueError, TypeError):
-            payload = {"content": event.content}
-        return _sse({event.type: payload})
-    return _sse({event.type: event.content})
 
 
 class ChatMessage(BaseModel):
@@ -285,149 +281,20 @@ def _create_session(
             return None
 
 
-def _append_message_rows(
-    session: Session,
-    session_id: str,
-    rows: List[Dict[str, Any]],
-) -> None:
-    """Insert transcript rows and refresh the session's ``updated_at``.
+def _turn_or_404(turn_id: str, product_id: str, user_id: Optional[str]) -> ActiveTurn:
+    """Resolve a turn for the attach/cancel endpoints or raise 404.
 
-    Each row gets an explicit strictly-increasing ``created_at`` (SQLite may
-    store the same microsecond for the whole batch, which would make the
-    transcript's ``ORDER BY created_at`` ordering unstable) and the parent
-    session's ``updated_at`` is touched so the session list stays newest-first.
+    The product scoping + owner check mirror the session endpoints: a turn
+    of another product or user is indistinguishable from a nonexistent one.
     """
-    if not rows:
-        return
-    # Base timestamp: now, clamped strictly past the session's newest row so
-    # a fast follow-up turn can never interleave with the previous turn's
-    # +i-second offsets (SQLite often stores the same microsecond per batch).
-    last = (
-        session.query(func.max(ChatMessageORM.created_at))
-        .filter(ChatMessageORM.session_id == session_id)
-        .scalar()
-    )
-    base = datetime.utcnow()
-    if last is not None and last >= base:
-        base = last + timedelta(seconds=1)
-    for i, row in enumerate(rows):
-        session.add(
-            ChatMessageORM(
-                id=_new_id("msg"),
-                session_id=session_id,
-                role=row["role"],
-                content=row["content"],
-                tool_name=row.get("tool_name"),
-                created_at=base + timedelta(seconds=i),
-            )
-        )
-    sess = session.get(ChatSessionORM, session_id)
-    if sess is not None:
-        sess.updated_at = base + timedelta(seconds=len(rows))
-    session.commit()
-
-
-def _tool_event_row(event: ExpertStreamEvent) -> Dict[str, Any]:
-    """Extract ``(tool_name, summary)`` from a tool_call/tool_result event."""
-    try:
-        payload = json.loads(event.content)
-    except (ValueError, TypeError):
-        payload = {"content": event.content}
-    if not isinstance(payload, dict):
-        payload = {"content": str(payload)}
-    name = str(payload.get("name") or "tool")[:128]
-    if event.type == EVENT_TOOL_CALL:
-        summary = json.dumps(payload.get("args") or {}, ensure_ascii=False)
-    else:
-        summary = str(payload.get("content") or "")
-    return {"role": "tool", "content": summary[:_TOOL_ROW_LIMIT], "tool_name": name}
-
-
-def _transcript_rows(query: str, events: List[ExpertStreamEvent]) -> List[Dict[str, Any]]:
-    """Build the transcript rows for one streamed turn.
-
-    The user turn first, then one row per tool call/result, then the
-    assembled assistant answer.
-    """
-    # Belt-and-braces cap: pydantic already bounds the query, but the
-    # persisted row must never exceed the cap regardless of the input path.
-    rows: List[Dict[str, Any]] = [
-        {"role": "user", "content": query[:MAX_QUERY_CHARS]}
-    ]
-    answer_parts: List[str] = []
-    for event in events:
-        if event.type == EVENT_CONTENT:
-            answer_parts.append(event.content)
-        elif event.type in (EVENT_TOOL_CALL, EVENT_TOOL_RESULT):
-            rows.append(_tool_event_row(event))
-    if answer_parts:
-        rows.append(
-            {"role": "assistant", "content": "".join(answer_parts)[:MAX_QUERY_CHARS]}
-        )
-    return rows
-
-
-async def _stream_and_persist(
-    product_id: str,
-    query: str,
-    session_id: Optional[str],
-    history: List[Dict[str, str]],
-    model: Optional[str],
-    seed_history: bool = False,
-    persist: bool = True,
-    deep_research: bool = False,
-) -> AsyncIterator[str]:
-    """Run the agent, yield SSE frames, persist the transcript at the end.
-
-    Events are buffered in memory and written in one short DB transaction
-    when the stream finishes (a chat turn is small: text deltas + tool
-    summaries), so persistence never interleaves with streaming. When
-    ``persist`` is False (ephemeral call for an unknown product) the
-    transcript is skipped entirely.
-
-    ``deep_research`` selects the planner → researcher → synthesizer runner
-    (``run_deep_research_stream``) instead of the regular react agent; the
-    SSE/transcript contracts are identical (the deep-research statuses are
-    plain status events).
-    """
-    collected: List[ExpertStreamEvent] = []
-    runner = run_deep_research_stream if deep_research else run_agent_chat_stream
-    try:
-        async for event in runner(
-            product_id,
-            query,
-            session_id=session_id,
-            history=history,
-            model=model,
-            seed_history=seed_history,
-        ):
-            if event is None:
-                continue
-            collected.append(event)
-            yield _format_sse(event)
-    except ValueError as e:
-        # Controlled message from the expert layer — safe to surface.
-        logger.warning("expert /ask stream failed: %s", e)
-        yield _sse({"error": str(e)})
-    except Exception as e:  # pragma: no cover - defensive over streaming
-        # Unexpected exceptions may embed internal URLs/paths — generic frame,
-        # full context in the server log only (review #5).
-        logger.error("expert /ask stream failed: %s", e, exc_info=True)
-        yield _sse({"error": "Expert agent stream failed; see server logs"})
-    finally:
-        if persist and session_id:
-            try:
-                with _local_session() as session:
-                    if session is not None:
-                        _append_message_rows(
-                            session, session_id, _transcript_rows(query, collected)
-                        )
-            except Exception as e:  # pragma: no cover - best-effort
-                logger.warning(
-                    "expert chat transcript persistence failed (session %s): %s",
-                    session_id,
-                    e,
-                )
+    turn = get_turn(turn_id)
+    if (
+        turn is None
+        or turn.product_id != product_id
+        or turn.user_id != user_id
+    ):
+        raise HTTPException(status_code=404, detail="Turn not found")
+    return turn
 
 
 @router.post("/{product_id}/ask")
@@ -436,16 +303,19 @@ async def expert_ask(
     body: ExpertAskRequest,
     user: UserORM = Depends(get_current_user),
 ):
-    """Stream an expert-chat answer as SSE (LangGraph agent with tools).
+    """Start a detached expert turn and stream it as SSE (issue #9).
 
-    Requires login. When ``body.session_id`` is provided the conversation
-    continues that persistent session (404 when it does not belong to the
-    product). Otherwise, when the product exists, a new session row is
-    created and its id is announced via ``data: {"session_id": ...}`` plus
-    the ``X-Session-Id`` header; the transcript (query / tool summaries /
-    answer) is persisted best-effort. For an unknown product the request
-    still streams (legacy behavior: no 404) but runs statelessly with no
-    session and no persistence.
+    Requires login. The generation runs as a background task registered in
+    ``api.expert.turns`` — a client disconnect (navigation, proxy timeout)
+    no longer cancels it; the answer is persisted to the session transcript
+    either way. The first SSE frame announces the ``turn_id`` (the re-attach
+    handle, also valid for ``/ask/stream/{turn_id}`` and the cancel
+    endpoint); a NEW session (no ``body.session_id``) is additionally
+    announced via ``data: {"session_id": ...}`` + the ``X-Session-Id``
+    header. A second ask into a session with a RUNNING turn → 409 with the
+    running turn id in ``X-Turn-Id`` (the client re-attaches instead).
+    For an unknown product the request still streams (legacy behavior: no
+    404) but runs statelessly with no session and no persistence.
     """
     # P1-17: per-user token bucket (30/min default) on the expert chat —
     # checked before any prompt/cognee work.
@@ -473,17 +343,37 @@ async def expert_ask(
             persist = True
 
     history = [{"role": m.role, "content": m.content} for m in body.messages]
+    # The runner is captured BY VALUE at request time so tests that
+    # monkeypatch the module attribute keep steering the flow.
+    runner = run_deep_research_stream if body.deep_research else run_agent_chat_stream
+
+    try:
+        turn = start_turn(
+            product_id=product_id,
+            query=body.query,
+            session_id=session_id,
+            user_id=user.id,
+            history=history,
+            model=body.model,
+            seed_history=session_created,
+            persist=persist,
+            runner=runner,
+        )
+    except TurnBusyError as busy:
+        raise HTTPException(
+            status_code=409,
+            detail="An expert answer is still generating for this chat",
+            headers={"X-Turn-Id": busy.turn_id},
+        ) from busy
 
     async def event_stream():
+        # Frame contract: turn id first (the re-attach handle), then the
+        # new-session id (if any), then the streamed events, then [DONE].
+        yield sse_payload({"turn_id": turn.id})
         if session_created and session_id:
-            yield _sse({"session_id": session_id})
-        async for frame in _stream_and_persist(
-            product_id, body.query, session_id, history, body.model,
-            seed_history=session_created, persist=persist,
-            deep_research=body.deep_research,
-        ):
+            yield sse_payload({"session_id": session_id})
+        async for frame in subscribe(turn.id):
             yield frame
-        yield "data: [DONE]\n\n"
 
     headers = {
         "Cache-Control": "no-cache",
@@ -497,6 +387,49 @@ async def expert_ask(
         media_type="text/event-stream",
         headers=headers,
     )
+
+
+@router.get("/{product_id}/ask/stream/{turn_id}")
+async def expert_ask_stream(
+    product_id: str,
+    turn_id: str,
+    user: UserORM = Depends(get_current_user),
+):
+    """Re-attach to a turn: SSE replay of the buffered events + live tail.
+
+    Same frame contract as ``/ask`` minus the turn/session announcements;
+    terminates with ``data: [DONE]``. Works for a RUNNING turn (live tail)
+    and a recently finished one (pure replay within the finished-turn TTL).
+    Only the turn's owner may attach.
+    """
+    _turn_or_404(turn_id, product_id, user.id)
+
+    async def event_stream():
+        async for frame in subscribe(turn_id):
+            yield frame
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/{product_id}/ask/{turn_id}/cancel")
+async def expert_ask_cancel(
+    product_id: str,
+    turn_id: str,
+    user: UserORM = Depends(get_current_user),
+):
+    """Stop a running turn (the UI Stop button); returns the final status.
+
+    The partial answer assembled so far is persisted to the transcript
+    (unless the turn already finished — then this is a no-op returning its
+    terminal status).
+    """
+    _turn_or_404(turn_id, product_id, user.id)
+    status = await cancel_turn(turn_id)
+    return {"turn_id": turn_id, "status": status}
 
 
 @router.post("/{product_id}/ask/doc")
@@ -611,6 +544,79 @@ def list_chat_messages(
         }
         for m in rows
     ]
+
+
+@router.get("/{product_id}/chat/sessions/{session_id}/active-turn")
+def get_chat_active_turn(
+    product_id: str,
+    session_id: str,
+    user: UserORM = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The RUNNING turn of a chat session, or ``null`` (re-attach probe).
+
+    The UI calls this when mounting / selecting a session: a non-null
+    descriptor (with ``turn_id``) means an answer is still generating —
+    the client attaches via ``GET /ask/stream/{turn_id}`` to catch the tail.
+    """
+    chat_session = _get_session_or_404(product_id, session_id, db, user.id)
+    turn = active_for_session(chat_session.id)
+    return turn.describe() if turn is not None else None
+
+
+@router.delete("/{product_id}/chat/sessions/{session_id}")
+async def delete_chat_session(
+    product_id: str,
+    session_id: str,
+    user: UserORM = Depends(get_current_user),
+):
+    """Delete a chat session with its whole transcript. Requires login.
+
+    A RUNNING turn of the session is cancelled first (with persistence
+    disabled, so it can never write rows for a session that no longer
+    exists). Message rows are deleted explicitly — the ORM relationship
+    cascade is not trusted here because SQLite builds do not always enable
+    foreign-key cascades. The LangGraph checkpoint thread is dropped
+    best-effort via ``adelete_thread``.
+    """
+    # Same-thread rule: async handler → short-lived local DB session.
+    with _local_session() as db:
+        if db is None:
+            raise HTTPException(status_code=503, detail="Chat history unavailable")
+        chat_session = (
+            db.query(ChatSessionORM)
+            .filter(
+                ChatSessionORM.id == session_id,
+                ChatSessionORM.product_id == product_id,
+                _session_owner_filter(user.id),
+            )
+            .first()
+        )
+        if chat_session is None:
+            raise HTTPException(status_code=404, detail="Chat session not found")
+        # Cancel the running turn BEFORE deleting rows: the turn task would
+        # otherwise write its (partial) transcript into a dead session.
+        cancelled = cancel_turns_for_session(chat_session.id)
+        db.query(ChatMessageORM).filter(
+            ChatMessageORM.session_id == chat_session.id
+        ).delete(synchronize_session=False)
+        db.delete(chat_session)
+        db.commit()
+
+    # Best-effort LangGraph checkpoint thread cleanup (async checkpointer
+    # API; any failure is harmless — checkpoints are keyed by session id and
+    # an orphaned thread is unreachable garbage).
+    try:
+        from api.agents.runtime import get_checkpointer
+
+        checkpointer = await get_checkpointer()
+        deleter = getattr(checkpointer, "adelete_thread", None)
+        if deleter is not None:
+            await deleter(session_id)
+    except Exception as e:  # pragma: no cover - best-effort
+        logger.debug("checkpoint thread cleanup failed (%s): %s", session_id, e)
+
+    return {"deleted": session_id, "cancelled_turns": cancelled}
 
 
 __all__ = ["router"]

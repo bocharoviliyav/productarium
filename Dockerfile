@@ -1,14 +1,13 @@
 ARG CUSTOM_CERT_DIR="certs"
 
-FROM node:20-alpine3.22 AS node_base
+FROM node:22-alpine3.22 AS node_base
 
-# Install bun for frontend dependency install + build (Phase B: yarn -> bun).
-RUN npm install -g bun
+RUN npm install -g bun@1.4.2
 
 FROM node_base AS node_deps
 WORKDIR /app
 COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile
+RUN bun install --frozen-lockfile || (rm -rf ~/.bun/install/cache && bun install --frozen-lockfile)
 
 FROM node_base AS node_builder
 WORKDIR /app
@@ -33,6 +32,8 @@ RUN python -m pip install poetry==2.0.1 --no-cache-dir && \
     POETRY_MAX_WORKERS=10 poetry install --no-interaction --no-ansi --only main && \
     poetry cache clear --all .
 
+FROM python:3.12-slim AS py312
+
 # Use Python 3.11 as final image
 FROM python:3.11-slim
 
@@ -48,11 +49,26 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
-    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
     && apt-get update \
     && apt-get install -y nodejs \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @bytebase/dbhub@1.2.3
+RUN python -m pip install --no-cache-dir uv==0.8.14
+
+COPY --from=py312 /usr/local/bin/python3.12 /usr/local/bin/python3.12
+COPY --from=py312 /usr/local/lib/python3.12 /usr/local/lib/python3.12
+COPY --from=py312 /usr/local/lib/libpython3.12.so.1.0 /usr/local/lib/libpython3.12.so.1.0
+
+RUN ldconfig && python3.12 --version \
+    && mkdir -p /opt/mcp \
+    && uv venv /opt/mcp/oracle --python /usr/local/bin/python3.12 \
+    && git clone https://github.com/danielmeppiel/oracle-mcp-server /opt/mcp/oracle/app \
+    && git -C /opt/mcp/oracle/app checkout 37ce2ead4e8caa274eb9442b44aff7f7a59573dd \
+    && uv pip install --python /opt/mcp/oracle/bin/python --no-cache -e /opt/mcp/oracle/app \
+    && rm -rf /opt/mcp/oracle/app/.git
 
 # Update certificates if custom ones were provided and copied successfully
 RUN if [ -n "${CUSTOM_CERT_DIR}" ]; then \
@@ -71,27 +87,9 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Copy Python dependencies
 COPY --from=py_deps /api/.venv /opt/venv
 COPY api/ ./api/
-# Copy the externalized prompt bodies (refs/prompts/*.md) and reference docs.
-# api/prompts.py loads these at import time via load_prompt_file(); without
-# this copy, every prompt constant is empty inside the container and all
-# docgen/deep-research sections render with blank instructions.
+
 COPY refs/ ./refs/
 
-# Pre-vendor tiktoken's cl100k_base BPE mergeable-ranks file (offline fix).
-# api/utils/llm_tokens.py (and langchain's token counters) call
-# tiktoken.get_encoding("cl100k_base") at first use, which otherwise downloads
-# cl100k_base.tiktoken from
-# openaipublic.blob.core.windows.net -- unreachable offline in this container,
-# crashing startup with ConnectionError. tiktoken's read_file_cached()
-# (tiktoken/load.py) names the cache file by sha1(download_url) and serves it
-# with no network when the file exists and its sha256 matches the expected
-# hash. We vendor that verified file (sha256
-# 223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7) named
-# 9b5ad71b2ce5302211f9c61530b329a4922fc6a4 (= sha1 of the blob URL).
-# TIKTOKEN_CACHE_DIR below points tiktoken at this dir. Regenerating the file:
-#   curl -fsSL -o tiktoken_cache/9b5ad71b2ce5302211f9c61530b329a4922fc6a4 \
-#     https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken
-# (then verify sha256 matches the hash above).
 COPY tiktoken_cache/ /opt/tiktoken_cache/
 
 # Copy Node app

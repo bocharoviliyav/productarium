@@ -226,6 +226,7 @@ def init_db() -> bool:
     try:
         _ensure_pgvector_extension()
         Base.metadata.create_all(bind=engine)
+        _ensure_schema_columns()
         _ensure_hnsw_index()
         _db_ready = True
         logger.info("SQLAlchemy tables ready (url=%s).", _safe_url(DATABASE_URL))
@@ -233,6 +234,34 @@ def init_db() -> bool:
     except Exception as e:
         logger.warning("create_all failed (non-fatal): %s", e)
         return False
+
+
+# Columns added to EXISTING tables after their initial create_all. There is
+# no migration machinery in this project (create_all only creates missing
+# tables, never alters existing ones), so nullable additions are shimmed
+# here idempotently at startup ("already exists" = success, non-fatal).
+_SCHEMA_COLUMN_SHIMS: tuple = (
+    ("databases", "db_type", "VARCHAR(32)"),
+    ("mcp_servers", "preset_key", "VARCHAR(32)"),
+)
+
+
+def _ensure_schema_columns() -> None:
+    """Best-effort ``ALTER TABLE … ADD COLUMN`` for ``_SCHEMA_COLUMN_SHIMS``."""
+    for table, column, ddl_type in _SCHEMA_COLUMN_SHIMS:
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"
+                )
+            logger.info("Schema shim: added column %s.%s", table, column)
+        except Exception as e:
+            text = str(e).lower()
+            if "already exists" in text or "duplicate column" in text:
+                continue
+            logger.warning(
+                "Schema shim for %s.%s failed (non-fatal): %s", table, column, e
+            )
 
 
 def _ensure_pgvector_extension() -> None:

@@ -440,6 +440,16 @@ export function Modal({
 }) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const prevFocusRef = useRef<HTMLElement | null>(null);
+  // Callers routinely pass inline arrow callbacks, so `onClose` gets a new
+  // identity on every parent render. Keeping it in a ref lets the open
+  // effect below depend on [open] only — otherwise every parent state
+  // update (e.g. each keystroke in a modal form field) re-ran the effect
+  // and moved focus back to the first focusable element (the header close
+  // button), making typed input impossible (issue #1).
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   useEffect(() => {
     if (!open) return;
@@ -455,7 +465,7 @@ export function Modal({
     }
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (e.key === "Tab" && dialogRef.current) {
@@ -483,7 +493,7 @@ export function Modal({
       document.body.style.overflow = prev;
       prevFocusRef.current?.focus?.();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   // Render into document.body via a portal so the dialog escapes any ancestor
   // stacking context (e.g. the .reveal class used by <Reveal>, which keeps

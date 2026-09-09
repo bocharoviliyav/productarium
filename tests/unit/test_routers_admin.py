@@ -5,7 +5,10 @@ Focuses on the lines NOT already covered by tests/integration/test_admin_public.
 - connectivity tests (POST /{group}/test) for models, git, confluence, integrations
 - _ping_model_endpoint branches (success, auth-rejected, probe failure, non-200)
 - _lazy_connector / _connector_test_result helper branches
-- prompts list/get/put (including invalid filename + path traversal + missing file)
+- prompts list/get/put (including invalid filename + path traversal + missing file,
+  the ?lang= parameter, en fallback, ru/en listing parity)
+- GET /api/admin/openapi (read-only public API viewer)
+- generation group (GET resolved view + PUT language validation)
 - memory endpoints (GET/PUT /api/admin/memory, POST /api/admin/memory/reindex)
 - settings group GETs with ``resolved`` views (git, confluence, integrations,
   ssl, embedder, memory, timeouts)
@@ -531,6 +534,53 @@ class TestPrompts:
         assert body["filename"] == "docgen_sections.md"
         assert "content" in body
         assert len(body["content"]) > 0
+        assert body["language"] in ("ru", "en")
+
+    def test_list_prompts_lang_parity(self, isolated_db):
+        """?lang=ru and ?lang=en list the same complete inventory."""
+        from api.routers import admin as admin_mod
+        from api.prompts import PROMPT_FILES
+
+        app, client = _build_client(isolated_db, admin_mod)
+        ru = client.get("/api/admin/prompts?lang=ru")
+        en = client.get("/api/admin/prompts?lang=en")
+        assert ru.status_code == 200 and en.status_code == 200
+        ru_names = [p["filename"] for p in ru.json()]
+        en_names = [p["filename"] for p in en.json()]
+        assert ru_names == en_names
+        assert set(en_names) == set(PROMPT_FILES)
+        # README.md is documentation, never listed as an editable prompt.
+        assert "README.md" not in en_names
+
+    def test_get_prompt_lang_reports_language(self, isolated_db):
+        from api.routers import admin as admin_mod
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.get("/api/admin/prompts/product_summary.md?lang=ru")
+        assert resp.status_code == 200
+        assert resp.json()["language"] == "ru"
+
+    def test_get_prompt_falls_back_to_en_copy(
+        self, isolated_db, monkeypatch, tmp_path
+    ):
+        """When the ru copy is missing on disk, GET serves the English body."""
+        from api.routers import admin as admin_mod
+        from api import prompts as prompts_mod
+
+        en_dir = tmp_path / "en"
+        en_dir.mkdir(parents=True)
+        (en_dir / "product_summary.md").write_text("EN body.", encoding="utf-8")
+        # prompts_dir() resolves through api.prompts.PROMPTS_DIR; the admin
+        # module keeps its own imported copy (used by _safe_prompt_filename).
+        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(tmp_path))
+        monkeypatch.setattr(admin_mod, "PROMPTS_DIR", str(tmp_path))
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.get("/api/admin/prompts/product_summary.md?lang=ru")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["language"] == "en"
+        assert body["content"] == "EN body."
 
     def test_get_prompt_invalid_filename(self, isolated_db):
         from api.routers import admin as admin_mod
@@ -573,20 +623,23 @@ class TestPrompts:
 
         # A registered prompt file (the PUT hot-reloads it in memory, so the
         # finally block must restore BOTH the file and the loaded constant).
+        # ?lang=en writes into refs/prompts/en/ specifically.
         fname = "mermaid_repair.md"
-        fpath = os.path.join(PROMPTS_DIR, fname)
+        fpath = os.path.join(PROMPTS_DIR, "en", fname)
         original = open(fpath, "r", encoding="utf-8").read()
         try:
             app, client = _build_client(isolated_db, admin_mod)
             resp = client.put(
-                f"/api/admin/prompts/{fname}",
+                f"/api/admin/prompts/{fname}?lang=en",
                 json={"content": "# Test content\n\nNew prompt body."},
             )
             assert resp.status_code == 200
             body = resp.json()
             assert body["success"] is True
             assert body["filename"] == fname
-            # File was written.
+            assert body["language"] == "en"
+            # File was written into the English language dir (not the parent
+            # and not the active-language dir).
             new_content = open(fpath, "r", encoding="utf-8").read()
             assert "Test content" in new_content
         finally:
@@ -603,6 +656,84 @@ class TestPrompts:
             json={"content": "x"},
         )
         assert resp.status_code == 400
+
+
+# --- Public API viewer: GET /api/admin/openapi (issue #4) --------------------
+class TestPublicApiViewer:
+    def test_get_openapi_schema(self, isolated_db):
+        from api.routers import admin as admin_mod
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.get("/api/admin/openapi")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["openapi"].startswith("3.")
+        assert "paths" in body
+        # The admin router's own endpoints (including the viewer itself) are
+        # part of the schema the SpecViewer renders.
+        assert "/api/admin/prompts" in body["paths"]
+        assert "/api/admin/openapi" in body["paths"]
+
+
+# --- Generation language group (issue #2) -----------------------------------
+class TestGenerationGroup:
+    def test_get_generation_group_resolved(self, isolated_db):
+        from api.routers import admin as admin_mod
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.get("/api/admin/generation")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["group"] == "generation"
+        assert body["resolved"]["language"] in ("ru", "en")
+
+    def test_put_generation_language_valid(self, isolated_db):
+        from api.routers import admin as admin_mod
+        from api.prompts import get_generation_language, reload_all_prompt_files
+        import api.config.settings as ss
+
+        app, client = _build_client(isolated_db, admin_mod)
+        try:
+            resp = client.put(
+                "/api/admin/generation",
+                json={"generation.language": "en"},
+            )
+            assert resp.status_code == 200
+            assert "generation.language" in resp.json()["saved"]
+            assert get_generation_language() == "en"
+        finally:
+            # Restore: clear the override and hot-reload back to the default
+            # language's prompt set so later tests in the session see ru.
+            ss.set_setting("generation.language", "")
+            reload_all_prompt_files()
+
+    def test_put_generation_language_case_normalized(self, isolated_db):
+        from api.routers import admin as admin_mod
+        import api.config.settings as ss
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.put(
+            "/api/admin/generation",
+            json={"generation.language": "  RU  "},
+        )
+        assert resp.status_code == 200
+        assert "generation.language" in resp.json()["saved"]
+        assert ss.get_setting("generation.language") == "ru"
+        ss.set_setting("generation.language", "")
+
+    def test_put_generation_language_invalid_ignored(self, isolated_db):
+        """An invalid language is rejected, not persisted (no silent typo)."""
+        from api.routers import admin as admin_mod
+        import api.config.settings as ss
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.put(
+            "/api/admin/generation",
+            json={"generation.language": "klingon"},
+        )
+        assert resp.status_code == 200
+        assert "generation.language" not in resp.json()["saved"]
+        assert ss.get_setting("generation.language") is None
 
 
 # --- Memory endpoints (GET/PUT /api/admin/memory, POST reindex) --------------

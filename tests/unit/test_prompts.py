@@ -13,8 +13,12 @@ Covers:
 - ``_parse_section_blocks`` (block parsing, dedup, malformed input).
 - ``SECTION_PROMPTS`` registry (all 7 sections present, non-empty, raw — not
   wrapped with the language block).
-- ``PROMPT_FILES`` registry completeness (exact match with refs/prompts/*.md
-  minus README).
+- ``PROMPT_FILES`` registry completeness (exact match with the *.md files in
+  EACH of refs/prompts/en and refs/prompts/ru — one file per prompt per
+  language; the ru/en inventories must match).
+- ``get_generation_language`` (admin setting > lang.json default; invalid
+  stored value ignored) + ``prompts_dir``/``_resolve_prompt_path`` (language
+  dirs with en fallback).
 - Module-level constants (``LANGUAGE_INSTRUCTION``, ``DETAIL_LEVEL_COMPREHENSIVE``,
   ``LANGUAGE_NAMES``, ``_UNWRAPPED_PROMPTS``; the dead per-section WIKI_* and
   deep_research_*_iteration constants are GONE).
@@ -35,6 +39,7 @@ from api.prompts import (
     LANGUAGE_INSTRUCTION,
     LANGUAGE_NAMES,
     PROMPT_FILES,
+    PROMPT_LANGUAGES,
     PROMPTS_DIR,
     SECTION_PROMPTS,
     SUBPAGE_CONTRACTS,
@@ -47,9 +52,12 @@ from api.prompts import (
     _maybe_wrap,
     _parse_section_blocks,
     _parse_subpage_blocks,
+    _resolve_prompt_path,
     _wrap_prompt,
+    get_generation_language,
     get_section_title,
     load_prompt_file,
+    prompts_dir,
     reload_prompt_file,
 )
 
@@ -248,6 +256,32 @@ class TestLoadPromptFile:
         result = load_prompt_file("mermaid_repair.md", "fallback")
         assert "language" not in result.lower() or result == "fallback"
 
+    def test_requested_language_dir_wins(self, monkeypatch, tmp_path):
+        # Both language copies exist on disk: the requested language's copy
+        # is loaded (never silently mixed).
+        for lang, body in (("ru", "RU summary prompt."), ("en", "EN summary prompt.")):
+            d = tmp_path / lang
+            d.mkdir()
+            (d / "product_summary.md").write_text(body, encoding="utf-8")
+        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(tmp_path))
+        assert "RU summary prompt." in load_prompt_file(
+            "product_summary.md", "", language="ru"
+        )
+        assert "EN summary prompt." in load_prompt_file(
+            "product_summary.md", "", language="en"
+        )
+
+    def test_missing_language_copy_falls_back_to_en(self, monkeypatch, tmp_path):
+        # Only the English copy exists: a ru request reads it BEFORE falling
+        # back to the in-code fallback text.
+        d = tmp_path / "en"
+        d.mkdir(parents=True)
+        (d / "product_summary.md").write_text("EN only body.", encoding="utf-8")
+        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(tmp_path))
+        result = load_prompt_file("product_summary.md", "the fallback", language="ru")
+        assert "EN only body." in result
+        assert "the fallback" not in result
+
 
 # ---------------------------------------------------------------------------
 # reload_prompt_file
@@ -287,14 +321,14 @@ class TestReloadPromptFile:
         assert reload_prompt_file("product_summary.md") is False
 
     def test_reload_docgen_sections_reparses_registry(self, monkeypatch, tmp_path):
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        (prompts_dir / "docgen_sections.md").write_text(
+        lang_dir = tmp_path / "en"
+        lang_dir.mkdir(parents=True)
+        (lang_dir / "docgen_sections.md").write_text(
             '<section id="overview">\nNew overview contract.\n</section>\n',
             encoding="utf-8",
         )
-        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(prompts_dir))
-        assert reload_prompt_file("docgen_sections.md") is True
+        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(tmp_path))
+        assert reload_prompt_file("docgen_sections.md", language="en") is True
         # Unwrapped prompt file: the constant holds the raw file text...
         assert "New overview contract." in prompts_mod.DOCGEN_SECTIONS_PROMPT
         # The registry is re-parsed in place...
@@ -304,14 +338,14 @@ class TestReloadPromptFile:
             assert sid in SECTION_PROMPTS and SECTION_PROMPTS[sid]
 
     def test_reload_docgen_subpages_reparses_registry(self, monkeypatch, tmp_path):
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        (prompts_dir / "docgen_subpages.md").write_text(
+        lang_dir = tmp_path / "en"
+        lang_dir.mkdir(parents=True)
+        (lang_dir / "docgen_subpages.md").write_text(
             '<subpage id="functional_item">\nNew functional contract.\n</subpage>\n',
             encoding="utf-8",
         )
-        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(prompts_dir))
-        assert reload_prompt_file("docgen_subpages.md") is True
+        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(tmp_path))
+        assert reload_prompt_file("docgen_subpages.md", language="en") is True
         assert "New functional contract." in prompts_mod.DOCGEN_SUBPAGES_PROMPT
         assert SUBPAGE_CONTRACTS["functional_item"] == "New functional contract."
         # The other canonical subpage types fall back to generic stubs.
@@ -319,13 +353,13 @@ class TestReloadPromptFile:
             assert sp_type in SUBPAGE_CONTRACTS and SUBPAGE_CONTRACTS[sp_type]
 
     def test_reload_non_section_prompt(self, monkeypatch, tmp_path):
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        (prompts_dir / "product_summary.md").write_text(
+        lang_dir = tmp_path / "en"
+        lang_dir.mkdir(parents=True)
+        (lang_dir / "product_summary.md").write_text(
             "Summary prompt.", encoding="utf-8"
         )
-        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(prompts_dir))
-        assert reload_prompt_file("product_summary.md") is True
+        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(tmp_path))
+        assert reload_prompt_file("product_summary.md", language="en") is True
         # Wrapped generation prompts carry the language block first — note
         # LANGUAGE_INSTRUCTION itself starts with a leading newline.
         wrapped = prompts_mod.PRODUCT_SUMMARY_PROMPT
@@ -333,27 +367,47 @@ class TestReloadPromptFile:
         assert "Summary prompt." in wrapped
 
     def test_reload_verification_guard(self, monkeypatch, tmp_path):
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        (prompts_dir / "_verification_guard.md").write_text("Guard rules.", encoding="utf-8")
-        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(prompts_dir))
-        assert reload_prompt_file("_verification_guard.md") is True
+        lang_dir = tmp_path / "en"
+        lang_dir.mkdir(parents=True)
+        (lang_dir / "_verification_guard.md").write_text("Guard rules.", encoding="utf-8")
+        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(tmp_path))
+        assert reload_prompt_file("_verification_guard.md", language="en") is True
         assert prompts_mod.VERIFICATION_GUARD == "Guard rules."
 
     def test_reload_mermaid_repair(self, monkeypatch, tmp_path):
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        (prompts_dir / "mermaid_repair.md").write_text("Repair rules.", encoding="utf-8")
-        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(prompts_dir))
-        assert reload_prompt_file("mermaid_repair.md") is True
+        lang_dir = tmp_path / "en"
+        lang_dir.mkdir(parents=True)
+        (lang_dir / "mermaid_repair.md").write_text("Repair rules.", encoding="utf-8")
+        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(tmp_path))
+        assert reload_prompt_file("mermaid_repair.md", language="en") is True
         assert prompts_mod.MERMAID_REPAIR_PROMPT == "Repair rules."
 
+    def test_reload_requested_language_wins(self, monkeypatch, tmp_path):
+        # Both language copies exist: reload(language=…) reads that copy.
+        for lang, body in (("ru", "RU repair."), ("en", "EN repair.")):
+            d = tmp_path / lang
+            d.mkdir()
+            (d / "mermaid_repair.md").write_text(body, encoding="utf-8")
+        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(tmp_path))
+        assert reload_prompt_file("mermaid_repair.md", language="ru") is True
+        assert prompts_mod.MERMAID_REPAIR_PROMPT == "RU repair."
+        assert reload_prompt_file("mermaid_repair.md", language="en") is True
+        assert prompts_mod.MERMAID_REPAIR_PROMPT == "EN repair."
+
+    def test_reload_missing_lang_copy_falls_back_to_en(self, monkeypatch, tmp_path):
+        lang_dir = tmp_path / "en"
+        lang_dir.mkdir(parents=True)
+        (lang_dir / "_verification_guard.md").write_text("EN guard.", encoding="utf-8")
+        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(tmp_path))
+        assert reload_prompt_file("_verification_guard.md", language="ru") is True
+        assert prompts_mod.VERIFICATION_GUARD == "EN guard."
+
     def test_reload_read_error_returns_false(self, monkeypatch, tmp_path):
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        bad_file = prompts_dir / "product_summary.md"
+        lang_dir = tmp_path / "en"
+        lang_dir.mkdir(parents=True)
+        bad_file = lang_dir / "product_summary.md"
         bad_file.write_text("content", encoding="utf-8")
-        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(prompts_dir))
+        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(tmp_path))
         original_open = open
 
         def fake_open(path, *args, **kwargs):
@@ -362,7 +416,7 @@ class TestReloadPromptFile:
             return original_open(path, *args, **kwargs)
 
         monkeypatch.setattr("builtins.open", fake_open)
-        assert reload_prompt_file("product_summary.md") is False
+        assert reload_prompt_file("product_summary.md", language="en") is False
 
 
 # ---------------------------------------------------------------------------
@@ -544,9 +598,9 @@ class TestPromptContentValidation:
         ],
     }
 
-    def _raw_body(self, filename: str) -> str:
-        """Read the raw, unwrapped prompt body from refs/prompts/<filename>."""
-        path = os.path.join(PROMPTS_DIR, filename)
+    def _raw_body(self, filename: str, language: str = "en") -> str:
+        """Read the raw, unwrapped body from refs/prompts/<language>/<filename>."""
+        path = os.path.join(PROMPTS_DIR, language, filename)
         assert os.path.exists(path), f"prompt file missing: {filename}"
         with open(path, "r", encoding="utf-8") as f:
             return f.read().strip()
@@ -621,17 +675,28 @@ class TestPromptContentValidation:
 # ---------------------------------------------------------------------------
 
 class TestPromptFiles:
-    def _disk_files(self):
+    @staticmethod
+    def _disk_files(language: str) -> set:
+        directory = os.path.join(PROMPTS_DIR, language)
+        assert os.path.isdir(directory), f"missing language dir: {directory}"
         return {
-            name for name in os.listdir(PROMPTS_DIR)
+            name for name in os.listdir(directory)
             if name.endswith(".md") and name != "README.md"
         }
 
-    def test_registry_matches_files_on_disk(self):
-        # THE inventory invariant: registry keys == refs/prompts/*.md minus
-        # README. Adding/deleting a prompt file without updating the registry
-        # (or vice versa) fails here.
-        assert set(PROMPT_FILES) == self._disk_files()
+    def test_registry_matches_files_on_disk_per_language(self):
+        # THE inventory invariant: registry keys == the *.md files in EACH
+        # language dir (refs/prompts/en, refs/prompts/ru — the parent only
+        # keeps README.md). Adding/deleting a prompt file in either language
+        # without updating the registry (or vice versa) fails here.
+        for language in PROMPT_LANGUAGES:
+            assert set(PROMPT_FILES) == self._disk_files(language), language
+
+    def test_ru_and_en_inventories_match(self):
+        # Translation invariant: every English prompt ships a Russian copy
+        # and vice versa (the admin panel falls back to en when a copy is
+        # missing, but the shipped tree is complete).
+        assert self._disk_files("en") == self._disk_files("ru")
 
     def test_contains_docgen_pipeline_prompts(self):
         for filename in (
@@ -677,6 +742,54 @@ class TestPromptFiles:
         for key, val in PROMPT_FILES.items():
             assert isinstance(val, str)
             assert val  # non-empty
+
+
+# ---------------------------------------------------------------------------
+# get_generation_language + prompts_dir / _resolve_prompt_path
+# ---------------------------------------------------------------------------
+
+class TestGenerationLanguage:
+    def test_defaults_to_lang_json_default(self, isolated_db):
+        # No admin override stored in the fresh settings store: the lang.json
+        # default (ru) wins.
+        assert get_generation_language() == "ru"
+
+    def test_admin_setting_overrides(self, isolated_db):
+        from api.config.settings import set_setting
+
+        set_setting(prompts_mod.GENERATION_LANGUAGE_SETTING, "en")
+        assert get_generation_language() == "en"
+
+    def test_invalid_admin_setting_falls_back(self, isolated_db):
+        from api.config.settings import set_setting
+
+        set_setting(prompts_mod.GENERATION_LANGUAGE_SETTING, "klingon")
+        assert get_generation_language() == "ru"
+
+
+class TestPromptsDirHelpers:
+    def test_prompts_dir_explicit_language(self):
+        assert prompts_dir("en") == os.path.join(PROMPTS_DIR, "en")
+        assert prompts_dir("ru") == os.path.join(PROMPTS_DIR, "ru")
+
+    def test_prompts_dir_default_uses_active_language(self):
+        active = get_generation_language()
+        assert prompts_dir(None) == os.path.join(PROMPTS_DIR, active)
+        # Unknown codes normalize to the active language too.
+        assert prompts_dir("klingon") == os.path.join(PROMPTS_DIR, active)
+
+    def test_resolve_prompt_path_lang_dir_first_en_fallback(self, monkeypatch, tmp_path):
+        en_dir = tmp_path / "en"
+        en_dir.mkdir(parents=True)
+        (en_dir / "product_summary.md").write_text("EN body.", encoding="utf-8")
+        monkeypatch.setattr(prompts_mod, "PROMPTS_DIR", str(tmp_path))
+        # ru copy missing -> the en copy path is returned...
+        assert _resolve_prompt_path("product_summary.md", "ru") == str(
+            en_dir / "product_summary.md"
+        )
+        # ...and when nothing exists anywhere, the primary (language-dir)
+        # path is returned so callers can log a meaningful target.
+        assert _resolve_prompt_path("ghost.md", "ru") == str(tmp_path / "ru" / "ghost.md")
 
 
 # ---------------------------------------------------------------------------

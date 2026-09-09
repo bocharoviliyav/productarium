@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from types import SimpleNamespace
@@ -581,8 +582,13 @@ class TestRunDeepResearchStream:
         assert len(prompts) == dr_mod.MAX_ITERATIONS + 1
         assert len(researcher_calls) == 4
         # Iteration budget visible to the researcher system prompts 1..4.
+        # The prompt body is language-dependent (admin generation.language),
+        # so match the rendered numbers, not the English wording.
         for i, call in enumerate(researcher_calls, start=1):
-            assert f"iteration {i} of {dr_mod.MAX_ITERATIONS}" in call["system_prompt"]
+            assert re.search(
+                rf"{i}\s+(?:of|из)\s+{dr_mod.MAX_ITERATIONS}",
+                call["system_prompt"],
+            )
         # Last planner prompt saw all four accumulated findings.
         assert "[4] FOUND-4" in prompts[dr_mod.MAX_ITERATIONS - 1]
 

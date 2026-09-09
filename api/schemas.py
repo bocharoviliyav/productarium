@@ -65,14 +65,22 @@ class Links(BaseModel):
 class Database(BaseModel):
     """Reverse-engineered database artifact (Wave E).
 
-    ``dsn`` is INPUT-ONLY: it is masked on acceptance (``mask_dsn``) and only
-    the masked form is persisted / returned as ``dsn_masked``. A round-trip
-    (GET → PUT) echoes ``dsn_masked`` back safely.
+    ``dsn`` is INPUT-ONLY (``exclude`` — it can never be serialized back):
+    on the legacy path it is masked on acceptance (``mask_dsn``) and only the
+    masked form is persisted / returned as ``dsn_masked``; on the preset path
+    (``db_type`` set) it is stored ONLY inside the dedicated preset MCP
+    server row's Fernet-encrypted env and never shown again after the
+    connection check passes. A round-trip (GET → PUT) echoes ``dsn_masked``
+    back safely.
     """
 
     id: str
     name: str
-    dsn: Optional[str] = None  # input-only; never persisted or returned
+    # Write-only (like Codebase.token): accepted on input, excluded from
+    # every serialized response.
+    dsn: Optional[str] = Field(default=None, exclude=True)
+    # Preset database type (postgresql|mysql|…|oracle) or None (manual path).
+    db_type: Optional[str] = None
     dsn_masked: Optional[str] = None
     mcp_server_id: Optional[str] = None
     generated_docs: Optional[str] = None

@@ -167,7 +167,11 @@ def _database_orm_from_pydantic(d: Database) -> DatabaseORM:
     masked form reaches the ORM (``dsn_masked``); a provided ``dsn_masked``
     (round-trip echo) is preferred as-is, then re-masked defensively so a
     client-crafted "dsn_masked" containing credentials cannot smuggle a
-    secret into storage either.
+    secret into storage either. The PRESET path (``db_type``) never passes
+    through here — the databases router builds its own DatabaseORM with
+    ``dsn_masked=None`` (the raw DSN lives only in the preset server's
+    encrypted env); ``db_type`` is still copied for callers that send it
+    without a preset flow (it is then informational only).
     """
     from api.docgen.verification import mask_dsn
 
@@ -175,6 +179,7 @@ def _database_orm_from_pydantic(d: Database) -> DatabaseORM:
     return DatabaseORM(
         id=d.id,
         name=d.name,
+        db_type=d.db_type,
         dsn_masked=mask_dsn(dsn_masked) if dsn_masked else None,
         mcp_server_id=d.mcp_server_id,
         generated_docs=d.generated_docs,
@@ -241,6 +246,7 @@ def orm_to_product(p_orm: ProductORM) -> Product:
             Database(
                 id=d.id,
                 name=d.name,
+                db_type=d.db_type,
                 dsn_masked=d.dsn_masked,
                 mcp_server_id=d.mcp_server_id,
                 generated_docs=d.generated_docs,

@@ -129,9 +129,9 @@ def build_connection(server: Any) -> Dict[str, Any]:
     never stored, never logged.
     """
     timeout = discovery_timeout()
-    if server.transport == "http":
+    if server.transport in ("http", "sse"):
         conn: Dict[str, Any] = {
-            "transport": "http",
+            "transport": server.transport,
             "url": server.url,
             "timeout": timeout,
         }
@@ -140,12 +140,29 @@ def build_connection(server: Any) -> Dict[str, Any]:
             conn["headers"] = headers
         return conn
     if server.transport == "stdio":
-        # Defense in depth: rows registered before the router policy existed
-        # are still refused here (best-effort skip upstream), never spawned.
-        error = stdio_command_error(server.command)
-        if error:
-            raise ValueError(error)
         env = decrypt_secret_dict(server.env)
+        preset_key = getattr(server, "preset_key", None)
+        if preset_key:
+            # System-managed preset row (api/mcp/presets.py): the interpreter
+            # ban does not apply (dbhub needs Node, oracle needs a venv
+            # python). Instead the FULL row — command + args + env — must
+            # match the hardcoded registry exactly (rebuilt from the stored
+            # DSN), so tampering the row still cannot execute anything
+            # outside the preset launchers. Env keys keep the policy check.
+            from api.mcp.presets import preset_row_mismatch
+
+            error = preset_row_mismatch(
+                preset_key, server.command, server.args or [], env
+            )
+            if error:
+                raise ValueError(error)
+        else:
+            # Defense in depth: rows registered before the router policy
+            # existed are still refused here (best-effort skip upstream),
+            # never spawned.
+            error = stdio_command_error(server.command)
+            if error:
+                raise ValueError(error)
         if env:
             error = stdio_env_error(env)
             if error:
