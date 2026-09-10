@@ -184,5 +184,79 @@ class TestServerCompatChatOpenAI(unittest.TestCase):
         self.assertIsInstance(model, ChatOpenAI)
 
 
+class TestLLMConcurrencySemaphore(unittest.TestCase):
+    """``build_chat_model(llm_concurrency=N)`` bounds the async subagent burst.
+
+    deepagents orchestrator + task-spawned subagents share ONE chat instance;
+    LangGraph fans task calls out with asyncio.gather, so without the
+    per-instance semaphore the burst can exceed a local server's
+    parallel-request limit (429, "11 of 10 parallel calls").
+    """
+
+    def _build(self, llm_concurrency):
+        from api.llm.client import build_chat_model
+
+        return build_chat_model(
+            model="qwen/qwen3.6-27b",
+            base_url="http://localhost:9/v1",
+            api_key="not-needed",
+            llm_concurrency=llm_concurrency,
+        )
+
+    def _run_burst(self, model, n):
+        """Fire n concurrent ainvokes; return {peak, done} of the patched
+        _agenerate (no network — ChatOpenAI._agenerate is faked)."""
+        from langchain_core.messages import AIMessage, HumanMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+        from langchain_openai import ChatOpenAI
+
+        state = {"active": 0, "peak": 0, "done": 0}
+
+        async def _fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+            await asyncio.sleep(0.01)
+            state["active"] -= 1
+            state["done"] += 1
+            return ChatResult(
+                generations=[ChatGeneration(message=AIMessage(content="ok"))]
+            )
+
+        async def _run():
+            tasks = [
+                model.ainvoke([HumanMessage(content=f"burst {i}")])
+                for i in range(n)
+            ]
+            return await asyncio.gather(*tasks)
+
+        with patch.object(ChatOpenAI, "_agenerate", _fake_agenerate):
+            asyncio.run(_run())
+        return state
+
+    def test_semaphore_caps_peak_concurrency(self):
+        model = self._build(llm_concurrency=2)
+        state = self._run_burst(model, n=6)
+        self.assertEqual(state["done"], 6)
+        # Never more than 2 in flight …
+        self.assertLessEqual(state["peak"], 2)
+        # … but genuinely 2 (the semaphore admits a second call while the
+        # first is awaiting; deterministic on a single event loop).
+        self.assertGreaterEqual(state["peak"], 2)
+
+    def test_no_semaphore_without_llm_concurrency(self):
+        model = self._build(llm_concurrency=None)
+        self.assertIsNone(model._llm_semaphore)
+        # Unbounded (previous behavior preserved for non-docgen callers):
+        # all 6 calls are in flight simultaneously.
+        state = self._run_burst(model, n=6)
+        self.assertEqual(state["peak"], 6)
+
+    def test_non_positive_llm_concurrency_is_ignored(self):
+        # 0 / negative mean "no bound" — the guard is `> 0`.
+        for value in (0, -3):
+            model = self._build(llm_concurrency=value)
+            self.assertIsNone(model._llm_semaphore)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

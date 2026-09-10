@@ -421,11 +421,11 @@
       "models": "Models",
       "ssl": "SSL / TLS",
       "git": "Git credentials",
-      "confluence": "Confluence",
       "integrations": "Integrations",
       "mcp": "MCP Servers",
       "prompts": "System prompts",
       "memory": "Agent memory",
+      "databases": "Databases",
       "timeouts": "Timeouts",
       "users": "Users",
       "tokens": "API tokens",
@@ -493,6 +493,8 @@
       "current": "Current: verification {state}"
     },
     "confluence": {
+      "title": "Confluence",
+      "subtitle": "Credentials for pulling Confluence pages into product knowledge nodes.",
       "baseUrl": "Base URL",
       "apiToken": "API token",
       "spaceKey": "Space key",
@@ -647,7 +649,7 @@
       "reindexOkMsg": "Memory index rebuilt."
     },
     "timeouts": {
-      "intro": "Centralized timeout management. Each value is resolved with precedence: admin store > env var > default. Leave a field empty to fall back to the env var or the built-in default.",
+      "intro": "Centralized timeout management. Each value is resolved with precedence: admin store > env var > default. Leave a field empty to fall back to the env var or the built-in default. LLM and docgen agent knobs live on the Models tab, memory knobs on the Agent Memory tab, database knobs on the Databases tab.",
       "loading": "Loading timeout settings…",
       "save": "Save",
       "savedToast": "Saved timeout settings.",
@@ -667,6 +669,12 @@
         "model_list": "Model list / existence check",
         "provider_test": "Provider connection test",
         "docgen_map_concurrency": "Docgen map-phase parallel LLM calls",
+        "docgen_unit_recursion_limit": "Docgen: unit agent recursion limit",
+        "docgen_orchestrator_recursion_limit": "Docgen: orchestrator recursion limit",
+        "docgen_section_concurrency": "Docgen: parallel section agents (fallback path)",
+        "docgen_llm_concurrency": "Docgen: max parallel LLM calls",
+        "docgen_spec_context_enabled": "Docgen: spec contract context in codebase briefs",
+        "docgen_db_context_enabled": "Docgen: database context in codebase briefs",
         "expert_stream": "Expert ask turn budget (wall-clock)",
         "docgen_indexing_drain": "Docgen indexing drain",
         "memory_query": "Memory semantic query (pgvector cosine)",
@@ -690,6 +698,12 @@
         "model_list": "HTTP timeout for model listing and existence checks.",
         "provider_test": "Timeout for the admin panel connection test.",
         "docgen_map_concurrency": "Max parallel LLM calls in the docgen MAP phase; 1 = strictly sequential.",
+        "docgen_unit_recursion_limit": "LangGraph graph-step budget for one writer agent (section subpage). Raised from the hardcoded 60 that killed large-repo explorations.",
+        "docgen_orchestrator_recursion_limit": "Graph-step budget for the deepagents orchestrator; must cover dispatching all subagents (they inherit it).",
+        "docgen_section_concurrency": "How many python-parallel fallback section agents run at once (clamped to the number of sections).",
+        "docgen_llm_concurrency": "Ceiling on concurrently in-flight LLM calls through the shared docgen chat instance (orchestrator + subagents + fallback). Stops 429 bursts from local servers' parallel-request limits.",
+        "docgen_spec_context_enabled": "0/1. Injects the API-spec digest (own + external client contracts) into codebase docgen briefs and gives unit agents the spec_lookup tool. Menu in the brief, details on demand.",
+        "docgen_db_context_enabled": "0/1. Injects the product's documented database digest (schemas, top tables) into codebase docgen briefs. Identifiers are marked as NOT repo paths.",
         "expert_stream": "Budget for one expert ask. The turn runs as a detached background task and survives client disconnects, so minutes are normal; on expiry the partial answer is saved.",
         "docgen_indexing_drain": "How long a docgen worker waits for background memory indexing before finishing the job.",
         "memory_query": "pgvector cosine-recall query timeout (embed query + ORDER BY embedding <=> :q LIMIT k). On timeout the backend returns an empty string and the expert falls back to artifact docs.",
@@ -707,6 +721,9 @@
         "db_fk_evidence_tables": "How many tables the walk probes for constraints/indexes to build the honest FK graph; affects the introspection cache.",
         "db_source_objects": "How many views/procedures/triggers/sequences/types get their source fetched; affects the introspection cache."
       }
+    },
+    "databases": {
+      "intro": "Database settings: preset connection checks and reverse-engineering docgen budgets. Values resolve with precedence: admin store > env var > default."
     },
     "users": {
       "createTitle": "Create user",

@@ -8,10 +8,10 @@ import {
   Brain,
   Code,
   Copy,
+  Database,
   FileText,
   Gear,
   GitBranch,
-  Globe,
   Key,
   PencilSimple,
   Plug,
@@ -66,11 +66,11 @@ type Section =
   | "models"
   | "ssl"
   | "git"
-  | "confluence"
   | "integrations"
   | "mcp"
   | "prompts"
   | "memory"
+  | "databases"
   | "timeouts"
   | "users"
   | "tokens"
@@ -80,11 +80,11 @@ const SECTIONS: { key: Section; icon: typeof Gear }[] = [
   { key: "models", icon: Rocket },
   { key: "ssl", icon: Shield },
   { key: "git", icon: GitBranch },
-  { key: "confluence", icon: Globe },
   { key: "integrations", icon: Plug },
   { key: "mcp", icon: Plugs },
   { key: "prompts", icon: FileText },
   { key: "memory", icon: Brain },
+  { key: "databases", icon: Database },
   { key: "timeouts", icon: Wrench },
   { key: "users", icon: UserCircleGear },
   { key: "tokens", icon: Key },
@@ -490,6 +490,10 @@ function ModelsSection() {
           </Card>
         );
       })}
+
+      {/* LLM request budgets + docgen agent knobs (LLM group of the timeout
+          registry; saves only these keys). */}
+      <TimeoutFieldsCard fields={LLM_TIMEOUT_FIELDS} />
     </div>
   );
 }
@@ -716,7 +720,7 @@ function GitSection() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Confluence section                                                  */
+/* Confluence block (rendered inside the Integrations section)         */
 /* ------------------------------------------------------------------ */
 
 interface ConfluenceCfg {
@@ -840,6 +844,10 @@ function ConfluenceSection() {
 
   return (
     <div className="space-y-6">
+      <SectionHeader
+        title={tc.title ?? "Confluence"}
+        subtitle={tc.subtitle ?? ""}
+      />
       <Card className="p-5">
         <div className="grid gap-4 md:grid-cols-3">
           <Field
@@ -2129,12 +2137,15 @@ function McpSection() {
           </div>
         )}
       </Modal>
+
+      {/* Confluence pull credentials (former standalone section). */}
+      <ConfluenceSection />
     </div>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* Rate-limit card (Embedder)                                         */
+/* MCP servers section (global registry, wave C)                      */
 /* ------------------------------------------------------------------ */
 
 interface RateLimitGroupResponse {
@@ -2407,6 +2418,10 @@ function MemorySection() {
           </Button>
         </div>
       </Card>
+
+      {/* Memory-group knobs of the timeout registry (query timeout + docgen
+          indexing drain; saves only these keys). */}
+      <TimeoutFieldsCard fields={MEMORY_TIMEOUT_FIELDS} />
     </div>
   );
 }
@@ -2415,27 +2430,38 @@ function MemorySection() {
 /* Timeouts section (central timeout_config resolvers)                */
 /* ------------------------------------------------------------------ */
 
-// Static catalog of every timeout key rendered in the UI. Kept in sync with
-// api/timeout_config.TIMEOUT_KEYS; the resolved view from the backend carries
-// the effective value / default / floor / unit / group / label, but the list
-// of keys + their order + grouping is defined here so the UI renders even
-// before the first load (and so the i18n keys are stable).
-const TIMEOUT_FIELDS: { key: string; group: string }[] = [
+// Static catalog of every timeout key rendered in the UI, split by the tab
+// the key lives on. Kept in sync with api/config/timeout.TIMEOUT_KEYS; the
+// resolved view from the backend carries the effective value / default /
+// floor / unit / label, but the list of keys + their order + grouping is
+// defined here so the UI renders even before the first load (and so the i18n
+// keys are stable). The union of the subsets must equal TIMEOUT_KEYS.
+type TimeoutFieldSpec = { key: string; group: string };
+
+// Models tab: the LLM group — request budgets and docgen agent knobs
+// (recursion limits, parallelism, cross-context toggles).
+const LLM_TIMEOUT_FIELDS: TimeoutFieldSpec[] = [
   { key: "llm_request", group: "LLM" },
   { key: "llm_retry_max_time", group: "LLM" },
   { key: "model_list", group: "LLM" },
   { key: "provider_test", group: "LLM" },
   { key: "docgen_map_concurrency", group: "LLM" },
-  { key: "expert_stream", group: "Expert" },
+  { key: "docgen_unit_recursion_limit", group: "LLM" },
+  { key: "docgen_orchestrator_recursion_limit", group: "LLM" },
+  { key: "docgen_section_concurrency", group: "LLM" },
+  { key: "docgen_llm_concurrency", group: "LLM" },
+  { key: "docgen_spec_context_enabled", group: "LLM" },
+  { key: "docgen_db_context_enabled", group: "LLM" },
+];
+
+// Agent Memory tab: the Memory group.
+const MEMORY_TIMEOUT_FIELDS: TimeoutFieldSpec[] = [
   { key: "docgen_indexing_drain", group: "Memory" },
   { key: "memory_query", group: "Memory" },
-  { key: "integration_http", group: "Integrations" },
-  { key: "git_file_content", group: "Integrations" },
-  { key: "mcp_stdio_wait", group: "Integrations" },
-  { key: "mermaid_verify", group: "Mermaid" },
-  { key: "mermaid_repair", group: "Mermaid" },
-  { key: "mermaid_max_repair_attempts", group: "Mermaid" },
-  { key: "mermaid_repair_deadline", group: "Mermaid" },
+];
+
+// Databases tab: connection check + RE docgen budgets.
+const DATABASES_TIMEOUT_FIELDS: TimeoutFieldSpec[] = [
   { key: "db_connect_check", group: "Databases" },
   { key: "db_docgen_enrich_batch", group: "Databases" },
   { key: "db_docgen_max_subpages", group: "Databases" },
@@ -2444,14 +2470,17 @@ const TIMEOUT_FIELDS: { key: string; group: string }[] = [
   { key: "db_source_objects", group: "Databases" },
 ];
 
-const TIMEOUT_GROUPS = [
-  "LLM",
-  "Expert",
-  "Memory",
-  "Integrations",
-  "Mermaid",
-  "Databases",
-] as const;
+// Timeouts tab: everything that did not move to a topical tab.
+const TIMEOUT_FIELDS: TimeoutFieldSpec[] = [
+  { key: "expert_stream", group: "Expert" },
+  { key: "integration_http", group: "Integrations" },
+  { key: "git_file_content", group: "Integrations" },
+  { key: "mcp_stdio_wait", group: "Integrations" },
+  { key: "mermaid_verify", group: "Mermaid" },
+  { key: "mermaid_repair", group: "Mermaid" },
+  { key: "mermaid_max_repair_attempts", group: "Mermaid" },
+  { key: "mermaid_repair_deadline", group: "Mermaid" },
+];
 
 interface TimeoutResolvedEntry {
   value: string;
@@ -2471,7 +2500,14 @@ interface TimeoutsGroupResponse {
   resolved?: TimeoutResolvedView;
 }
 
-function TimeoutsSection() {
+/**
+ * Reusable timeout-registry card: loads GET /api/admin/timeouts, renders the
+ * given fields grouped by their group label (one Card per group) and saves
+ * ONLY its own keys (PUT /api/admin/timeouts; empty string = clear override).
+ * Sections embed it with their field subset — Models (LLM), Agent Memory
+ * (Memory), Databases, and the general Timeouts tab.
+ */
+function TimeoutFieldsCard({ fields }: { fields: TimeoutFieldSpec[] }) {
   const { getJson, putJson, notify } = useAdminApi();
   const { messages } = useLanguage();
   const t = messages?.admin ?? {};
@@ -2492,7 +2528,7 @@ function TimeoutsSection() {
       const r = data?.resolved ?? {};
       setResolved(r);
       const next: Record<string, string> = {};
-      for (const f of TIMEOUT_FIELDS) {
+      for (const f of fields) {
         const stored = data?.settings?.[`timeouts.${f.key}`]?.value;
         // Show the stored override if present; otherwise empty (no override).
         next[f.key] = stored ?? "";
@@ -2507,7 +2543,7 @@ function TimeoutsSection() {
     } finally {
       setLoading(false);
     }
-  }, [getJson, notify, t]);
+  }, [fields, getJson, notify, t]);
 
   useEffect(() => {
     void load();
@@ -2518,10 +2554,10 @@ function TimeoutsSection() {
     setSaving(true);
     try {
       const body: Record<string, string> = {};
-      for (const f of TIMEOUT_FIELDS) {
+      for (const f of fields) {
         const v = (values[f.key] ?? "").trim();
-        // Only send keys the user touched (non-empty). Empty clears: send an
-        // explicit empty string so the backend clears the override.
+        // Only send this card's keys. Empty clears: send an explicit empty
+        // string so the backend clears the override.
         body[`timeouts.${f.key}`] = v;
       }
       await putJson("/api/admin/timeouts", body);
@@ -2563,6 +2599,11 @@ function TimeoutsSection() {
     return parts.join(" · ");
   };
 
+  // Distinct groups of this card's fields, in first-appearance order.
+  const groups = fields
+    .map((f) => f.group)
+    .filter((g, i, arr) => arr.indexOf(g) === i);
+
   if (loading) {
     return (
       <div className="flex items-center gap-2 text-sm text-muted">
@@ -2572,17 +2613,12 @@ function TimeoutsSection() {
   }
 
   return (
-    <div className="space-y-6">
-      <p className="text-[15px] text-muted">
-        {tt.intro ??
-          "Centralized timeout management. Each value is resolved with precedence: admin store > env var > default. Leave a field empty to fall back to the env var or the built-in default."}
-      </p>
-
-      {TIMEOUT_GROUPS.map((g) => (
+    <>
+      {groups.map((g) => (
         <Card key={g} className="p-5">
           <SectionHeader title={groupLabel(g)} />
           <div className="mt-4 grid gap-4 md:grid-cols-2">
-            {TIMEOUT_FIELDS.filter((f) => f.group === g).map((f) => {
+            {fields.filter((f) => f.group === g).map((f) => {
               const entry = resolved?.[f.key];
               return (
                 <div key={f.key}>
@@ -2609,6 +2645,40 @@ function TimeoutsSection() {
           {tt.save ?? "Save"}
         </Button>
       </div>
+    </>
+  );
+}
+
+function TimeoutsSection() {
+  const { messages } = useLanguage();
+  const t = messages?.admin ?? {};
+  const tt = t?.timeouts ?? {};
+  return (
+    <div className="space-y-6">
+      <p className="text-[15px] text-muted">
+        {tt.intro ??
+          "Centralized timeout management. Each value is resolved with precedence: admin store > env var > default. Leave a field empty to fall back to the env var or the built-in default. LLM and docgen agent knobs live on the Models tab, memory knobs on the Agent Memory tab, database knobs on the Databases tab."}
+      </p>
+      <TimeoutFieldsCard fields={TIMEOUT_FIELDS} />
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Databases tab (connection checks + RE docgen budgets)              */
+/* ------------------------------------------------------------------ */
+
+function DatabasesSection() {
+  const { messages } = useLanguage();
+  const t = messages?.admin ?? {};
+  const tdb = t?.databases ?? {};
+  return (
+    <div className="space-y-6">
+      <p className="text-[15px] text-muted">
+        {tdb.intro ??
+          "Database settings: preset connection checks and reverse-engineering docgen budgets."}
+      </p>
+      <TimeoutFieldsCard fields={DATABASES_TIMEOUT_FIELDS} />
     </div>
   );
 }
@@ -3512,11 +3582,11 @@ function AdminShell() {
             {section === "models" && <ModelsSection />}
             {section === "ssl" && <SslSection />}
             {section === "git" && <GitSection />}
-            {section === "confluence" && <ConfluenceSection />}
             {section === "integrations" && <IntegrationsSection />}
             {section === "mcp" && <McpSection />}
             {section === "prompts" && <PromptsSection />}
             {section === "memory" && <MemorySection />}
+            {section === "databases" && <DatabasesSection />}
             {section === "timeouts" && <TimeoutsSection />}
             {section === "users" && <UsersSection />}
             {section === "tokens" && <TokensSection />}

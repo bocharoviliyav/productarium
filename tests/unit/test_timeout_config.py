@@ -31,10 +31,17 @@ from api.config.timeout import (
     resolve_db_docgen_max_subpages,
     resolve_db_fk_evidence_tables,
     resolve_db_source_objects,
+    resolve_docgen_db_context_enabled,
     resolve_docgen_indexing_drain_seconds,
+    resolve_docgen_llm_concurrency,
     resolve_docgen_map_concurrency,
+    resolve_docgen_orchestrator_recursion_limit,
+    resolve_docgen_section_concurrency,
+    resolve_docgen_spec_context_enabled,
+    resolve_docgen_unit_recursion_limit,
     resolve_expert_stream_timeout,
     resolve_timeout,
+    resolve_timeout_bool,
     resolve_timeout_int,
     sync_timeout_env,
 )
@@ -48,6 +55,12 @@ WRAPPER_TO_KEY = {
     "resolve_llm_retry_max_time": "llm_retry_max_time",
     "resolve_docgen_indexing_drain_seconds": "docgen_indexing_drain",
     "resolve_docgen_map_concurrency": "docgen_map_concurrency",
+    "resolve_docgen_unit_recursion_limit": "docgen_unit_recursion_limit",
+    "resolve_docgen_orchestrator_recursion_limit": "docgen_orchestrator_recursion_limit",
+    "resolve_docgen_section_concurrency": "docgen_section_concurrency",
+    "resolve_docgen_llm_concurrency": "docgen_llm_concurrency",
+    "resolve_docgen_spec_context_enabled": "docgen_spec_context_enabled",
+    "resolve_docgen_db_context_enabled": "docgen_db_context_enabled",
     "resolve_expert_stream_timeout": "expert_stream",
     "resolve_memory_query_timeout": "memory_query",
     "resolve_model_list_timeout": "model_list",
@@ -244,6 +257,129 @@ class TestTimeoutConfig(unittest.TestCase):
             self.assertEqual(resolve_docgen_map_concurrency(), 1)
             os.environ["DOCGEN_MAP_CONCURRENCY"] = "garbage"
             self.assertEqual(resolve_docgen_map_concurrency(), 3)
+
+    # ------------------------------------------------------------------
+    # docgen agent budgets: recursion limits + parallelism (admin-tunable)
+    # ------------------------------------------------------------------
+    def test_docgen_recursion_limit_defaults(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            self.assertEqual(resolve_docgen_unit_recursion_limit(), 256)
+            self.assertEqual(resolve_docgen_orchestrator_recursion_limit(), 400)
+
+    def test_docgen_recursion_limit_env_override(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["DOCGEN_UNIT_RECURSION_LIMIT"] = "128"
+            self.assertEqual(resolve_docgen_unit_recursion_limit(), 128)
+            os.environ["DOCGEN_ORCHESTRATOR_RECURSION_LIMIT"] = "600"
+            self.assertEqual(resolve_docgen_orchestrator_recursion_limit(), 600)
+
+    def test_docgen_recursion_limit_floors(self):
+        # A typo can't drop a recursion limit below its floor (16 / 32).
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["DOCGEN_UNIT_RECURSION_LIMIT"] = "1"
+            self.assertEqual(resolve_docgen_unit_recursion_limit(), 16)
+            os.environ["DOCGEN_ORCHESTRATOR_RECURSION_LIMIT"] = "5"
+            self.assertEqual(resolve_docgen_orchestrator_recursion_limit(), 32)
+
+    def test_docgen_concurrency_knob_defaults(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            self.assertEqual(resolve_docgen_section_concurrency(), 3)
+            self.assertEqual(resolve_docgen_llm_concurrency(), 8)
+
+    def test_docgen_concurrency_knob_env_override(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["DOCGEN_SECTION_CONCURRENCY"] = "5"
+            self.assertEqual(resolve_docgen_section_concurrency(), 5)
+            os.environ["DOCGEN_LLM_CONCURRENCY"] = "2"
+            self.assertEqual(resolve_docgen_llm_concurrency(), 2)
+
+    def test_docgen_concurrency_knob_floors(self):
+        # 0 clamps to 1 (sequential); garbage falls back to the default.
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["DOCGEN_SECTION_CONCURRENCY"] = "0"
+            self.assertEqual(resolve_docgen_section_concurrency(), 1)
+            os.environ["DOCGEN_LLM_CONCURRENCY"] = "0"
+            self.assertEqual(resolve_docgen_llm_concurrency(), 1)
+            os.environ["DOCGEN_LLM_CONCURRENCY"] = "garbage"
+            self.assertEqual(resolve_docgen_llm_concurrency(), 8)
+
+    # ------------------------------------------------------------------
+    # Cross-context toggles (bool flags through the same registry)
+    # ------------------------------------------------------------------
+    def test_cross_context_toggles_default_on(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            self.assertIs(resolve_docgen_spec_context_enabled(), True)
+            self.assertIs(resolve_docgen_db_context_enabled(), True)
+
+    def test_cross_context_toggles_env_off(self):
+        # Regression: DOCGEN_DB_CONTEXT_ENABLED=false deployments must NOT
+        # flip to on when the flag moves into the registry — a plain float
+        # parse would read "false" as unset and fall back to the default.
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            for off in ("false", "0", "no", "off"):
+                os.environ["DOCGEN_SPEC_CONTEXT_ENABLED"] = off
+                os.environ["DOCGEN_DB_CONTEXT_ENABLED"] = off
+                self.assertIs(resolve_docgen_spec_context_enabled(), False)
+                self.assertIs(resolve_docgen_db_context_enabled(), False)
+
+    def test_cross_context_toggles_env_legacy_truthy(self):
+        # Legacy env semantics: anything except the explicit off-words is ON
+        # (including an empty value and unrecognised garbage).
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            for on in ("true", "1", "yes", "garbage", ""):
+                os.environ["DOCGEN_SPEC_CONTEXT_ENABLED"] = on
+                self.assertIs(resolve_docgen_spec_context_enabled(), True)
+
+    def test_cross_context_toggle_admin_beats_env(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with patch("api.config.settings.get_setting") as mock_get, _EnvGuard(env_vars, []):
+            def _get(key, *a, **kw):
+                if key == "timeouts.docgen_spec_context_enabled":
+                    return "0"
+                return None
+            mock_get.side_effect = _get
+            os.environ["DOCGEN_SPEC_CONTEXT_ENABLED"] = "1"
+            self.assertIs(resolve_docgen_spec_context_enabled(), False)
+
+    def test_cross_context_toggle_admin_word_forms(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with patch("api.config.settings.get_setting") as mock_get, _EnvGuard(env_vars, []):
+            state = {"v": None}
+
+            def _get(key, *a, **kw):
+                if key == "timeouts.docgen_db_context_enabled":
+                    return state["v"]
+                return None
+            mock_get.side_effect = _get
+            for off in ("0", "false", "no", "off"):
+                state["v"] = off
+                self.assertIs(resolve_docgen_db_context_enabled(), False)
+            for on in ("1", "true", "yes", "on"):
+                state["v"] = on
+                self.assertIs(resolve_docgen_db_context_enabled(), True)
+
+    def test_cross_context_toggle_admin_typo_falls_to_env(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with patch("api.config.settings.get_setting") as mock_get, _EnvGuard(env_vars, []):
+            def _get(key, *a, **kw):
+                if key == "timeouts.docgen_spec_context_enabled":
+                    return "garbage"
+                return None
+            mock_get.side_effect = _get
+            os.environ["DOCGEN_SPEC_CONTEXT_ENABLED"] = "false"
+            self.assertIs(resolve_docgen_spec_context_enabled(), False)
+
+    def test_resolve_timeout_bool_unknown_key_is_false(self):
+        self.assertIs(resolve_timeout_bool("does_not_exist"), False)
 
     def test_docgen_drain_explicit_override_below_floor_is_clamped(self):
         # An explicit DOCGEN_INDEXING_DRAIN_SECONDS below the drain floor (5)

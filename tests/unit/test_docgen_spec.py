@@ -715,6 +715,213 @@ class TestSpecGraphRuntime:
 
 
 # ============================================================================
+# Cross-context for CODEBASE docgen: spec digest + spec_lookup tool
+# ============================================================================
+class TestSpecContextEnabled:
+    def test_default_on(self, monkeypatch):
+        monkeypatch.delenv("DOCGEN_SPEC_CONTEXT_ENABLED", raising=False)
+        assert spec_mod.spec_context_enabled() is True
+
+    def test_env_off_variants(self, monkeypatch):
+        for off in ("false", "0", "no", "off"):
+            monkeypatch.setenv("DOCGEN_SPEC_CONTEXT_ENABLED", off)
+            assert spec_mod.spec_context_enabled() is False
+
+    def test_env_legacy_truthy_variants(self, monkeypatch):
+        # Anything except the explicit off-words (empty included) is ON.
+        for on in ("true", "1", "yes", "garbage", ""):
+            monkeypatch.setenv("DOCGEN_SPEC_CONTEXT_ENABLED", on)
+            assert spec_mod.spec_context_enabled() is True
+
+
+_OPENAPI_SPEC = json.dumps({
+    "openapi": "3.0.0",
+    "info": {"title": "Billing API", "version": "2.1"},
+    "servers": [{"url": "https://api.example.com"}],
+    "paths": {
+        "/orders": {
+            "get": {"summary": "List orders"},
+            "post": {"summary": "Create order"},
+        },
+    },
+    "components": {
+        "schemas": {
+            "Order": {"type": "object", "properties": {"id": {"type": "integer"}}},
+            "User": {"type": "object", "properties": {"id": {"type": "integer"}}},
+        }
+    },
+}, ensure_ascii=False)
+
+_ASYNCAPI_SPEC = json.dumps({
+    "asyncapi": "2.6.0",
+    "info": {"title": "Events", "version": "1.0"},
+    "servers": {"prod": {"protocol": "kafka", "url": "kafka:9092"}},
+    "channels": {
+        "orders.created": {"publish": {"summary": "Order created"}},
+        "orders.updated": {"subscribe": {"summary": "Order updated"}},
+    },
+}, ensure_ascii=False)
+
+
+class TestProductSpecContext:
+    @pytest.fixture()
+    def seeded(self, isolated_db):
+        from api.models import ProductORM, SpecORM
+
+        with isolated_db.SessionLocal() as s:
+            s.add(ProductORM(id="prod_specctx", name="P"))
+            s.add(SpecORM(
+                id="spec_api", product_id="prod_specctx", name="Public API",
+                kind="openapi", content=_OPENAPI_SPEC,
+            ))
+            s.add(SpecORM(
+                id="spec_events", product_id="prod_specctx", name="Events",
+                kind="asyncapi", content=_ASYNCAPI_SPEC,
+            ))
+            s.add(SpecORM(
+                id="spec_broken", product_id="prod_specctx", name="Broken",
+                kind="openapi", content="not valid: [json or yaml",
+            ))
+            s.add(SpecORM(
+                id="spec_empty", product_id="prod_specctx", name="Empty",
+                kind="openapi", content="   ",
+            ))
+            s.commit()
+        return isolated_db
+
+    def test_digest_menu_lines_and_markers(self, seeded):
+        out = spec_mod.product_spec_context("prod_specctx")
+        assert out.startswith("### Контракт-контекст продукта (спецификации API)")
+        # Explicit "do not cite as paths" marker for the citation guard.
+        assert "не цитировать как пути" in out
+        assert "`spec_lookup`" in out
+        # openapi menu line: name, kind, title+version, op/schema counts.
+        assert (
+            "**Public API** (openapi; Billing API v2.1; операций 2, схем 2)"
+            in out
+        )
+        assert "`GET /orders`" in out
+        assert "`POST /orders`" in out
+        assert "схемы: `Order`" in out
+        assert "`https://api.example.com`" in out
+        # asyncapi menu line: channels + ops + server protocol.
+        assert "**Events** (asyncapi; Events v1.0; каналов 2, схем 0)" in out
+        assert "`orders.created publish`" in out
+        assert "`orders.updated subscribe`" in out
+        assert "`prod`:kafka" in out
+        # Unparseable spec degrades to a head-of-text line, never raises.
+        assert "**Broken** (openapi; не разобрана)" in out
+        # The empty-content spec is skipped entirely.
+        assert "Empty" not in out
+
+    def test_digest_caps_long_output(self, seeded):
+        out = spec_mod.product_spec_context("prod_specctx", max_chars=300)
+        # cap() appends its own truncation marker on top of the slice.
+        assert len(out) <= 300 + 100
+
+    def test_no_rows_returns_empty(self, isolated_db):
+        assert spec_mod.product_spec_context("prod_none") == ""
+
+    def test_empty_product_returns_empty(self):
+        assert spec_mod.product_spec_context("") == ""
+
+
+class TestBuildSpecTools:
+    @pytest.fixture()
+    def seeded(self, isolated_db):
+        from api.models import ProductORM, SpecORM
+
+        with isolated_db.SessionLocal() as s:
+            s.add(ProductORM(id="prod_spectools", name="P"))
+            s.add(SpecORM(
+                id="spec_tool_api", product_id="prod_spectools", name="Public API",
+                kind="openapi", content=_OPENAPI_SPEC,
+            ))
+            s.commit()
+        return isolated_db
+
+    def test_tool_name_and_hit(self, seeded):
+        tools = spec_mod.build_spec_tools("prod_spectools")
+        assert [t.name for t in tools] == ["spec_lookup"]
+        out = tools[0].invoke({"spec_name": "Public API", "path": "info.title"})
+        assert "не цитировать как пути" in out
+        assert "Billing API" in out
+
+    def test_path_with_dots_in_key(self, seeded):
+        tools = spec_mod.build_spec_tools("prod_spectools")
+        out = tools[0].invoke({
+            "spec_name": "Public API", "path": "paths./orders.get.summary",
+        })
+        assert "List orders" in out
+
+    def test_case_insensitive_spec_name(self, seeded):
+        tools = spec_mod.build_spec_tools("prod_spectools")
+        out = tools[0].invoke({"spec_name": "public api", "path": "info.title"})
+        assert "Billing API" in out
+
+    def test_unknown_spec_lists_available(self, seeded):
+        tools = spec_mod.build_spec_tools("prod_spectools")
+        out = tools[0].invoke({"spec_name": "Ghost", "path": ""})
+        assert out.startswith("ERROR: unknown spec")
+        assert "`Public API`" in out
+
+    def test_missing_path_lists_root_keys(self, seeded):
+        tools = spec_mod.build_spec_tools("prod_spectools")
+        out = tools[0].invoke({"spec_name": "Public API", "path": "nope.nope"})
+        assert "ERROR: path not found" in out
+        assert "`paths`" in out
+
+    def test_result_capped(self, seeded):
+        from api.models import ProductORM, SpecORM
+
+        big = json.loads(_OPENAPI_SPEC)
+        big["components"] = {"schemas": {
+            f"S{i}": {"type": "object", "properties": {
+                f"field_{j}": {"type": "string", "description": "d" * 200}
+                for j in range(20)
+            }}
+            for i in range(40)
+        }}
+        with seeded.SessionLocal() as s:
+            s.add(ProductORM(id="prod_spectools_big", name="P2"))
+            s.add(SpecORM(
+                id="spec_big", product_id="prod_spectools_big", name="Big",
+                kind="openapi", content=json.dumps(big),
+            ))
+            s.commit()
+
+        tools = spec_mod.build_spec_tools("prod_spectools_big")
+        assert len(tools) == 1
+        out = tools[0].invoke({"spec_name": "Big", "path": "components"})
+        assert len(out) <= spec_mod._SPEC_TOOL_MAX_CHARS + 100
+        assert "обрезано для контекста LLM" in out
+
+    def test_no_specs_returns_empty(self, isolated_db):
+        from api.models import ProductORM
+
+        with isolated_db.SessionLocal() as s:
+            s.add(ProductORM(id="prod_nospec", name="P"))
+            s.commit()
+        assert spec_mod.build_spec_tools("prod_nospec") == []
+
+    def test_only_unparseable_specs_returns_empty(self, isolated_db):
+        from api.models import ProductORM, SpecORM
+
+        with isolated_db.SessionLocal() as s:
+            s.add(ProductORM(id="prod_badonly", name="P"))
+            s.add(SpecORM(
+                id="spec_bad", product_id="prod_badonly", name="Bad",
+                kind="openapi", content="not valid: [json or yaml",
+            ))
+            s.commit()
+        # No parseable specs -> no dead tool in the subagent specs.
+        assert spec_mod.build_spec_tools("prod_badonly") == []
+
+    def test_empty_product_returns_empty(self):
+        assert spec_mod.build_spec_tools("") == []
+
+
+# ============================================================================
 # Helpers
 # ============================================================================
 async def _async_return(value):

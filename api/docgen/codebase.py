@@ -4,7 +4,9 @@ Generates the 7 wiki sections for a codebase artifact with NATIVE deepagents
 subagents (Wave F redesign + the units restructure):
 
 - Phase 0 — repo brief, no LLM: file tree (capped), languages, manifests,
-  config files, README head.
+  config files, README head + cross-context blocks (spec digest / DB digest /
+  product knowledge), each with its own budget so a long README cannot
+  starve them out of the brief.
 - Phase 1 — router (1 LLM call): ``docgen_router.md`` maps each section to
   likely files + a focus hint. Any failure degrades to no hints ( the unit
   agents then explore on their own).
@@ -242,7 +244,7 @@ def _brief_max_chars() -> int:
     """Adaptive cap for the Phase-0 repo brief (chars).
 
     The brief rides in EVERY section contract (subagent system prompts and
-    the standard-LLM fallback scaffold); at a static 12k chars (~3k tokens)
+    the standard-LLM fallback scaffold); at a static 16k chars (~4k tokens)
     plus the instruction slot it alone could exceed a small window's whole
     prompt budget, so it scales with ``_ctx_scale`` like the other caps.
     """
@@ -1194,15 +1196,18 @@ _DECOMPOSER_FALLBACK = (
 
 # Caps for the scaffolding inputs (chars): keep every subagent's system
 # prompt lean regardless of repo size (the file tree inside the brief is
-# already capped by _build_file_tree).
-_BRIEF_MAX_CHARS = 12_000
+# already capped by _build_file_tree). 16k accommodates the README head plus
+# the cross-context blocks (specs / DB / knowledge), each with its own share
+# of the brief budget.
+_BRIEF_MAX_CHARS = 16_000
 _HINT_MAX_FILES = 10
 _HINT_FILE_MAX_CHARS = 200
 _HINT_FOCUS_MAX_CHARS = 400
 _SECTION_INSTRUCTION_MAX_CHARS = 12_000
-# Python-orchestration fallback: how many unit agents run in parallel.
-_SECTION_CONCURRENCY_ENV = "DOCGEN_SECTION_CONCURRENCY"
-_SECTION_CONCURRENCY_DEFAULT = 3
+# Python-orchestration fallback: how many unit agents run in parallel —
+# bounded by the docgen_section_concurrency registry key (admin > env
+# DOCGEN_SECTION_CONCURRENCY > default 3); _section_concurrency() also
+# clamps the result to the number of sections.
 
 # --- Units restructure: subpages, decomposition, notes workspace -------------
 # Sections that decompose into parent + child pages (canonical ids from
@@ -1227,10 +1232,13 @@ _SUMMARY_NOTE_CHARS = 2_000
 # Inline budget for the standard-LLM fallback (which has no notes tools).
 _NOTES_INLINE_MAX_CHARS = 6_000
 # Long-running harness: the orchestrator dispatches one subagent per unit
-# (7 parents + up to 28 children); each unit agent keeps its own 60-turn
-# budget, the orchestrator gets enough turns to dispatch them all.
-_ORCHESTRATOR_RECURSION_LIMIT = 400
-_UNIT_RECURSION_LIMIT = 60
+# (7 parents + up to 28 children); each unit agent keeps its own graph-step
+# budget, the orchestrator gets enough turns to dispatch them all. The
+# budgets live in the timeout registry (admin > env > default, group LLM):
+# docgen_unit_recursion_limit (default 256 — raised from the old hardcoded
+# 60 that killed large-repo explorations), docgen_orchestrator_recursion_limit
+# (default 400), and docgen_llm_concurrency (default 8) bounding the
+# concurrent LLM calls of the shared chat instance.
 
 
 def _resolve_language_name(language: str) -> str:
@@ -1278,11 +1286,23 @@ def _build_repo_brief(
     file_analysis: Dict[str, Any],
     file_tree: str,
     readme: str,
+    extra_context: Optional[List[str]] = None,
 ) -> str:
-    """Phase 0: compact repo brief (no LLM) shared by router + writers."""
+    """Phase 0: compact repo brief (no LLM) shared by router + writers.
+
+    ``extra_context`` blocks (spec digest / DB digest / product knowledge)
+    render as SEPARATE parts after the README head, each with its own
+    budget (``brief_cap // 4``) — the fix for the latent defect where the
+    blocks were appended to ``readme`` and the README-head cap silently
+    truncated the cross-context away on real repos. With blocks present
+    the README head yields (brief cap minus the blocks minus a tree
+    reserve) so the parts stay inside the cap; the final ``cap`` keeps the
+    hard bound (a huge file tree may then head-truncate, visibly).
+    """
     from api.utils.llm_helpers import cap as _cap_text
 
     brief_cap = _brief_max_chars()
+    blocks = [b for b in ((s or "").strip() for s in (extra_context or [])) if b]
 
     def _joined(values: Any) -> str:
         return ", ".join(f"`{v}`" for v in (values or [])[:12]) or "(none)"
@@ -1298,8 +1318,15 @@ def _build_repo_brief(
         f"CI/CD files: {_joined(file_analysis.get('cicd_files'))}",
         f"Docker files: {_joined(file_analysis.get('docker_files'))}",
     ]
+    readme_budget = max(800, brief_cap // 3)
+    block_budget = max(600, brief_cap // 4)
+    if blocks:
+        tree_reserve = min(2_000, brief_cap // 8)
+        readme_budget = max(800, brief_cap - block_budget * len(blocks) - tree_reserve)
     if readme:
-        parts.append("README (head):\n```\n" + _cap_text(readme, max(800, brief_cap // 3)) + "\n```")
+        parts.append("README (head):\n```\n" + _cap_text(readme, readme_budget) + "\n```")
+    for block in blocks:
+        parts.append(_cap_text(block, block_budget))
     if file_tree:
         parts.append("File tree (capped):\n```\n" + file_tree + "\n```")
     return _cap_text("\n\n".join(parts), brief_cap)
@@ -1720,6 +1747,7 @@ def _build_section_subagent_specs(
     language: str,
     unit_titles: Optional[Dict[str, str]] = None,
     notes_dir: Optional[str] = None,
+    spec_tools: Optional[List[Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Declarative deepagents SubAgent specs, one per UNIT to generate.
 
@@ -1728,12 +1756,15 @@ def _build_section_subagent_specs(
     ``system_prompt`` so the orchestrator's short dispatch message cannot
     lose or paraphrase it. ``unit_titles`` supplies child display titles
     (parents resolve from the section registry); ``notes_dir`` adds the
-    shared-notes tools to every spec. ``model`` and ``tools`` are required
+    shared-notes tools and ``spec_tools`` adds the on-demand spec-lookup
+    tool to every spec. ``model`` and ``tools`` are required
     by ``create_sub_agent``.
     """
     tools = build_repo_tools(repo_dir)
     if notes_dir:
         tools = tools + build_notes_tools(notes_dir)
+    if spec_tools:
+        tools = tools + list(spec_tools)
     titles = unit_titles or {}
     specs: List[Dict[str, Any]] = []
     for unit_id, system_prompt in system_prompts.items():
@@ -1763,13 +1794,15 @@ def _build_orchestrator_agent(
 
 
 def _section_concurrency() -> int:
-    """Parallel section agents in the python-orchestration fallback."""
-    raw = (os.environ.get(_SECTION_CONCURRENCY_ENV) or "").strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        return _SECTION_CONCURRENCY_DEFAULT
-    return max(1, min(len(SECTION_ORDER), value))
+    """Parallel section agents in the python-orchestration fallback.
+
+    Resolves through the timeout registry (admin > env > default 3) and
+    clamps to the number of sections; the env-only semantics of
+    ``DOCGEN_SECTION_CONCURRENCY`` are preserved.
+    """
+    from api.config.timeout import resolve_docgen_section_concurrency
+
+    return max(1, min(len(SECTION_ORDER), resolve_docgen_section_concurrency()))
 
 
 async def _run_parallel_section_agents(
@@ -1779,19 +1812,23 @@ async def _run_parallel_section_agents(
     dispatches: Dict[str, str],
     tracker: _SectionProgressTracker,
     notes_dir: Optional[str] = None,
+    spec_tools: Optional[List[Any]] = None,
 ) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
     """Python-orchestration fallback: independent UNIT agents, parallel.
 
     ``asyncio.gather`` over per-unit deep agents bounded by a semaphore
     (``DOCGEN_SECTION_CONCURRENCY``). Individual failures never raise — a
     failed unit simply yields empty text and the caller falls back to the
-    standard-LLM path. ``notes_dir`` (optional) adds the shared-notes tools.
+    standard-LLM path. ``notes_dir`` (optional) adds the shared-notes tools;
+    ``spec_tools`` (optional) adds the on-demand spec-lookup tool.
     """
     from deepagents import create_deep_agent
 
     repo_tools = build_repo_tools(repo_dir)
     if notes_dir:
         repo_tools = repo_tools + build_notes_tools(notes_dir)
+    if spec_tools:
+        repo_tools = repo_tools + list(spec_tools)
     semaphore = asyncio.Semaphore(_section_concurrency())
 
     async def _one(sid: str) -> Tuple[str, str, List[str]]:
@@ -1906,10 +1943,12 @@ async def _run_agent_section(
     """
     from langchain_core.messages import HumanMessage
 
+    from api.config.timeout import resolve_docgen_unit_recursion_limit
+
     try:
         result = await agent.ainvoke(
             {"messages": [HumanMessage(content=task_prompt)]},
-            config={"recursion_limit": _UNIT_RECURSION_LIMIT},
+            config={"recursion_limit": resolve_docgen_unit_recursion_limit()},
         )
     except Exception as e:  # pragma: no cover - depends on live model
         if _is_context_overflow(e):
@@ -2456,33 +2495,65 @@ async def generate_codebase_docs(
     )
     readme = _read_readme(repo_dir)
 
-    # Enrich docgen context with product-level knowledge (Confluence pages / specs)
+    # --- Cross-context: specs / DB / product knowledge -----------------------
+    # Blocks render as SEPARATE brief parts (each with its own budget) so a
+    # long README can no longer truncate them away (the old code appended
+    # them to ``readme`` and the README-head cap cut them off). Every block
+    # is explicitly marked as NOT repo paths so the citation guard never
+    # treats its identifiers as file citations.
     pid = getattr(product, "id", None) or getattr(product, "product_id", None)
+    cross_parts: List[str] = []
     if pid:
+        # Own API contracts + external client contracts (spec digest "menu").
         try:
-            from api.expert.knowledge import _retrieve_product_knowledge
-            p_knowledge = await _retrieve_product_knowledge(pid, "architecture functional API specifications")
-            if p_knowledge and p_knowledge.strip():
-                from api.utils.llm_helpers import cap as _cap_text
-                clamped_kn = _cap_text(p_knowledge, 16000)  # ~4000 tokens
-                readme = (readme or "") + f"\n\n### Дополнительный контекст продукта (Confluence / База знаний):\n{clamped_kn}\n"
-        except Exception as e:
-            logger.debug("Docgen product knowledge retrieval skipped for %s: %s", pid, e)
+            from api.docgen.spec import product_spec_context, spec_context_enabled
 
-    # Cross-context (DB-RE restructure): append the product's documented
-    # database digest (schemas, top tables by FK-degree) so codebase docs are
-    # grounded in the schema. Explicitly marked as NOT repo paths so the
-    # citation guard never treats these identifiers as file citations.
-    if pid:
+            if spec_context_enabled():
+                spec_ctx = product_spec_context(pid, max_chars=4000)
+                if spec_ctx:
+                    cross_parts.append(spec_ctx)
+        except Exception as e:  # context is never fatal
+            logger.debug("Docgen spec context skipped for %s: %s", pid, e)
+        # The product's documented databases (schemas, top tables by FK
+        # degree) so codebase docs are grounded in the schema.
         try:
             from api.docgen.database import db_context_enabled, product_database_context
 
             if db_context_enabled():
                 db_ctx = product_database_context(pid, max_chars=4000)
                 if db_ctx:
-                    readme = (readme or "") + f"\n\n{db_ctx}\n"
+                    cross_parts.append(db_ctx)
         except Exception as e:  # context is never fatal
             logger.debug("Docgen database context skipped for %s: %s", pid, e)
+        # Product-level knowledge recall (Confluence pages / indexed docs).
+        try:
+            from api.expert.knowledge import _retrieve_product_knowledge
+
+            p_knowledge = await _retrieve_product_knowledge(
+                pid, "architecture functional API specifications"
+            )
+            if p_knowledge and p_knowledge.strip():
+                cross_parts.append(
+                    "### Дополнительный контекст продукта (Confluence / База знаний):\n"
+                    + p_knowledge.strip()
+                )
+        except Exception as e:
+            logger.debug("Docgen product knowledge retrieval skipped for %s: %s", pid, e)
+
+    # On-demand spec details for the unit agents: the brief carries the
+    # menu, this tool serves schema/operation fragments on request. Empty
+    # when disabled or the product has no parseable specs — no dead tool
+    # in the subagent specs.
+    spec_tools: List[Any] = []
+    if pid:
+        try:
+            from api.docgen.spec import build_spec_tools, spec_context_enabled
+
+            if spec_context_enabled():
+                spec_tools = build_spec_tools(pid)
+        except Exception as e:  # pragma: no cover - tools are optional
+            logger.debug("Docgen spec tools unavailable for %s: %s", pid, e)
+            spec_tools = []
 
     # Always split the codebase into token-budget chunks: they feed the
     # FALLBACK standard-LLM path (single call / map-reduce) when the agent
@@ -2504,6 +2575,7 @@ async def generate_codebase_docs(
         file_analysis=file_analysis,
         file_tree=file_tree,
         readme=readme,
+        extra_context=cross_parts,
     )
     sections_list_all = _sections_list_text(language)
     writer_rules = _section_writer_rules(language)
@@ -2612,6 +2684,7 @@ async def generate_codebase_docs(
     if (sections_to_generate or pass_a_pending) and _deepagents_available():
         try:
             from api.llm.client import build_chat_model
+            from api.config.timeout import resolve_docgen_llm_concurrency
 
             # Small-window servers count prompt + completion against the
             # SAME window: reserve a window-proportional completion budget
@@ -2621,6 +2694,7 @@ async def generate_codebase_docs(
                 model=model,
                 base_url=resolved_base_url,
                 api_key=resolved_api_key,
+                llm_concurrency=resolve_docgen_llm_concurrency(),
                 **({"max_tokens": completion_cap} if completion_cap else {}),
             )
         except Exception as e:
@@ -2803,9 +2877,12 @@ async def generate_codebase_docs(
             try:
                 from langchain_core.messages import HumanMessage
 
+                from api.config.timeout import resolve_docgen_orchestrator_recursion_limit
+
                 specs = _build_section_subagent_specs(
                     chat, repo_dir, system_prompts, language,
                     unit_titles=unit_titles, notes_dir=notes_dir,
+                    spec_tools=spec_tools,
                 )
                 reused_lines = "\n".join(
                     f"- `{u.unit_id}` — {u.title}"
@@ -2828,7 +2905,7 @@ async def generate_codebase_docs(
                         f"of these pages exactly once: {dispatch_list}."
                     ))]},
                     config={
-                        "recursion_limit": _ORCHESTRATOR_RECURSION_LIMIT,
+                        "recursion_limit": resolve_docgen_orchestrator_recursion_limit(),
                         "callbacks": [_TaskToolProgressHandler(tracker)],
                     },
                 )
@@ -2868,6 +2945,7 @@ async def generate_codebase_docs(
                         {uid: dispatches[uid] for uid in missing},
                         tracker,
                         notes_dir=notes_dir,
+                        spec_tools=spec_tools,
                     )
                 except Exception as e:  # pragma: no cover - depends on live model
                     logger.warning("Parallel unit agents failed: %s", e)

@@ -308,6 +308,223 @@ def make_spec_lookup_tool(parsed: dict) -> Any:
 
 
 # --------------------------------------------------------------------------- #
+# Cross-context for CODEBASE docgen: spec digest (menu) + on-demand lookup
+# --------------------------------------------------------------------------- #
+# Guard so a pathological spec cannot stall the brief builder.
+_SPEC_CONTEXT_PARSE_MAX_CHARS = 512_000
+_SPEC_MENU_OPS = 12
+_SPEC_MENU_SCHEMAS = 8
+_SPEC_MENU_SERVERS = 3
+# Result cap for the on-demand lookup (menu in the brief, details on demand).
+_SPEC_TOOL_MAX_CHARS = 6_000
+
+
+def spec_context_enabled() -> bool:
+    """Cross-context toggle: spec digest + spec_lookup in codebase docgen.
+
+    Resolves through the timeout registry (admin store > env
+    ``DOCGEN_SPEC_CONTEXT_ENABLED`` > default on), mirroring
+    ``api.docgen.database.db_context_enabled``.
+    """
+    from api.config.timeout import resolve_docgen_spec_context_enabled
+
+    return resolve_docgen_spec_context_enabled()
+
+
+def _spec_menu_block(name: str, kind: str, content: str, parsed: Optional[dict]) -> str:
+    """One compact menu line for a product spec (used by the brief digest).
+
+    Unparseable specs (including already-generated specs whose ``content``
+    now holds the enriched markdown) degrade to a head-of-text line — still
+    informative, never fatal.
+    """
+    if not isinstance(parsed, dict) or not parsed:
+        head = " ".join((content or "").split())[:300]
+        piece = f"**{name}** ({kind}; не разобрана)"
+        return f"{piece} — {head}" if head else piece
+
+    info = parsed.get("info", {}) or {}
+    title = info.get("title") or name
+    version = f" v{info['version']}" if info.get("version") else ""
+    schemes = list(((parsed.get("components", {}) or {}).get("schemas", {}) or {}))
+    tail = ""
+
+    if kind == "asyncapi":
+        servers = parsed.get("servers", {}) or {}
+        channels = parsed.get("channels", {}) or {}
+        ops: List[str] = []
+        for ch_name, ch in channels.items():
+            for op in ("publish", "subscribe"):
+                if (ch or {}).get(op):
+                    ops.append(f"{ch_name} {op}")
+        head = (
+            f"**{name}** (asyncapi; {title}{version}; каналов {len(channels)}, "
+            f"схем {len(schemes)})"
+        )
+        srv = ", ".join(
+            f"`{n}`:{(s or {}).get('protocol', '')}"
+            for n, s in list(servers.items())[:_SPEC_MENU_SERVERS]
+        )
+        if srv:
+            head += f"; servers: {srv}"
+    else:
+        paths = parsed.get("paths", {}) or {}
+        ops = []
+        for path, methods in paths.items():
+            for method in (methods or {}):
+                if method.lower() in (
+                    "get", "post", "put", "delete", "patch", "options", "head",
+                ):
+                    ops.append(f"{method.upper()} {path}")
+        head = (
+            f"**{name}** (openapi; {title}{version}; операций {len(ops)}, "
+            f"схем {len(schemes)})"
+        )
+        servers = parsed.get("servers", []) or []
+        srv = ", ".join(
+            f"`{(s or {}).get('url', '')}`"
+            for s in servers[:_SPEC_MENU_SERVERS] if isinstance(s, dict)
+        )
+        if srv:
+            head += f"; servers: {srv}"
+
+    if ops:
+        shown = ", ".join(f"`{o}`" for o in ops[:_SPEC_MENU_OPS])
+        tail = f" — {shown}"
+        if len(ops) > _SPEC_MENU_OPS:
+            tail += f" (+{len(ops) - _SPEC_MENU_OPS})"
+    if schemes:
+        tail += "; схемы: " + ", ".join(f"`{s}`" for s in schemes[:_SPEC_MENU_SCHEMAS])
+    return head + tail
+
+
+def _product_specs(product_id: Any) -> List[Any]:
+    """The product's SpecORM rows (best-effort; [] on any failure)."""
+    if not product_id:
+        return []
+    try:
+        from api.db import SessionLocal
+        from api.models import SpecORM
+
+        session = SessionLocal()
+        try:
+            return (
+                session.query(SpecORM)
+                .filter(SpecORM.product_id == product_id)
+                .order_by(SpecORM.id)
+                .all()
+            )
+        finally:
+            session.close()
+    except Exception as e:  # pragma: no cover - context is never fatal
+        logger.debug("product specs unavailable for %s: %s", product_id, e)
+        return []
+
+
+def product_spec_context(product_id: Any, max_chars: int = 4000) -> str:
+    """Compact Russian markdown digest ("menu") of the product's API specs.
+
+    Sync + best-effort (called from the codebase flow's brief builder):
+    per-spec line with kind/title/counts + a capped list of operations or
+    channels — the identifiers the API wiki sections need verbatim.
+    Explicitly marked as supplementary — NOT repository paths — so writers
+    (and the citation guard) never treat these identifiers as file
+    citations; schema/operation details stay available on demand through
+    the ``spec_lookup`` tool (``build_spec_tools``).
+    """
+    blocks: List[str] = []
+    for row in _product_specs(product_id):
+        content = (getattr(row, "content", "") or "").strip()
+        if not content:
+            continue
+        kind = (getattr(row, "kind", "") or "openapi").strip().lower()
+        try:
+            parsed = _parse_spec(content[:_SPEC_CONTEXT_PARSE_MAX_CHARS])
+        except Exception:  # pragma: no cover - parse is already guarded
+            parsed = None
+        blocks.append(_spec_menu_block(row.name, kind, content, parsed))
+    if not blocks:
+        return ""
+    text = (
+        "### Контракт-контекст продукта (спецификации API)\n"
+        "Собственные API сервиса и внешние клиентские контракты интеграций. "
+        "Дополнительно — НЕ файлы репозитория; не цитировать как пути. "
+        "Детали схем и операций — инструмент `spec_lookup`.\n"
+        + "\n".join(f"- {b}" for b in blocks)
+    )
+    return _cap(text, max_chars)
+
+
+def build_spec_tools(product_id: Any) -> List[Any]:
+    """Read-only ``spec_lookup`` tool over the product's PARSED specs.
+
+    Built for the codebase flow's unit agents (menu in the brief, details on
+    demand): ``spec_lookup(spec_name, path)`` resolves a dotted path against
+    the parsed content of the named spec. Returns ``[]`` when the product
+    has no parseable specs — no dead tool in the subagent specs.
+    """
+    parsed_by_name: Dict[str, dict] = {}
+    for row in _product_specs(product_id):
+        name = (getattr(row, "name", "") or "").strip()
+        content = (getattr(row, "content", "") or "").strip()
+        if not name or not content:
+            continue
+        try:
+            parsed = _parse_spec(content[:_SPEC_CONTEXT_PARSE_MAX_CHARS])
+        except Exception:  # pragma: no cover - parse is already guarded
+            parsed = None
+        if isinstance(parsed, dict) and parsed:
+            parsed_by_name[name] = parsed
+    if not parsed_by_name:
+        return []
+
+    from langchain_core.tools import tool
+
+    marker = "(дополнительно — НЕ файлы репозитория; не цитировать как пути)"
+    names = ", ".join(f"`{n}`" for n in parsed_by_name)
+
+    @tool
+    def spec_lookup(spec_name: str, path: str = "") -> str:
+        """Look up an exact value from a product API spec by dotted path.
+
+        ``spec_name`` is one of the specs listed in the brief's
+        Контракт-контекст block; ``path`` is a dotted path into the parsed
+        document (``info``, ``paths./users/{id}.get``, ``components.schemas.User``,
+        ``channels.<name>.publish``). Returns the JSON fragment
+        (pretty-printed, capped), or an ERROR line listing the available
+        specs / root keys when the name or path is unknown.
+        """
+        target = parsed_by_name.get((spec_name or "").strip())
+        if target is None:
+            # Case-insensitive fallback so a near-miss still resolves
+            # instead of dead-ending.
+            low = (spec_name or "").strip().lower()
+            for key in parsed_by_name:
+                if key.lower() == low:
+                    target = parsed_by_name[key]
+                    break
+        if target is None:
+            return (
+                f"ERROR: unknown spec {spec_name!r}. Available specs: {names}. "
+                + marker
+            )
+        value = _lookup_path(target, path or "")
+        if value is _MISSING:
+            root = ", ".join(f"`{k}`" for k in list(target)[:12])
+            return (
+                f"ERROR: path not found in {spec_name!r}: {path}. "
+                f"Root keys: {root}. " + marker
+            )
+        try:
+            body = json.dumps(value, ensure_ascii=False, indent=2, default=str)
+        except Exception as e:  # pragma: no cover - defensive
+            return f"ERROR: could not serialize value at {path}: {e}"
+        return _cap(f"{marker}\n{body}", _SPEC_TOOL_MAX_CHARS)
+
+    return [spec_lookup]
+
+
+# --------------------------------------------------------------------------- #
 # Enrichment agent (react agent over spec_lookup)
 # --------------------------------------------------------------------------- #
 _SPEC_AGENT_SYSTEM_FALLBACK = (

@@ -109,6 +109,78 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         unit="parallel calls",
         group="LLM",
     ),
+    # --- Docgen graph budgets (deepagents, api/docgen/codebase.py) ------
+    # LangGraph recursion limits. The unit-agent default is raised from the
+    # old hardcoded 60: exploring a large repo legitimately needs more than
+    # 60 graph steps (larger repos died with RecursionError before). The
+    # orchestrator budget also counts its subagent hand-offs, so it is larger.
+    TimeoutKey(
+        key="docgen_unit_recursion_limit",
+        env_var="DOCGEN_UNIT_RECURSION_LIMIT",
+        default=256.0,
+        floor=16.0,
+        label="Docgen: unit agent recursion limit",
+        unit="graph steps",
+        group="LLM",
+    ),
+    TimeoutKey(
+        key="docgen_orchestrator_recursion_limit",
+        env_var="DOCGEN_ORCHESTRATOR_RECURSION_LIMIT",
+        default=400.0,
+        floor=32.0,
+        label="Docgen: orchestrator recursion limit",
+        unit="graph steps",
+        group="LLM",
+    ),
+    # Promoted from the env-only DOCGEN_SECTION_CONCURRENCY knob (bounds the
+    # section agents of the python-parallel fallback). Env semantics are
+    # unchanged; the registry only adds the admin-store layer above it.
+    TimeoutKey(
+        key="docgen_section_concurrency",
+        env_var="DOCGEN_SECTION_CONCURRENCY",
+        default=3.0,
+        floor=1.0,
+        label="Docgen: parallel section agents (fallback path)",
+        unit="agents",
+        group="LLM",
+    ),
+    # Per-run ceiling on concurrently in-flight LLM calls through the ONE
+    # chat instance shared by the deepagents orchestrator and its subagents
+    # (langgraph's ToolNode fans task calls out with asyncio.gather; an
+    # unbounded burst trips local servers' parallel-request limit with 429).
+    TimeoutKey(
+        key="docgen_llm_concurrency",
+        env_var="DOCGEN_LLM_CONCURRENCY",
+        default=8.0,
+        floor=1.0,
+        label="Docgen: max parallel LLM calls",
+        unit="parallel calls",
+        group="LLM",
+    ),
+    # Cross-context 0/1 toggles for codebase docgen briefs (spec digest +
+    # spec_lookup tool / DB digest). Not timeouts; they share the registry
+    # precedence machinery and are read through ``resolve_timeout_bool`` so
+    # the legacy env truthy-string semantics of the formerly env-only
+    # ``DOCGEN_DB_CONTEXT_ENABLED`` are preserved byte-for-byte (a plain
+    # numeric key would silently flip existing ``=false`` deployments).
+    TimeoutKey(
+        key="docgen_spec_context_enabled",
+        env_var="DOCGEN_SPEC_CONTEXT_ENABLED",
+        default=1.0,
+        floor=0.0,
+        label="Docgen: spec contract context in codebase briefs",
+        unit="0/1",
+        group="LLM",
+    ),
+    TimeoutKey(
+        key="docgen_db_context_enabled",
+        env_var="DOCGEN_DB_CONTEXT_ENABLED",
+        default=1.0,
+        floor=0.0,
+        label="Docgen: database context in codebase briefs",
+        unit="0/1",
+        group="LLM",
+    ),
     # --- Expert chat (detached ask turns, api/expert/turns.py) ----------
     # Wall-clock budget for ONE expert ask turn (regular agent or deep
     # research) including retrieval, tool calls, and streaming. The turn is
@@ -333,6 +405,65 @@ def _resolve_with_key(key: str) -> float:
     return max(spec.floor, spec.default)
 
 
+def _parse_bool_strict(raw: object) -> Optional[bool]:
+    """Parse an ADMIN-STORE boolean value; None = unset or a typo.
+
+    Accepts the numeric forms the admin UI writes (``0``/``1``) plus the
+    common word forms; anything else is treated as a typo and skipped, so
+    the precedence level falls through instead of guessing.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return float(raw) != 0.0
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def resolve_timeout_bool(key: str) -> bool:
+    """Resolve a 0/1 registry flag with the full precedence chain.
+
+    1. admin store — strict parse (``0/1/true/false/yes/no/on/off``); unset
+       or a typo falls through to the next level.
+    2. env var — the LEGACY truthy-string semantics of the former env-only
+       toggles: anything except ``0/false/no/off`` (including an empty
+       value) is ON. This preserves existing deployments byte-for-byte —
+       ``_parse_float("false")`` is None, so a plain numeric key would
+       silently flip an ``DOCGEN_DB_CONTEXT_ENABLED=false`` install.
+    3. default — the per-key constant.
+
+    Never raises; an unknown key returns ``False`` (logged).
+    """
+    spec = _BY_KEY.get(key)
+    if spec is None:
+        logger.debug("resolve_timeout_bool: unknown key %r; returning False", key)
+        return False
+
+    try:
+        from api.config.settings import get_setting
+
+        store_val = get_setting(f"timeouts.{key}")
+    except Exception as e:  # pragma: no cover - settings store is import-safe
+        logger.debug("get_setting(%r) failed: %s", key, e)
+        store_val = None
+
+    parsed = _parse_bool_strict(store_val)
+    if parsed is not None:
+        return parsed
+
+    env_val = os.environ.get(spec.env_var)
+    if env_val is not None:
+        return (env_val or "").strip().lower() not in ("0", "false", "no", "off")
+
+    return bool(spec.default)
+
+
 def resolve_timeout(key: str) -> float:
     """Resolve a timeout (seconds or milliseconds) to a float.
 
@@ -381,6 +512,65 @@ def resolve_docgen_map_concurrency() -> int:
     sequential (shared REPL session). Floor 1 = sequential fallback.
     """
     return resolve_timeout_int("docgen_map_concurrency")
+
+
+def resolve_docgen_unit_recursion_limit() -> int:
+    """LangGraph ``recursion_limit`` for one unit-agent run (section subpage).
+
+    Raised from the old hardcoded 60: deepagents explorations of large repos
+    legitimately exceed 60 graph steps. Read per agent run, so an admin change
+    applies to the next docgen run without a restart.
+    """
+    return resolve_timeout_int("docgen_unit_recursion_limit")
+
+
+def resolve_docgen_orchestrator_recursion_limit() -> int:
+    """LangGraph ``recursion_limit`` for the deepagents orchestrator run.
+
+    The orchestrator budget also covers its subagent hand-offs (task calls
+    inherit the parent config's recursion_limit), so it must stay above the
+    unit limit.
+    """
+    return resolve_timeout_int("docgen_orchestrator_recursion_limit")
+
+
+def resolve_docgen_section_concurrency() -> int:
+    """Max parallel section agents in the python-parallel fallback path.
+
+    Formerly the env-only ``DOCGEN_SECTION_CONCURRENCY``; the caller still
+    clamps the result to the number of sections.
+    """
+    return resolve_timeout_int("docgen_section_concurrency")
+
+
+def resolve_docgen_llm_concurrency() -> int:
+    """Max concurrently in-flight LLM calls per docgen run.
+
+    Bounds the shared chat instance (orchestrator + subagents + fallback
+    sections) with an asyncio.Semaphore so a burst of task-dispatched
+    subagents cannot exceed the local server's parallel-request limit.
+    Floor 1 = fully sequential fallback.
+    """
+    return resolve_timeout_int("docgen_llm_concurrency")
+
+
+def resolve_docgen_spec_context_enabled() -> bool:
+    """Cross-context toggle: spec digest + ``spec_lookup`` in codebase docgen.
+
+    Own API contracts and external client contracts ride into the codebase
+    docgen brief as a deterministic menu, with schema/operation details
+    available on demand through the ``spec_lookup`` tool.
+    """
+    return resolve_timeout_bool("docgen_spec_context_enabled")
+
+
+def resolve_docgen_db_context_enabled() -> bool:
+    """Cross-context toggle: DB digest in codebase docgen briefs.
+
+    Wraps the formerly env-only ``DOCGEN_DB_CONTEXT_ENABLED``; legacy env
+    truthy-string semantics are preserved (see ``resolve_timeout_bool``).
+    """
+    return resolve_timeout_bool("docgen_db_context_enabled")
 
 
 def resolve_expert_stream_timeout() -> float:
@@ -564,6 +754,13 @@ __all__ = [
     "resolve_expert_stream_timeout",
     "resolve_docgen_indexing_drain_seconds",
     "resolve_docgen_map_concurrency",
+    "resolve_docgen_unit_recursion_limit",
+    "resolve_docgen_orchestrator_recursion_limit",
+    "resolve_docgen_section_concurrency",
+    "resolve_docgen_llm_concurrency",
+    "resolve_docgen_spec_context_enabled",
+    "resolve_docgen_db_context_enabled",
+    "resolve_timeout_bool",
     "resolve_memory_query_timeout",
     "resolve_model_list_timeout",
     "resolve_integration_http_timeout",

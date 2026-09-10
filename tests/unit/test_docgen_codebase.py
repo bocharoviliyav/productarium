@@ -1320,14 +1320,16 @@ class TestScaffoldingRendering:
         assert len(brief) <= cb._BRIEF_MAX_CHARS + 100  # cap + truncation marker
 
     def test_section_concurrency_default_and_env(self, monkeypatch):
-        monkeypatch.delenv(cb._SECTION_CONCURRENCY_ENV, raising=False)
-        assert cb._section_concurrency() == cb._SECTION_CONCURRENCY_DEFAULT
-        monkeypatch.setenv(cb._SECTION_CONCURRENCY_ENV, "5")
+        # Registry-backed (admin > env DOCGEN_SECTION_CONCURRENCY > default 3)
+        # with the same clamp semantics as the former env-only knob.
+        monkeypatch.delenv("DOCGEN_SECTION_CONCURRENCY", raising=False)
+        assert cb._section_concurrency() == 3
+        monkeypatch.setenv("DOCGEN_SECTION_CONCURRENCY", "5")
         assert cb._section_concurrency() == 5
-        monkeypatch.setenv(cb._SECTION_CONCURRENCY_ENV, "0")
+        monkeypatch.setenv("DOCGEN_SECTION_CONCURRENCY", "0")
         assert cb._section_concurrency() == 1  # clamped to >= 1
-        monkeypatch.setenv(cb._SECTION_CONCURRENCY_ENV, "not-a-number")
-        assert cb._section_concurrency() == cb._SECTION_CONCURRENCY_DEFAULT
+        monkeypatch.setenv("DOCGEN_SECTION_CONCURRENCY", "not-a-number")
+        assert cb._section_concurrency() == 3
 
 
 # ============================================================================
@@ -1434,7 +1436,8 @@ class TestDocgenAgentFlow:
         monkeypatch.setattr(cb, "_decompose_sections", fake_decompose)
         monkeypatch.setattr(cb, "_notes_dir_for", lambda cid: None)
 
-        async def default_parallel(chat, repo_dir, system_prompts, dispatches, tracker, notes_dir=None):
+        async def default_parallel(chat, repo_dir, system_prompts, dispatches, tracker,
+                                   notes_dir=None, spec_tools=None):
             return {}, {}
         monkeypatch.setattr(cb, "_run_parallel_section_agents", parallel or default_parallel)
 
@@ -1587,7 +1590,8 @@ class TestDocgenAgentFlow:
 
         parallel_calls: Dict[str, Any] = {}
 
-        async def fake_parallel(chat, repo_dir, system_prompts, dispatches, tracker, notes_dir=None):
+        async def fake_parallel(chat, repo_dir, system_prompts, dispatches, tracker,
+                                notes_dir=None, spec_tools=None):
             parallel_calls["sids"] = list(system_prompts)
             parallel_calls["prompts"] = dict(system_prompts)
             parallel_calls["dispatches"] = dict(dispatches)
@@ -1616,7 +1620,8 @@ class TestDocgenAgentFlow:
     def test_orchestrator_failure_full_parallel_success(self, fake_artifact, fake_product, fake_repo_dir, monkeypatch):
         orchestrator = _FakeOrchestrator({}, error=RuntimeError("orchestrator exploded"))
 
-        async def fake_parallel(chat, repo_dir, system_prompts, dispatches, tracker, notes_dir=None):
+        async def fake_parallel(chat, repo_dir, system_prompts, dispatches, tracker,
+                                notes_dir=None, spec_tools=None):
             texts = {sid: f"Parallel wrote {sid}" for sid in system_prompts}
             files = {sid: ["main.py"] for sid in system_prompts}
             for sid in system_prompts:
@@ -1629,6 +1634,89 @@ class TestDocgenAgentFlow:
         result = asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
         assert f"Parallel wrote {cb.SECTION_ORDER[0]}" in result
         assert fake_artifact.pages["page_overview"]["provenance"]["generator"] == "deepagents"
+
+    # --- Cross-context: spec digest + spec_lookup reach the unit agents --- #
+    _SPEC_CTX_OPENAPI = json.dumps({
+        "openapi": "3.0.0",
+        "info": {"title": "Billing API", "version": "2.1"},
+        "paths": {"/orders": {"get": {"summary": "List orders"}}},
+    })
+
+    def _seed_spec(self, isolated_db, product_id="prod_agent"):
+        from api.models import ProductORM, SpecORM
+
+        with isolated_db.SessionLocal() as s:
+            s.add(ProductORM(id=product_id, name="P"))
+            s.add(SpecORM(
+                id="spec_ctx", product_id=product_id, name="Public API",
+                kind="openapi", content=self._SPEC_CTX_OPENAPI,
+            ))
+            s.commit()
+
+    def test_spec_context_reaches_unit_subagents(
+        self, fake_artifact, fake_product, fake_repo_dir, monkeypatch, isolated_db
+    ):
+        """With a spec on the product and the toggle on (default), every unit
+        subagent gets the spec digest inside its brief + the spec_lookup
+        tool for on-demand schema/operation details."""
+        self._seed_spec(isolated_db)
+        captured: Dict[str, Any] = {}
+
+        def capture_builder(chat, specs, system_prompt):
+            captured["specs"] = specs
+            return _FakeOrchestrator({sid: "text" for sid in cb.SECTION_ORDER})
+
+        self._patch_flow(monkeypatch, fake_repo_dir, builder=capture_builder)
+        asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
+
+        specs = captured["specs"]
+        assert specs
+        for spec in specs:
+            assert "Контракт-контекст продукта" in spec["system_prompt"]
+            assert any(t.name == "spec_lookup" for t in spec["tools"])
+
+    def test_spec_context_disabled_by_env(
+        self, fake_artifact, fake_product, fake_repo_dir, monkeypatch, isolated_db
+    ):
+        """DOCGEN_SPEC_CONTEXT_ENABLED=false: no spec block in the brief and
+        no spec_lookup tool anywhere in the subagent specs."""
+        self._seed_spec(isolated_db)
+        monkeypatch.setenv("DOCGEN_SPEC_CONTEXT_ENABLED", "false")
+        captured: Dict[str, Any] = {}
+
+        def capture_builder(chat, specs, system_prompt):
+            captured["specs"] = specs
+            return _FakeOrchestrator({sid: "text" for sid in cb.SECTION_ORDER})
+
+        self._patch_flow(monkeypatch, fake_repo_dir, builder=capture_builder)
+        asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
+
+        for spec in captured["specs"]:
+            assert "Контракт-контекст продукта" not in spec["system_prompt"]
+            assert not any(t.name == "spec_lookup" for t in spec["tools"])
+
+    def test_spec_tools_reach_parallel_fallback(
+        self, fake_artifact, fake_product, fake_repo_dir, monkeypatch, isolated_db
+    ):
+        self._seed_spec(isolated_db)
+        orchestrator = _FakeOrchestrator({}, error=RuntimeError("orchestrator exploded"))
+        parallel_calls: Dict[str, Any] = {}
+
+        async def fake_parallel(chat, repo_dir, system_prompts, dispatches, tracker,
+                                notes_dir=None, spec_tools=None):
+            parallel_calls["spec_tools"] = list(spec_tools or [])
+            texts = {sid: f"Parallel wrote {sid}" for sid in system_prompts}
+            files = {sid: ["main.py"] for sid in system_prompts}
+            for sid in system_prompts:
+                tracker.section_started(sid)
+                tracker.section_finished(sid)
+            return texts, files
+
+        self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator,
+                         parallel=fake_parallel)
+        asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
+
+        assert [t.name for t in parallel_calls["spec_tools"]] == ["spec_lookup"]
 
     def test_all_agent_paths_fail_falls_back_to_standard_llm(
         self, fake_artifact, fake_product, fake_repo_dir, monkeypatch
@@ -1973,9 +2061,9 @@ class TestAdaptiveCaps:
         monkeypatch.setattr(cb, "_resolve_docgen_context_window", lambda: 131_072)
         assert cb._brief_max_chars() == cb._BRIEF_MAX_CHARS
         monkeypatch.setattr(cb, "_resolve_docgen_context_window", lambda: 16_384)
-        assert cb._brief_max_chars() == 6_000  # 12000 * 0.5
+        assert cb._brief_max_chars() == 8_000  # 16000 * 0.5
         monkeypatch.setattr(cb, "_resolve_docgen_context_window", lambda: 8_192)
-        assert cb._brief_max_chars() == 3_000  # floor keeps the brief usable
+        assert cb._brief_max_chars() == 4_000  # 16000 * 0.25 (floor no longer binds)
 
     def test_repo_brief_scales_for_small_window(self, monkeypatch):
         """At ctx=8192 the whole brief must fit a fraction of the window:
@@ -1998,6 +2086,54 @@ class TestAdaptiveCaps:
         assert len(brief) <= cb._brief_max_chars() + 100
         # ~750 tokens at the 0.25 floor — a fraction of the 6144 budget.
         assert cb._count_tokens(brief) <= 1_500
+
+
+class TestRepoBriefExtraContext:
+    """Cross-context blocks (specs / DB / knowledge) inside the repo brief.
+
+    Regression for the latent defect where the blocks were appended to
+    ``readme`` and the README-head cap silently truncated them away on
+    real repos with a long README."""
+
+    def _brief(self, monkeypatch, extra):
+        monkeypatch.setattr(cb, "_resolve_docgen_context_window", lambda: 131_072)
+        return cb._build_repo_brief(
+            repo_url="https://github.com/o/r",
+            repo_type="github",
+            file_analysis={
+                "primary_language": "Python", "file_count": 10,
+                "main_directories": [], "config_files": [],
+                "cicd_files": [], "docker_files": [],
+            },
+            file_tree="src/a.py\nsrc/b.py",
+            readme="readme " * 4_000,  # ~28k chars — used to starve the blocks
+            extra_context=extra,
+        )
+
+    def test_blocks_survive_huge_readme(self, monkeypatch):
+        brief = self._brief(monkeypatch, [
+            "### Контракт-контекст продукта (спецификации API)\n- **API** (openapi)",
+            "### Контекст баз данных продукта\n- **Core** (schemas: public)",
+            "### Дополнительный контекст продукта (Confluence / База знаний):\nзаметки",
+        ])
+        assert "Контракт-контекст продукта" in brief
+        assert "Контекст баз данных продукта" in brief
+        assert "Дополнительный контекст продукта" in brief
+        # The whole brief still honors the hard cap.
+        assert len(brief) <= cb._brief_max_chars() + 100
+
+    def test_each_block_capped_at_quarter(self, monkeypatch):
+        brief = self._brief(monkeypatch, ["MARK\n" + "X" * 20_000])
+        budget = max(600, cb._brief_max_chars() // 4)
+        assert "MARK" in brief
+        assert brief.count("X") <= budget + 10
+
+    def test_blocks_render_between_readme_and_tree(self, monkeypatch):
+        brief = self._brief(monkeypatch, ["### Контракт-контекст продукта (спецификации API)"])
+        readme_pos = brief.index("README (head):")
+        spec_pos = brief.index("Контракт-контекст продукта")
+        tree_pos = brief.index("File tree (capped):")
+        assert readme_pos < spec_pos < tree_pos
 
 
 class TestFitFileBlocksToBudget:

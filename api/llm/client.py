@@ -33,12 +33,14 @@ Behavior carried over from the former client:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, Dict, Optional, Union
 
 import httpx
 from langchain_openai import ChatOpenAI
+from pydantic import PrivateAttr
 
 logger = logging.getLogger(__name__)
 
@@ -292,15 +294,29 @@ class ServerCompatChatOpenAI(ChatOpenAI):
     with ``400 "name" is only valid on role="tool" messages`` — the error
     that killed whole orchestrated docgen runs (deepagents orchestrator
     transcripts) and forced the expensive python-parallel fallback.
+
+    Optionally carries a per-instance ``asyncio.Semaphore`` bounding how
+    many ``_agenerate`` calls may be in flight at once. LangGraph's
+    ToolNode fans parallel tool calls out with ``asyncio.gather``, so one
+    deepagents orchestrator dispatching N ``task`` calls spawns N
+    subagents that all hit the server concurrently through this shared
+    instance — an unbounded burst that trips local servers'
+    parallel-request limits with 429. Set via :func:`build_chat_model`
+    (``llm_concurrency``); ``None`` keeps the previous unbounded behavior.
     """
+
+    _llm_semaphore: Optional[asyncio.Semaphore] = PrivateAttr(default=None)
 
     def _generate(self, messages, *args: Any, **kwargs: Any):
         return super()._generate(strip_non_tool_message_names(messages), *args, **kwargs)
 
     async def _agenerate(self, messages, *args: Any, **kwargs: Any):
-        return await super()._agenerate(
-            strip_non_tool_message_names(messages), *args, **kwargs
-        )
+        cleaned = strip_non_tool_message_names(messages)
+        sem = self._llm_semaphore
+        if sem is None:
+            return await super()._agenerate(cleaned, *args, **kwargs)
+        async with sem:
+            return await super()._agenerate(cleaned, *args, **kwargs)
 
     def _stream(self, messages, *args: Any, **kwargs: Any):
         yield from super()._stream(
@@ -318,6 +334,7 @@ def build_chat_model(
     model: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    llm_concurrency: Optional[int] = None,
     **overrides: Any,
 ) -> Any:
     """Build a :class:`langchain_openai.ChatOpenAI` for the configured endpoint.
@@ -328,6 +345,11 @@ def build_chat_model(
         base_url: Endpoint base URL (admin-configured per task, e.g.
             ``models.docgen.base_url``); defaults to ``LOCAL_OPENAI_BASE_URL``.
         api_key: API key (admin-configured per task); placeholder-aware.
+        llm_concurrency: Optional ceiling on concurrently in-flight async
+            LLM calls through this ONE instance (``asyncio.Semaphore`` on
+            ``_agenerate``). Used by docgen, where the deepagents
+            orchestrator + its task-spawned subagents share a single chat
+            instance; left unset for everything else.
         **overrides: Explicit model-parameter overrides (e.g.
             ``temperature=0``) that win over the JSON config.
 
@@ -377,4 +399,7 @@ def build_chat_model(
     if extra_kwargs:
         kwargs["model_kwargs"] = extra_kwargs
 
-    return ServerCompatChatOpenAI(**kwargs)
+    chat = ServerCompatChatOpenAI(**kwargs)
+    if llm_concurrency is not None and llm_concurrency > 0:
+        chat._llm_semaphore = asyncio.Semaphore(int(llm_concurrency))
+    return chat

@@ -2737,10 +2737,15 @@ def _db_context_payload(info: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def db_context_enabled() -> bool:
-    """Cross-context toggle: inject the DB digest into codebase docgen briefs."""
-    return (os.environ.get("DOCGEN_DB_CONTEXT_ENABLED", "true") or "").strip().lower() not in (
-        "0", "false", "no", "off",
-    )
+    """Cross-context toggle: inject the DB digest into codebase docgen briefs.
+
+    Resolves through the timeout registry (admin store > env
+    ``DOCGEN_DB_CONTEXT_ENABLED`` > default on); the legacy env
+    truthy-string semantics are preserved by ``resolve_timeout_bool``.
+    """
+    from api.config.timeout import resolve_docgen_db_context_enabled
+
+    return resolve_docgen_db_context_enabled()
 
 
 def product_database_context(product_id: str, max_chars: int = 4000) -> str:
