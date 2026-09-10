@@ -20,6 +20,7 @@ import { VerifiedBadge, VerifiedButton } from "@/components/VerifiedBadge";
 import { MarkdownEditor, EditorSaveBar } from "@/components/MarkdownEditor";
 import { SpecViewer } from "@/components/SpecViewer";
 import { LinksViewer } from "@/components/LinksViewer";
+import { ProvenancePanel } from "@/components/ProvenancePanel";
 import dynamic from "next/dynamic";
 import {
   Button,
@@ -621,6 +622,9 @@ export default function EntityDocsViewer() {
                 </aside>
 
                 <div className="flex flex-col gap-8">
+                  {!editing && activePage?.provenance ? (
+                    <ProvenancePanel provenance={activePage.provenance} />
+                  ) : null}
                   <Card className="p-6 md:p-10">
                     {editing ? (
                       <div className="flex flex-col gap-4">

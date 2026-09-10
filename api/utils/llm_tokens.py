@@ -32,11 +32,18 @@ def get_model_context_window(
 
     Order of precedence:
     1. Explicit env var `RLM_MODEL_CONTEXT_WINDOW`
-    2. Task/admin config `models.<task>.max_prompt_tokens` / `context_window`
-    3. Live API metadata query (cached for 5 minutes):
-       - OpenAI-compatible: GET {base_url}/models -> parse `max_model_len` / `context_window` / `max_tokens`
-    4. Model name heuristic hints
-    5. Safe fallback default: 8192 tokens
+    2. Task/admin config `models.<task>.max_prompt_tokens`
+    3. Live API metadata query (cached for 5 minutes), in order:
+       - OpenAI-compatible: GET {base_url}/v1/models -> `max_model_len` /
+         `context_window` / `max_tokens` / `max_context_length` / `n_ctx`
+         (vLLM advertises these; LM Studio / llama.cpp / Ollama do NOT)
+       - LM Studio native: GET {origin}/api/v0/models -> `maxContextLength`
+       - llama.cpp: GET {origin}/props -> `default_generation_settings.n_ctx`
+       - Ollama: POST {origin}/api/show -> `model_info["*.context_length"]`
+    4. Safe fallback default: 8192 tokens (logged as a WARNING that names
+       the manual overrides — a silent 8192 previously clamped every docgen
+       budget on 262k-token models whose server does not advertise the
+       window via /v1/models)
     """
     # 1. Environment variable override
     raw = os.environ.get("RLM_MODEL_CONTEXT_WINDOW")
@@ -80,7 +87,7 @@ def get_model_context_window(
 
     ctx_found: Optional[int] = None
 
-    # 3. Live endpoint query
+    # 3. Live endpoint queries
     try:
         from api.config.ssl import requests_verify
         from api.config.settings import _sanitize_api_key
@@ -91,26 +98,108 @@ def get_model_context_window(
         if clean_key and clean_key.lower() not in ("not-needed", "not_needed"):
             headers["Authorization"] = f"Bearer {clean_key}"
 
-        # OpenAI-compatible /v1/models
+        request_timeout = resolve_model_list_timeout()
+        verify = requests_verify()
+
+        def _get(probe_url: str) -> Optional[dict]:
+            try:
+                resp = requests.get(
+                    probe_url, headers=headers,
+                    timeout=request_timeout, verify=verify,
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+            except Exception as e:
+                logger.debug("Context-window probe %s failed: %s", probe_url, e)
+            return None
+
+        model_l = model.lower()
+
+        # 3a. OpenAI-compatible /v1/models (vLLM advertises max_model_len &
+        # friends here; LM Studio / llama.cpp / Ollama list bare ids only).
         oai_url = url if url.endswith("/v1") else url.rstrip("/") + "/v1"
-        try:
-            resp = requests.get(f"{oai_url}/models", headers=headers, timeout=resolve_model_list_timeout(), verify=requests_verify())
-            if resp.status_code == 200:
-                data = resp.json()
-                models_list = data.get("data", []) if isinstance(data, dict) else []
-                for mobj in models_list:
-                    if isinstance(mobj, dict) and (mobj.get("id") == model or mobj.get("name") == model):
-                        for key in ("max_model_len", "context_window", "max_tokens", "max_context_length", "n_ctx"):
-                            val = mobj.get(key)
-                            if isinstance(val, (int, float)) and val > 0:
+        data = _get(f"{oai_url}/models")
+        if isinstance(data, dict):
+            for mobj in data.get("data", []) or []:
+                if not isinstance(mobj, dict):
+                    continue
+                entry_id = str(mobj.get("id") or mobj.get("name") or "").strip().lower()
+                if entry_id != model_l:
+                    continue
+                for key in ("max_model_len", "context_window", "max_tokens", "max_context_length", "n_ctx"):
+                    val = mobj.get(key)
+                    if isinstance(val, (int, float)) and val > 0:
+                        ctx_found = int(val)
+                        break
+                if ctx_found:
+                    break
+
+        # 3b-d. Server-NATIVE probes: these servers do not publish the
+        # context window through /v1/models, only through their own endpoints.
+        # origin = the OpenAI base without the /v1 suffix.
+        origin = oai_url[: -len("/v1")].rstrip("/") if oai_url.endswith("/v1") else oai_url.rstrip("/")
+
+        if ctx_found is None:
+            # LM Studio native REST API.
+            data = _get(f"{origin}/api/v0/models")
+            if isinstance(data, dict):
+                for mobj in data.get("data", []) or []:
+                    if not isinstance(mobj, dict):
+                        continue
+                    entry_id = str(mobj.get("id") or "").strip().lower()
+                    if entry_id != model_l:
+                        continue
+                    val = mobj.get("maxContextLength")
+                    if isinstance(val, (int, float)) and val > 0:
+                        ctx_found = int(val)
+                        break
+
+        if ctx_found is None:
+            # llama.cpp server properties.
+            data = _get(f"{origin}/props")
+            if isinstance(data, dict):
+                settings = data.get("default_generation_settings")
+                if isinstance(settings, dict):
+                    val = settings.get("n_ctx")
+                    if isinstance(val, (int, float)) and val > 0:
+                        ctx_found = int(val)
+
+        if ctx_found is None:
+            # Ollama model info: model_info["<arch>.context_length"].
+            try:
+                resp = requests.post(
+                    f"{origin}/api/show",
+                    json={"model": model},
+                    timeout=request_timeout,
+                    verify=verify,
+                )
+                if resp.status_code == 200:
+                    info = (resp.json() or {}).get("model_info")
+                    if isinstance(info, dict):
+                        for key, val in info.items():
+                            if (
+                                isinstance(key, str)
+                                and key.endswith(".context_length")
+                                and isinstance(val, (int, float))
+                                and val > 0
+                            ):
                                 ctx_found = int(val)
                                 break
-        except Exception as e:
-            logger.debug("OpenAI /v1/models query failed for %s: %s", model, e)
+            except Exception as e:
+                logger.debug("Context-window probe %s/api/show failed: %s", origin, e)
     except Exception as e:
         logger.debug("get_model_context_window fetch exception: %s", e)
 
     final_ctx = ctx_found or 8192
+    if ctx_found is None:
+        logger.warning(
+            "No advertised context window for %s at %s (probed /v1/models, "
+            "LM Studio /api/v0/models, llama.cpp /props, Ollama /api/show); "
+            "falling back to 8192 tokens. If the real window is larger, set "
+            "RLM_MODEL_CONTEXT_WINDOW or the admin Models -> "
+            "max_prompt_tokens override.",
+            model, url,
+        )
 
     _MODEL_CTX_CACHE[cache_key] = (now, final_ctx)
     logger.info("Resolved model context window for %s at %s: %d tokens", model, url, final_ctx)

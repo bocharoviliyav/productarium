@@ -260,7 +260,23 @@
     "notFound": "Product not found.",
     "delete": "Delete",
     "deleteConfirm": "Delete this artifact?",
-    "deleteFailedTitle": "Delete failed"
+    "deleteFailedTitle": "Delete failed",
+    "provenance": {
+      "title": "Verification",
+      "judgeConsistent": "Judge: consistent",
+      "judgeInconsistent": "Judge: inconsistencies",
+      "judgeSkipped": "Judge: skipped",
+      "judgeIssues": "Judge issues",
+      "citations": "Citations",
+      "citationsResolved": "resolved {n}",
+      "citationsUnresolved": "unresolved {n}",
+      "citationsRemoved": "removed {n}",
+      "mermaidOk": "ok {n}",
+      "mermaidFixed": "repaired {n}",
+      "mermaidFailed": "failed {n}",
+      "secretsMasked": "secrets masked: {n}",
+      "corroborateRemoved": "ungrounded dropped: {n}"
+    }
   },
   "knowledge": {
     "header": "Knowledge",

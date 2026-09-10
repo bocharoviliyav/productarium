@@ -324,10 +324,19 @@ class ServerCompatChatOpenAI(ChatOpenAI):
         )
 
     async def _astream(self, messages, *args: Any, **kwargs: Any):
-        async for chunk in super()._astream(
-            strip_non_tool_message_names(messages), *args, **kwargs
-        ):
-            yield chunk
+        cleaned = strip_non_tool_message_names(messages)
+        sem = self._llm_semaphore
+        if sem is None:
+            async for chunk in super()._astream(cleaned, *args, **kwargs):
+                yield chunk
+            return
+        # The semaphore is held for the WHOLE stream lifetime: an openai
+        # stream holds a server connection exactly like a plain request, so
+        # releasing after the first chunk would let a burst of streams bypass
+        # the parallel-request limit the semaphore exists to enforce.
+        async with sem:
+            async for chunk in super()._astream(cleaned, *args, **kwargs):
+                yield chunk
 
 
 def build_chat_model(

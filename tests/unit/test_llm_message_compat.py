@@ -257,6 +257,53 @@ class TestLLMConcurrencySemaphore(unittest.TestCase):
             model = self._build(llm_concurrency=value)
             self.assertIsNone(model._llm_semaphore)
 
+    def _run_stream_burst(self, model, n):
+        """Fire n concurrent astream iterations; return {peak, done} of the
+        patched _astream (no network). The semaphore sits in OUR _astream
+        override while the fake replaces the PARENT ChatOpenAI._astream, so
+        the measurement reflects the wrap, not the fake."""
+        from langchain_core.messages import AIMessageChunk, HumanMessage
+        from langchain_core.outputs import ChatGenerationChunk
+        from langchain_openai import ChatOpenAI
+
+        state = {"active": 0, "peak": 0, "done": 0}
+
+        async def _fake_astream(self, messages, stop=None, run_manager=None, **kwargs):
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+            await asyncio.sleep(0.01)
+            state["active"] -= 1
+            state["done"] += 1
+            yield ChatGenerationChunk(message=AIMessageChunk(content="ok"))
+
+        async def _run():
+            async def _one(i):
+                chunks = []
+                async for chunk in model.astream([HumanMessage(content=f"burst {i}")]):
+                    chunks.append(chunk)
+                return chunks
+
+            return await asyncio.gather(*(_one(i) for i in range(n)))
+
+        with patch.object(ChatOpenAI, "_astream", _fake_astream):
+            asyncio.run(_run())
+        return state
+
+    def test_semaphore_caps_peak_streaming_concurrency(self):
+        # Streaming previously BYPASSED the semaphore (only _agenerate was
+        # wrapped) — an astream burst could exceed the server limit even
+        # with llm_concurrency set.
+        model = self._build(llm_concurrency=2)
+        state = self._run_stream_burst(model, n=6)
+        self.assertEqual(state["done"], 6)
+        self.assertLessEqual(state["peak"], 2)
+        self.assertGreaterEqual(state["peak"], 2)
+
+    def test_streaming_unbounded_without_semaphore(self):
+        model = self._build(llm_concurrency=None)
+        state = self._run_stream_burst(model, n=6)
+        self.assertEqual(state["peak"], 6)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

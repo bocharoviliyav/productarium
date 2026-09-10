@@ -668,13 +668,17 @@ class PgVectorMemoryBackend(MemoryBackend):
         from sqlalchemy import text
 
         query_timeout = resolve_timeout("memory_query")
-        # pgvector cosine distance: embedding <=> :q (smaller = more similar).
-        # Cast the parameter to vector so the <=> operator resolves. The HNSW
-        # index on embedding (created in init_db) accelerates the ORDER BY.
+        # pgvector cosine distance (smaller = more similar). The ORDER BY must
+        # match the live HNSW index expression — plain vector comparison, or
+        # the halfvec cast pair when the column was pinned beyond pgvector's
+        # 2000-dim vector-index limit (see api.db.embedding_distance_expr).
+        from api.db import embedding_distance_expr
+
+        order_by, _cast = embedding_distance_expr()
         sql = text(
             "SELECT content FROM knowledge_chunks "
             "WHERE product_id = :pid "
-            "ORDER BY embedding <=> CAST(:q AS vector) "
+            f"ORDER BY {order_by} "
             "LIMIT :k"
         )
         # pgvector accepts a "[1,2,3]"-style string literal for the cast.

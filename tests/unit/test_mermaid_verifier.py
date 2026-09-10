@@ -95,6 +95,33 @@ class TestExtractMermaidBlocks:
         md = "```python\nprint('hi')\n```\n```js\nconsole.log(1)\n```\n"
         assert mv.extract_mermaid_blocks(md) == []
 
+    def test_unterminated_tail_block_detected(self):
+        mv = _reload()
+        md = (
+            "```mermaid\nflowchart TD\n  A --> B\n```\n"
+            "text\n"
+            "```mermaid\nsequenceDiagram\n  A->>B: hi"
+        )
+        blocks = mv.extract_mermaid_blocks(md)
+        assert len(blocks) == 2
+        assert blocks[0].terminated is True
+        tail = blocks[1]
+        assert tail.terminated is False
+        assert tail.body == "sequenceDiagram\n  A->>B: hi"
+        assert tail.raw.startswith("```mermaid")
+        assert tail.end == len(md)
+        assert md[tail.start:tail.end] == tail.raw
+
+    def test_closed_blocks_all_terminated(self):
+        mv = _reload()
+        md = (
+            "```mermaid\nflowchart TD\n  A --> B\n```\n"
+            "```mermaid\nsequenceDiagram\n  A->>B: hi\n```\n"
+        )
+        blocks = mv.extract_mermaid_blocks(md)
+        assert len(blocks) == 2
+        assert all(b.terminated for b in blocks)
+
 
 # ============================================================================
 # verify_diagram infrastructure failure handling
@@ -114,6 +141,52 @@ class TestVerifyDiagramInfrastructure:
         monkeypatch.setattr(mv.shutil, "which", lambda name: "/usr/bin/node")
         res = asyncio.run(mv.verify_diagram("   "))
         assert res.ok is True
+
+
+class TestImportFailedWarnOnce:
+    """The mermaid.py:208 spam fix: the missing-node_modules-bundle warning
+    fires ONCE per process even though every diagram spawns the validator
+    subprocess (a real run verifies each diagram separately)."""
+
+    def _patch_import_failure(self, monkeypatch):
+        mv = _reload()
+
+        class _FakeProc:
+            returncode = 3
+
+            async def communicate(self, input=None):
+                return (
+                    b"",
+                    b"MERMAID_IMPORT_FAILED: mermaid package not found in node_modules\n",
+                )
+
+        async def _fake_exec(*args, **kwargs):
+            return _FakeProc()
+
+        monkeypatch.setattr(mv.asyncio, "create_subprocess_exec", _fake_exec)
+        monkeypatch.setattr(mv.shutil, "which", lambda name: "/usr/bin/node")
+        # Point the script check at a file that exists (this test module —
+        # /bin/true is absent on modern macOS); no global os.path patch. The
+        # subprocess is faked anyway, so the file is never executed.
+        monkeypatch.setattr(mv, "_VALIDATOR_SCRIPT", os.path.abspath(__file__))
+        return mv
+
+    def test_warns_once_not_per_diagram(self, monkeypatch, caplog):
+        mv = self._patch_import_failure(monkeypatch)
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="api.formats.mermaid"):
+            r1 = asyncio.run(mv.verify_diagram("flowchart TD\n  A --> B"))
+            r2 = asyncio.run(mv.verify_diagram("sequenceDiagram\n  A->>B: hi"))
+
+        # Both diagrams degrade to unverifiable — generation never breaks.
+        assert r1.ok and r1.unverifiable
+        assert r2.ok and r2.unverifiable
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "bun install" in r.getMessage()
+        ]
+        assert len(warnings) == 1
 
 
 # ============================================================================
@@ -392,8 +465,7 @@ class TestRunRepairLoop:
             # A NEW broken body each call: unique suffix -> unique hash -> a
             # fresh per-body budget every time without the global cap.
             return f"```mermaid\nflowchart TD\n  A --> > BROKEN{call_count['n']}\n```"
-
-        md = f"```mermaid\n{broken}```\n"
+        md = f"```mermaid\n{broken}\n```\n"
         patched, stats = asyncio.run(mv.run_repair_loop(md, llm))
         # Terminated within the per-block total cap: max_attempts(3) * 3 = 9.
         assert call_count["n"] <= 9
@@ -404,6 +476,48 @@ class TestRunRepairLoop:
         # Original broken body preserved in place with the error marker.
         assert "BROKEN0" in patched
         assert "Mermaid" in patched
+
+    def test_unterminated_block_repaired_and_closed(self, monkeypatch):
+        mv = _patch_verify(monkeypatch, {})
+
+        async def llm(prompt):
+            return "```mermaid\nsequenceDiagram\n  A->>B: hi\n```"
+
+        md = (
+            "intro\n\n```mermaid\nflowchart TD\n  A --> B\n```\n\n"
+            "```mermaid\nsequenceDiagram\n  A->>B: hi"
+        )
+        patched, stats = asyncio.run(mv.run_repair_loop(md, llm))
+        # The truncated block was rebuilt as a closed, verified diagram.
+        assert patched.count("```mermaid") == 2
+        assert patched.endswith("```")
+        assert stats == {"verified": 1, "broken": 1, "unverifiable": 0,
+                         "fixed": 1, "failed": 0}
+
+    def test_unterminated_block_removed_without_llm(self, monkeypatch):
+        mv = _patch_verify(monkeypatch, {})
+        md = "```mermaid\nflowchart TD\n  A --> B\n```\ntail\n```mermaid\nflowchart TD\n  A"
+        patched, stats = asyncio.run(mv.run_repair_loop(md, llm=None))
+        # The truncated fragment is spliced out entirely; the good block stays.
+        assert patched.count("```mermaid") == 1
+        assert "tail" in patched
+        assert stats == {"verified": 1, "broken": 1, "unverifiable": 0,
+                         "fixed": 0, "failed": 1}
+
+    def test_unterminated_repair_failure_removes_block(self, monkeypatch):
+        monkeypatch.setenv("MERMAID_MAX_REPAIR_ATTEMPTS", "1")
+        mv = _patch_verify(monkeypatch, {})
+
+        async def llm(prompt):
+            return "I cannot fix this"
+
+        md = "text\n```mermaid\nflowchart TD\n  A"
+        patched, stats = asyncio.run(mv.run_repair_loop(md, llm))
+        # A truncated fragment has no salvageable original: removed, not marked.
+        assert "```" not in patched
+        assert patched == "text\n"
+        assert stats["failed"] == 1
+        assert stats["fixed"] == 0
 
 
 # ============================================================================

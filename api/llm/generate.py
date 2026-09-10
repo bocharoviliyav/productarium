@@ -107,6 +107,16 @@ class GenerateLLM:
                 result = await self._chat.ainvoke([HumanMessage(content=prompt)])
                 text = _message_text(result)
                 if text:
+                    finish = (getattr(result, "response_metadata", None) or {}).get(
+                        "finish_reason"
+                    )
+                    if str(finish).lower() == "length":
+                        logger.warning(
+                            "GenerateLLM: answer truncated by the token limit "
+                            "(finish_reason=length, prompt %d chars, answer %d "
+                            "chars).",
+                            len(prompt), len(text),
+                        )
                     return text
                 logger.warning(
                     "GenerateLLM: empty response on attempt %d/%d.",

@@ -144,6 +144,55 @@ def strip_number_prefixes_from_block(block: List[str]) -> List[str]:
     return out
 
 
+# --- LLM meta-preamble stripping ----------------------------------------------
+# The writer contract says the final message is the section markdown ONLY,
+# yet models still prepend assistant meta-commentary ("Now let me generate the
+# final architecture section:", "Хорошо, вот раздел:"). A line counts as meta
+# only when it starts with a known meta opener AND ends with ':' (a lead-in
+# into the content that follows) — ordinary prose and lead-ins like "Основные
+# компоненты системы:" never match and are kept.
+_PREAMBLE_META_RE = re.compile(
+    r"(?i)^(?:now|okay|ok|well|let(?:'s| us)? me|i(?:'ll| will|'ve| have)|"
+    r"here(?:'s| is)?|below|based on|finally|next|вот|ниже|хорошо|отлично|"
+    r"понятно|принято|сейчас|итак|давайте|продолж|начн|сгенерир|готово|финальн)"
+)
+# First structural markdown element: heading, fence, list item or table row.
+_STRUCTURAL_MD_RE = re.compile(r"^\s*(?:#{1,6}\s|```|\||[-*+]\s|\d+[.)]\s)")
+
+
+def strip_llm_preamble(text: Optional[str]) -> str:
+    """Drop leading assistant meta-commentary lines from an LLM answer.
+
+    Walks the leading run of non-blank lines before the first structural
+    markdown element; strips the meta-matching prefix (bounded to 4 lines)
+    wherever one exists. Anything that is not a clear meta lead-in — prose,
+    lead-ins without a meta opener — leaves the text untouched.
+    """
+    if not text:
+        return ""
+    lines = text.split("\n")
+    meta_end = 0
+    seen_meta = 0
+    for idx, ln in enumerate(lines):
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        if _STRUCTURAL_MD_RE.match(ln):
+            break
+        if (
+            len(stripped) <= 200
+            and stripped.endswith(":")
+            and _PREAMBLE_META_RE.match(stripped)
+        ):
+            seen_meta += 1
+            meta_end = idx + 1
+            continue
+        break
+    if 0 < seen_meta <= 4:
+        return "\n".join(lines[meta_end:]).lstrip("\n")
+    return text
+
+
 def strip_inline_line_numbers(text: Optional[str]) -> str:
     """Strip leading ``N``/``N.``/``N:`` prefixes from lines INSIDE fenced code
     blocks only.

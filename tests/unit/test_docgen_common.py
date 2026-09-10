@@ -96,6 +96,13 @@ class TestCleanLlmText:
         assert "flowchart TD" in result
         assert "some intro" in result
 
+    def test_strips_leaked_preamble(self):
+        text = (
+            "Now let me generate the final architecture section:\n"
+            "# Архитектура\n\nСостав системы."
+        )
+        assert c._clean_llm_text(text) == "# Архитектура\n\nСостав системы."
+
 
 # ============================================================================
 # _repo_name_from_url

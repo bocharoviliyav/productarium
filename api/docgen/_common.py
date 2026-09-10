@@ -24,6 +24,7 @@ from api.utils.llm_helpers import (  # noqa: E402
     cap as _cap,
     aclose_llm as _aclose_llm,
     strip_inline_line_numbers as _strip_inline_line_numbers,
+    strip_llm_preamble as _strip_llm_preamble,
     strip_number_prefixes_from_block as _strip_number_prefixes_from_block,
     LINE_NUM_PREFIX_RE as _LINE_NUM_PREFIX_RE,
     LINE_NUM_ONLY_RE as _LINE_NUM_ONLY_RE,
@@ -92,6 +93,7 @@ def _clean_llm_text(text: Optional[str]) -> str:
         if t.endswith("```"):
             t = t[:-3]
     t = _strip_inline_line_numbers(t)
+    t = _strip_llm_preamble(t)
     return t.strip()
 
 

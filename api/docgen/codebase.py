@@ -1726,6 +1726,48 @@ def _extract_orchestrated_sections(result: Any) -> Dict[str, str]:
     return sections
 
 
+def _orchestration_dispatch_stats(
+    result: Any,
+) -> Tuple[Set[str], Dict[str, str]]:
+    """Why units are missing: ``(dispatched ids, failed id -> error head)``.
+
+    Walks the orchestrator transcript exactly like
+    :func:`_extract_orchestrated_sections`, but also keeps the units whose
+    ``task`` call ran yet produced no usable text (empty answer or the
+    deepagents error wrapper — the signature of a subagent killed by a
+    server 429/timeout). The caller logs the split so a pilot log
+    distinguishes "the orchestrator never dispatched X" (prompt /
+    completion-cap behavior) from "X's subagent ran and failed" (server
+    errors) without guessing. ``None`` (orchestrated run raised) yields
+    empty collections.
+    """
+    messages = getattr(result, "messages", None) or (
+        result.get("messages") if isinstance(result, dict) else None
+    ) or []
+    call_to_sid: Dict[Any, str] = {}
+    for message in messages:
+        for call in getattr(message, "tool_calls", None) or []:
+            if not isinstance(call, dict) or call.get("name") != "task":
+                continue
+            subagent_type = (call.get("args") or {}).get("subagent_type")
+            if isinstance(subagent_type, str) and subagent_type.startswith("section-"):
+                call_to_sid[call.get("id")] = subagent_type[len("section-"):]
+    dispatched: Set[str] = set(call_to_sid.values())
+    failed: Dict[str, str] = {}
+    for message in messages:
+        if getattr(message, "type", "") != "tool":
+            continue
+        sid = call_to_sid.get(getattr(message, "tool_call_id", None))
+        if sid is None:
+            continue
+        content = getattr(message, "content", "")
+        text = _clean_llm_text(content if isinstance(content, str) else str(content))
+        if text and not text.startswith("We cannot invoke subagent"):
+            continue
+        failed[sid] = (text or "empty task result").strip()[:200]
+    return dispatched, failed
+
+
 def _build_orchestrator_system_prompt(
     *, repo_name: str, sections_list: str, reused_sections: str,
 ) -> str:
@@ -2001,6 +2043,92 @@ async def _close_chat_client(chat: Any) -> None:
 # ---------------------------------------------------------------------------
 # Section generation (standard LLM single-call + agentic bottom-up map-reduce)
 # ---------------------------------------------------------------------------
+# Tokens kept free for the ANSWER when fitting a prompt into the model window.
+# 4096 leaves room for long sections with diagrams; the former 2048 cut
+# architecture-style pages mid-mermaid (the unclosed-fence defect).
+_COMPLETION_RESERVE_TOKENS = 4096
+
+
+def _has_open_fence(text: str) -> bool:
+    """True when a ``` fence is left unclosed (token-limit truncation)."""
+    open_ = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            open_ = not open_
+    return open_
+
+
+def _looks_truncated(text: str) -> bool:
+    """Heuristic truncation detector for a generated unit body.
+
+    Signals: an unclosed code fence (cut mid-block) or an abrupt mid-sentence
+    ending — the last non-empty line ends with a letter or comma while the
+    body is long enough for the ending to be meaningful.
+    """
+    if not text or not text.strip():
+        return False
+    if _has_open_fence(text):
+        return True
+    if len(text) < 500:
+        return False
+    last = [ln for ln in text.splitlines() if ln.strip()][-1].rstrip()
+    return bool(last) and (last[-1].isalpha() or last[-1] == ",")
+
+
+def _drop_dangling_fence_tail(text: str) -> str:
+    """Remove a trailing unterminated ``` fence fragment (cut mid-block)."""
+    lines = text.splitlines()
+    last_open = -1
+    open_ = False
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            open_ = not open_
+            if open_:
+                last_open = i
+    if not open_ or last_open < 0:
+        return text
+    return "\n".join(lines[:last_open]).rstrip()
+
+
+async def _heal_truncated_unit(
+    uid: str, content: str, llm: Optional[_StandardLLM],
+) -> str:
+    """Detect a token-limit cut and try ONE bounded LLM continuation.
+
+    On a failed/empty continuation an unclosed fence tail is dropped
+    deterministically — a half-diagram fragment is worse than no diagram.
+    """
+    if not _looks_truncated(content):
+        return content
+    logger.warning(
+        "Unit %s looks truncated (open fence / abrupt ending); "
+        "attempting one continuation.", uid,
+    )
+    if llm is not None:
+        prompt = (
+            "Ниже — конец НЕЗАВЕРШЁННОГО раздела документации (генерация "
+            "прервалась). Продолжи текст РОВНО с места обрыва до логического "
+            "завершения раздела. Не повторяй уже написанное, не добавляй "
+            "преамбулу и пояснения. Если фрагмент обрывается на начатом "
+            "код-блоке или Mermaid-диаграмме — сначала заверши его. Если текст "
+            "уже завершён, верни пустой ответ.\n\n"
+            "<fragment>\n" + content[-4000:] + "\n</fragment>"
+        )
+        try:
+            extra = _clean_llm_text(await llm.generate(prompt))
+        except Exception as e:  # pragma: no cover - depends on live LLM
+            logger.warning("Continuation call failed for unit %s: %s", uid, e)
+            extra = ""
+        if extra:
+            healed = content.rstrip() + "\n" + extra
+            logger.info("Unit %s: continuation appended +%d chars.", uid, len(extra))
+            content = healed
+    if _has_open_fence(content):
+        content = _drop_dangling_fence_tail(content)
+        logger.warning("Unit %s: dropped a dangling unterminated fence tail.", uid)
+    return content
+
+
 async def _generate_section_text(
     section_prompt: str,
     codebase_chunks: List[str],
@@ -2038,7 +2166,7 @@ async def _generate_section_single_call(
         return ""
     try:
         ctx_win = _resolve_docgen_context_window() or 8192
-        max_p_tokens = max(1024, ctx_win - 2048)
+        max_p_tokens = max(1024, ctx_win - _COMPLETION_RESERVE_TOKENS)
 
         prompt = section_prompt
         if codebase_blob:
@@ -2075,7 +2203,7 @@ async def _reduce_section_drafts(
     if len(drafts) == 1:
         return drafts[0]
     ctx_win = _resolve_docgen_context_window() or 8192
-    max_p_tokens = max(1024, ctx_win - 2048)
+    max_p_tokens = max(1024, ctx_win - _COMPLETION_RESERVE_TOKENS)
     scaffold = (
         "Ниже представлены частичные черновики одного раздела документации,\n"
         "полученные из разных частей кодовой базы. Объедини их в один\n"
@@ -2166,7 +2294,7 @@ async def _agentic_bottom_up_docgen(
         return ""
 
     ctx_win = _resolve_docgen_context_window() or 8192
-    max_p_tokens = max(1024, ctx_win - 2048)
+    max_p_tokens = max(1024, ctx_win - _COMPLETION_RESERVE_TOKENS)
 
     # Phase 1: Map all file chunks to technical file summaries.
     # P1-24: chunks are independent LLM calls — run them with bounded
@@ -2874,6 +3002,9 @@ async def generate_codebase_docs(
                 if u.unit_id in units_to_generate
             }
             emit_progress(progress, phase="sections", sections_total=sections_total)
+            # Bound before the try so the missing-units diagnostics below can
+            # safely read the transcript even when the orchestrated run raised.
+            result: Any = None
             try:
                 from langchain_core.messages import HumanMessage
 
@@ -2933,11 +3064,25 @@ async def generate_codebase_docs(
                 uid for uid in units_to_generate if not agent_units.get(uid)
             ]
             if missing:
+                try:
+                    dispatched, failed_tasks = _orchestration_dispatch_stats(result)
+                except Exception:  # pragma: no cover - diagnostics never break the run
+                    dispatched, failed_tasks = set(), {}
+                never_dispatched = [u for u in missing if u not in dispatched]
+                dispatched_failed = {
+                    u: err for u, err in failed_tasks.items() if u in missing
+                }
                 logger.warning(
                     "Units missing after orchestration; python-parallel "
-                    "fallback for: %s",
-                    missing,
+                    "fallback for: %s (never dispatched: %s; dispatched but "
+                    "no usable text: %s)",
+                    missing, never_dispatched, sorted(dispatched_failed),
                 )
+                if dispatched_failed:
+                    logger.warning(
+                        "Orchestrator task failures: %s",
+                        dict(sorted(dispatched_failed.items())),
+                    )
                 try:
                     p_texts, p_files = await _run_parallel_section_agents(
                         chat, repo_dir,
@@ -3006,6 +3151,10 @@ async def generate_codebase_docs(
                     files_used = []
                 if not content:
                     content = _SECTION_UNAVAILABLE_PLACEHOLDER
+                else:
+                    # Token-limit cuts (unclosed fence / abrupt ending) get one
+                    # bounded continuation before the mermaid repair loop.
+                    content = await _heal_truncated_unit(uid, content, llm)
                 # Validate + repair any mermaid diagrams in this unit
                 # before storing it, so broken diagrams never reach the UI.
                 # Non-fatal by contract.

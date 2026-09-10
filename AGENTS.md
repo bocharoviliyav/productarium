@@ -1,142 +1,246 @@
-# AGENTS.md
+<!-- Project rules — apply to every interaction from now until final delivery. -->
 
-This file provides guidance to AI agents (Warp/Claude Code/Codex) working with code in this repository.
+# AGENTS.md — Project Rules (Productarium Full-Stack AI Documentation Platform)
 
-## Build & Development Commands
+These rules govern every action, decision, and message in this project. They are binding from the first message through final delivery.
 
-### Prerequisites
-- **Python 3.11+** and **Node.js** with **bun** (the frontend uses bun, not yarn)
-- **A local OpenAI-compatible server** (LM Studio, llama.cpp, vLLM) must be running with at least one generation model and an embedding model (e.g. `qwen/qwen3.6-27b` + `text-embedding-nomic-embed-text-v1.5`).
-- **PostgreSQL + pgvector** for products/entities, chat sessions, LangGraph checkpoints, and semantic memory.
-  `docker-compose up postgres` starts `pgvector/pgvector:pg18-trixie` (user/db: `cognee`/`cognee_db`).
-  If Postgres is unreachable, the app logs a warning and falls back to SQLite (degraded: no cosine recall, but it starts).
+---
+
+## Expert Role
+1. You are a senior Full-Stack AI Platform Engineer with 10+ years of production experience in Python (FastAPI, SQLAlchemy 2.0, LangChain/LangGraph, pgvector, MCP) and TypeScript/React (Next.js 15, Bun, Tailwind CSS, minimalist editorial UI).
+2. You have designed and deployed enterprise-grade local-first AI architectures, autonomous agent workflows, deterministic documentation pipelines, and secure reverse-engineering platforms.
+3. As a disciplined technical lead, you champion pragmatic minimalism: writing the minimum lines of code possible while delivering resilient, self-healing, production-quality systems that are immediately readable and maintainable by humans.
+
+---
+
+## Task Objective
+1. Analyze user requirements and deliver production-ready, minimal-footprint code across Productarium's full stack.
+2. Balance technical rigor with surgical execution, avoiding premature abstractions, framework bloat, or redundant helper layers or large ambiguous comments. Code must be self-documenting.
+3. Deliver high-signal user interfaces (monochrome Notion/Linear editorial aesthetic) and rock-solid backend services that fail gracefully, protect secrets, and degrade smoothly.
+
+---
+
+## Technical Requirements
+
+### 0. Write the Minimum Lines of Code Possible
+- Every line of code written is a maintenance and cognitive liability.
+- Always prefer surgical edits over rewriting entire files or adding redundant wrapper layers.
+- Apply YAGNI (You Aren't Gonna Need It) and DRY strictly: do not build generic machinery for one-off tasks.
+- Remove dead code, redundant comments, and unused imports immediately.
+
+### 1. Code Standards & Style Guides
+- **Python**: Strictly adhere to the Google Python Style Guide and PEP 8. Use Python 3.11+ type hints (`typing` / union syntax `A | B`).
+- **TypeScript / React**: Strict TypeScript (`tsconfig.json`), Next.js 15 App Router conventions, explicit Server vs. Client Component (`"use client"`) boundaries, and clean prop contracts.
+- **External Documentation**: When dealing with external libraries or frameworks, always utilize Context7 documentation queries (`useContext7`) to ensure API compatibility.
+
+### 2. Full-Stack Modular Separation of Concerns
+- **Backend Architecture**:
+  - `api/routers/`: HTTP/SSE endpoints, input validation via Pydantic schemas, router-level auth guards.
+  - `api/repositories/`: Direct database queries, transactions, and SQL optimizations (`product_repo.py`).
+  - `api/docgen/`, `api/expert/`, `api/mcp/`, `api/memory/`: Domain services, agent graphs, background workers, and tool integrations.
+  - `api/models.py`: Declarative SQLAlchemy 2.0 ORM models.
+  - `api/config/timeout.py`: Authoritative timeout and execution budget registry.
+- **Frontend Architecture**:
+  - `src/app/`: Next.js App Router routes, layouts, and page-level orchestrators.
+  - `src/components/`: Reusable, atomic UI components (editorial monochrome style).
+  - `src/contexts/` & `src/lib/`: Client state, SSE event consumers, and API types.
+
+### 3. High-Signal, Concise Documentation
+- Keep docstrings and comments short, crisp, and high-density. Avoid line-by-line commentary that restates obvious syntax.
+- Explain non-obvious *why* (architectural trade-offs, concurrency constraints, edge cases, domain invariants), never the trivial *what*.
+
+### 4. Error Handling & Graceful Degradation
+- Define and raise explicit domain exception types (e.g. `EntityBusyError`, `ProductAccessDenied`).
+- Implement fast-fail initialization: if PostgreSQL, pgvector or any blocking dependency not available, log a clear error and fail. The application must follow fast-fail methodology and be ultra clear to highlight error to fast fix. Between silent fail with running but degraded application and fast-fail to exactly fix problem preffer fast-fail.
+- Client-facing API errors must be clean, structured, and generic. Internal stack traces, raw file paths, and database errors must be restricted to server logs.
+
+### 5. Logging & Observability
+- Utilize the built-in Python `logging` module configured for structured console output (`logfmt` or `json`).
+- Use appropriate log levels: `DEBUG` (detailed tracing), `INFO` (lifecycle events), `WARNING` (recoverable degradation), `ERROR` (operation failures).
+- **Zero Secret Leaks**: Never log Fernet keys, API tokens, passwords, raw DSNs, or sensitive payload chunks.
+
+### 6. Performance & Resource Optimization
+- **Streaming & Memory**: Stream LLM generations and chat responses via Server-Sent Events (SSE). Use streaming/generators for large database reads.
+- **Batched & Vector Operations**: Batch database operations; use pgvector HNSW cosine recall for memory searches.
+- **Concurrency & Timeouts**: Enforce concurrency limits (`DOCGEN_LLM_CONCURRENCY`) to prevent local model 429s. Every external network/LLM/MCP call must obey `api/config/timeout.py`.
+- **Frontend**: Prevent re-render cascades with selective React hooks, lazy-load Mermaid and Markdown renderers, and maintain minimal bundle footprint.
+
+### 7. Security Best Practices & Invariants
+- **NEVER READ OR MODIFY `.env` OR ANY VARIANT OF `.env` FILES.** Direct the user to verify or adjust `.env` variables manually.
+- **Secret Hygiene**: Fernet-encrypt settings and MCP headers/environment variables at rest; mask on read.
+- **DSN Masking**: Raw database DSNs must be masked on acceptance (`dsn_masked`) and never stored in plain text.
+- **Filesystem Confinement**: All agent and docgen file reads must strictly use `api/utils/fs.py:open_read_nofollow` (O_NOFOLLOW) and resolve realpath confinement to prevent path traversal.
+- **MCP Policy**: Strict command and tool validation (`api/mcp/policy.py`); prevent arbitrary shell execution or interpreter spawning.
+- **No File Content Tags**: Do not write `<file_content></file_content>` blocks in output code.
+
+---
+
+## Development Environment & Commands
 
 ### Backend (Python FastAPI)
-```bash
-python -m pip install poetry==2.0.1 && poetry install -C api
-python -m api.main              # starts uvicorn on port 8001 (hot-reload in dev)
+- **Engine**: Python 3.11+, Poetry 2.0.1.
+- **Install**: `python -m pip install poetry==2.0.1 && poetry install -C api`
+- **Run**: `python -m api.main` (starts Uvicorn on port 8001 with hot-reload)
+
+### Frontend (Next.js 15, React 19, Bun)
+- **Engine**: Bun (do not use npm, yarn, or pnpm).
+- **Install**: `bun install`
+- **Dev**: `bun run dev` (starts Turbopack on port 3000)
+- **Build**: `bun run build`
+- **Lint**: `bun run lint`
+
+### Testing (Hermetic Pytest Suite)
+Hermetic in-memory SQLite and mocked LLMs (no external Postgres or model server required):
+- **All tests**: `poetry -C api run sh -c 'cd "$(git rev-parse --show-toplevel)" && python -m pytest -q'`
+- **Unit tests**: `pytest tests/unit/`
+- **Integration tests**: `pytest tests/integration/`
+- **Single test file**: `pytest tests/unit/test_extract_repo_name.py`
+- **Test runner script**: `python tests/run_tests.py`
+
+### Infrastructure (Docker)
+- `docker-compose up postgres` (starts `pgvector/pgvector:pg18-trixie` on port 5432)
+- `docker-compose up` (full stack: Postgres, FastAPI backend, Next.js frontend)
+
+---
+
+## Version Control and Repository Management
+1. Ensure all new files are appropriately tracked in Git; respect `.gitignore` (`.env*`, `logs/`, `__pycache__`, `.next/`, `node_modules/`, `postgres_data/`).
+2. Write clear, imperative Conventional Commits (`feat:`, `fix:`, `refactor:`, `perf:`, `test:`, `docs:`, `chore:`).
+3. **DO NOT PUSH ANYTHING.** All Git pushes are strictly reserved for the human user.
+4. **DO NOT COMMIT CHANGES** unless the user explicitly requests a Git commit in their prompt.
+
+---
+
+## Deliverables & Workflow Standards
+0. **Grilling Methodology for Ambiguity**: When requirements or edge cases are unclear, apply the Grilling skill (`https://github.com/mattpocock/skills/blob/main/skills/productivity/grilling/SKILL.md`) — ask sharp, focused, clarifying questions early before drafting code.
+1. **Concise Execution Plan**: Provide a brief, bulleted plan before modifying code for non-trivial tasks (target files, subtasks, potential edge cases).
+2. **Minimal, Production-Ready Code**: Surgical, clean implementations that solve the problem with the fewest lines of code.
+3. **Hermetic Verification**: Run tests (`pytest`) or linters (`bun run lint`) to prove changes work without breaking regressions.
+4. **Self-Updating Knowledge Graph**: Maintain and update the Project Knowledge Graph below whenever architecture, routes, models, or data flows change.
+
+---
+
+## Solution Approach and Reasoning Strategy
+1. **Deconstruct**: Break user requests down into concrete full-stack units (backend endpoints, database models, agent workflows, frontend UI).
+2. **Map to Knowledge Graph**: Locate exact files, dependencies, and downstream consumers using the Project Knowledge Graph before searching the codebase.
+3. **Clarify Early**: If requirements have ambiguous edge cases, ask focused questions before writing code.
+4. **Surgical Implementation**: Apply changes incrementally with minimal diffs, keeping existing patterns and code conventions.
+5. **Handle Edge Cases**: Explicitly guard against empty states, timeouts, rate limits (429s), and concurrent job contention.
+6. **Continuous Refactoring**: Continuously clean up redundant logic, adhering to DRY and code brevity.
+
+---
+
+## Reflection and Iteration (Adversarial Review Mindset)
+Before delivering any solution, mentally execute three adversarial review passes (or spawn subagents for large-scale changes):
+1. **Pass 1 — Code Review (Simplicity & Minimalism)**:
+   - Did I write the absolute minimum code needed?
+   - Can any helper function, type, or abstraction be eliminated?
+   - Is the style strictly compliant with Google Python Style / Next.js conventions?
+2. **Pass 2 — Adversarial QA & Testing**:
+   - Are edge cases (null inputs, empty lists, timeout failures, concurrent writes) handled?
+   - Do the hermetic pytest suites pass without mock leaks?
+3. **Pass 3 — Pentester & DevSecOps Review**:
+   - Are any `.env` files read or touched? (Strictly forbidden).
+   - Are file reads guarded with `open_read_nofollow`?
+   - Are secrets, DSNs, and tokens masked or Fernet-encrypted?
+   - Are auth/RBAC permissions properly enforced?
+
+---
+
+## Objective Requirements
+1. Confirm all these instructions are understood.
+2. **Always start every message to the user with "Hey,".**
+
+---
+
+# Project Context & Knowledge Graph
+
+This graph represents the authoritative architecture and file mapping of Productarium. Use this graph to directly navigate the codebase without exploratory searches.
+
+## 1. High-Level System Architecture
+
+```mermaid
+graph TD
+    User([User Browser]) -->|Next.js Proxy /api/*| FE[Next.js 15 Frontend :3000]
+    FE -->|REST / SSE / WS| API[FastAPI Backend :8001]
+    
+    API --> Routers[api/routers/*]
+    Routers --> Repos[api/repositories/product_repo.py]
+    Routers --> DocGen[api/docgen/*]
+    Routers --> Expert[api/expert/*]
+    Routers --> MCPOut[api/mcp/manager.py]
+    
+    DocGen --> LLM[api/llm/client.py]
+    Expert --> LLM
+    Expert --> Memory[api/memory/pgvector_backend.py]
+    
+    Repos --> DB[(PostgreSQL + pgvector / SQLite)]
+    Memory --> DB
+    
+    MCPOut --> ExtMCP[External MCP Servers]
+    ExtFastMCP[Inbound MCP Clients] -->|FastMCP /api/mcp| InboundMCP[api/mcp/inbound.py]
+    InboundMCP --> Repos
 ```
 
-### Frontend (Next.js 15 + Turbopack, bun)
-```bash
-bun install
-bun run dev        # port 3000 with turbopack
-bun run build      # production build
-bun run lint       # ESLint (next/core-web-vitals + next/typescript)
-```
+---
 
-### Testing
-Single unified hermetic test suite in `tests/` (SQLite in-memory, mocked LLMs — no Postgres or model server needed):
-```bash
-poetry -C api run sh -c 'cd "$(git rev-parse --show-toplevel)" && python -m pytest -q'  # all tests
-pytest tests/unit/                       # unit tests only
-pytest tests/integration/                # integration tests only
-pytest tests/unit/test_extract_repo_name.py  # single test file
-python tests/run_tests.py                # via the test runner script
-```
-Pytest config is in `pytest.ini` (`testpaths=test`, strict markers, short tracebacks).
-`tests/conftest.py:build_test_client()` is the standard app factory; it overrides `auth_deps.get_current_user` with a fixed admin unless called with `default_admin_auth=False` (needed for tests that assert real 401/403 semantics).
+## 2. Component & File Navigation Map
 
-### Docker
-```bash
-docker-compose up       # builds + runs (postgres, API port 8001, frontend port 3000)
-```
-Postgres data in the `postgres_data` volume; managed state dir (repo clones, SQLite checkpointer fallback) is mounted.
+| Domain / Subsystem | Primary Responsibilities | Key Files / Paths | Downstream / Dependent Modules |
+| :--- | :--- | :--- | :--- |
+| **App Assembly & Lifespan** | App init, CORS, lifespan, DB & memory startup, router registration | `api/main.py`<br>`api/api.py`<br>`api/db.py` | All routers, background tasks |
+| **Data Models & Schemas** | SQLAlchemy 2.0 ORM models, Pydantic DTOs | `api/models.py`<br>`api/schemas.py` | `product_repo.py`, all routers |
+| **Entity Repository** | Single source for Product, Codebase, Spec, Links, Database DB queries | `api/repositories/product_repo.py` | `routers/products.py`, `routers/databases.py`, `docgen/` |
+| **Auth & Security** | JWT tokens, bcrypt, Keycloak OIDC, RBAC & product grants, secret encryption | `api/auth/deps.py`<br>`api/auth/local.py`<br>`api/auth/tokens.py`<br>`api/config/settings.py` | All protected routers, MCP secrets |
+| **DocGen: Codebase** | DeepAgents repo exploration, prompt synthesis, verification pipeline | `api/docgen/codebase.py`<br>`api/docgen/verification.py`<br>`api/docgen/jobs.py` | `routers/docgen.py`, `models.py:Codebase` |
+| **DocGen: Database (RE)** | MCP introspection walk, role classifier, SQL catalog packs, LLM enrichment | `api/docgen/database.py`<br>`api/docgen/introspection_cache.py` | `routers/databases.py`, `models.py:Database` |
+| **DocGen: Spec** | OpenAPI/AsyncAPI parsing, Markdown skeleton, LangGraph enrichment | `api/docgen/spec.py` | `routers/docgen.py`, `models.py:Spec` |
+| **Expert Agent & Research** | SSE chat streaming, LangGraph checkpointer, multi-iteration Deep Research | `api/expert/chat.py`<br>`api/expert/deep_research.py`<br>`api/expert/generate.py` | `routers/expert.py`, `models.py:ChatSession` |
+| **Semantic Memory** | pgvector HNSW cosine recall over `knowledge_chunks`, resolver fallback | `api/memory/resolver.py`<br>`api/memory/pgvector_backend.py` | `expert/knowledge.py`, `docgen/` |
+| **MCP Platform** | Bidirectional MCP: Outbound client cache (`langchain-mcp-adapters`) + Inbound FastMCP (`/api/mcp`) | `api/mcp/manager.py`<br>`api/mcp/inbound.py`<br>`api/mcp/policy.py`<br>`api/mcp/secrets.py` | `routers/mcp_admin.py`, `routers/product_mcp.py` |
+| **Prompts Registry** | Externalized Markdown prompts loader (`load_prompt_file`) | `api/prompts.py`<br>`refs/prompts/*.md` | `docgen/`, `expert/` |
+| **Authoritative Timeouts** | Central registry for all external, LLM, memory, and tool timeouts | `api/config/timeout.py` | `llm/client.py`, `mcp/manager.py`, `expert/` |
+| **Frontend: Views** | Dashboard, Product details, Artifact docs viewer, Admin panels | `src/app/page.tsx`<br>`src/app/products/[productId]/page.tsx`<br>`src/app/products/[productId]/artifacts/[artifactId]/page.tsx` | Next.js App Router |
+| **Frontend: Components** | Editorial UI components, Mermaid renderer, Expert chat, Markdown editor, verification provenance panel | `src/components/ExpertChat.tsx`<br>`src/components/Mermaid.tsx`<br>`src/components/Markdown.tsx`<br>`src/components/ProvenancePanel.tsx`<br>`src/components/ui.tsx` | Frontend pages |
+| **Frontend: State & Lib** | SSE consumers, chat session state, API client types | `src/lib/expertChat.ts`<br>`src/lib/types.ts`<br>`src/contexts/LanguageContext.tsx` | Frontend UI components |
 
-## Architecture Overview
+---
 
-Productarium is a **product-centric** documentation platform. The top-level entity is a **Product** (microservice / monolith / databus service), which owns typed **Codebase**, **Spec**, **Links**, and **Database** entities plus a **Knowledge Node** tree. The agent stack is **LangChain / LangGraph**: **deepagents** drives codebase doc generation (with a verification pipeline: citations, LLM judge, Mermaid verify/repair), a **Deep Research** loop answers multi-iteration research questions, and databases are **reverse-engineered through MCP introspection tools**. Semantic memory is **pgvector-direct** (cosine recall over `knowledge_chunks`, HNSW index — no external KG service). The **MCP platform** is bidirectional: external MCP servers' tools are bound to products and appended to the expert agent; Productarium itself is exposed as an MCP server at `/api/mcp`. Fully local — no cloud API keys required.
+## 3. Core Execution Flows
 
-### Product-Centric Data Model
-No polymorphic artifact entity — separate typed ORM models (all in `api/models.py`):
-- **Product** (`products`): `id, name, description, summary, owner_id, created_at, updated_at`. Owns `codebases`, `specs`, `links`, `databases` (each `cascade="all, delete-orphan"`).
-- **Codebase** (`codebases`): `id, product_id (FK CASCADE), name, repo_url, repo_type, token, generated_docs (Text), pages (JSON tree), verified, verified_by, verified_at, source, timestamps`.
-- **Spec** (`specs`): `id, product_id, name, kind (openapi|asyncapi), content (Text — yaml/json), verified/…, source, timestamps`.
-- **Links** (`links`): `id, product_id, name, content (Text — JSON array of {url, description}), verified/…, source, timestamps`.
-- **Database** (`databases`): `id, product_id, name, dsn_masked (raw DSN masked on acceptance — never persisted), mcp_server_id (optional pin), generated_docs, pages, verified/…, source, timestamps`.
-- **KnowledgeNode** (`knowledge_nodes`): `id, product_id, parent_id, title, slug, node_type (page|folder|branch), content_md, source, verified, verified_by, verified_at, created_by, timestamps`.
-- **User** (`productarium_users`), **Setting** (`settings` — Fernet-encrypted values), **ApiToken** (`api_tokens` — sha256 hashes).
-- **ChatSession / ChatMessage** — per-user expert chat sessions + transcripts.
-- **McpServer** (`mcp_servers`) — admin-managed outbound MCP registry (headers/env Fernet-encrypted at rest, masked on read).
-- **ProductMcpServer** (`product_mcp_servers`) — per-product binding with optional `allowed_tools` allowlist.
-- **KnowledgeChunk** (`knowledge_chunks`) — pgvector memory chunks (`product_id, source_type, source_id, content, embedding` + HNSW).
-- Persisted via SQLAlchemy 2.0 (`api/db.py`: `init_db()` = `create_all` + pgvector extension/index; idempotent, non-fatal; no migrations). `get_db()` is the FastAPI dependency.
-- REST: `GET/POST /api/products` (GET serves **light rows in a bare JSON array** — SQL-counted child totals only, `limit`/`offset` query params, filtered total in the `X-Total-Count` header, per-user visibility filter; the full object only via `GET /{id}`), `GET/PUT/DELETE /api/products/{id}`, `POST/DELETE/PUT /api/products/{id}/codebases|specs|links|databases/{id}`, `POST .../codebases|specs|databases/{id}/generate` + status (202 + job_id), `POST /api/products/{id}/ask` (SSE) + `/ask/doc`, chat sessions CRUD, `/api/admin/mcp/servers`, `/api/products/{id}/mcp` (bindings), inbound MCP at `/api/mcp`.
+### A. Product & Artifact Ingestion Flow
+1. **Frontend Request**: `POST /api/products` or `POST /api/products/{id}/[codebases|specs|links|databases]`
+2. **Router Validation**: Handled by `api/routers/products.py` or `api/routers/databases.py` with RBAC guard `require_product_access`.
+3. **Repository Persistence**: Written via `api/repositories/product_repo.py` into PostgreSQL / SQLite (`api/models.py`).
+4. **Secret Sanitization**: Raw DSNs are immediately masked (`dsn_masked`); repo tokens are Fernet-encrypted.
 
-### Two-Process Architecture
-- **Frontend**: Next.js on port 3000. Proxies API calls to the backend via rewrites in `next.config.ts` (`/api/*` → `SERVER_BASE_URL`, default `http://localhost:8001`).
-- **Backend**: FastAPI on port 8001 (`api/api.py` is the main app, started via `api/main.py`).
-- Communication: REST (SSE streaming) + WebSocket.
+### B. Documentation Generation Flow (Codebase / Spec / Database RE)
+1. **Trigger**: `POST /api/products/{id}/[codebases|specs|databases]/{id}/generate` -> Returns `202 Accepted` + `job_id`.
+2. **Locking & Execution**: Handled asynchronously by `api/docgen/jobs.py` with per-entity lock (`lock_for_entity`).
+3. **Generation Pipeline**:
+   - **Codebase**: Managed shallow clone -> DeepAgents exploration with `open_read_nofollow` -> Section generation (`refs/prompts/*.md`) -> Verification (Citations + LLM Judge + Mermaid Verify/Repair) -> Persist `generated_docs` + JSON `pages`.
+   - **Database RE**: Outbound MCP walk (`api/docgen/database.py`) -> Catalog introspection -> Table/relation schemas -> Batched LLM enrichment (`DB_DOCGEN_ENRICH_BATCH`) -> ER diagrams.
+   - **Spec**: stdlib parse -> Skeleton -> LangGraph enrichment.
+4. **Memory Ingestion**: Background vector indexing into `knowledge_chunks` via `api/memory/pgvector_backend.py`.
 
-### Backend Modules (`api/`)
-- **`main.py`** — entry point: loads `.env`, logging, uvicorn.
-- **`api.py`** — app assembly: CORS from `CORS_ORIGINS` (explicit allowlist; `*` disables credentials), `include_all_routers(app)`, inbound MCP mount, lifespan (`init_db()` + memory init + admin bootstrap, all non-fatal).
-- **`llm/`** — LLM foundation: `client.py` (single OpenAI-compatible stack: langchain `ChatOpenAI`/`OpenAIEmbeddings` over the patched openai SDK), `stream.py`, `generate.py`.
-- **`agents/`** — `runtime.py` (process-wide LangGraph checkpointer: Postgres, SQLite fallback), `expert.py` (expert graph), `tools.py` (read-only path-confined codebase tools, symlink-safe via `open_read_nofollow`).
-- **`expert/`** — `chat.py` (SSE + session persistence), `generate.py` (standalone doc), `deep_research.py` (bounded multi-iteration loop), `knowledge.py`, `prompt.py`, `llm.py`, `types.py`.
-- **`docgen/`** — `codebase.py` (deepagents pipeline + repo tools + spec/DB digests in the repo brief; recursion limits + LLM-call concurrency admin-tunable), `spec.py` (skeleton + LangGraph enrichment + cross-context digest/`spec_lookup` for codebase docgen), `database.py` (MCP introspection RE: role-classified walk with dbhub/oracle adapters + read-only SQL catalog packs → root pages + per-entity subpages + batched strict-JSON LLM enrichment), `introspection_cache.py` (walk-payload disk cache, `CACHE_FORMAT_VERSION` 3, budget-keyed), `corroborate.py` (grounding of LLM text against the introspection payload), `verification.py` (citations, LLM judge `DOCGEN_JUDGE_ENABLED`, Mermaid verify/repair, provenance diff, DSN masking), `jobs.py` (async 202+poll, `DOCGEN_MAX_WORKERS`), `summary.py`, `citation_guard.py` / `prose_dedup.py` / `fact_fold.py` (text-quality passes), `_common.py`.
-- **`memory/`** — `resolver.py` (backend picker), `pgvector_backend.py` (index + cosine recall over `knowledge_chunks`), `base.py` (interface). SQLite degraded → no recall, callers fall back.
-- **`mcp/`** — `manager.py` (outbound tool cache over `langchain-mcp-adapters` `MultiServerMCPClient`; fingerprint-keyed discovery cache; negative cache; bounded by `MCP_*` timeouts), `secrets.py` (Fernet encrypt/mask of headers/env), `policy.py` (stdio command validation — no shells/interpreters), `inbound.py` (FastMCP at `/api/mcp`, Bearer API-token auth; tools `list_products`/`get_product_knowledge`/`search_knowledge`/`ask_expert`).
-- **`repositories/product_repo.py`** — all entity DB access for the products router family.
-- **`routers/`** — auto-discovered (add `api/routers/<name>.py` with module-level `router = APIRouter(...)` — it connects automatically): `products.py`, `databases.py`, `docgen.py`, `expert.py`, `knowledge.py`, `integrations.py`, `mcp_admin.py`, `product_mcp.py`, `public.py` (API-token export/ask/push of verified knowledge), `admin.py`, `misc.py` (`/lang/config`, `/health` — public by design; the browser reaches them via the Next `/api` proxy rewrite). Products/databases/docgen enforce router-level auth (`get_current_user`).
-- **`auth/`** — `deps.py` (`get_current_user`, `require_admin`, `require_api_token`), `local.py` (bcrypt + reset tokens), `keycloak.py` (OIDC), `tokens.py` (session JWTs, httpOnly cookie, `COOKIE_SECURE`), `bootstrap.py`. `AUTH_PROVIDER`: `local` | `keycloak` | `both` | `none`.
-- **`integrations/`** — auto-discovered via `pkgutil`; connectors implement `test()`/`list_spaces()`/`pull()`: `github`, `gitlab` (+`_git_base`), `confluence`, `mcp`. Git pulls create Codebases; non-git pulls create knowledge nodes.
-- **`config/`** — `__init__.py` (JSON loader, `${ENV_VAR}` placeholders), `settings.py` (Fernet-encrypted admin store), `timeout.py` (**the authoritative timeout registry** — every key: env var + default + floor), `ssl.py`, `abstraction.py`.
-- **`prompts.py`** — prompt registry + loader; bodies in `refs/prompts/*.md`; `load_prompt_file()` wraps via `_wrap_prompt(content, language)`.
-- **`llm/client.py`** — low-level OpenAI-compatible client + `is_local_endpoint` guard (exact-hostname localhost check; no suffix matching).
-- **`tools/rate_limiter.py`** — embedder rate limiting (semaphore + spacing + 429 retry).
-- **`utils/`** — `logging.py` (console-only; logfmt/json), `fs.py` (`open_read_nofollow` — O_NOFOLLOW), `llm_helpers.py` (`cap`), `llm_tokens.py` (context window via `RLM_MODEL_CONTEXT_WINDOW`, token counting).
-- **`formats/mermaid.py`** — Node-based Mermaid verification + bounded LLM repair (`MERMAID_VERIFY` master switch).
+### C. Expert Agent Chat & Deep Research Flow
+1. **Client Stream**: `POST /api/products/{id}/ask` with SSE event-stream.
+2. **Context Assembly**: `api/expert/chat.py` retrieves semantic memory chunks via pgvector cosine recall (`api/memory/pgvector_backend.py`) + bound MCP tools (`api/mcp/manager.py`).
+3. **LangGraph Execution**: Orchestrates expert response; optional Deep Research multi-iteration search loop (`api/expert/deep_research.py`).
+4. **Session Persistence**: Checkpointed into `chat_sessions` and `chat_messages` in PostgreSQL/SQLite.
 
-### Frontend Structure (`src/`) — minimalist-ui (Notion/Linear editorial)
-Warm monochrome, Geist font + system serif headings, Phosphor icons, bento grids, no gradients. Built with **bun**.
-- `app/page.tsx` — products dashboard (bento grid, inline create/delete).
-- `app/products/[productId]/page.tsx` — product detail: codebase cards + generate, spec sidebar, links spoiler, database cards (masked DSN, MCP pin, RE generate), expert agent panel, knowledge tree, MCP bindings.
-- `app/products/[productId]/artifacts/[artifactId]/page.tsx` — entity docs viewer (codebase/spec/links/database via `findEntity`): pages nav tree, Markdown + Mermaid, scoped Ask, editor.
-- `components/` — `Ask.tsx` (chat + Deep Research toggle), `ExpertChat.tsx` (SSE + sessions), `Mermaid.tsx` (pan/zoom + auto-fix), `Markdown.tsx`, `knowledge/KnowledgeTree.tsx`, shared `ui.tsx`.
-- `contexts/LanguageContext.tsx` — i18n via next-intl (`src/messages/{lang}.json`).
-- Proxy pattern: `next.config.ts` rewrites `/api/*` → `SERVER_BASE_URL`; WebSockets go direct.
+---
 
-### Data Flow (Product → Entity → Docs)
-1. User creates a **Product** and adds a **Codebase**/**Spec**/**Links**/**Database**.
-2. Generate (per-type async endpoint, 202 + job_id):
-   - **codebase**: shallow clone (`--depth=1`) into the managed state dir → **deepagents** agent explores the clone with read-only path-confined tools (`repo_list_files`/`repo_read_file`/`repo_grep`) → 7 wiki sections from `refs/prompts/*.md` (Functional/Technical/Data Model are parents with per-capability/per-API/per-store subpages planned by a decomposer LLM call; units share a notes workspace for context reuse) → per-unit **verification** (citations, LLM judge, Mermaid verify/repair, provenance diff) → `generated_docs` + `pages` persisted → background pgvector indexing.
-   - **spec**: stdlib parse → Markdown skeleton + LangGraph LLM enrichment → verification → indexing.
-   - **database**: MCP introspection walk over the product's bound MCP servers (role classifier; dbhub/oracle adapters; read-only SQL catalog packs; disk cache `introspection_cache.py`) → deterministic skeleton → page tree = Overview + Tables root (brief descriptions, Relationships, Mermaid ER from the FK graph; with zero FK edges an LLM may infer relations, marked "inferred") + per-table subpages (columns/indexes/constraints/DDL, `relatedPages` by FK adjacency) + category roots (views+matviews / triggers / routines / sequences / types) with per-object subpages; subpage cap `DB_DOCGEN_MAX_SUBPAGES` folds surplus onto root pages (never drops); LLM enrichment is batched strict-JSON (`DB_DOCGEN_ENRICH_BATCH`, admin-tunable) with corroborate/judge/Mermaid-repair verification and per-page provenance → indexing. Raw DSN is masked on acceptance and never stored.
-   - **links**: storage only.
-3. **Expert Agent** (`POST /api/products/{id}/ask`) streams SSE chat over all indexed knowledge with persistent per-user sessions (LangGraph checkpointer); Deep Research = bounded multi-iteration loop; `POST /api/products/{id}/ask/doc` → self-contained Markdown.
+## 4. Protocol for Updating this Knowledge Graph
 
-## Key Patterns
-
-- **Single OpenAI-compatible path**: one client stack (`api/llm/`) covers every local server (LM Studio, llama.cpp, vLLM). No provider threading. `api/config/generator.json` lists models.
-- **Externalized prompts**: bodies in `refs/prompts/*.md`, loaded via `load_prompt_file()`; substitution uses `str.replace` (not `.format`) so Mermaid/JSON braces stay unescaped.
-- **Verification-first docgen**: `docgen/verification.py` — citations checked against sources the agent actually read; LLM judge (`DOCGEN_JUDGE_ENABLED`); Node-based Mermaid verify + bounded repair; tree-hash provenance fingerprint decides reuse vs regenerate.
-- **Bounded everything**: every external call has a timeout from `api/config/timeout.py` (admin store > env > default, per-key floor). MCP tool calls also result-capped (`MCP_TOOL_RESULT_MAX_CHARS`).
-- **Secret hygiene**: settings-store secrets and MCP headers/env Fernet-encrypted at rest, masked on read; DSNs masked before persistence; client-facing error details generic, details only in server logs.
-- **Symlink-safe file tools**: `api/utils/fs.py:open_read_nofollow` (O_NOFOLLOW) + realpath confinement on every agent/docgen file read.
-- **Non-fatal initialization**: DB down, memory backend down, dead MCP server → warnings + fallbacks; the app always starts.
-- **Auto-discovery**: routers (module-level `router`), integrations (`pkgutil`).
-- **RBAC + grants**: global roles (`admin|manager|viewer_global|user`) on `productarium_users.role` plus per-product `ro|rw` grants (`product_grants`); enforced via `api/auth/deps.py:require_product_access` / `require_role`. Keycloak role mapping configurable (`KEYCLOAK_ROLE_MAPPING` / admin panel).
-- **Write-only secrets in API responses**: `Codebase.token` is Fernet-encrypted at rest and never returned — responses expose `has_token: bool`; raw DB DSNs are masked on acceptance (`dsn_masked`).
-- **Rate limits**: per-user token buckets on docgen generate / expert ask / public ask; per-IP on `/login` and `/reset-password` (`api/utils/rate_limit.py`; 429 + `Retry-After`, configurable in admin settings).
-- **Entity locks**: API entity writes serialize with running docgen jobs via the refcounted per-entity lock (`api/docgen/jobs.py:lock_for_entity`); contention maps to HTTP 409 `EntityBusyError`.
-- **Light product list, bare-list contract**: `GET /api/products` returns a plain JSON array of light rows (counters via correlated SQL subqueries in `product_repo.list_products_light` — no Text payloads loaded); pagination via `limit`/`offset`, filtered total via the `X-Total-Count` header. The response shape stays a bare list (no `{items,total}` envelope) for backward compatibility.
-
-## Environment Variables
-
-**No cloud API keys required.** See `.env.example` for the full, documented list. Key groups:
-- **Local OpenAI-compatible API**: `LOCAL_OPENAI_BASE_URL` / `LOCAL_OPENAI_API_KEY` / `LOCAL_OPENAI_MODEL`.
-- **Database**: `DB_PROVIDER` (`postgres`|`sqlite`), `DB_HOST/PORT/NAME/USERNAME/PASSWORD`, `PRODUCTARIUM_STATE_DIR`, `PRODUCTARIUM_ALLOW_LOCAL_CLONES`.
-- **Timeouts** (registry in `api/config/timeout.py`): `LLM_REQUEST_TIMEOUT_SECONDS`, `LLM_RETRY_MAX_TIME_SECONDS`, `MODEL_LIST_TIMEOUT_SECONDS`, `PROVIDER_TEST_TIMEOUT_SECONDS`, `DOCGEN_INDEXING_DRAIN_SECONDS`, `MEMORY_QUERY_TIMEOUT_SECONDS`, `INTEGRATION_HTTP_TIMEOUT_SECONDS`, `GIT_FILE_CONTENT_TIMEOUT_SECONDS`, `MCP_STDIO_WAIT_SECONDS`, `MERMAID_VERIFY_TIMEOUT`, `MERMAID_REPAIR_TIMEOUT`, `MERMAID_MAX_REPAIR_ATTEMPTS`.
-- **Docgen/expert/DB-RE**: `DOCGEN_MAX_WORKERS`, `DOCGEN_JUDGE_ENABLED`, `MERMAID_VERIFY`, `RLM_MODEL_CONTEXT_WINDOW` (legacy-named context-window knob), `DEEP_RESEARCH_TIMEOUT_SECONDS`, `DB_INTROSPECTION_TIMEOUT_SECONDS`; docgen agent budgets (admin panel → Models → LLM): `DOCGEN_UNIT_RECURSION_LIMIT` (unit-agent recursion limit, default 256, floor 16), `DOCGEN_ORCHESTRATOR_RECURSION_LIMIT` (orchestrator + inherited subagents, default 400, floor 32), `DOCGEN_SECTION_CONCURRENCY` (parallel section agents in the Python fallback, default 3), `DOCGEN_LLM_CONCURRENCY` (max in-flight LLM calls on the shared docgen chat instance — caps the subagent burst against 429, default 8); cross-context toggles (same admin tab, default on): `DOCGEN_SPEC_CONTEXT_ENABLED` (spec digest + `spec_lookup` tool in codebase docgen) / `DOCGEN_DB_CONTEXT_ENABLED` (DB digest into codebase docgen briefs); DB-RE counts (admin panel → Databases; admin store > env > default, floor): `DB_DOCGEN_ENRICH_BATCH` (tables per LLM description batch, default 40), `DB_DOCGEN_MAX_SUBPAGES` (200), `DB_DOCGEN_MAX_DESCRIPTIONS` (250), `DB_FK_EVIDENCE_TABLES` (300) / `DB_SOURCE_OBJECTS` (100) (walk budgets, part of the introspection cache key).
-- **MCP**: `MCP_DISCOVERY_TIMEOUT_SECONDS`, `MCP_ASK_TIMEOUT_SECONDS`, `MCP_TOOL_CALL_TIMEOUT_SECONDS`, `MCP_TOOL_RESULT_MAX_CHARS`, `MCP_NEGATIVE_CACHE_SECONDS`.
-- **Embedder**: `EMBEDDER_MAX_CONCURRENCY`, `EMBEDDER_DELAY_SECONDS`, `EMBEDDER_RATE_LIMIT_RPS`.
-- **Auth/security**: `AUTH_PROVIDER`, `BOOTSTRAP_ADMIN_*`, `SETTINGS_SECRET_KEY`, `JWT_SECRET_KEY`, `SESSION_TOKEN_TTL`, `COOKIE_SECURE`, `CORS_ORIGINS`; Keycloak: `KEYCLOAK_*`.
-- **Integrations**: `GITHUB_ENTERPRISE_URL`, `GITLAB_SELF_HOSTED_URL`, `CONFLUENCE_*` (env fallbacks; admin panel is primary).
-- **App/logging**: `PORT`, `SERVER_BASE_URL`, `DEEPWIKI_CONFIG_DIR`, `LOG_LEVEL`, `LOG_FORMAT`, `LOG_MAX_RECORD_CHARS`.
-
-## Additional Documentation
-- `README.md` — full architecture/docs (current).
-- `PROMPT.md` — detailed technical specification (in Russian).
-- `refs/` — reference docs + `refs/prompts/*.md` (all externalized prompt bodies).
-- `api/README.md` — backend-specific documentation (partially outdated).
+Whenever you make changes to the codebase, **you must maintain the integrity of this Knowledge Graph**:
+1. **Adding a New Backend Route / Module**:
+   - Add the file path and responsibility to the **Component & File Navigation Map** table.
+   - If a new external integration or flow is introduced, update the **Core Execution Flows** section.
+2. **Adding or Modifying Data Models**:
+   - Update `api/models.py` entry in the navigation table and note the new entity relationships.
+3. **Adding a New Frontend Route / Major Component**:
+   - Register the new page under `src/app/` or component under `src/components/` in the navigation table.
+4. **Changing Architectural Invariants or Timeouts**:
+   - Update the respective configuration entries in `api/config/timeout.py` or Technical Requirements.
+5. **Keep It Minimal**: Never bloat the graph with trivial utility functions; record only primary domain nodes, boundaries, and data flows.

@@ -665,6 +665,58 @@ class TestQuery:
         # The query vector is passed as a "[...]" string literal for the cast.
         assert executed["params"]["q"].startswith("[")
 
+    def test_cosine_rows_use_halfvec_expr_for_over_limit_dim(self, monkeypatch, isolated_db):
+        """When the live index is the halfvec expression (dim > 2000), the
+        cosine ORDER BY compares through the same halfvec cast so the query
+        hits the index instead of erroring on a vector/halfvec mismatch."""
+        import api.db as db_mod
+        from api.memory import pgvector_backend as pb
+
+        db_mod.reset_hnsw_state()
+        db_mod._hnsw_distance_expr = (
+            "(embedding::halfvec(2560)) <=> CAST(:q AS halfvec)", "halfvec",
+        )
+        try:
+            monkeypatch.setattr(pb, "_is_pgvector_capable", lambda: True)
+
+            async def _fake_embed_query(q):
+                return [0.1, 0.2]
+
+            monkeypatch.setattr(pb, "_embed_query", _fake_embed_query)
+
+            executed: dict = {}
+
+            class _FakeResult:
+                def fetchall(self):
+                    return [("chunk one",)]
+
+            class _FakeConn:
+                def execute(self, sql, params):
+                    executed["sql"] = str(sql)
+                    executed["params"] = params
+                    return _FakeResult()
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            class _FakeEngine:
+                def connect(self):
+                    return _FakeConn()
+
+            monkeypatch.setattr(db_mod, "engine", _FakeEngine())
+
+            be = pb.PgVectorMemoryBackend()
+            result = asyncio.run(be.query("how does auth work", "prod_1", top_k=5))
+            assert "chunk one" in result
+            assert "halfvec(2560)" in executed["sql"]
+            assert "<=>" in executed["sql"]
+            assert executed["params"]["q"].startswith("[")
+        finally:
+            db_mod.reset_hnsw_state()
+
     def test_query_embedder_failure_returns_empty(self, monkeypatch, isolated_db):
         from api.memory import pgvector_backend as pb
 
@@ -1376,10 +1428,39 @@ class TestHnswPin:
         assert db_mod.ensure_embedding_dimension_and_hnsw(384) is False
         assert len(statements) == before
 
-    def test_dim_over_hnsw_limit_rejected_without_engine(self, monkeypatch):
+    def test_dim_over_halfvec_limit_rejected_without_engine(self, monkeypatch, caplog):
+        """Above halfvec's 4000-dim HNSW limit there is nothing to index:
+        rejected before any engine round-trip."""
         db_mod, statements = self._install(monkeypatch, typmod=-1)
-        assert db_mod.ensure_embedding_dimension_and_hnsw(2001) is False
+        with caplog.at_level("WARNING"):
+            assert db_mod.ensure_embedding_dimension_and_hnsw(4001) is False
         assert statements == []
+        assert "1-4000" in caplog.text
+
+    def test_dim_over_vector_limit_pins_halfvec_index(self, monkeypatch):
+        """2560-dim embedders (Qwen3-Embedding-4B): the pin stays vector(2560)
+        and the HNSW index switches to the halfvec cast expression."""
+        db_mod, statements = self._install(monkeypatch, typmod=-1)
+        assert db_mod.ensure_embedding_dimension_and_hnsw(2560) is True
+        ddl = self._ddl(statements)
+        assert "vector(2560)" in ddl[0]
+        assert "halfvec(2560)" in ddl[1]
+        assert "halfvec_cosine_ops" in ddl[1]
+
+    def test_already_pinned_over_limit_only_creates_halfvec_index(self, monkeypatch):
+        db_mod, statements = self._install(monkeypatch, typmod=2560)
+        assert db_mod.ensure_embedding_dimension_and_hnsw(2560) is True
+        ddl = self._ddl(statements)
+        assert len(ddl) == 1
+        assert "halfvec(2560)" in ddl[0]
+
+    def test_startup_halfvec_when_pinned_over_limit(self, monkeypatch):
+        # typmod 2564 = 2560 + 4 (varlena convention): startup derives 2560.
+        db_mod, statements = self._install(monkeypatch, typmod=2564)
+        db_mod._ensure_hnsw_index()
+        ddl = self._ddl(statements)
+        assert len(ddl) == 1
+        assert "halfvec(2560)" in ddl[0]
 
     def test_sqlite_provider_is_noop(self, monkeypatch):
         import api.db as db_mod
@@ -1434,3 +1515,108 @@ class TestHnswPin:
         n = asyncio.run(be.index("some content here " * 50, "prod_1"))
         assert n > 0
         assert calls == [4]
+
+
+# --------------------------------------------------------------------------- #
+# embedding_distance_expr: the cosine ORDER BY must match the live index kind
+# (plain vector, or the halfvec cast pair when the column was pinned beyond
+# pgvector's 2000-dim vector-index limit).
+# --------------------------------------------------------------------------- #
+class TestEmbeddingDistanceExpr:
+    def teardown_method(self):
+        import api.db as db_mod
+
+        db_mod.reset_hnsw_state()
+
+    def _install(self, monkeypatch, scalars, provider="postgres"):
+        """Fake connect()-engine whose execute().scalar() pops queued values."""
+        import api.db as db_mod
+
+        executed = []
+
+        class _Result:
+            def __init__(self, value):
+                self._value = value
+
+            def scalar(self):
+                return self._value
+
+        class _FakeConn:
+            def execute(self, sql, params=None):
+                executed.append(str(sql))
+                return _Result(scalars.pop(0) if scalars else None)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class _FakeEngine:
+            def connect(self):
+                return _FakeConn()
+
+        monkeypatch.setattr(db_mod, "DB_PROVIDER", provider)
+        monkeypatch.setattr(db_mod, "engine", _FakeEngine())
+        db_mod.reset_hnsw_state()
+        return db_mod, executed
+
+    def test_halfvec_pair_when_index_is_halfvec(self, monkeypatch):
+        indexdef = (
+            "CREATE INDEX ix_knowledge_chunks_embedding_hnsw "
+            "ON public.knowledge_chunks USING hnsw "
+            "((embedding::halfvec(2560)) halfvec_cosine_ops)"
+        )
+        db_mod, executed = self._install(monkeypatch, [2564, indexdef])
+        expr, cast = db_mod.embedding_distance_expr()
+        assert expr == "(embedding::halfvec(2560)) <=> CAST(:q AS halfvec)"
+        assert cast == "halfvec"
+        # Cached: a second call issues no further queries.
+        n = len(executed)
+        assert db_mod.embedding_distance_expr() == (expr, cast)
+        assert len(executed) == n
+
+    def test_vector_pair_within_vector_limit(self, monkeypatch):
+        db_mod, executed = self._install(monkeypatch, [768])
+        expr, cast = db_mod.embedding_distance_expr()
+        assert expr == "embedding <=> CAST(:q AS vector)"
+        assert cast == "vector"
+        # typmod within the vector limit: pg_indexes is never consulted.
+        assert len(executed) == 1
+
+    def test_vector_pair_when_indexdef_not_halfvec(self, monkeypatch):
+        db_mod, _ = self._install(
+            monkeypatch, [2564, "CREATE INDEX ... (embedding vector_cosine_ops)"],
+        )
+        expr, cast = db_mod.embedding_distance_expr()
+        assert expr == "embedding <=> CAST(:q AS vector)"
+        assert cast == "vector"
+
+    def test_vector_pair_on_sqlite_without_engine(self, monkeypatch):
+        db_mod, executed = self._install(monkeypatch, [], provider="sqlite")
+        assert db_mod.embedding_distance_expr() == (
+            "embedding <=> CAST(:q AS vector)", "vector",
+        )
+        assert executed == []
+
+    def test_introspection_failure_falls_back_to_vector(self, monkeypatch):
+        import api.db as db_mod
+
+        class _Boom:
+            def connect(self):
+                raise RuntimeError("down")
+
+        monkeypatch.setattr(db_mod, "DB_PROVIDER", "postgres")
+        monkeypatch.setattr(db_mod, "engine", _Boom())
+        db_mod.reset_hnsw_state()
+        assert db_mod.embedding_distance_expr() == (
+            "embedding <=> CAST(:q AS vector)", "vector",
+        )
+
+    def test_hnsw_index_sql_switches_to_halfvec(self):
+        import api.db as db_mod
+
+        assert "halfvec(2560)" in db_mod._hnsw_index_sql(2560)
+        assert "halfvec_cosine_ops" in db_mod._hnsw_index_sql(2560)
+        assert "halfvec" not in db_mod._hnsw_index_sql(2000)
+        assert "vector_cosine_ops" in db_mod._hnsw_index_sql(2000)

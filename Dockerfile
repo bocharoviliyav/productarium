@@ -96,6 +96,12 @@ COPY tiktoken_cache/ /opt/tiktoken_cache/
 COPY --from=node_builder /app/public ./public
 COPY --from=node_builder /app/.next/standalone ./
 COPY --from=node_builder /app/.next/static ./.next/static
+# Runtime mermaid bundle for the headless diagram validator
+# (api/_mermaid_validate.mjs). The .next/standalone output does NOT include
+# it — Next bundles mermaid into static chunks — and the validator imports
+# the package directly from node_modules. The ESM bundle is self-contained
+# (relative chunks only, no external deps), so this one COPY is enough.
+COPY --from=node_deps /app/node_modules/mermaid ./node_modules/mermaid
 
 # Expose the port the app runs on
 EXPOSE ${PORT:-8001} 3000

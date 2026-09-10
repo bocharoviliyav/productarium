@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
@@ -312,17 +313,79 @@ def _embedding_column_typmod(conn: Any) -> Optional[int]:
 
 # pgvector cannot index a dimensionless `vector` column, so the pin + index
 # run ONCE, when the first real embedding batch reveals the embedder dim.
-_HNSW_MAX_DIM = 2000  # pgvector HNSW dimension limit
+# Above the vector-index limit the index switches to the halfvec CAST
+# expression (pgvector >= 0.7), which HNSW supports up to 4000 dims — covers
+# 2560-dim embedders (e.g. Qwen3-Embedding-4B) that previously fell back to
+# a sequential scan.
+_HNSW_VECTOR_INDEX_MAX_DIM = 2000  # vector_cosine_ops HNSW dimension limit
+_HNSW_MAX_DIM = 4000               # halfvec_cosine_ops HNSW dimension limit
 _hnsw_lock = threading.Lock()
 _hnsw_ready: bool = False
 _hnsw_failed: Optional[str] = None
+# Cached (cosine ORDER BY expression, query param cast) derived from the live
+# index kind — invalidated on every (re)build and by reset_hnsw_state.
+_hnsw_distance_expr: Optional[Tuple[str, str]] = None
+
+
+def _hnsw_index_sql(dim: int) -> str:
+    """CREATE INDEX statement for the embedding HNSW index at ``dim``.
+
+    Queries must compare through the SAME expression the index uses — see
+    :func:`embedding_distance_expr`.
+    """
+    target = (
+        f"((embedding::halfvec({dim})) halfvec_cosine_ops)"
+        if dim > _HNSW_VECTOR_INDEX_MAX_DIM
+        else "(embedding vector_cosine_ops)"
+    )
+    return (
+        "CREATE INDEX IF NOT EXISTS ix_knowledge_chunks_embedding_hnsw "
+        f"ON knowledge_chunks USING hnsw {target}"
+    )
+
+
+def embedding_distance_expr() -> Tuple[str, str]:
+    """(cosine ORDER BY expression, param cast) matching the live HNSW index.
+
+    ``("embedding <=> CAST(:q AS vector)", "vector")`` normally; the halfvec
+    cast pair when the pinned column exceeds the 2000-dim vector-index limit
+    and the existing index is the halfvec expression index. Derived from the
+    actual index definition (cached) so the query always hits the index.
+    """
+    global _hnsw_distance_expr
+    if _hnsw_distance_expr is not None:
+        return _hnsw_distance_expr
+    pair: Tuple[str, str] = ("embedding <=> CAST(:q AS vector)", "vector")
+    try:
+        if _is_postgres():
+            from sqlalchemy import text
+
+            with engine.connect() as conn:
+                typmod = _embedding_column_typmod(conn)
+                if typmod is not None and typmod > _HNSW_VECTOR_INDEX_MAX_DIM:
+                    indexdef = conn.execute(text(
+                        "SELECT indexdef FROM pg_indexes "
+                        "WHERE indexname = 'ix_knowledge_chunks_embedding_hnsw'"
+                    )).scalar()
+                    if indexdef and "halfvec" in indexdef:
+                        m = re.search(r"halfvec\((\d+)\)", indexdef)
+                        dim = m.group(1) if m else str(typmod)
+                        pair = (
+                            f"(embedding::halfvec({dim})) <=> CAST(:q AS halfvec)",
+                            "halfvec",
+                        )
+        _hnsw_distance_expr = pair
+    except Exception as e:  # pragma: no cover - introspection is non-fatal
+        logger.debug("embedding distance expression introspection failed: %s", e)
+    return pair
 
 
 def reset_hnsw_state() -> None:
     """Drop the cached HNSW pin/index state (tests)."""
-    global _hnsw_ready, _hnsw_failed
+    global _hnsw_ready, _hnsw_failed, _hnsw_distance_expr
     _hnsw_ready = False
     _hnsw_failed = None
+    _hnsw_distance_expr = None
 
 
 def ensure_embedding_dimension_and_hnsw(dim: int) -> bool:
@@ -385,11 +448,9 @@ def ensure_embedding_dimension_and_hnsw(dim: int) -> bool:
                         f"but the embedder produces {dim}-dim vectors; reindex "
                         f"or clear the product memory to re-pin"
                     )
-                conn.exec_driver_sql(
-                    "CREATE INDEX IF NOT EXISTS ix_knowledge_chunks_embedding_hnsw "
-                    "ON knowledge_chunks USING hnsw (embedding vector_cosine_ops)"
-                )
+                conn.exec_driver_sql(_hnsw_index_sql(dim))
             _hnsw_ready = True
+            _hnsw_distance_expr = None
             return True
         except Exception as e:
             _hnsw_failed = str(e)
@@ -431,10 +492,10 @@ def _ensure_hnsw_index() -> None:
                     "api.db.ensure_embedding_dimension_and_hnsw)."
                 )
                 return
-            conn.exec_driver_sql(
-                "CREATE INDEX IF NOT EXISTS ix_knowledge_chunks_embedding_hnsw "
-                "ON knowledge_chunks USING hnsw (embedding vector_cosine_ops)"
-            )
+            # Near/above the 2000-dim limit prefer the dim+4 typmod reading so
+            # an over-limit pin gets the halfvec expression index here too.
+            dim = typmod - 4 if typmod > _HNSW_VECTOR_INDEX_MAX_DIM else typmod
+            conn.exec_driver_sql(_hnsw_index_sql(max(1, dim)))
         _hnsw_ready = True
     except Exception as e:  # pragma: no cover - depends on live Postgres
         logger.warning("Could not create HNSW index on knowledge_chunks.embedding (non-fatal): %s", e)

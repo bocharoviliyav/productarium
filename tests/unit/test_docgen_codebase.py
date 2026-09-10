@@ -1373,6 +1373,91 @@ class _FakeOrchestrator:
         return {"messages": self._messages}
 
 
+class TestOrchestrationDispatchStats:
+    """_orchestration_dispatch_stats: split WHY units are missing after an
+    orchestrated run — never dispatched vs dispatched-but-failed (the pilot
+    log could not tell a truncated dispatch apart from a 429-killed
+    subagent)."""
+
+    def _task_call(self, sid, call_id):
+        return {
+            "name": "task",
+            "args": {
+                "description": f"write {sid}",
+                "subagent_type": f"section-{sid}",
+            },
+            "id": call_id,
+        }
+
+    def _transcript(self, calls, tool_messages):
+        from types import SimpleNamespace
+
+        messages = []
+        if calls:
+            messages.append(SimpleNamespace(type="ai", content="", tool_calls=calls))
+        messages.extend(tool_messages)
+        return SimpleNamespace(messages=messages)
+
+    @staticmethod
+    def _tool_msg(call_id, content):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(type="tool", tool_call_id=call_id, content=content)
+
+    def test_dispatched_and_ok_not_reported_failed(self):
+        result = self._transcript(
+            [self._task_call("overview", "c1")],
+            [self._tool_msg("c1", "Agent wrote the overview about `main.py`.")],
+        )
+        dispatched, failed = cb._orchestration_dispatch_stats(result)
+        assert dispatched == {"overview"}
+        assert failed == {}
+
+    def test_error_wrapper_marks_failed_with_capped_error_head(self):
+        err = "We cannot invoke subagent due to error: 429 rate limit " + "x" * 300
+        result = self._transcript(
+            [self._task_call("overview", "c1")],
+            [self._tool_msg("c1", err)],
+        )
+        dispatched, failed = cb._orchestration_dispatch_stats(result)
+        assert dispatched == {"overview"}
+        assert failed["overview"].startswith("We cannot invoke subagent")
+        assert len(failed["overview"]) == 200  # head capped at 200 chars
+
+    def test_empty_task_result_marks_failed(self):
+        result = self._transcript(
+            [self._task_call("overview", "c1")],
+            [self._tool_msg("c1", "   ")],
+        )
+        _, failed = cb._orchestration_dispatch_stats(result)
+        assert failed["overview"] == "empty task result"
+
+    def test_unit_without_task_call_is_never_dispatched(self):
+        result = self._transcript(
+            [self._task_call("overview", "c1")],
+            [self._tool_msg("c1", "ok text")],
+        )
+        dispatched, failed = cb._orchestration_dispatch_stats(result)
+        # architecture had no `task` call at all: absent from both maps.
+        assert "architecture" not in dispatched
+        assert "architecture" not in failed
+
+    def test_none_result_yields_empty_collections(self):
+        # Orchestrated run raised -> result stayed None: diagnostics degrade.
+        assert cb._orchestration_dispatch_stats(None) == (set(), {})
+
+    def test_non_task_tool_calls_ignored(self):
+        call = {
+            "name": "read_file",  # not a dispatch
+            "args": {"subagent_type": "section-overview"},
+            "id": "c1",
+        }
+        result = self._transcript([call], [self._tool_msg("c1", "file text")])
+        dispatched, failed = cb._orchestration_dispatch_stats(result)
+        assert dispatched == set()
+        assert failed == {}
+
+
 class TestDocgenAgentFlow:
     """Full generate_codebase_docs runs with the subagent seams patched in.
 
@@ -1616,6 +1701,60 @@ class TestDocgenAgentFlow:
         par_prov = fake_artifact.pages[f"page_{missing[-1]}"]["provenance"]
         assert par_prov["generator"] == "deepagents"
         assert par_prov["source_files"] == ["src/parallel.py"]
+
+    def test_missing_units_log_dispatch_split(
+        self, fake_artifact, fake_product, fake_repo_dir, monkeypatch, caplog
+    ):
+        """Pilot bug 3 diagnostics: the 'Units missing after orchestration'
+        warning splits never-dispatched units (orchestrator truncation) from
+        dispatched ones whose subagent returned no usable text (429-killed,
+        the deepagents error wrapper), and a second warning carries the error
+        heads for the failed tasks."""
+        import logging
+
+        ok = dict.fromkeys(cb.SECTION_ORDER[:2], "Orchestrated section text")
+        failed_sid = cb.SECTION_ORDER[2]
+        ok[failed_sid] = "We cannot invoke subagent due to error: 429 rate limit"
+        orchestrator = _FakeOrchestrator(ok)
+        parallel_calls: Dict[str, Any] = {}
+
+        async def fake_parallel(chat, repo_dir, system_prompts, dispatches, tracker,
+                                notes_dir=None, spec_tools=None):
+            parallel_calls["sids"] = list(system_prompts)
+            return (
+                {sid: f"Parallel wrote {sid}" for sid in system_prompts},
+                {sid: ["main.py"] for sid in system_prompts},
+            )
+
+        self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator,
+                         parallel=fake_parallel)
+
+        with caplog.at_level(logging.WARNING, logger="api.docgen.codebase"):
+            asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
+
+        missing = cb.SECTION_ORDER[2:]
+        # The fallback runs for exactly the missing units.
+        assert parallel_calls["sids"] == missing
+        split = next(
+            r for r in caplog.records
+            if "Units missing after orchestration" in r.getMessage()
+        )
+        msg = split.getMessage()
+        # never-dispatched list = the units with NO task call at all.
+        never_part = msg.split("(never dispatched: ", 1)[1].split(
+            "; dispatched but", 1
+        )[0]
+        assert f"'{cb.SECTION_ORDER[3]}'" in never_part
+        assert f"'{failed_sid}'" not in never_part
+        # The 429-wrapped unit lands in the dispatched-but-failed bucket.
+        assert f"dispatched but no usable text: ['{failed_sid}']" in msg
+        failures = [
+            r for r in caplog.records
+            if "Orchestrator task failures" in r.getMessage()
+        ]
+        assert len(failures) == 1
+        assert "429" in failures[0].getMessage()
+        assert failed_sid in failures[0].getMessage()
 
     def test_orchestrator_failure_full_parallel_success(self, fake_artifact, fake_product, fake_repo_dir, monkeypatch):
         orchestrator = _FakeOrchestrator({}, error=RuntimeError("orchestrator exploded"))
@@ -3021,3 +3160,78 @@ def _async_return(value):
     async def _inner(*a, **kw):
         return value
     return _inner
+
+
+# ============================================================================
+# Truncation detection + healing (token-limit cuts mid-mermaid / mid-sentence)
+# ============================================================================
+class TestTruncationHeuristics:
+    def test_has_open_fence(self):
+        assert cb._has_open_fence("# T\n\n```mermaid\nflowchart TD\n  A") is True
+        assert cb._has_open_fence("# T\n\n```python\nx = 1\n```") is False
+        assert cb._has_open_fence("plain prose") is False
+
+    def test_looks_truncated(self):
+        assert cb._looks_truncated("") is False
+        # Open fence signals a cut regardless of length.
+        assert cb._looks_truncated("```mermaid\nflowchart TD\n  A") is True
+        # Abrupt ending below the length threshold is inconclusive.
+        assert cb._looks_truncated("Обрыв на полусл") is False
+        long = "Предложение текста. " * 30
+        assert cb._looks_truncated(long + "и вот обрыв на полусл") is True
+        assert cb._looks_truncated(long + "Завершённый текст.") is False
+        assert cb._looks_truncated(long + "перечисление начинается,") is True
+
+    def test_drop_dangling_fence_tail(self):
+        text = "# Заголовок\n\n```mermaid\nflowchart TD\n  A"
+        assert cb._drop_dangling_fence_tail(text) == "# Заголовок"
+        balanced = "# T\n\n```python\nx = 1\n```\n\nХвост."
+        assert cb._drop_dangling_fence_tail(balanced) == balanced
+
+    def test_heal_skips_complete_content(self):
+        async def llm(prompt):
+            pytest.fail("LLM must not be called for complete content")
+
+        content = "# Раздел\n\nЗавершённый текст."
+        assert asyncio.run(cb._heal_truncated_unit("u1", content, llm)) == content
+
+    def test_heal_appends_continuation(self):
+        content = "# Архитектура\n\n" + "Описание компонента. " * 40 + "обрыв на"
+
+        class _LLM:
+            async def generate(self, prompt):
+                assert "<fragment>" in prompt
+                return "полусловии.\n\n## Итог"
+
+        healed = asyncio.run(cb._heal_truncated_unit("u1", content, _LLM()))
+        assert healed.startswith(content.rstrip())
+        assert healed.endswith("## Итог")
+
+    def test_heal_drops_open_fence_without_llm(self):
+        content = "# T\n\n" + "текст. " * 100 + "\n\n```mermaid\nflowchart TD\n  A"
+        healed = asyncio.run(cb._heal_truncated_unit("u1", content, None))
+        assert "```" not in healed
+        assert healed.startswith("# T")
+
+    def test_single_call_reserves_completion_budget(self, monkeypatch):
+        """The prompt-fit budget leaves 4096 tokens for the answer (the old
+        2048 reserve is what cut pages mid-mermaid)."""
+        monkeypatch.setattr(cb, "_resolve_docgen_context_window", lambda: 8192)
+        captured: Dict[str, Any] = {}
+
+        def fake_fit(blob, budget, prefix=None):
+            captured["budget"] = budget
+            return "fitted blob"
+
+        monkeypatch.setattr(cb, "_fit_file_blocks_to_budget", fake_fit)
+
+        class _LLM:
+            async def generate(self, prompt):
+                return "section text"
+
+        result = asyncio.run(
+            cb._generate_section_single_call("prompt", "blob", _LLM())
+        )
+        assert result == "section text"
+        assert cb._COMPLETION_RESERVE_TOKENS == 4096
+        assert captured["budget"] == 8192 - cb._COMPLETION_RESERVE_TOKENS

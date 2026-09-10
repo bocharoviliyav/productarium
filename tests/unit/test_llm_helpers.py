@@ -9,6 +9,8 @@ Covers:
   no-op, empty block).
 - ``strip_inline_line_numbers`` (fenced code blocks, mermaid blocks skipped,
   prose untouched, no fence passthrough, empty/None input).
+- ``strip_llm_preamble`` (ru/en meta lead-ins stripped, content lead-ins and
+  meta lines without a colon kept, structural-first untouched).
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from api.utils.llm_helpers import (
     cap,
     safe_replace,
     strip_inline_line_numbers,
+    strip_llm_preamble,
     strip_number_prefixes_from_block,
 )
 
@@ -253,6 +256,44 @@ class TestStripInlineLineNumbers:
         assert "1000" in result
         assert "2000" in result
         assert "3000" in result
+
+
+# ---------------------------------------------------------------------------
+# strip_llm_preamble
+# ---------------------------------------------------------------------------
+
+class TestStripLlmPreamble:
+    def test_empty(self):
+        assert strip_llm_preamble("") == ""
+        assert strip_llm_preamble(None) == ""
+
+    def test_english_meta_line_stripped(self):
+        text = (
+            "Now let me generate the final architecture section:\n"
+            "# Архитектура\n\nОбзор системы."
+        )
+        assert strip_llm_preamble(text) == "# Архитектура\n\nОбзор системы."
+
+    def test_russian_meta_lines_stripped(self):
+        text = "Хорошо, продолжим:\nВот финальный вариант:\n\n## Схема"
+        assert strip_llm_preamble(text) == "## Схема"
+
+    def test_content_lead_in_kept(self):
+        text = "Основные компоненты системы:\n\n- ядро\n- API"
+        assert strip_llm_preamble(text) == text
+
+    def test_meta_without_colon_kept(self):
+        # Not a lead-in into following content — conservative keep.
+        text = "Now let me think about the structure.\n\n# Заголовок"
+        assert strip_llm_preamble(text) == text
+
+    def test_structural_first_untouched(self):
+        text = "```mermaid\nflowchart TD\n  A --> B\n```"
+        assert strip_llm_preamble(text) == text
+
+    def test_meta_before_prose_stripped(self):
+        text = "Хорошо, вот краткое резюме:\nПрозаический ответ модели."
+        assert strip_llm_preamble(text) == "Прозаический ответ модели."
 
 
 # ---------------------------------------------------------------------------

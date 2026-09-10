@@ -44,6 +44,17 @@ def _clear_cache():
     _MODEL_CTX_CACHE.clear()
 
 
+@pytest.fixture(autouse=True)
+def _block_unmocked_post(monkeypatch):
+    """Hermetic guard: the Ollama /api/show context probe POSTs; unless a
+    test mocks ``requests.post`` explicitly, refuse fast instead of touching
+    the network ("Single unified hermetic test suite")."""
+    def _refuse(*args, **kwargs):
+        raise ConnectionError("requests.post not mocked in this test")
+
+    monkeypatch.setattr("requests.post", _refuse)
+
+
 # ---------------------------------------------------------------------------
 # get_model_context_window — env var overrides
 # ---------------------------------------------------------------------------
@@ -311,15 +322,18 @@ class TestLiveApiQuery:
 
     def test_url_normalization_appends_v1(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
-        captured = {}
+        urls = []
 
         def fake_get(url, **kw):
-            captured["url"] = url
+            urls.append(url)
             return types.SimpleNamespace(status_code=200, json=lambda: {"data": []})
 
         monkeypatch.setattr("requests.get", fake_get)
         get_model_context_window(base_url="http://localhost:8080", model_name="m")
-        assert captured["url"] == "http://localhost:8080/v1/models"
+        # The OpenAI-compatible probe is always the FIRST request; the native
+        # follow-up probes (LM Studio /api/v0/models, llama.cpp /props) only
+        # run afterwards when /v1/models yields nothing.
+        assert urls[0] == "http://localhost:8080/v1/models"
 
     def test_authorization_header_sent(self, monkeypatch):
         monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
@@ -383,6 +397,121 @@ class TestLiveApiQuery:
         # No model_name -> should use default
         result = get_model_context_window()
         assert result == 8192
+
+
+# ---------------------------------------------------------------------------
+# get_model_context_window — server-native probes
+# (LM Studio /api/v0/models, llama.cpp /props, Ollama /api/show)
+# ---------------------------------------------------------------------------
+
+class TestServerNativeProbes:
+    """LM Studio, llama.cpp and Ollama list bare ids in ``/v1/models`` and
+    publish the context window only through their NATIVE endpoints. The
+    probes close the pilot gap where a 262k model silently resolved to
+    8192 (clamping every docgen budget, completion max_tokens included)."""
+
+    @staticmethod
+    def _dispatch(monkeypatch, by_suffix):
+        """Route requests.get by URL suffix; unmatched probes -> 404."""
+        def fake_get(url, **kw):
+            for suffix, payload in by_suffix.items():
+                if url.endswith(suffix):
+                    return types.SimpleNamespace(
+                        status_code=200, json=lambda payload=payload: payload,
+                    )
+            return types.SimpleNamespace(status_code=404, json=lambda: {})
+
+        monkeypatch.setattr("requests.get", fake_get)
+
+    def test_lmstudio_max_context_length(self, monkeypatch):
+        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
+        self._dispatch(monkeypatch, {
+            "/v1/models": {"data": [{"id": "qwen/qwen3.6-27b"}]},
+            "/api/v0/models": {"data": [
+                {"id": "qwen/qwen3.6-27b", "maxContextLength": 262144},
+            ]},
+        })
+        assert get_model_context_window(
+            base_url="http://localhost:1234/v1",
+            model_name="qwen/qwen3.6-27b",
+        ) == 262144
+
+    def test_llamacpp_props_n_ctx(self, monkeypatch):
+        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
+        self._dispatch(monkeypatch, {
+            "/v1/models": {"data": [{"id": "llama-3"}]},
+            "/props": {"default_generation_settings": {"n_ctx": 131072}},
+        })
+        assert get_model_context_window(
+            base_url="http://localhost:8080/v1", model_name="llama-3",
+        ) == 131072
+
+    def test_ollama_show_context_length(self, monkeypatch):
+        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
+        self._dispatch(monkeypatch, {
+            "/v1/models": {"data": [{"id": "qwen2.5:7b"}]},
+        })
+        monkeypatch.setattr("requests.post", lambda url, **kw: types.SimpleNamespace(
+            status_code=200,
+            json=lambda: {"model_info": {"qwen2.context_length": 32768}},
+        ))
+        assert get_model_context_window(
+            base_url="http://localhost:11434/v1", model_name="qwen2.5:7b",
+        ) == 32768
+
+    def test_openai_models_wins_over_native_probes(self, monkeypatch):
+        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
+        urls = []
+
+        def fake_get(url, **kw):
+            urls.append(url)
+            if url.endswith("/v1/models"):
+                return types.SimpleNamespace(status_code=200, json=lambda: {
+                    "data": [{"id": "m", "max_model_len": 131072}],
+                })
+            # A native answer exists but must never be reached.
+            return types.SimpleNamespace(status_code=200, json=lambda: {
+                "data": [{"id": "m", "maxContextLength": 4096}],
+            })
+
+        monkeypatch.setattr("requests.get", fake_get)
+        assert get_model_context_window(
+            base_url="http://localhost:8080/v1", model_name="m",
+        ) == 131072
+        # The native probes never ran once /v1/models answered.
+        assert all(not u.endswith("/api/v0/models") for u in urls)
+
+    def test_case_insensitive_model_id_match(self, monkeypatch):
+        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
+        self._dispatch(monkeypatch, {
+            "/v1/models": {
+                "data": [{"id": "Qwen/Qwen3.6-27B", "max_model_len": 262144}],
+            },
+        })
+        assert get_model_context_window(
+            base_url="http://localhost:8080/v1",
+            model_name="qwen/qwen3.6-27b",
+        ) == 262144
+
+    def test_all_probes_fail_warns_and_falls_back(self, monkeypatch, caplog):
+        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
+        monkeypatch.setattr(
+            "requests.get",
+            lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("refused")),
+        )
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="api.utils.llm_tokens"):
+            result = get_model_context_window(
+                base_url="http://localhost:8080/v1", model_name="m",
+            )
+        assert result == 8192
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "falling back to 8192" in r.getMessage()
+        ]
+        assert warnings, "expected the actionable fallback warning"
 
 
 # ---------------------------------------------------------------------------

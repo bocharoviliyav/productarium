@@ -260,7 +260,23 @@
     "notFound": "Продукт не найден.",
     "delete": "Удалить",
     "deleteConfirm": "Удалить этот артефакт?",
-    "deleteFailedTitle": "Не удалось удалить"
+    "deleteFailedTitle": "Не удалось удалить",
+    "provenance": {
+      "title": "Проверка",
+      "judgeConsistent": "Judge: согласовано",
+      "judgeInconsistent": "Judge: есть расхождения",
+      "judgeSkipped": "Judge: пропущён",
+      "judgeIssues": "Замечания judge",
+      "citations": "Цитаты",
+      "citationsResolved": "подтверждено {n}",
+      "citationsUnresolved": "не найдено {n}",
+      "citationsRemoved": "удалено {n}",
+      "mermaidOk": "ок {n}",
+      "mermaidFixed": "исправлено {n}",
+      "mermaidFailed": "не испр. {n}",
+      "secretsMasked": "секретов скрыто: {n}",
+      "corroborateRemoved": "без подтверждений убрано: {n}"
+    }
   },
   "knowledge": {
     "header": "База знаний",

@@ -83,6 +83,32 @@ _VALIDATOR_SCRIPT = os.path.join(
 # Marker emitted on stderr by the Node script when the mermaid import fails.
 _IMPORT_FAILED_MARKER = "MERMAID_IMPORT_FAILED"
 
+# Warn-once latch for the import-failed marker: a real run verifies EVERY
+# diagram through the same validator subprocess, so without the latch the
+# log gets one warning per diagram (pilot spam at mermaid.py:208). Reset by
+# importlib.reload in tests.
+_IMPORT_FAILED_WARNED = False
+
+
+def _warn_import_failed(stderr: str) -> None:
+    """Log the missing-mermaid-bundle situation once per process."""
+    global _IMPORT_FAILED_WARNED
+    if _IMPORT_FAILED_WARNED:
+        logger.debug(
+            "Mermaid validator import failed again; skipping validation. %s",
+            stderr.strip(),
+        )
+        return
+    _IMPORT_FAILED_WARNED = True
+    logger.warning(
+        "Mermaid validator import failed — the mermaid package was not found "
+        "in node_modules; diagram verification is DISABLED for this process. "
+        "Run `bun install` at the repo root (the validator imports "
+        "node_modules/mermaid; the Docker image ships it), or set "
+        "MERMAID_VERIFY=false to silence. Details: %s",
+        stderr.strip()[:300],
+    )
+
 
 # ---------------------------------------------------------------------------
 # Block extraction
@@ -96,6 +122,9 @@ _MERMAID_FENCE_RE = re.compile(
     r"```mermaid[^\n`]*\n(?P<body>.*?)```",
     re.DOTALL | re.IGNORECASE,
 )
+# Bare opening fence — used to detect a TRUNCATED tail block (generation cut
+# by a token limit mid-diagram, closing fence never emitted).
+_MERMAID_OPEN_RE = re.compile(r"```mermaid[^\n`]*\n", re.IGNORECASE)
 
 
 @dataclass
@@ -115,6 +144,9 @@ class MermaidBlock:
         Character offsets of ``raw`` within the source markdown. Updated by
         :func:`run_repair_loop` after every splice so subsequent splices stay
         correct.
+    terminated:
+        False when the closing fence was never emitted (truncated tail); such
+        a block is broken by definition and is repaired or removed.
     """
 
     index: int
@@ -122,23 +154,44 @@ class MermaidBlock:
     body: str
     start: int
     end: int
+    terminated: bool = True
 
 
 def extract_mermaid_blocks(markdown: str) -> List[MermaidBlock]:
-    """Return all fenced ```mermaid blocks in ``markdown`` (in document order)."""
+    """Return all fenced ```mermaid blocks in ``markdown`` (in document order).
+
+    A trailing opener with no closing fence (a diagram cut off mid-stream by
+    a token limit) is appended last with ``terminated=False``; it would never
+    match the closed-block regex and previously slipped through to the UI,
+    where it renders as "Diagram rendering error".
+    """
     if not markdown:
         return []
     blocks: List[MermaidBlock] = []
     for i, m in enumerate(_MERMAID_FENCE_RE.finditer(markdown)):
-        raw = m.group(0)
-        body = m.group("body")
         blocks.append(
             MermaidBlock(
                 index=i,
-                raw=raw,
-                body=body,
+                raw=m.group(0),
+                body=m.group("body"),
                 start=m.start(),
                 end=m.end(),
+            )
+        )
+    last_end = blocks[-1].end if blocks else 0
+    tail = None
+    for m in _MERMAID_OPEN_RE.finditer(markdown):
+        if m.start() >= last_end and "```" not in markdown[m.end():]:
+            tail = m
+    if tail is not None:
+        blocks.append(
+            MermaidBlock(
+                index=len(blocks),
+                raw=markdown[tail.start():],
+                body=markdown[tail.end():],
+                start=tail.start(),
+                end=len(markdown),
+                terminated=False,
             )
         )
     return blocks
@@ -205,11 +258,7 @@ async def verify_diagram(body: str, timeout: Optional[float] = None) -> VerifyRe
         if proc.returncode != 0:
             # Exit code 3 => import failed (no mermaid in node_modules).
             if _IMPORT_FAILED_MARKER in stderr:
-                logger.warning(
-                    "Mermaid validator import failed (mermaid not in "
-                    "node_modules); skipping validation. %s",
-                    stderr.strip(),
-                )
+                _warn_import_failed(stderr)
             else:
                 logger.warning("Mermaid validator exited %s: %s", proc.returncode, stderr.strip())
             return VerifyResult(ok=True, unverifiable=True)
@@ -452,14 +501,37 @@ async def run_repair_loop(
     if not blocks:
         return page_markdown, stats
 
-    # 1+2. Verify all blocks in parallel.
-    results = await _verify_many([b.body for b in blocks])
+    # 1+2. Verify the CLOSED blocks in parallel.
+    closed_blocks = [b for b in blocks if b.terminated]
+    results = await _verify_many([b.body for b in closed_blocks])
+
+    # Truncated (unterminated) blocks are broken by definition: queue them for
+    # repair straight away, or splice them out when no LLM is available — a
+    # half-diagram fragment is worse than no diagram.
+    unterminated = {b.index for b in blocks if not b.terminated}
+    attempt_counts: Dict[str, int] = {}
+    queue: List[RepairJob] = []
+    marked: set = set()                  # block_index -> needs error marker
+    for block in (b for b in blocks if not b.terminated):
+        stats["broken"] += 1
+        if llm is not None and _budget_left(block.index):
+            h = _body_hash(block.body)
+            attempt_counts[h] = attempt_counts.get(h, 0)
+            queue.append(
+                RepairJob(
+                    block_index=block.index,
+                    body=block.body,
+                    error="диаграмма обрезана: закрывающий ``` не был сгенерирован",
+                    original_body=block.body,
+                )
+            )
+        else:
+            marked.add(block.index)
+            stats["failed"] += 1
 
     # 3. Enqueue broken-but-judgeable diagrams. Track per-unique-body attempt
     # counts so the budget is shared across semantically-identical suggestions.
-    attempt_counts: Dict[str, int] = {}
-    queue: List[RepairJob] = []
-    for block, res in zip(blocks, results):
+    for block, res in zip(closed_blocks, results):
         if res.ok:
             stats["verified"] += 1
             continue
@@ -489,7 +561,6 @@ async def run_repair_loop(
     # consuming its own repair budget (and LLM tokens). This also keeps the
     # per-unique-body budget meaningful: one unique broken diagram = one budget.
     fixed_by_hash: Dict[str, str] = {}   # body_hash -> repaired body
-    marked: set = set()                  # block_index -> needs error marker
 
     while queue:
         job = queue.pop(0)
@@ -570,6 +641,11 @@ async def run_repair_loop(
         if block.index in fixed_bodies:
             to_apply.append((block.index, f"```mermaid\n{fixed_bodies[block.index]}```"))
         elif block.index in marked:
+            if block.index in unterminated:
+                # A truncated fragment has no salvageable "original" to keep —
+                # remove it entirely instead of the keep-the-original marker.
+                to_apply.append((block.index, ""))
+                continue
             attempts_used = attempt_counts.get(_body_hash(block.body), max_attempts)
             to_apply.append((block.index, block.raw + _error_marker(attempts_used)))
     # Apply in reverse document order.

@@ -56,13 +56,30 @@ function resolveMermaidPath() {
   return null;
 }
 
+async function importMermaid() {
+  // 1. Known dist bundles (deterministic ESM entry, no exports-map lookup).
+  const explicit = resolveMermaidPath();
+  if (explicit) {
+    try {
+      return await import(explicit);
+    } catch {
+      // fall through to the package specifier
+    }
+  }
+  // 2. Package specifier: Node resolves node_modules walking up from THIS
+  // file's directory (CWD-independent), honoring the package exports map —
+  // survives dist-file renames across mermaid majors. Throws when the
+  // package is absent.
+  return import("mermaid");
+}
+
 let mermaid;
 try {
-  const mermaidPath = resolveMermaidPath();
-  if (!mermaidPath) {
-    throw new Error("mermaid package not found in node_modules");
+  const mod = await importMermaid();
+  mermaid = mod.default || mod.mermaid;
+  if (!mermaid) {
+    throw new Error("mermaid package found but exports no default/mermaid binding");
   }
-  mermaid = (await import(mermaidPath)).default || (await import(mermaidPath)).mermaid;
 } catch (err) {
   process.stderr.write("MERMAID_IMPORT_FAILED: " + String(err && err.message || err) + "\n");
   process.exit(3);

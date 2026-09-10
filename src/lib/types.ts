@@ -13,6 +13,31 @@ export type ArtifactSource = "manual" | "generated" | "api" | "mcp";
 /* Pages (codebase wiki page tree)                                      */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Verification-pipeline provenance block persisted per page by
+ * api/docgen/verification.py (judge verdict, citation/secret/mermaid
+ * counters, generation meta). Additive — legacy pages carry none of it,
+ * so every field is optional and unknown keys are tolerated.
+ */
+export interface PageProvenance {
+  section_id?: string;
+  generated_at?: string;
+  generator?: string;
+  model?: string;
+  regen?: string;
+  secrets_masked?: number;
+  citations?: {
+    resolved?: string[];
+    unresolved?: string[];
+    removed?: string[];
+    fixed?: string[];
+  };
+  judge?: { verdict?: string; issues?: string[] };
+  mermaid?: Record<string, number>;
+  corroborate?: { removed?: string[] };
+  [key: string]: unknown;
+}
+
 export interface ArtifactPage {
   id: string;
   title: string;
@@ -32,7 +57,7 @@ export interface ArtifactPage {
    * (api/docgen/verification.py). Unknown to legacy pages — the viewer must
    * tolerate its presence without breaking.
    */
-  provenance?: Record<string, unknown>;
+  provenance?: PageProvenance;
 }
 
 /**
