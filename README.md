@@ -195,7 +195,7 @@ CORS from `CORS_ORIGINS` (explicit allowlist; `*` disables credentials), dynamic
 `chat.py` (SSE chat over the agent stream, session persistence), `generate.py` (standalone Markdown document), `deep_research.py` (bounded multi-iteration research loop, `DEEP_RESEARCH_TIMEOUT_SECONDS`), `knowledge.py`/`prompt.py`/`llm.py`/`types.py`.
 
 ### `docgen/` — documentation generation package
-`codebase.py` (deepagents orchestrator + section subagents + repo tools + verification + adaptive small-context caps), `spec.py` (OpenAPI/AsyncAPI → skeleton + LangGraph enrichment), `database.py` (MCP introspection reverse-engineering flow), `verification.py` (citation checks, LLM judge — `DOCGEN_JUDGE_ENABLED`, Mermaid verify/repair, provenance diff, DSN masking), `jobs.py` (async 202+poll worker with the progress model — phases, sections_done, tqdm-style logs — `DOCGEN_MAX_WORKERS`), `summary.py`, `_common.py` (shared background indexing).
+`codebase.py` (deepagents orchestrator + section subagents + repo tools + verification + adaptive small-context caps + DB digest in the repo brief), `spec.py` (OpenAPI/AsyncAPI → skeleton + LangGraph enrichment), `database.py` (MCP introspection RE: role-classified walk + dbhub/oracle adapters + read-only SQL catalog packs → root pages + per-entity subpages + batched strict-JSON LLM enrichment), `introspection_cache.py` (walk-payload disk cache), `corroborate.py` (grounding LLM text against the introspection payload), `verification.py` (citation checks, LLM judge — `DOCGEN_JUDGE_ENABLED`, Mermaid verify/repair, provenance diff, DSN masking), `jobs.py` (async 202+poll worker with the progress model — phases, sections_done, tqdm-style logs — `DOCGEN_MAX_WORKERS`), `summary.py`, `citation_guard.py` / `prose_dedup.py` / `fact_fold.py` (text-quality passes), `_common.py` (shared background indexing).
 
 ### `memory/` — semantic memory backends
 `resolver.py` picks the active backend; `pgvector_backend.py` implements indexing + cosine recall over `knowledge_chunks` (bounded by `MEMORY_QUERY_TIMEOUT_SECONDS`); `base.py` is the interface. SQLite degraded mode returns no recall (callers fall back).
@@ -286,7 +286,7 @@ Every timeout lives in `timeout.py`'s registry (admin panel → Timeouts; env fa
 
 ## 12. Prompts (refs/prompts/)
 
-All prompt bodies are externalized to `refs/prompts/*.md` (`docgen_sections.md` holds the contracts of all 7 wiki sections in one file; `docgen_subpages.md` holds the subpage contracts for the decomposed sections; `docgen_decomposer.md` plans the subpage units as strict JSON; plus `docgen_router.md` / `docgen_orchestrator.md` / `docgen_agent_system.md` / `docgen_agent_section.md`, spec docs, expert agent, deep research iterations). Edit directly — no code changes needed. Contracts are in English with Russian technical terms kept where natural. Substitution uses `str.replace` (not `.format`) so Mermaid/JSON literal braces stay unescaped.
+All prompt bodies are externalized to `refs/prompts/*.md` (`docgen_sections.md` holds the contracts of all 7 wiki sections in one file; `docgen_subpages.md` holds the subpage contracts for the decomposed sections; `docgen_decomposer.md` plans the subpage units as strict JSON; plus `docgen_router.md` / `docgen_orchestrator.md` / `docgen_agent_system.md` / `docgen_agent_section.md`, spec docs, database prompts (`database_doc.md` overview, `database_tables.md` batched table descriptions, `database_categories.md`, `database_relations.md` FK inference), expert agent, deep research iterations). Edit directly — no code changes needed. Contracts are in English with Russian technical terms kept where natural. Substitution uses `str.replace` (not `.format`) so Mermaid/JSON literal braces stay unescaped.
 
 ---
 
@@ -322,7 +322,44 @@ The 7 sections — Overview, Architecture, Functional description, Technical det
 
 ## 14. Database Reverse-Engineering
 
-A **Database** entity stores only a MASKED DSN (`dsn_masked`) — the raw DSN is masked on acceptance and never persisted, logged, or returned. `POST .../databases/{id}/generate` starts a LangGraph flow that drives the product's **bound MCP servers** (e.g. a Postgres/Oracle MCP introspection server) through the same bounded tool manager the expert agent uses (`MCP_TOOL_CALL_TIMEOUT_SECONDS`, `MCP_TOOL_RESULT_MAX_CHARS`, `DB_INTROSPECTION_TIMEOUT_SECONDS` overall). The agent maps tables/columns/relations and writes wiki-style database documentation, which then goes through the same verification pipeline and pgvector indexing. An optional `mcp_server_id` pin restricts the flow to one bound server.
+A **Database** entity stores only a MASKED DSN (`dsn_masked`) — the raw DSN is masked on acceptance and never persisted, logged, or returned. `POST .../databases/{id}/generate` drives the product's **bound MCP servers** through the same bounded tool manager the expert agent uses (`MCP_TOOL_CALL_TIMEOUT_SECONDS`, `MCP_TOOL_RESULT_MAX_CHARS`, `DB_INTROSPECTION_TIMEOUT_SECONDS` overall); an optional `mcp_server_id` pin restricts the flow to one bound server. Priority dialects: **Oracle and PostgreSQL** — the bundled `dbhub` and `oracle-mcp-server` presets are the reference adapters, and a generic name-based classifier handles any other introspection-shaped MCP server. The goal: an ideal tool for reverse-engineering Oracle monoliths.
+
+```mermaid
+flowchart TD
+  G([POST /databases/…/generate]) --> W[Introspection walk<br/>dbhub / oracle / generic adapters<br/>+ read-only SQL catalog packs]
+  W --> P[structured payload<br/>schemas · tables · fk_edges<br/>views · triggers · routines · sequences · types]
+  P --> SK[deterministic skeleton<br/>root pages + per-entity subpages]
+  SK --> ENR[LLM enrichment — strict-JSON batches<br/>1 overview + N table batches + 1 categories call<br/>+ relations inference only when no FK edges]
+  ENR --> V[verification: corroborate grounding<br/>LLM judge · Mermaid ER repair · masking]
+  V --> Pers[generated_docs + pages tree<br/>per-page provenance]
+  Pers --> Idx[background pgvector indexing]
+```
+
+### Introspection walk (deterministic)
+
+Discovered tools are classified into roles by name tokens (schemas / tables / describe / ddl / indexes / constraints / relationships / views / routines / triggers / sequences / types / sql). The walk lists schemas → tables → per-table structure (describe, DDL fallback) → category listings → optional read-only SQL catalog packs (`_PG_SQL_PACK` / `_ORACLE_SQL_PACK`, allowed only after a SELECT-only constant + identifier-regex guard) that fill FK edges, indexes, triggers, routines, sequences, materialized views and types. Oracle specifics: `ALL_SOURCE` line rows are regrouped into one row per object; PL/SQL objects get their full source fetched. The output is a structured payload (facts, never prose), cached on disk between runs (`CACHE_FORMAT_VERSION` 3; walk-affecting budgets participate in the cache key). Categories probed but empty are recorded in `unavailable` and documented as such.
+
+### Page tree — root pages + per-entity subpages
+
+- **Overview** — LLM-written from a deterministic fact sheet: overview / schema layout / design remarks. The old stub "Schemas" and "Documentation" pages are gone.
+- **Tables** — brief table descriptions, **Relationships**, and a **Mermaid ER diagram** rendered from the FK graph, not invented. If introspection reports zero FK edges, an LLM may infer candidate relations — always marked "inferred" in the output.
+- **Per-table subpages** — columns, indexes, constraints, DDL and the LLM description; FK-adjacent tables cross-link via `relatedPages`; optional blocks for triggers/relations that affect the table.
+- **Category roots** (created only when the walk found evidence): Views (incl. materialized), Triggers, Routines (procedures/functions), Sequences, Types — each object gets a subpage with its full source/DDL.
+
+Subpages are capped by `DB_DOCGEN_MAX_SUBPAGES` (default 200), ranked FK-degree → column count → name; surplus objects stay on the root page as folded (`<details>`) rows — hidden, never dropped. The tables root folds its name list at 60 visible rows.
+
+### LLM enrichment — batched, admin-tunable
+
+One overview call, one categories call, and table descriptions in **strict-JSON batches** of `DB_DOCGEN_ENRICH_BATCH` tables per call (default 40, floor 5) — a 61-table database costs a handful of calls, an Oracle monolith dozens rather than thousands. Names not present in the batch are discarded from the response. `DB_DOCGEN_MAX_DESCRIPTIONS` (default 250) bounds how many objects get LLM text at all; structure/DDL subpages stay deterministic. All three knobs live in the timeout registry (admin panel → Timeouts → Databases; admin store > env > default, per-key floor) and are re-read on every generation — an admin change applies to the next run without a restart.
+
+### Cross-context with codebase docs
+
+- **DB ← product knowledge**: recall from the product's memory chunks is injected as `<product_context>` into the enrichment prompts, so database pages can build on what codebase docs already established.
+- **Codebase ← database facts**: codebase docgen receives a compact DB digest (database names, schemas, top tables by FK degree; capped, marked "do not cite as file paths") in its repo brief — `DOCGEN_DB_CONTEXT_ENABLED`, default on.
+
+### Verification & provenance
+
+Free LLM prose exists only where it can be checked: the overview goes through the **corroborate pass** (identifiers absent from the introspection payload are stripped, removals recorded in provenance) and the **LLM judge** (`DOCGEN_JUDGE_ENABLED`); batched descriptions are keyed to names the walk actually found; the **ER diagram** goes through Node-based Mermaid verify + bounded repair (repair failure is non-fatal — the fenced diagram survives). Every page carries provenance: generator (standard-llm / skeleton / introspection), prompt file, `tools_used`, a sha256 schema fingerprint of the payload, applied caps, corroborate removals, and introspection-cache hit/miss.
 
 ---
 
@@ -388,7 +425,7 @@ Self-signed certificates: place `.crt`/`.pem` files in a `certs/` directory and 
 - **Docgen**: `DOCGEN_MAX_WORKERS`, `DOCGEN_JUDGE_ENABLED`, `MERMAID_VERIFY`, `DOCGEN_SECTION_CONCURRENCY`, `RLM_MODEL_CONTEXT_WINDOW` (legacy-named context-window knob).
 - **Agent runtime**: `PRODUCTARIUM_CHECKPOINTER=memory` (test-only in-memory checkpointer override; default is Postgres-only — no Postgres, no app start).
 - **Expert**: `DEEP_RESEARCH_TIMEOUT_SECONDS`.
-- **Database RE**: `DB_INTROSPECTION_TIMEOUT_SECONDS`.
+- **Database RE**: `DB_INTROSPECTION_TIMEOUT_SECONDS`, `DB_CONNECT_CHECK_SECONDS`, `DB_INTROSPECTION_CACHE_TTL_SECONDS`, plus admin-tunable counts (admin panel → Timeouts → Databases; see [§14](#14-database-reverse-engineering)): `DB_DOCGEN_ENRICH_BATCH` (tables per LLM batch, default 40), `DB_DOCGEN_MAX_SUBPAGES` (200), `DB_DOCGEN_MAX_DESCRIPTIONS` (250), `DB_FK_EVIDENCE_TABLES` / `DB_SOURCE_OBJECTS` (walk budgets, part of the introspection cache key); cross-context: `DOCGEN_DB_CONTEXT_ENABLED` (DB digest in codebase docgen briefs, default on).
 - **MCP**: `MCP_DISCOVERY_TIMEOUT_SECONDS`, `MCP_ASK_TIMEOUT_SECONDS`, `MCP_TOOL_CALL_TIMEOUT_SECONDS`, `MCP_TOOL_RESULT_MAX_CHARS`, `MCP_NEGATIVE_CACHE_SECONDS`.
 - **Embedder rate limits**: `EMBEDDER_MAX_CONCURRENCY`, `EMBEDDER_DELAY_SECONDS`, `EMBEDDER_RATE_LIMIT_RPS`.
 - **Auth**: `AUTH_PROVIDER`, `BOOTSTRAP_ADMIN_*`, `SETTINGS_SECRET_KEY`, `JWT_SECRET_KEY`, `SESSION_TOKEN_TTL`, `COOKIE_SECURE`; Keycloak: `KEYCLOAK_*`.

@@ -3,18 +3,27 @@
 Hermetic: every MCP tool, LLM call, repair loop and indexing call is a fake
 patched onto the module seams; no server, DB-with-data, or network access.
 
-Covers:
+Covers (post-restructure contract: root pages + per-entity subpages):
 - ``mask_dsn`` (the DSN secret choke point).
-- ``_classify_introspection_tools`` (name-token heuristics).
-- ``_parse_names`` (JSON / dict shapes / quoted fallback / ERROR results).
-- ``_build_tool_args`` + ``_tool_arg_names`` ((schema, table) mapping).
+- ``_classify_introspection_tools`` (name-token heuristics, all 15 roles).
+- ``_parse_names`` / ``_parse_object_rows`` / ``_rows_from_sql_result`` /
+  ``_parse_json_array`` / ``_parse_table_definition`` (result parsing).
+- ``_build_tool_args`` + ``_tool_arg_names`` + ``_sql_args``.
 - ``_call_tool`` (dict→JSON, content-block envelope unwrapping, exceptions,
   timeout, result cap).
-- ``_render_skeleton`` (overview / schemas / tables).
-- ``_introspect`` (schemas → tables → definitions walk).
+- ``_assert_readonly_sql`` (read-only SQL guard) + the PG catalog pack walk.
+- ``_detect_engine`` (db_type / DSN scheme / oracle tool names).
+- ``_edges_from_fk_rows`` / ``_er_mermaid`` (FK graph → relationships/ER).
+- ``_render_skeleton`` (overview facts + tables root).
+- ``_render_table_subpage`` / category roots+subpages / ``_render_page_tree``
+  (parent, relatedPages, caps, fold).
+- Batched enrichment (``_enrich_table_descriptions`` / ``_enrich_categories``
+  / ``_infer_relations``) — strict JSON, name validation, budgets.
+- Cross-context (``_db_context_payload`` / ``product_database_context``).
+- ``_introspect`` (schemas → tables → structure → categories → SQL pack).
 - ``_tools_for_pinned_server`` (binding/allowlist/unreachable rules).
 - ``generate_database_docs`` (happy path, skeleton fallback, masking,
-  provenance + indexing, honest ValueErrors).
+  corroborate, judge, provenance + indexing, honest ValueErrors).
 - ``api.docgen.jobs`` database dispatch (success + failure).
 """
 
@@ -130,6 +139,10 @@ def _patch_generation(monkeypatch, *, llm_text, tools=None):
     monkeypatch.setattr(
         db_doc_mod, "run_repair_loop", lambda content, llm: _async_return_pair((content, {}))
     )
+    # Cross-context recall is patched out: hermetic, no memory backend.
+    monkeypatch.setattr(
+        db_doc_mod, "_product_knowledge_context", lambda pid: _async_return("")
+    )
     monkeypatch.setenv("DOCGEN_JUDGE_ENABLED", "false")
 
     indexing: list = []
@@ -139,6 +152,83 @@ def _patch_generation(monkeypatch, *, llm_text, tools=None):
 
     monkeypatch.setattr(db_doc_mod, "_index_in_background", track_indexing)
     return indexing
+
+
+def _sample_info(**overrides):
+    """A two-table payload in the post-walk shape (fk edge users ← orders)."""
+    info = {
+        "schemas": ["public"],
+        "tables": {
+            "public.users": {
+                "schema": "public",
+                "table": "users",
+                "definition": "CREATE TABLE users (id integer PRIMARY KEY);",
+                "columns": [
+                    {"name": "id", "type": "integer", "nullable": False, "default": None},
+                ],
+                "indexes": [
+                    {"name": "users_pkey", "columns": ["id"], "unique": True, "primary": True},
+                ],
+                "constraints": [
+                    {"name": "users_pkey", "type": "PRIMARY KEY", "columns": ["id"]},
+                ],
+            },
+            "public.orders": {
+                "schema": "public",
+                "table": "orders",
+                "definition": (
+                    "CREATE TABLE orders (id integer PRIMARY KEY, "
+                    "user_id integer REFERENCES users(id));"
+                ),
+                "columns": [
+                    {"name": "id", "type": "integer", "nullable": False, "default": None},
+                    {"name": "user_id", "type": "integer", "nullable": True, "default": None},
+                ],
+            },
+        },
+        "fk_edges": [
+            {
+                "from": "public.orders", "from_cols": ["user_id"],
+                "to": "public.users", "to_cols": ["id"],
+                "constraint": "fk_orders_user", "kind": "fk",
+            },
+        ],
+        "views": {},
+        "triggers": {},
+        "routines": {},
+        "sequences": {},
+        "types": {},
+        "tools_used": {
+            "schemas": "list_schemas",
+            "tables": "list_tables",
+            "describe": "describe_table",
+        },
+        "unavailable": [],
+    }
+    info.update(overrides)
+    return info
+
+
+def _dispatch_llm(tables_payload, *, overview_text="OVERVIEW TEXT", relations_payload=None):
+    """Fake `_llm_or_none` dispatching by prompt markers (language-agnostic).
+
+    - relations prompt: its strict-JSON template line carries the placeholder
+      ``"from": "<…>" `` (ru/en files alike) — real introspection values never
+      start with ``<``, so the overview's schema_dump cannot collide;
+    - table/category batch prompts (stub headers ``### ` `` are code-side);
+    - anything else → the overview text.
+    """
+    captured: list = []
+
+    async def fake(prompt, model, base_url=None, api_key=None):
+        captured.append(prompt)
+        if '"from": "<' in prompt:
+            return json.dumps(relations_payload if relations_payload is not None else [])
+        if "### `" in prompt:
+            return json.dumps(tables_payload)
+        return overview_text
+
+    return fake, captured
 
 
 # ============================================================================
@@ -296,7 +386,7 @@ class TestIntrospectionBudgets:
 
 
 # ============================================================================
-# build_database_doc_prompt — per-request language (review #4 LOW)
+# build_*_prompt — per-request language (review #4 LOW)
 # ============================================================================
 class TestDatabaseDocPromptLanguage:
     def test_language_substituted_en(self):
@@ -334,6 +424,36 @@ class TestDatabaseDocPromptLanguage:
         assert captured
         assert "English" in captured[0]
 
+    def test_tables_prompt_placeholders(self):
+        prompt = db_doc_mod.build_database_tables_prompt(
+            table_batch="### `public.users`",
+            product_context="ctx",
+            language="en",
+        )
+        assert "### `public.users`" in prompt
+        assert "ctx" in prompt
+        assert "English" in prompt
+        assert "{table_batch}" not in prompt
+        assert "{product_context}" not in prompt
+        assert "{language_name}" not in prompt
+
+    def test_categories_prompt_placeholders(self):
+        prompt = db_doc_mod.build_database_categories_prompt(
+            category_title="Views", objects="### `public.v`", language="en",
+        )
+        assert "Views" in prompt
+        assert "English" in prompt
+        assert "{category_title}" not in prompt
+
+    def test_relations_prompt_placeholders(self):
+        prompt = db_doc_mod.build_database_relations_prompt(
+            table_batch="### `public.users`", language="en",
+        )
+        # The strict-JSON template (from/from_cols) is the prompt's contract.
+        assert '"from_cols"' in prompt
+        assert "English" in prompt
+        assert "{table_batch}" not in prompt
+
 
 # ============================================================================
 # _classify_introspection_tools
@@ -361,6 +481,24 @@ class TestClassifyTools:
         assert [t.name for t in roles["describe"]] == ["get_table_info"]
         assert [t.name for t in roles["ddl"]] == ["get_table_definition"]
 
+    def test_category_roles_detected(self):
+        roles = self._classify(
+            "list_views", "list_triggers", "list_procedures", "list_sequences",
+            "list_types",
+        )
+        assert [t.name for t in roles["views"]] == ["list_views"]
+        assert [t.name for t in roles["triggers"]] == ["list_triggers"]
+        assert [t.name for t in roles["routines"]] == ["list_procedures"]
+        assert [t.name for t in roles["sequences"]] == ["list_sequences"]
+        assert [t.name for t in roles["types"]] == ["list_types"]
+
+    def test_sql_role_requires_sql_token(self):
+        # "execute_query" has execute+query but no "sql" token → unclassified;
+        # "run_sql_query" carries the token → the sql role (catalog packs).
+        roles = self._classify("execute_query", "run_sql_query")
+        assert roles["sql"] and roles["sql"][0].name == "run_sql_query"
+        assert not roles["tables"]
+
     def test_ddl_checked_before_describe_and_tables(self):
         # "create_table_ddl" contains table+ddl → ddl, not tables/describe.
         roles = self._classify("create_table_ddl")
@@ -377,9 +515,11 @@ class TestClassifyTools:
         assert all(not v for v in roles.values())
 
     def test_empty_input(self):
+        # Every role key is present (the walk indexes without KeyError).
         assert db_doc_mod._classify_introspection_tools([]) == {
-            "schemas": [], "tables": [], "describe": [], "ddl": [],
+            key: [] for key in db_doc_mod._ROLE_KEYS
         }
+        assert db_doc_mod._classify_introspection_tools([]) == db_doc_mod._empty_roles()
 
     def test_all_role_matches_collected(self):
         # Every tool matching a role is collected; the walk picks the first.
@@ -389,28 +529,46 @@ class TestClassifyTools:
 
 # ============================================================================
 # preset adapters (dbhub search_objects / oracle-mcp-server)
-# ===========================================================================
+# ============================================================================
 class TestPresetAdapters:
     def _dbhub_tools(self):
+        def responder(a):
+            obj = a.get("object_type")
+            if obj == "schema":
+                return json.dumps({
+                    "count": 1,
+                    "results": [{"name": "public", "schema": "public"}],
+                })
+            if obj == "view":
+                return json.dumps({
+                    "count": 1,
+                    "results": [{
+                        "name": "active_users", "schema": "public",
+                        "definition": "CREATE VIEW active_users AS SELECT 1",
+                    }],
+                })
+            if obj in ("procedure", "function"):
+                return json.dumps({
+                    "count": 1, "results": [{"name": f"do_{obj}"}],
+                })
+            if a.get("detail_level") == "full":
+                return json.dumps({
+                    "count": 1,
+                    "results": [{
+                        "name": a.get("pattern"), "schema": a.get("schema"),
+                        "column_count": 1, "row_count": 7,
+                        "columns": [{"name": "id", "type": "integer", "nullable": False}],
+                        "indexes": [{"name": "pk", "columns": ["id"], "unique": True, "primary": True}],
+                    }],
+                })
+            return json.dumps({
+                "count": 1, "results": [{"name": "users", "schema": "public"}],
+            })
+
         so = FakeTool(
             "search_objects",
             {"object_type": {}, "pattern": {}, "schema": {}, "detail_level": {}},
-            lambda a: json.dumps({
-                "object_type": "schema",
-                "count": 1,
-                "results": [{"name": "public", "schema": "public"}],
-            }) if a.get("object_type") == "schema" else json.dumps({
-                "count": 1,
-                "results": [{
-                    "name": a.get("pattern"), "schema": a.get("schema"),
-                    "column_count": 1, "row_count": 7,
-                    "columns": [{"name": "id", "type": "integer", "nullable": False}],
-                    "indexes": [{"name": "pk", "columns": ["id"], "unique": True, "primary": True}],
-                }],
-            }) if a.get("detail_level") == "full" else json.dumps({
-                "count": 1,
-                "results": [{"name": "users", "schema": "public"}],
-            }),
+            responder,
         )
         return [FakeTool("execute_sql", {"sql": {}}), so], so
 
@@ -420,6 +578,10 @@ class TestPresetAdapters:
         assert roles is not None
         assert roles["ddl"] == []
         assert [t.name for t in roles["schemas"]] == ["search_objects[schemas]"]
+        # Views + routines adapters and the guarded sql role are wired too.
+        assert [t.name for t in roles["views"]] == ["search_objects[views]"]
+        assert [t.name for t in roles["routines"]] == ["search_objects[routines]"]
+        assert [t.name for t in roles["sql"]] == ["execute_sql[sql]"]
 
     def test_dbhub_walk_end_to_end(self):
         tools, so = self._dbhub_tools()
@@ -429,6 +591,18 @@ class TestPresetAdapters:
         assert list(info["tables"]) == ["public.users"]
         assert "| id | integer | NO | - |" in info["tables"]["public.users"]["definition"]
         assert "index pk (id) UNIQUE PRIMARY" in info["tables"]["public.users"]["definition"]
+        # Categories with evidence: views (full detail) + routines (names).
+        assert info["views"] == {
+            "public.active_users": {
+                "schema": "public", "name": "active_users",
+                "source": "CREATE VIEW active_users AS SELECT 1",
+            },
+        }
+        # dbhub's names-level routine listing carries no schema → unqualified.
+        assert set(info["routines"]) == {"do_procedure", "do_function"}
+        assert info["routines"]["do_procedure"]["kind"] == "PROCEDURE"
+        assert info["routines"]["do_function"]["kind"] == "FUNCTION"
+        assert info["tools_used"]["views"] == "search_objects[views]"
         # The listing went through search_objects with the right payload.
         assert {
             "object_type": "table", "detail_level": "names",
@@ -459,6 +633,35 @@ class TestPresetAdapters:
         # Pattern listing + per-table lookup, arg names mapped at runtime.
         assert {"pattern": "%"} in search.calls
         assert {"table_name": "EMPLOYEES"} in lookup.calls
+
+    def test_oracle_categories_and_source(self):
+        search = FakeTool(
+            "search_tables_schema", {"pattern": {}},
+            lambda a: json.dumps({"tables": [{"table_name": "EMP"}]}),
+        )
+        plsql = FakeTool(
+            "get_pl_sql_objects", {"object_type": {}, "pattern": {}},
+            lambda a: json.dumps({
+                "objects": [{"name": "V_EMP"}],
+            }) if a.get("object_type") == "VIEW" else json.dumps({"objects": []}),
+        )
+        source = FakeTool(
+            "get_object_source", {"object_name": {}, "object_type": {}},
+            lambda a: f"SOURCE OF {a.get('object_name')}",
+        )
+        roles = db_doc_mod.preset_adapter_roles([search, plsql, source])
+        assert roles is not None
+        assert [t.name for t in roles["views"]] == ["get_pl_sql_objects[views]"]
+        info = asyncio.run(db_doc_mod._introspect(roles))
+        # Views listed by object_type probe with pattern "%".
+        assert {"object_type": "VIEW", "pattern": "%"} in plsql.calls
+        assert info["views"]["V_EMP"]["kind"] == "VIEW"
+        # Per-object source fetched with the mapped (name, type) payload.
+        assert {"object_name": "V_EMP", "object_type": "VIEW"} in source.calls
+        assert info["views"]["V_EMP"]["source"] == "SOURCE OF V_EMP"
+        # Probed-but-empty categories are recorded as unavailable evidence.
+        assert {"triggers", "sequences", "routines"} <= set(info["unavailable"])
+        assert "views" not in info["unavailable"]
 
     def test_oracle_describe_falls_back_to_search(self):
         search = FakeTool(
@@ -532,6 +735,22 @@ _DBHUB_FULL_ENVELOPE = json.dumps({
         "truncated": False,
     },
 })
+_DBHUB_VIEWS_ENVELOPE = json.dumps({
+    "success": True,
+    "data": {
+        "object_type": "view", "pattern": "%", "detail_level": "full",
+        "count": 1,
+        "results": [{
+            "name": "active_users", "schema": "public",
+            "definition": "CREATE VIEW active_users AS SELECT 1",
+        }],
+        "truncated": False,
+    },
+})
+_DBHUB_EMPTY_ENVELOPE = json.dumps({
+    "success": True,
+    "data": {"count": 0, "results": [], "truncated": False},
+})
 
 
 def _langchain_blocks(payload: str):
@@ -553,16 +772,22 @@ def _call_tool_result(payload: str):
 
 class TestDbhubRealShapes:
     def _tools(self):
+        def responder(a):
+            obj = a.get("object_type")
+            if obj == "schema":
+                return _langchain_blocks(_DBHUB_SCHEMA_ENVELOPE)
+            if obj == "view":
+                return _langchain_blocks(_DBHUB_VIEWS_ENVELOPE)
+            if obj in ("procedure", "function"):
+                return _langchain_blocks(_DBHUB_EMPTY_ENVELOPE)
+            if a.get("detail_level") == "full":
+                return _langchain_blocks(_DBHUB_FULL_ENVELOPE)
+            return _langchain_blocks(_DBHUB_TABLES_ENVELOPE)
+
         so = FakeTool(
             "search_objects",
             {"object_type": {}, "pattern": {}, "schema": {}, "detail_level": {}},
-            lambda a: (
-                _langchain_blocks(_DBHUB_SCHEMA_ENVELOPE)
-                if a.get("object_type") == "schema"
-                else _langchain_blocks(_DBHUB_FULL_ENVELOPE)
-                if a.get("detail_level") == "full"
-                else _langchain_blocks(_DBHUB_TABLES_ENVELOPE)
-            ),
+            responder,
         )
         return [FakeTool("execute_sql", {"sql": {}}), so], so
 
@@ -581,6 +806,11 @@ class TestDbhubRealShapes:
         assert "| payload | json | YES | - |" in definition
         # Postgres index columns arrive as the array literal "{id}".
         assert "index Entity_name_pkey (id) UNIQUE PRIMARY" in definition
+        # The views adapter reached the inner envelope through the blocks.
+        assert list(info["views"]) == ["public.active_users"]
+        assert info["views"]["public.active_users"]["source"] == (
+            "CREATE VIEW active_users AS SELECT 1"
+        )
         # The envelope itself must be gone from the rendered definition.
         assert "lc_0f2fccb8" not in definition
         assert "success" not in definition
@@ -672,7 +902,83 @@ class TestParseNames:
 
 
 # ============================================================================
-# _tool_arg_names / _build_tool_args
+# _parse_object_rows / _rows_from_sql_result / _parse_json_array
+# ============================================================================
+class TestParseObjectRows:
+    def test_keeps_row_evidence(self):
+        rows = db_doc_mod._parse_object_rows(
+            json.dumps({"results": [{
+                "name": "v", "schema": "public", "definition": "SELECT 1",
+                "kind": "VIEW",
+            }]})
+        )
+        assert rows == [{
+            "name": "v", "schema": "public", "definition": "SELECT 1",
+            "kind": "VIEW",
+        }]
+
+    def test_strings_become_name_rows(self):
+        assert db_doc_mod._parse_object_rows('["a","b"]') == [
+            {"name": "a"}, {"name": "b"},
+        ]
+
+    def test_error_and_garbage_empty(self):
+        assert db_doc_mod._parse_object_rows("ERROR: boom") == []
+        assert db_doc_mod._parse_object_rows("not json") == []
+
+
+class TestRowsFromSqlResult:
+    def test_dbhub_envelope_columns_zipped(self):
+        text = json.dumps({"success": True, "data": {
+            "columns": ["table_name", "n"],
+            "rows": [["users", 3], ["orders", 5]],
+        }})
+        assert db_doc_mod._rows_from_sql_result(text) == [
+            {"table_name": "users", "n": "3"},
+            {"table_name": "orders", "n": "5"},
+        ]
+
+    def test_bare_columns_rows_dict(self):
+        text = json.dumps({"columns": ["a"], "rows": [["1"]]})
+        assert db_doc_mod._rows_from_sql_result(text) == [{"a": "1"}]
+
+    def test_list_of_dicts_passthrough(self):
+        rows = [{"a": 1}, {"a": 2}]
+        assert db_doc_mod._rows_from_sql_result(json.dumps(rows)) == rows
+
+    def test_pipe_table_fallback(self):
+        text = "| table_name | n |\n| --- | --- |\n| users | 3 |"
+        assert db_doc_mod._rows_from_sql_result(text) == [
+            {"table_name": "users", "n": "3"},
+        ]
+
+    def test_error_and_empty(self):
+        assert db_doc_mod._rows_from_sql_result("ERROR: boom") == []
+        assert db_doc_mod._rows_from_sql_result("") == []
+        assert db_doc_mod._rows_from_sql_result('{"a": 1}') == []
+
+
+class TestParseJsonArray:
+    def test_plain_array(self):
+        assert db_doc_mod._parse_json_array('[{"a": 1}]') == [{"a": 1}]
+
+    def test_fenced_array(self):
+        assert db_doc_mod._parse_json_array('```json\n[{"a": 1}]\n```') == [{"a": 1}]
+
+    def test_prose_around_array(self):
+        assert db_doc_mod._parse_json_array('Here you go:\n[{"a": 1}]\nthanks') == [
+            {"a": 1},
+        ]
+
+    def test_non_array_and_non_dict_rows_dropped(self):
+        assert db_doc_mod._parse_json_array('{"a": 1}') == []
+        assert db_doc_mod._parse_json_array('[1, "x", null]') == []
+        assert db_doc_mod._parse_json_array("") == []
+        assert db_doc_mod._parse_json_array("no array at all") == []
+
+
+# ============================================================================
+# _tool_arg_names / _build_tool_args / _sql_args
 # ============================================================================
 class TestBuildToolArgs:
     def test_schema_and_table_mapped(self):
@@ -705,6 +1011,19 @@ class TestBuildToolArgs:
         tool = FakeTool("t", {"table_schema": {}})
         args = db_doc_mod._build_tool_args(tool, schema="public", table="users")
         assert args == {"table_schema": "public"}
+
+    def test_sql_args_mapping(self):
+        assert db_doc_mod._sql_args(FakeTool("q", {"query": {}}), "SELECT 1") == {
+            "query": "SELECT 1",
+        }
+        assert db_doc_mod._sql_args(FakeTool("q", {"sql": {}}), "SELECT 1") == {
+            "sql": "SELECT 1",
+        }
+        # Unknown spellings fall back to the first declared arg.
+        assert db_doc_mod._sql_args(FakeTool("q", {"stmt": {}}), "SELECT 1") == {
+            "stmt": "SELECT 1",
+        }
+        assert db_doc_mod._sql_args(FakeTool("q"), "SELECT 1") == {"sql": "SELECT 1"}
 
 
 # ============================================================================
@@ -754,63 +1073,242 @@ class TestCallTool:
 
 
 # ============================================================================
-# _render_skeleton
+# _assert_readonly_sql (defense in depth over the catalog packs)
 # ============================================================================
-class TestRenderSkeleton:
-    def test_renders_all_sections(self):
-        entity = _fake_entity()
-        info = {
-            "schemas": ["public"],
-            "tables": {
-                "public.users": {
-                    "schema": "public",
-                    "table": "users",
-                    "definition": "CREATE TABLE users (id integer);",
-                },
-                "public.orders": {
-                    "schema": "public",
-                    "table": "orders",
-                    "definition": "",
-                },
-            },
-        }
-        overview, schema_md, tables_md = db_doc_mod._render_skeleton(entity, info)
-        assert "# Database: Main DB" in overview
-        assert "postgresql://***REDACTED***@db:5432/prod" in overview
-        assert "**Tables introspected:** 2" in overview
-        assert "`public` — 2 table(s)" in schema_md
-        assert "### `public.users`" in tables_md
-        assert "```sql" in tables_md
-        assert "### `public.orders`" in tables_md
-        assert "(no definition available" in tables_md
+class TestSqlGuard:
+    def test_select_and_with_accepted(self):
+        assert db_doc_mod._assert_readonly_sql("SELECT 1")
+        assert db_doc_mod._assert_readonly_sql("select * from pg_indexes")
+        assert db_doc_mod._assert_readonly_sql(
+            "WITH x AS (SELECT 1) SELECT * FROM x"
+        )
+        assert db_doc_mod._assert_readonly_sql("SELECT 1;\n")
 
-    def test_no_schemas_renders_default(self):
-        entity = _fake_entity(dsn_masked=None)
-        info = {
-            "schemas": [],
-            "tables": {
-                "users": {"schema": None, "table": "users", "definition": ""},
-            },
-        }
-        overview, schema_md, _ = db_doc_mod._render_skeleton(entity, info)
-        assert "(default)" in overview
-        assert "Single default schema" in schema_md
+    def test_mutations_rejected(self):
+        for bad in (
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD COLUMN x int",
+            "CREATE TABLE t (id int)",
+            "CREATE OR REPLACE VIEW v AS SELECT 1",
+            "TRUNCATE TABLE t",
+            "MERGE INTO t USING s ON (1 = 1)",
+            "GRANT SELECT ON t TO PUBLIC",
+            "CALL do_thing()",
+            "COMMIT",
+        ):
+            assert not db_doc_mod._assert_readonly_sql(bad), bad
 
-    def test_error_definition_rendered_as_note(self):
-        entity = _fake_entity()
-        info = {
-            "schemas": [],
-            "tables": {
-                "users": {
-                    "schema": None,
-                    "table": "users",
-                    "definition": "ERROR: MCP tool 'describe_table' failed (Boom).",
-                },
+    def test_non_select_and_multi_statement_rejected(self):
+        assert not db_doc_mod._assert_readonly_sql("")
+        assert not db_doc_mod._assert_readonly_sql("EXPLAIN SELECT 1")
+        assert not db_doc_mod._assert_readonly_sql(
+            "SELECT 1; DELETE FROM t"
+        )
+        # DML smuggled past a leading SELECT is still rejected.
+        assert not db_doc_mod._assert_readonly_sql(
+            "SELECT 1 WHERE NOT EXISTS (DELETE FROM t)"
+        )
+
+    def test_pack_constants_pass_the_guard(self):
+        for pack in (db_doc_mod._PG_SQL_PACK, db_doc_mod._ORACLE_SQL_PACK):
+            for name, query in pack.items():
+                assert db_doc_mod._assert_readonly_sql(query), name
+
+
+# ============================================================================
+# _detect_engine
+# ============================================================================
+class TestDetectEngine:
+    def test_db_type_attribute_wins(self):
+        assert db_doc_mod._detect_engine(
+            SimpleNamespace(db_type="postgresql", dsn_masked="")
+        ) == "postgresql"
+        assert db_doc_mod._detect_engine(
+            SimpleNamespace(db_type="postgres", dsn_masked="")
+        ) == "postgresql"
+        assert db_doc_mod._detect_engine(
+            SimpleNamespace(db_type="Oracle", dsn_masked="")
+        ) == "oracle"
+        # Only the two focus engines have SQL packs.
+        assert db_doc_mod._detect_engine(
+            SimpleNamespace(db_type="mysql", dsn_masked="")
+        ) is None
+
+    def test_dsn_scheme(self):
+        assert db_doc_mod._detect_engine(
+            SimpleNamespace(db_type=None, dsn_masked="jdbc:oracle:thin:@//h:1521/x")
+        ) == "oracle"
+        assert db_doc_mod._detect_engine(
+            SimpleNamespace(db_type=None, dsn_masked="postgresql://***@db:5432/x")
+        ) == "postgresql"
+        assert db_doc_mod._detect_engine(
+            SimpleNamespace(db_type=None, dsn_masked="mysql://u@h/db")
+        ) is None
+
+    def test_oracle_tool_names(self):
+        entity = SimpleNamespace(db_type=None, dsn_masked="")
+        assert db_doc_mod._detect_engine(
+            entity, [FakeTool("get_pl_sql_objects")]
+        ) == "oracle"
+        assert db_doc_mod._detect_engine(
+            entity, [FakeTool("search_tables_schema")]
+        ) == "oracle"
+        assert db_doc_mod._detect_engine(entity, [FakeTool("list_tables")]) is None
+
+
+# ============================================================================
+# _parse_table_definition (JSON detail + controlled render re-parse)
+# ============================================================================
+class TestParseTableDefinition:
+    def test_json_object_detail(self):
+        parsed = db_doc_mod._parse_table_definition(json.dumps({
+            "name": "users",
+            "comment": "app users",
+            "row_count": 7,
+            "columns": [
+                {"name": "id", "type": "int", "nullable": False, "default": None},
+                {"name": "email", "type": "text", "nullable": True, "default": ""},
+            ],
+            "indexes": [
+                {"name": "pk", "columns": "{id}", "unique": True, "primary": True},
+            ],
+        }))
+        assert parsed["comment"] == "app users"
+        assert parsed["row_count"] == 7
+        assert [c["name"] for c in parsed["columns"]] == ["id", "email"]
+        assert parsed["columns"][0]["nullable"] is False
+        assert parsed["indexes"][0]["columns"] == ["id"]  # "{id}" unwrapped
+        assert parsed["indexes"][0]["unique"] is True
+
+    def test_controlled_render(self):
+        definition = (
+            "table users (public) — 2 columns, ~7 rows\n"
+            "| column | type | null | default |\n"
+            "| --- | --- | --- | --- |\n"
+            "| id | integer | NO | - |\n"
+            "| email | text | YES | - |\n"
+            "index users_pkey (id) UNIQUE PRIMARY\n"
+            "comment: app users\n"
+        )
+        parsed = db_doc_mod._parse_table_definition(definition)
+        assert parsed["row_count"] == 7
+        assert [c["name"] for c in parsed["columns"]] == ["id", "email"]
+        assert parsed["columns"][1]["nullable"] is True
+        assert parsed["indexes"] == [{
+            "name": "users_pkey", "columns": ["id"],
+            "unique": True, "primary": True,
+        }]
+        assert parsed["comment"] == "app users"
+
+    def test_error_and_empty(self):
+        assert db_doc_mod._parse_table_definition("") == {}
+        assert db_doc_mod._parse_table_definition(
+            "ERROR: MCP tool 'describe_table' failed (Boom)."
+        ) == {}
+
+
+# ============================================================================
+# FK graph → relationships / ER diagram
+# ============================================================================
+class TestEdgesAndER:
+    def test_edges_from_fk_rows_grouping(self):
+        rows = [
+            {
+                "table_schema": "public", "table_name": "order_items",
+                "constraint_name": "fk_oi", "column_name": "order_id",
+                "foreign_schema": "public", "foreign_table": "orders",
+                "foreign_column": "id",
             },
+            {
+                "table_schema": "public", "table_name": "order_items",
+                "constraint_name": "fk_oi", "column_name": "line",
+                "foreign_schema": "public", "foreign_table": "orders",
+                "foreign_column": "line_no",
+            },
+        ]
+        tables = {"public.order_items": {}, "public.orders": {}}
+        edges = db_doc_mod._edges_from_fk_rows(rows, tables)
+        assert edges == [{
+            "from": "public.order_items", "from_cols": ["order_id", "line"],
+            "to": "public.orders", "to_cols": ["id", "line_no"],
+            "constraint": "fk_oi", "kind": "fk",
+        }]
+
+    def test_edges_skipped_without_target(self):
+        assert db_doc_mod._edges_from_fk_rows(
+            [{"table_name": "t", "constraint_name": "c"}], {"t": {}}
+        ) == []
+
+    def test_er_mermaid(self):
+        body = db_doc_mod._er_mermaid(_sample_info()["fk_edges"])
+        lines = body.splitlines()
+        assert lines[0] == "erDiagram"
+        assert "    public_users ||--o{ public_orders : fk_orders_user" in lines
+
+    def test_er_mermaid_empty(self):
+        assert db_doc_mod._er_mermaid([]) == ""
+
+    def test_mermaid_safe(self):
+        assert db_doc_mod._mermaid_safe("public.weird-name") == "public_weird_name"
+        assert db_doc_mod._mermaid_safe("") == "x"
+        assert db_doc_mod._mermaid_safe(None) == "x"
+
+    def test_edge_line_rendering(self):
+        line = db_doc_mod._edge_line(_sample_info()["fk_edges"][0])
+        assert line == (
+            "- `public.orders`(user_id) → `public.users`(id) (fk_orders_user)"
+        )
+        inferred = {
+            "from": "a", "from_cols": [], "to": "b", "to_cols": [],
+            "constraint": "", "kind": "inferred",
         }
-        _, _, tables_md = db_doc_mod._render_skeleton(entity, info)
-        assert "_ERROR:" in tables_md
-        assert "```sql" not in tables_md
+        assert db_doc_mod._edge_line(inferred) == "- `a` → `b` — inferred"
+
+
+# ============================================================================
+# Category helpers
+# ============================================================================
+class TestCategoryHelpers:
+    def test_category_entry_qualified(self):
+        full, meta = db_doc_mod._category_entry({
+            "name": "v", "schema": "public",
+            "definition": "SELECT 1", "kind": "VIEW",
+        })
+        assert full == "public.v"
+        assert meta["schema"] == "public"
+        assert meta["name"] == "v"
+        assert meta["kind"] == "VIEW"
+        assert meta["source"] == "SELECT 1"
+
+    def test_category_entry_unqualified_and_extras(self):
+        full, meta = db_doc_mod._category_entry({
+            "object_name": "seq_1", "min_value": 1, "cycle_flag": "N",
+        })
+        assert full == "seq_1"
+        assert meta["meta"] == {"min_value": 1, "cycle_flag": "N"}
+
+    def test_category_entry_without_name_dropped(self):
+        assert db_doc_mod._category_entry({"trigger_name": "x"})[0] == ""
+
+    def test_join_line_rows(self):
+        rows = [
+            {"schema_name": "APP", "object_name": "P", "object_type": "PROCEDURE",
+             "line": "1", "line_text": "BEGIN"},
+            {"schema_name": "APP", "object_name": "P", "object_type": "PROCEDURE",
+             "line": "2", "line_text": "END;"},
+            {"schema_name": "APP", "object_name": "Q", "object_type": "FUNCTION",
+             "line": "1", "line_text": "RETURN 1;"},
+        ]
+        out = db_doc_mod._join_line_rows(
+            rows, ("schema_name", "object_name"),
+            type_key="object_type", text_key="line_text",
+        )
+        assert len(out) == 2
+        joined = next(r for r in out if r["object_name"] == "P")
+        assert joined["line_text"] == "BEGIN\nEND;\n"
 
 
 # ============================================================================
@@ -828,6 +1326,11 @@ class TestIntrospect:
             "tables": "list_tables",
             "describe": "describe_table",
         }
+        # Payload shape: every walk stage key present, FK graph initialized.
+        assert info["fk_edges"] == []
+        for cat in ("views", "triggers", "routines", "sequences", "types"):
+            assert info[cat] == {}
+        assert info["unavailable"] == []
 
     def test_no_tables_tool_raises(self):
         tools = [FakeTool("list_schemas", {}, '["public"]')]
@@ -865,6 +1368,615 @@ class TestIntrospect:
         # describe failed → ddl fallback provided the definition (as an
         # ERROR-string from _call_tool, then the ddl tool's output wins).
         assert "CREATE TABLE users (id int);" in info["tables"]["users"]["definition"]
+
+    def test_generic_category_tool_collected(self):
+        tools = _default_tools() + [
+            FakeTool(
+                "list_views", {},
+                json.dumps({
+                    "results": [{
+                        "name": "v_stats", "schema": "public",
+                        "definition": "SELECT 1",
+                    }],
+                }),
+            ),
+        ]
+        roles = db_doc_mod._classify_introspection_tools(tools)
+        info = asyncio.run(db_doc_mod._introspect(roles))
+        assert info["views"] == {
+            "public.v_stats": {
+                "schema": "public", "name": "v_stats", "source": "SELECT 1",
+            },
+        }
+        assert info["tools_used"]["views"] == "list_views"
+
+    def test_categories_without_roles_left_empty(self):
+        # No evidence → no category collections, no unavailable noise.
+        roles = db_doc_mod._classify_introspection_tools(_default_tools())
+        info = asyncio.run(db_doc_mod._introspect(roles))
+        assert all(info[cat] == {} for cat in db_doc_mod._CATEGORIES)
+        assert info["unavailable"] == []
+
+
+# ============================================================================
+# Read-only SQL catalog pack walk (engine + sql role)
+# ============================================================================
+class TestSqlPackWalk:
+    def _tools(self):
+        def sql_responder(a):
+            q = str(a.get("query") or a.get("sql") or "")
+            if "information_schema.table_constraints" in q:
+                return json.dumps({"columns": [
+                    "table_schema", "table_name", "constraint_name",
+                    "column_name", "foreign_schema", "foreign_table",
+                    "foreign_column",
+                ], "rows": [["public", "orders", "fk_o_u", "user_id",
+                             "public", "users", "id"]]})
+            if "pg_get_triggerdef" in q:
+                return json.dumps({"columns": [
+                    "schema_name", "table_name", "trigger_name",
+                    "function_name", "definition",
+                ], "rows": [["public", "users", "set_updated", "set_updated_fn",
+                             "CREATE TRIGGER set_updated BEFORE UPDATE ON users"]]})
+            if "pg_get_functiondef" in q:
+                return json.dumps({"columns": [
+                    "schema_name", "routine_name", "kind", "source",
+                ], "rows": [["public", "do_thing", "PROCEDURE",
+                             "CREATE PROCEDURE do_thing() BEGIN END;"]]})
+            if "pg_indexes" in q:
+                return json.dumps({"columns": [
+                    "table_schema", "table_name", "index_name", "index_def",
+                ], "rows": [["public", "users", "users_pkey",
+                             "CREATE UNIQUE INDEX users_pkey ON public.users(id)"]]})
+            if "pg_sequences" in q:
+                return json.dumps({"columns": [
+                    "schema_name", "sequence_name", "start_value",
+                    "minimum_value", "maximum_value", "increment",
+                ], "rows": [["public", "users_id_seq", "1", "1",
+                             "9223372036854775807", "1"]]})
+            if "pg_matviews" in q:
+                return json.dumps({"columns": [
+                    "schema_name", "view_name", "definition",
+                ], "rows": [["public", "mv_stats", "SELECT count(*) FROM users"]]})
+            if "relkind = 'c'" in q:
+                return json.dumps({"columns": [
+                    "schema_name", "type_name", "attributes",
+                ], "rows": [["public", "user_status", "status text, changed_at timestamptz"]]})
+            return json.dumps({"columns": [], "rows": []})
+
+        sql = FakeTool("run_sql_query", {"query": {}}, sql_responder)
+        return _default_tools() + [sql], sql
+
+    def test_pg_pack_fills_every_collection(self):
+        tools, sql = self._tools()
+        roles = db_doc_mod._classify_introspection_tools(tools)
+        entity = _fake_entity(db_type="postgresql")
+        engine = db_doc_mod._detect_engine(entity, tools)
+        assert engine == "postgresql"
+        info = asyncio.run(db_doc_mod._introspect(roles, engine=engine))
+
+        # The pack queries went through the declared arg mapping.
+        assert sql.calls and all("query" in c for c in sql.calls)
+        assert any(
+            "information_schema.table_constraints" in c["query"] for c in sql.calls
+        )
+        assert info["tools_used"]["sql"] == "run_sql_query"
+
+        # FK graph grouped from catalog rows.
+        assert info["fk_edges"] == [{
+            "from": "public.orders", "from_cols": ["user_id"],
+            "to": "public.users", "to_cols": ["id"],
+            "constraint": "fk_o_u", "kind": "fk",
+        }]
+        # Indexes attached to their table.
+        idx = info["tables"]["public.users"]["indexes"][0]
+        assert idx["name"] == "users_pkey"
+        assert idx["ddl"].startswith("CREATE UNIQUE INDEX")
+        # Triggers / sequences / matviews / types / routines collections.
+        assert info["triggers"]["public.set_updated"]["meta"]["table"] == "users"
+        assert info["triggers"]["public.set_updated"]["source"].startswith(
+            "CREATE TRIGGER"
+        )
+        assert info["sequences"]["public.users_id_seq"]["kind"] == "SEQUENCE"
+        assert info["sequences"]["public.users_id_seq"]["meta"]["increment"] == "1"
+        assert info["views"]["public.mv_stats"]["kind"] == "MATERIALIZED VIEW"
+        assert info["views"]["public.mv_stats"]["source"] == (
+            "SELECT count(*) FROM users"
+        )
+        assert info["types"]["public.user_status"]["meta"]["attributes"] == (
+            "status text, changed_at timestamptz"
+        )
+        assert info["routines"]["public.do_thing"]["kind"] == "PROCEDURE"
+        assert info["routines"]["public.do_thing"]["source"].startswith(
+            "CREATE PROCEDURE"
+        )
+        # Every pack query produced rows → no unavailable markers.
+        assert info["unavailable"] == []
+
+    def test_no_engine_skips_pack(self):
+        tools, sql = self._tools()
+        roles = db_doc_mod._classify_introspection_tools(tools)
+        info = asyncio.run(db_doc_mod._introspect(roles, engine=None))
+        assert not sql.calls
+        assert info["fk_edges"] == []
+
+
+# ============================================================================
+# _render_skeleton
+# ============================================================================
+class TestRenderSkeleton:
+    def test_overview_facts_and_tables_root(self):
+        entity = _fake_entity()
+        overview, tables_md = db_doc_mod._render_skeleton(entity, _sample_info())
+        assert "# Database: Main DB" in overview
+        assert "postgresql://***REDACTED***@db:5432/prod" in overview
+        assert "**Schemas:** public" in overview
+        assert "**Tables introspected:** 2" in overview
+        assert "**Foreign keys:** 1" in overview
+        assert "## Tables" in tables_md
+        assert "2 table(s)" in tables_md
+        assert "- `public.users`" in tables_md
+        assert "- `public.orders`" in tables_md
+        # Relationships + ER from the FK graph.
+        assert "## Relationships" in tables_md
+        assert "- `public.orders`(user_id) → `public.users`(id) (fk_orders_user)" in tables_md
+        assert "## ER Diagram" in tables_md
+        assert "```mermaid" in tables_md
+        assert "erDiagram" in tables_md
+
+    def test_no_schemas_renders_default(self):
+        entity = _fake_entity(dsn_masked=None)
+        info = _sample_info(schemas=[], fk_edges=[])
+        overview, tables_md = db_doc_mod._render_skeleton(entity, info)
+        assert "(default)" in overview
+        assert "**Connection" not in overview
+        assert (
+            "_Introspection reported no explicit foreign keys for this "
+            "database._" in tables_md
+        )
+        assert (
+            "_No relationships were reported or confidently inferred; "
+            "an ER diagram would be speculation._" in tables_md
+        )
+
+    def test_category_counts_in_overview(self):
+        entity = _fake_entity()
+        info = _sample_info(views={"public.v": {"schema": "public", "name": "v"}})
+        overview, _ = db_doc_mod._render_skeleton(entity, info)
+        assert "**Views:** 1" in overview
+
+    def test_root_fold_beyond_visible(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_TABLES_ROOT_VISIBLE", 1)
+        entity = _fake_entity()
+        _, tables_md = db_doc_mod._render_skeleton(entity, _sample_info())
+        assert "<details" in tables_md
+        assert "Remaining tables" in tables_md
+
+
+# ============================================================================
+# _render_table_subpage
+# ============================================================================
+class TestRenderTableSubpage:
+    def test_full_subpage_blocks(self):
+        info = _sample_info(triggers={
+            "public.set_updated": {
+                "schema": "public", "name": "set_updated", "kind": "TRIGGER",
+                "meta": {"table": "users"},
+            },
+        })
+        desc = {"purpose": "Пользователи приложений.", "notes": "См. orders."}
+        content = db_doc_mod._render_table_subpage(
+            "public.users", info["tables"]["public.users"], desc,
+            info["fk_edges"], info["triggers"],
+        )
+        assert content.startswith("## `public.users`")
+        assert "Пользователи приложений." in content
+        assert "## Notes" in content
+        assert "## Structure" in content
+        assert "| id | integer | NO | - |" in content
+        assert "## Indexes" in content
+        assert "- `users_pkey` (id) UNIQUE PRIMARY" in content
+        assert "## Constraints" in content
+        assert "| users_pkey | PRIMARY KEY | id |" in content
+        assert "## Relations" in content
+        assert "## Triggers" in content
+        assert "- `public.set_updated`" in content
+        assert "## DDL" in content
+        assert "```sql" in content
+
+    def test_error_definition_rendered_as_note(self):
+        meta = {
+            "schema": None, "table": "users",
+            "definition": "ERROR: MCP tool 'describe_table' failed (Boom).",
+        }
+        content = db_doc_mod._render_table_subpage("users", meta, {}, [], {})
+        assert "_ERROR:" in content
+        assert "```sql" not in content
+
+    def test_missing_description_note(self):
+        meta = {"schema": "public", "table": "orders", "definition": ""}
+        content = db_doc_mod._render_table_subpage(
+            "public.orders", meta, {}, [], {}
+        )
+        assert "(no description available" in content
+
+
+# ============================================================================
+# Category page renders
+# ============================================================================
+class TestRenderCategoryPages:
+    def test_root_with_descriptions(self):
+        entries = {
+            "public.v": {"schema": "public", "name": "v"},
+            "public.w": {"schema": "public", "name": "w"},
+        }
+        content = db_doc_mod._render_category_root(
+            "views", entries, {"public.v": "Статистика сессий"}
+        )
+        assert "## Views" in content
+        assert "2 object(s)" in content
+        assert "- `public.v` — Статистика сессий" in content
+        assert "- `public.w`" in content
+
+    def test_subpage_metadata_and_source(self):
+        meta = {
+            "schema": "public", "name": "v", "kind": "MATERIALIZED VIEW",
+            "source": "SELECT count(*) FROM users",
+            "meta": {"owner": "app"},
+        }
+        content = db_doc_mod._render_category_subpage(
+            "views", "public.v", meta, "Агрегаты."
+        )
+        assert content.startswith("## `public.v`")
+        assert "Агрегаты." in content
+        assert "## Metadata" in content
+        assert "| kind | MATERIALIZED VIEW |" in content
+        assert "| owner | app |" in content
+        assert "## Source" in content
+        assert "```sql" in content
+
+    def test_subpage_without_description(self):
+        meta = {"schema": "public", "name": "v", "kind": "VIEW"}
+        content = db_doc_mod._render_category_subpage("views", "public.v", meta, "")
+        assert "(no description available; VIEW evidence below)" in content
+
+
+# ============================================================================
+# _render_page_tree (parent / relatedPages / caps / fold / assembly)
+# ============================================================================
+class TestPageTree:
+    def test_full_tree_parents_and_related(self):
+        pages, order = db_doc_mod._render_page_tree(
+            _fake_entity(), _sample_info(),
+            {"overview": None, "tables": {}, "categories": {}},
+        )
+        # orders ranks first (FK-degree tie, more columns).
+        assert order == [
+            "page_overview", "page_tables",
+            "page_tbl_public_orders", "page_tbl_public_users",
+        ]
+        assert set(pages) == set(order)
+        assert pages["page_overview"]["relatedPages"] == ["page_tables"]
+        assert pages["page_tables"]["relatedPages"] == ["page_overview"]
+        for child in ("page_tbl_public_orders", "page_tbl_public_users"):
+            assert pages[child]["parent"] == "page_tables"
+            assert pages[child]["importance"] == "medium"
+        # FK adjacency → cross-linked relatedPages.
+        assert pages["page_tbl_public_orders"]["relatedPages"] == [
+            "page_tbl_public_users"
+        ]
+        assert pages["page_tbl_public_users"]["relatedPages"] == [
+            "page_tbl_public_orders"
+        ]
+        assert pages["page_tbl_public_users"]["title"] == "users"
+        # Root rows link to the subpages.
+        assert "- [`public.users`](page_tbl_public_users)" in pages["page_tables"]["content"]
+
+    def test_overview_enrichment_appended(self):
+        enrich = {
+            "overview": "ОБЗОР БАЗЫ",
+            "tables": {"public.users": {"purpose": "Пользователи."}},
+            "categories": {},
+        }
+        pages, _ = db_doc_mod._render_page_tree(_fake_entity(), _sample_info(), enrich)
+        assert "ОБЗОР БАЗЫ" in pages["page_overview"]["content"]
+        assert "# Database: Main DB" in pages["page_overview"]["content"]  # facts stay
+        assert "— Пользователи." in pages["page_tables"]["content"]
+        assert "Пользователи." in pages["page_tbl_public_users"]["content"]
+
+    def test_overview_fallback_note_without_llm(self):
+        pages, _ = db_doc_mod._render_page_tree(
+            _fake_entity(), _sample_info(),
+            {"overview": None, "tables": {}, "categories": {}},
+        )
+        assert "(LLM enrichment unavailable" in pages["page_overview"]["content"]
+
+    def test_subpage_cap_keeps_surplus_on_root(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_subpage_cap", lambda: 1)
+        pages, order = db_doc_mod._render_page_tree(
+            _fake_entity(), _sample_info(),
+            {"overview": None, "tables": {}, "categories": {}},
+        )
+        assert order == ["page_overview", "page_tables", "page_tbl_public_orders"]
+        # users stayed on the root as a plain (non-linked) row.
+        assert "- `public.users`" in pages["page_tables"]["content"]
+        assert "](page_tbl_public_users)" not in pages["page_tables"]["content"]
+
+    def test_category_roots_and_children(self):
+        info = _sample_info(views={
+            "public.session_stats": {
+                "schema": "public", "name": "session_stats",
+                "kind": "MATERIALIZED VIEW", "source": "SELECT 1",
+            },
+        })
+        enrich = {
+            "overview": None, "tables": {},
+            "categories": {"views": {"public.session_stats": "Статистика."}},
+        }
+        pages, order = db_doc_mod._render_page_tree(_fake_entity(), info, enrich)
+        assert "page_views" in pages
+        child = "page_view_public_session_stats"
+        assert child in pages
+        assert pages[child]["parent"] == "page_views"
+        assert pages[child]["title"] == "session_stats"
+        assert pages[child]["importance"] == "low"
+        assert pages["page_views"]["relatedPages"] == [child]
+        assert order[-2:] == ["page_views", child]
+        assert "Статистика." in pages[child]["content"]
+
+    def test_assemble_docs_order_and_separator(self):
+        pages, order = db_doc_mod._render_page_tree(
+            _fake_entity(), _sample_info(),
+            {"overview": None, "tables": {}, "categories": {}},
+        )
+        docs = db_doc_mod._assemble_docs(pages, order)
+        parts = docs.split("\n\n---\n\n")
+        assert len(parts) == 4
+        assert parts[0].startswith("# Database: Main DB")
+        assert parts[1].startswith("## Tables")
+        assert parts[2].startswith("## `public.orders`")
+        assert parts[3].startswith("## `public.users`")
+
+
+# ============================================================================
+# Batched LLM enrichment (strict JSON + name validation + budgets)
+# ============================================================================
+class TestBatchedEnrichment:
+    def test_batches_names_and_related_validation(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_enrich_batch_size", lambda: 2)
+        monkeypatch.setattr(db_doc_mod, "_max_descriptions", lambda: 10)
+        captured = []
+
+        async def fake(prompt, model, base_url=None, api_key=None):
+            captured.append(prompt)
+            return json.dumps([
+                {"name": "public.t1", "purpose": "one"},
+                {"name": "GHOST_TABLE", "purpose": "invented"},
+                {"name": "t2", "purpose": "two", "related": ["t1", "NOWHERE"]},
+            ])
+
+        monkeypatch.setattr(db_doc_mod, "_llm_or_none", fake)
+        info = {
+            "schemas": ["public"],
+            "tables": {
+                f"public.t{i}": {"schema": "public", "table": f"t{i}", "definition": ""}
+                for i in (1, 2, 3)
+            },
+            "fk_edges": [],
+        }
+        out = asyncio.run(db_doc_mod._enrich_table_descriptions(
+            info, product_context="", model=None, base_url=None,
+            api_key=None, language="ru",
+        ))
+        # 3 tables, batch size 2 → exactly 2 prompts; batch membership visible.
+        assert len(captured) == 2
+        assert "### `public.t1`" in captured[0]
+        assert "### `public.t2`" in captured[0]
+        assert "### `public.t3`" in captured[1]
+        # Invented names dropped; short names matched to qualified tables;
+        # related validated against the introspected set.
+        assert set(out) == {"public.t1", "public.t2"}
+        assert out["public.t2"]["related"] == ["public.t1"]
+
+    def test_description_cap_ranks_first(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_enrich_batch_size", lambda: 40)
+        monkeypatch.setattr(db_doc_mod, "_max_descriptions", lambda: 1)
+        captured_prompts: list = []
+
+        async def fake(prompt, model, base_url=None, api_key=None):
+            captured_prompts.append(prompt)
+            return json.dumps([{"name": n, "purpose": "p"} for n in ("t1", "t2")])
+
+        monkeypatch.setattr(db_doc_mod, "_llm_or_none", fake)
+        info = {
+            "schemas": [],
+            "tables": {
+                "t1": {"schema": None, "table": "t1", "definition": ""},
+                "t2": {"schema": None, "table": "t2", "definition": ""},
+            },
+            "fk_edges": [],
+        }
+        out = asyncio.run(db_doc_mod._enrich_table_descriptions(
+            info, product_context="", model=None, base_url=None,
+            api_key=None, language="ru",
+        ))
+        # The cap bounds the ASK: exactly one call, only the top-ranked table
+        # in the prompt. A grounded description for a real table that arrived
+        # in the same response is still kept (no extra calls, valid evidence).
+        assert len(captured_prompts) == 1
+        assert "### `t1`" in captured_prompts[0]
+        assert "### `t2`" not in captured_prompts[0]
+        assert "t1" in out
+        assert set(out) <= {"t1", "t2"}
+
+    def test_invalid_json_keeps_deterministic(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_enrich_batch_size", lambda: 40)
+        monkeypatch.setattr(
+            db_doc_mod, "_llm_or_none", lambda *a, **kw: _async_return("no json")
+        )
+        info = {
+            "schemas": [],
+            "tables": {"t1": {"schema": None, "table": "t1", "definition": ""}},
+            "fk_edges": [],
+        }
+        out = asyncio.run(db_doc_mod._enrich_table_descriptions(
+            info, product_context="", model=None, base_url=None,
+            api_key=None, language="ru",
+        ))
+        assert out == {}
+
+    def test_category_budget(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_max_descriptions", lambda: 2)
+        captured = []
+
+        async def fake(prompt, model, base_url=None, api_key=None):
+            captured.append(prompt)
+            return json.dumps([{"name": "public.a", "purpose": "pa"}])
+
+        monkeypatch.setattr(db_doc_mod, "_llm_or_none", fake)
+        info = {
+            "views": {
+                "public.a": {"schema": "public", "name": "a"},
+                "public.b": {"schema": "public", "name": "b"},
+            },
+        }
+        out = asyncio.run(db_doc_mod._enrich_categories(
+            info, product_context="", model=None, base_url=None,
+            api_key=None, language="ru", already_described=1,
+        ))
+        # budget = 2 - 1 = 1 → only the first sorted object reaches the prompt.
+        assert len(captured) == 1
+        assert "### `public.a`" in captured[0]
+        assert "### `public.b`" not in captured[0]
+        assert out == {"views": {"public.a": "pa"}}
+
+    def test_category_budget_exhausted(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_max_descriptions", lambda: 2)
+        called = []
+
+        async def fake(prompt, model, base_url=None, api_key=None):
+            called.append(prompt)
+            return "[]"
+
+        monkeypatch.setattr(db_doc_mod, "_llm_or_none", fake)
+        info = {"views": {"public.a": {"schema": "public", "name": "a"}}}
+        out = asyncio.run(db_doc_mod._enrich_categories(
+            info, product_context="", model=None, base_url=None,
+            api_key=None, language="ru", already_described=2,
+        ))
+        assert out == {}
+        assert called == []
+
+    def test_infer_relations_validates_endpoints(self, monkeypatch):
+        async def fake(prompt, model, base_url=None, api_key=None):
+            return json.dumps([
+                {"from": "orders", "from_cols": ["user_id"],
+                 "to": "users", "to_cols": ["id"]},
+                {"from": "ghost", "to": "users"},
+                {"from": "users", "to": "users"},
+            ])
+
+        monkeypatch.setattr(db_doc_mod, "_llm_or_none", fake)
+        info = {
+            "schemas": ["public"],
+            "tables": {
+                "public.users": {"schema": "public", "table": "users", "definition": ""},
+                "public.orders": {"schema": "public", "table": "orders", "definition": ""},
+            },
+            "fk_edges": [],
+        }
+        edges = asyncio.run(db_doc_mod._infer_relations(
+            info, model=None, base_url=None, api_key=None, language="ru",
+        ))
+        assert edges == [{
+            "from": "public.orders", "from_cols": ["user_id"],
+            "to": "public.users", "to_cols": ["id"],
+            "constraint": "", "kind": "inferred",
+        }]
+
+    def test_infer_relations_skipped_with_fk_edges(self, monkeypatch):
+        called = []
+
+        async def fake(prompt, model, base_url=None, api_key=None):
+            called.append(prompt)
+            return "[]"
+
+        monkeypatch.setattr(db_doc_mod, "_llm_or_none", fake)
+        info = _sample_info()  # has one explicit FK edge
+        edges = asyncio.run(db_doc_mod._infer_relations(
+            info, model=None, base_url=None, api_key=None, language="ru",
+        ))
+        assert edges == []
+        assert called == []
+
+
+# ============================================================================
+# Cross-context digest (DB docs → codebase briefs)
+# ============================================================================
+class TestDbContextPayload:
+    def test_payload_shape(self):
+        payload = db_doc_mod._db_context_payload(_sample_info())
+        assert payload["schemas"] == ["public"]
+        # Ranked by FK degree: both degree 1, users wins on fewer columns?
+        # No — degree tie → more columns first: orders (2) before users (1).
+        assert payload["tables"][0] == ["public.orders", 1]
+        assert payload["tables"][1] == ["public.users", 1]
+        assert payload["counts"] == {"tables": 2, "fk_edges": 1}
+
+    def test_payload_includes_categories(self):
+        info = _sample_info(views={"public.v": {"schema": "public", "name": "v"}})
+        payload = db_doc_mod._db_context_payload(info)
+        assert payload["counts"]["views"] == 1
+
+
+class TestProductDatabaseContext:
+    @pytest.fixture()
+    def seeded(self, isolated_db):
+        from api.models import DatabaseORM, ProductORM
+
+        with isolated_db.SessionLocal() as s:
+            s.add(ProductORM(id="prod_ctx", name="P"))
+            s.add(DatabaseORM(
+                id="db_a", product_id="prod_ctx", name="Core", source="manual",
+                pages={
+                    "page_tables": {"provenance": {"db_context": {
+                        "schemas": ["public"],
+                        "tables": [["public.users", 3], ["public.orders", 1]],
+                        "counts": {"tables": 2, "fk_edges": 1},
+                    }}},
+                },
+            ))
+            s.add(DatabaseORM(
+                id="db_b", product_id="prod_ctx", name="Legacy", source="manual",
+                generated_docs=(
+                    "## Tables\n\n2 table(s)\n\n- `legacy.users`\n- `legacy.orders`\n"
+                ),
+            ))
+            s.commit()
+        return isolated_db
+
+    def test_digest_from_provenance_and_legacy_fallback(self, seeded):
+        out = db_doc_mod.product_database_context("prod_ctx")
+        assert out.startswith("### Контекст баз данных продукта")
+        # Explicit "do not cite as paths" marker for the citation guard.
+        assert "не цитировать как пути" in out
+        assert "**Core** (schemas: public; таблиц: 2)" in out
+        assert "`public.users`" in out
+        assert "**Legacy** — таблицы: `legacy.users`" in out
+
+    def test_no_rows_returns_empty(self, isolated_db):
+        assert db_doc_mod.product_database_context("prod_none") == ""
+
+    def test_empty_product_returns_empty(self):
+        assert db_doc_mod.product_database_context("") == ""
+
+    def test_flag_default_on_and_env_off(self, monkeypatch):
+        assert db_doc_mod.db_context_enabled() is True
+        for off in ("false", "0", "no", "off"):
+            monkeypatch.setenv("DOCGEN_DB_CONTEXT_ENABLED", off)
+            assert db_doc_mod.db_context_enabled() is False
+        monkeypatch.setenv("DOCGEN_DB_CONTEXT_ENABLED", "true")
+        assert db_doc_mod.db_context_enabled() is True
 
 
 # ============================================================================
@@ -985,13 +2097,19 @@ class TestGenerateDatabaseDocs:
             db_doc_mod.generate_database_docs(entity, product, model="test-model")
         )
 
-        assert result == "ENRICHED DATABASE DOCS"
-        assert entity.generated_docs == "ENRICHED DATABASE DOCS"
-        # Pages: overview / schema / tables / documentation + provenance.
+        # The assembled docs carry the LLM overview + every deterministic page.
+        assert "ENRICHED DATABASE DOCS" in result
+        assert "## Tables" in result
+        assert entity.generated_docs == result
+        # Pages: overview + tables root + one subpage per table (cap 200).
         assert set(entity.pages) == {
-            "page_overview", "page_schema", "page_tables", "page_documentation",
+            "page_overview", "page_tables",
+            "page_tbl_public_orders", "page_tbl_public_users",
         }
-        assert entity.pages["page_documentation"]["content"] == result
+        # The old flat pages are gone; categories appear only with evidence.
+        assert "page_schema" not in entity.pages
+        assert "page_documentation" not in entity.pages
+        assert not any(k.startswith("page_views") for k in entity.pages)
         prov = entity.pages["page_overview"]["provenance"]
         assert prov["generator"] == "standard-llm"
         assert prov["prompt_file"] == "database_doc.md"
@@ -1001,6 +2119,14 @@ class TestGenerateDatabaseDocs:
             "describe": "describe_table",
         }
         assert prov["schema_fingerprint_source"] == "mcp_introspection"
+        assert "caps" in prov and "enrich_batch" in prov["caps"]
+        # Children are deterministic introspection pages.
+        child = entity.pages["page_tbl_public_users"]["provenance"]
+        assert child["generator"] == "introspection"
+        assert child["prompt_file"] == "introspection"
+        # DB-context digest for the codebase flow lands on the tables page.
+        db_ctx = entity.pages["page_tables"]["provenance"]["db_context"]
+        assert db_ctx["counts"]["tables"] == 2
         # Indexing: final docs, product dataset, database source scoping.
         assert len(indexing) == 1
         content, dataset, source_type, source_id = indexing[0]
@@ -1017,9 +2143,8 @@ class TestGenerateDatabaseDocs:
 
         assert "## Tables" in result
         assert "`public.users`" in result
+        assert "(LLM enrichment unavailable" in result
         assert entity.generated_docs == result
-        # Skeleton source → no AI documentation page content.
-        assert entity.pages["page_documentation"]["content"] == ""
         assert entity.pages["page_overview"]["provenance"]["generator"] == "skeleton"
 
     def test_secrets_masked_before_persist(self, monkeypatch):
@@ -1036,7 +2161,7 @@ class TestGenerateDatabaseDocs:
     def test_corroborate_filters_invented_identifiers(self, monkeypatch):
         """3.1: model-generated sentences naming identifiers that are NOT in
         the introspected schema are dropped; every removal lands in the
-        provenance report."""
+        provenance report (now on the overview page — the only LLM page)."""
         llm_text = (
             "The schema stores users in `public.users`. "
             "Invented table `GhostArchiveTable` keeps audit rows."
@@ -1049,8 +2174,9 @@ class TestGenerateDatabaseDocs:
         )
 
         assert "GhostArchiveTable" not in result
-        assert result == "The schema stores users in `public.users`."
-        prov = entity.pages["page_documentation"]["provenance"]
+        assert "keeps audit rows" not in result
+        assert "The schema stores users in `public.users`." in result
+        prov = entity.pages["page_overview"]["provenance"]
         assert prov["corroborate"] == {"removed": ["GhostArchiveTable"]}
         assert "GhostArchiveTable" not in entity.generated_docs
 
@@ -1067,9 +2193,9 @@ class TestGenerateDatabaseDocs:
         assert "`public.users`" in result
         assert "corroborate" not in entity.pages["page_overview"]["provenance"]
 
-    def test_corroborate_fail_open_when_filter_empties(self, monkeypatch):
-        """A filter that would empty the whole doc keeps the original text
-        (and records nothing as removed)."""
+    def test_corroborate_all_ungrounded_keeps_facts(self, monkeypatch):
+        """The deterministic facts block always anchors the overview, so a
+        fully-ungrounded LLM paragraph is dropped while the facts survive."""
         _patch_generation(monkeypatch, llm_text="Only `GhostArchiveTable` here.")
         entity = _fake_entity()
 
@@ -1077,8 +2203,10 @@ class TestGenerateDatabaseDocs:
             db_doc_mod.generate_database_docs(entity, _fake_product())
         )
 
-        assert result == "Only `GhostArchiveTable` here."
-        assert "corroborate" not in entity.pages["page_overview"]["provenance"]
+        assert "# Database: Main DB" in result
+        assert "GhostArchiveTable" not in result
+        prov = entity.pages["page_overview"]["provenance"]
+        assert prov["corroborate"] == {"removed": ["GhostArchiveTable"]}
 
     def test_no_tools_raises(self, monkeypatch):
         _patch_generation(monkeypatch, llm_text="x", tools=[])
@@ -1118,15 +2246,28 @@ class TestGenerateDatabaseDocs:
 
         asyncio.run(db_doc_mod.generate_database_docs(_fake_entity(), _fake_product()))
 
-        assert len(captured) == 1
+        # Deterministic call plan: 1 overview + 1 description batch (2 tables
+        # fit one batch) + 1 relation-inference call (no FK edges, ≥2 tables).
+        assert len(captured) == 3
         prompt = captured[0]
         assert "Main DB" in prompt
         assert "public.users" in prompt
         # The masked DSN goes into the prompt; a raw one never exists here.
         assert "***REDACTED***" in prompt
+        # The description batch carries the evidence stubs.
+        assert "### `public.users`" in captured[1]
 
     def test_mermaid_repair_failure_non_fatal(self, monkeypatch):
-        _patch_generation(monkeypatch, llm_text="docs with mermaid")
+        # A real mermaid fence (inferred-relations ER on the tables page) goes
+        # through the repair loop; a raising verifier must not break the run.
+        fake, _ = _dispatch_llm(
+            [], relations_payload=[
+                {"from": "orders", "from_cols": ["user_id"],
+                 "to": "users", "to_cols": ["id"]},
+            ],
+        )
+        _patch_generation(monkeypatch, llm_text="x")
+        monkeypatch.setattr(db_doc_mod, "_llm_or_none", fake)
 
         async def boom(content, llm):
             raise RuntimeError("repair failed")
@@ -1135,7 +2276,7 @@ class TestGenerateDatabaseDocs:
         result = asyncio.run(
             db_doc_mod.generate_database_docs(_fake_entity(), _fake_product())
         )
-        assert result == "docs with mermaid"
+        assert "erDiagram" in result
 
     def test_judge_only_for_model_generated(self, monkeypatch):
         from api.docgen.verification import JudgeVerdict
@@ -1153,13 +2294,86 @@ class TestGenerateDatabaseDocs:
         # Skeleton source → deterministic evidence → judge skipped.
         assert calls == []
 
-        # Now with model-generated docs the judge runs (and never blocks).
+        # Now with model-generated docs the judge runs on the overview page
+        # (facts + LLM text) and never blocks.
         monkeypatch.setattr(
             db_doc_mod, "_llm_or_none", lambda *a, **kw: _async_return("LLM docs")
         )
         asyncio.run(db_doc_mod.generate_database_docs(_fake_entity(), _fake_product()))
         assert len(calls) == 1
-        assert calls[0][1] == "LLM docs"
+        assert calls[0][0] == "database"
+        assert "LLM docs" in calls[0][1]
+        assert "# Database: Main DB" in calls[0][1]
+
+    def test_batched_descriptions_end_to_end(self, monkeypatch):
+        fake, _ = _dispatch_llm([
+            {"name": "public.users", "purpose": "Пользователи приложений.",
+             "notes": "См. orders.", "related": ["orders", "GHOST"]},
+            {"name": "public.orders", "purpose": "Заказы."},
+        ])
+        _patch_generation(monkeypatch, llm_text="x")
+        monkeypatch.setattr(db_doc_mod, "_llm_or_none", fake)
+        entity = _fake_entity()
+
+        result = asyncio.run(
+            db_doc_mod.generate_database_docs(entity, _fake_product())
+        )
+
+        # Root rows carry the purposes; invented related-table dropped.
+        assert "— Пользователи приложений." in result
+        assert "— Заказы." in result
+        assert "GHOST" not in result
+        # The subpage renders purpose + notes.
+        users_page = entity.pages["page_tbl_public_users"]["content"]
+        assert "Пользователи приложений." in users_page
+        assert "## Notes" in users_page
+        assert "См. orders." in users_page
+        # Tables page becomes LLM-enriched; caps record the descriptions.
+        prov = entity.pages["page_tables"]["provenance"]
+        assert prov["generator"] == "standard-llm"
+        assert prov["prompt_file"] == "database_tables.md"
+        assert prov["caps"]["descriptions"] == 2
+
+    def test_inferred_relations_end_to_end(self, monkeypatch):
+        fake, _ = _dispatch_llm(
+            [], relations_payload=[
+                {"from": "orders", "from_cols": ["user_id"],
+                 "to": "users", "to_cols": ["id"]},
+            ],
+        )
+        _patch_generation(monkeypatch, llm_text="x")
+        monkeypatch.setattr(db_doc_mod, "_llm_or_none", fake)
+        entity = _fake_entity()
+
+        result = asyncio.run(
+            db_doc_mod.generate_database_docs(entity, _fake_product())
+        )
+
+        # Marked as an inference in the relationships block…
+        assert "- `public.orders`(user_id) → `public.users`(id) — inferred" in result
+        # …and in the derived ER diagram (repaired through the patched loop).
+        assert "```mermaid" in result
+        assert "public_users ||--o{ public_orders : fk" in result
+        # FK adjacency links the subpages.
+        assert entity.pages["page_tbl_public_users"]["relatedPages"] == [
+            "page_tbl_public_orders"
+        ]
+
+    def test_subpage_cap_applied(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_subpage_cap", lambda: 1)
+        _patch_generation(monkeypatch, llm_text="docs")
+        entity = _fake_entity()
+
+        result = asyncio.run(
+            db_doc_mod.generate_database_docs(entity, _fake_product())
+        )
+
+        assert set(entity.pages) == {
+            "page_overview", "page_tables", "page_tbl_public_orders",
+        }
+        # The folded-out table stays on the root.
+        assert "- `public.users`" in result
+        assert entity.pages["page_tables"]["provenance"]["caps"]["max_subpages"] == 1
 
 
 # ============================================================================

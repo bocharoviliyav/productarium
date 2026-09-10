@@ -677,7 +677,12 @@
         "mermaid_repair": "Mermaid diagram repair",
         "mermaid_max_repair_attempts": "Mermaid max repair attempts",
         "mermaid_repair_deadline": "Mermaid repair loop budget",
-        "db_connect_check": "Database preset connection check (MCP handshake)"
+        "db_connect_check": "Database preset connection check (MCP handshake)",
+        "db_docgen_enrich_batch": "DB RE docgen: tables per LLM description batch",
+        "db_docgen_max_subpages": "DB RE docgen: max entity subpages",
+        "db_docgen_max_descriptions": "DB RE docgen: max LLM-described objects",
+        "db_fk_evidence_tables": "DB RE: tables probed for constraints/indexes",
+        "db_source_objects": "DB RE: objects with fetched source"
       },
       "hints": {
         "llm_request": "HTTP timeout for OpenAI-compatible clients.",
@@ -695,7 +700,12 @@
         "mermaid_repair": "Per-LLM-call timeout for repairing one diagram.",
         "mermaid_max_repair_attempts": "Repair attempt budget per unique diagram body.",
         "mermaid_repair_deadline": "Wall-clock budget for the whole repair drain of one page.",
-        "db_connect_check": "Budget for the full MCP handshake when adding a preset database (launcher spawn + initialize + tools/list + one probe tool call). Generous default — the docker-fallback launcher may pull the image on the very first check."
+        "db_connect_check": "Budget for the full MCP handshake when adding a preset database (launcher spawn + initialize + tools/list + one probe tool call). Generous default — the docker-fallback launcher may pull the image on the very first check.",
+        "db_docgen_enrich_batch": "Table descriptions are generated as strict-JSON batches, not per page: a 61-table Postgres or an Oracle monolith costs dozens of calls, not thousands.",
+        "db_docgen_max_subpages": "How many entity subpages (tables/views/triggers/…) are rendered; the surplus stays in the category root's folded list — hidden, never dropped.",
+        "db_docgen_max_descriptions": "Overall cap of LLM descriptions per database run (structures/indexes/DDL stay deterministic).",
+        "db_fk_evidence_tables": "How many tables the walk probes for constraints/indexes to build the honest FK graph; affects the introspection cache.",
+        "db_source_objects": "How many views/procedures/triggers/sequences/types get their source fetched; affects the introspection cache."
       }
     },
     "users": {

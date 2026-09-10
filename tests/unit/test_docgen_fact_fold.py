@@ -123,59 +123,62 @@ def _db_info(n_tables: int, definition: str = "CREATE TABLE x (id int)") -> dict
 
 
 class TestDatabaseTablesFold:
+    """Post-restructure contract: the tables ROOT lists ranked names only
+    (descriptions/relations/ER live there, DDL on per-table subpages) — the
+    fold hides surplus NAME rows, never structure blocks."""
+
     def test_small_schema_no_disclosure(self):
         from api.docgen.database import _render_skeleton
 
-        _, _, tables_md = _render_skeleton(_Entity(), _db_info(5))
+        _, tables_md = _render_skeleton(_Entity(), _db_info(5))
         assert "<details>" not in tables_md
         for i in range(5):
-            assert f"### `table_{i:03d}`" in tables_md
+            assert f"- `table_{i:03d}`" in tables_md
+        # The root lists names only — DDL lives on subpages.
+        assert "CREATE TABLE" not in tables_md
 
     def test_large_schema_folds_with_count(self):
-        from api.docgen.database import _TABLES_VISIBLE, _render_skeleton
+        from api.docgen.database import _TABLES_ROOT_VISIBLE, _render_skeleton
 
-        n = 40
-        _, _, tables_md = _render_skeleton(_Entity(), _db_info(n))
+        n = _TABLES_ROOT_VISIBLE + 20
+        _, tables_md = _render_skeleton(_Entity(), _db_info(n))
         assert "<details>" in tables_md
-        assert f"<summary>Remaining tables ({n - _TABLES_VISIBLE})</summary>" in tables_md
-        # Conservation: EVERY table is still on the page (12 visible + 28 folded).
+        assert (
+            f"<summary>Remaining tables ({n - _TABLES_ROOT_VISIBLE})</summary>"
+            in tables_md
+        )
+        # Conservation: EVERY table is still on the page (60 visible + 20 folded).
         for i in range(n):
-            assert f"### `table_{i:03d}`" in tables_md
+            assert f"- `table_{i:03d}`" in tables_md
         # The disclosure comes after the visible ones.
-        first_hidden = tables_md.index("### `table_012`")
+        first_hidden = tables_md.index(f"- `table_{_TABLES_ROOT_VISIBLE:03d}`")
         details_at = tables_md.index("<details>")
         assert details_at < first_hidden
 
-    def test_ddl_with_closing_tag_stays_inside_disclosure(self):
+    def test_definitions_live_on_subpages_not_root(self):
+        # The restructure moved DDL/structure into per-table subpages: the
+        # tables ROOT is names + relations + ER only, so raw DDL (and any
+        # stray ``</details>`` inside it) can never break a fold.
         from api.docgen.database import _render_skeleton
 
-        # 15 tables → 12 visible, 3 hidden; the POISON goes into one HIDDEN
-        # table's DDL — visible tables keep raw tags inside their ```sql
-        # fences (fences protect them), the hidden body gets neutralised so
-        # it cannot end the disclosure early.
-        info = _db_info(15)
-        info["tables"]["table_014"]["definition"] = (
-            "CREATE TABLE x (id int); -- </details>"
-        )
-        _, _, tables_md = _render_skeleton(_Entity(), info)
-        assert tables_md.count("</details>") == 1  # only the block's own tag
+        info = _db_info(3, definition="CREATE TABLE x (id int); -- </details>")
+        _, tables_md = _render_skeleton(_Entity(), info)
+        assert "CREATE TABLE" not in tables_md
+        assert "</details>" not in tables_md
+        for i in range(3):
+            assert f"- `table_{i:03d}`" in tables_md
 
-    def test_blocks_conserved(self):
-        from api.docgen.database import _TABLES_VISIBLE, _table_block
+    def test_rows_conserved(self):
+        from api.docgen.database import _TABLES_ROOT_VISIBLE, _render_skeleton
 
-        info = _db_info(20)
-        names = sorted(info["tables"])
-        blocks = [_table_block(f, info["tables"][f]) for f in names]
-        visible, hidden = ff.rank_split(blocks, key=lambda b: 0, keep=_TABLES_VISIBLE)
-        # Blocks are lists (unhashable) — conservation on the table NAMES
-        # they render, which is what a reader counts as facts.
-        def _names(parts) -> list:
-            return [b[0] for b in parts]
-
-        assert ff.is_conserved(
-            [f"### `{f}`" for f in names],
-            _names(visible), _names(hidden),
-        )
+        n = _TABLES_ROOT_VISIBLE + 8
+        _, tables_md = _render_skeleton(_Entity(), _db_info(n))
+        names = sorted(f"table_{i:03d}" for i in range(n))
+        head, _, tail = tables_md.partition("<details>")
+        visible = [ln for ln in head.splitlines() if ln.startswith("- `")]
+        hidden = [ln for ln in tail.splitlines() if ln.startswith("- `")]
+        # What a reader counts as facts: the rendered name rows.
+        assert ff.is_conserved([f"- `{f}`" for f in names], visible, hidden)
         assert len(hidden) == 8
 
 

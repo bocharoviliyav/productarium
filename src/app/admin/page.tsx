@@ -2437,6 +2437,11 @@ const TIMEOUT_FIELDS: { key: string; group: string }[] = [
   { key: "mermaid_max_repair_attempts", group: "Mermaid" },
   { key: "mermaid_repair_deadline", group: "Mermaid" },
   { key: "db_connect_check", group: "Databases" },
+  { key: "db_docgen_enrich_batch", group: "Databases" },
+  { key: "db_docgen_max_subpages", group: "Databases" },
+  { key: "db_docgen_max_descriptions", group: "Databases" },
+  { key: "db_fk_evidence_tables", group: "Databases" },
+  { key: "db_source_objects", group: "Databases" },
 ];
 
 const TIMEOUT_GROUPS = [
@@ -2541,7 +2546,14 @@ function TimeoutsSection() {
 
   const fieldHint = (key: string, entry: TimeoutResolvedEntry | undefined) => {
     const floor = entry?.floor ?? "";
-    const unit = entry?.unit === "milliseconds" ? "ms" : "s";
+    // Time units render compactly; budget knobs carry their own unit label
+    // (e.g. "tables per LLM call") which is shown verbatim after a space.
+    const unit =
+      entry?.unit === "milliseconds"
+        ? "ms"
+        : entry?.unit === "seconds" || !entry?.unit
+          ? "s"
+          : ` ${entry.unit}`;
     const def = entry?.default ?? "";
     const i18nHint = tt.hints?.[key];
     const parts: string[] = [];

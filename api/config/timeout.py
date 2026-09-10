@@ -220,6 +220,56 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         label="Database preset connection check (MCP handshake)",
         group="Databases",
     ),
+    # --- Database RE docgen budgets (walk + render, api/docgen/database.py) --
+    # Not timeouts but tunable knobs sharing the registry's precedence
+    # (admin store > env > default) + floor machinery, like
+    # docgen_map_concurrency. Values are read on every generation, so an
+    # admin change applies to the next run without a restart.
+    TimeoutKey(
+        key="db_docgen_enrich_batch",
+        env_var="DB_DOCGEN_ENRICH_BATCH",
+        default=40.0,
+        floor=5.0,
+        label="Database docgen: tables per LLM description batch",
+        unit="tables per LLM call",
+        group="Databases",
+    ),
+    TimeoutKey(
+        key="db_docgen_max_subpages",
+        env_var="DB_DOCGEN_MAX_SUBPAGES",
+        default=200.0,
+        floor=1.0,
+        label="Database docgen: max entity subpages",
+        unit="pages",
+        group="Databases",
+    ),
+    TimeoutKey(
+        key="db_docgen_max_descriptions",
+        env_var="DB_DOCGEN_MAX_DESCRIPTIONS",
+        default=250.0,
+        floor=1.0,
+        label="Database docgen: max LLM-described objects",
+        unit="objects",
+        group="Databases",
+    ),
+    TimeoutKey(
+        key="db_fk_evidence_tables",
+        env_var="DB_FK_EVIDENCE_TABLES",
+        default=300.0,
+        floor=1.0,
+        label="Database RE: tables probed for constraints/indexes",
+        unit="tables",
+        group="Databases",
+    ),
+    TimeoutKey(
+        key="db_source_objects",
+        env_var="DB_SOURCE_OBJECTS",
+        default=100.0,
+        floor=1.0,
+        label="Database RE: objects with fetched source/definition",
+        unit="objects",
+        group="Databases",
+    ),
 ]
 
 # Fast lookup by key + by env var.
@@ -414,6 +464,47 @@ def resolve_db_connect_check_timeout() -> float:
     return resolve_timeout("db_connect_check")
 
 
+def resolve_db_docgen_enrich_batch() -> int:
+    """Tables per LLM description batch in database docgen.
+
+    Table descriptions are enriched in strict-JSON batches (not per page) so
+    a 61-table Postgres or a multi-thousand-table Oracle monolith costs
+    dozens — not thousands — of LLM calls. Read per generation: an admin
+    change applies to the next run without a restart.
+    """
+    return resolve_timeout_int("db_docgen_enrich_batch")
+
+
+def resolve_db_docgen_max_subpages() -> int:
+    """Max entity subpages (tables + category objects) rendered per database.
+
+    Above the cap the surplus stays on the category root page in a folded
+    (``<details>``) list — hidden, never dropped.
+    """
+    return resolve_timeout_int("db_docgen_max_subpages")
+
+
+def resolve_db_docgen_max_descriptions() -> int:
+    """Max objects that get an LLM description per database run."""
+    return resolve_timeout_int("db_docgen_max_descriptions")
+
+
+def resolve_db_fk_evidence_tables() -> int:
+    """Max tables probed for constraints/indexes during the RE walk.
+
+    Walk-affecting budget: participates in the introspection cache key.
+    """
+    return resolve_timeout_int("db_fk_evidence_tables")
+
+
+def resolve_db_source_objects() -> int:
+    """Max non-table objects (views/routines/triggers/…) with fetched source.
+
+    Walk-affecting budget: participates in the introspection cache key.
+    """
+    return resolve_timeout_int("db_source_objects")
+
+
 def sync_timeout_env() -> None:
     """Export admin-store timeout overrides to their canonical env vars.
 
@@ -484,6 +575,11 @@ __all__ = [
     "resolve_mermaid_repair_deadline",
     "resolve_provider_test_timeout",
     "resolve_db_connect_check_timeout",
+    "resolve_db_docgen_enrich_batch",
+    "resolve_db_docgen_max_subpages",
+    "resolve_db_docgen_max_descriptions",
+    "resolve_db_fk_evidence_tables",
+    "resolve_db_source_objects",
     "sync_timeout_env",
     "get_timeout_resolved_view",
 ]

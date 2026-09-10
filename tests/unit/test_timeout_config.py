@@ -25,6 +25,12 @@ from api.config.timeout import (
     _BY_KEY,
     _resolve_with_key,
     get_timeout_resolved_view,
+    resolve_db_connect_check_timeout,
+    resolve_db_docgen_enrich_batch,
+    resolve_db_docgen_max_descriptions,
+    resolve_db_docgen_max_subpages,
+    resolve_db_fk_evidence_tables,
+    resolve_db_source_objects,
     resolve_docgen_indexing_drain_seconds,
     resolve_docgen_map_concurrency,
     resolve_expert_stream_timeout,
@@ -53,6 +59,12 @@ WRAPPER_TO_KEY = {
     "resolve_mermaid_max_repair_attempts": "mermaid_max_repair_attempts",
     "resolve_mermaid_repair_deadline": "mermaid_repair_deadline",
     "resolve_provider_test_timeout": "provider_test",
+    "resolve_db_connect_check_timeout": "db_connect_check",
+    "resolve_db_docgen_enrich_batch": "db_docgen_enrich_batch",
+    "resolve_db_docgen_max_subpages": "db_docgen_max_subpages",
+    "resolve_db_docgen_max_descriptions": "db_docgen_max_descriptions",
+    "resolve_db_fk_evidence_tables": "db_fk_evidence_tables",
+    "resolve_db_source_objects": "db_source_objects",
 }
 
 
@@ -288,6 +300,44 @@ class TestTimeoutConfig(unittest.TestCase):
             sync_timeout_env()
             # Invalid admin value is skipped; env var left unset (None here).
             self.assertIsNone(os.environ.get("LLM_REQUEST_TIMEOUT_SECONDS"))
+
+    # ------------------------------------------------------------------
+    # DB RE docgen budgets (counts, not seconds; admin > env > default)
+    # ------------------------------------------------------------------
+    def test_db_docgen_budget_defaults(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            self.assertEqual(resolve_db_docgen_enrich_batch(), 40)
+            self.assertEqual(resolve_db_docgen_max_subpages(), 200)
+            self.assertEqual(resolve_db_docgen_max_descriptions(), 250)
+            self.assertEqual(resolve_db_fk_evidence_tables(), 300)
+            self.assertEqual(resolve_db_source_objects(), 100)
+
+    def test_db_docgen_budget_env_override(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["DB_DOCGEN_ENRICH_BATCH"] = "7"
+            self.assertEqual(resolve_db_docgen_enrich_batch(), 7)
+            os.environ["DB_DOCGEN_MAX_SUBPAGES"] = "3"
+            self.assertEqual(resolve_db_docgen_max_subpages(), 3)
+            os.environ["DB_FK_EVIDENCE_TABLES"] = "12"
+            self.assertEqual(resolve_db_fk_evidence_tables(), 12)
+
+    def test_db_docgen_budget_floors(self):
+        # A typo can't shrink a batch below its floor or kill all subpages.
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["DB_DOCGEN_ENRICH_BATCH"] = "1"
+            self.assertEqual(resolve_db_docgen_enrich_batch(), 5)
+            os.environ["DB_DOCGEN_MAX_SUBPAGES"] = "0"
+            self.assertEqual(resolve_db_docgen_max_subpages(), 1)
+            os.environ["DB_DOCGEN_MAX_DESCRIPTIONS"] = "-3"
+            self.assertEqual(resolve_db_docgen_max_descriptions(), 250)
+
+    def test_db_connect_check_wrapper(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            self.assertEqual(resolve_db_connect_check_timeout(), 180.0)
 
     # ------------------------------------------------------------------
     # resolved view for the admin panel

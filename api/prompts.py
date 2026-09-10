@@ -125,8 +125,13 @@ _UNWRAPPED_PROMPTS = frozenset({
     "deep_research_synthesizer.md",
     # Wave E review #4: the database doc prompt carries {language_name}
     # substituted per-request from the generate body (was pinned to the
-    # config default language and the request field was dropped).
+    # config default language and the request field was dropped). The
+    # DB RE restructure adds the strict-JSON batch prompts (tables /
+    # category objects) with the same per-request substitution.
     "database_doc.md",
+    "database_tables.md",
+    "database_categories.md",
+    "database_relations.md",
 })
 
 
@@ -200,6 +205,9 @@ DEEP_RESEARCH_PLANNER_PROMPT = ""
 DEEP_RESEARCH_RESEARCHER_PROMPT = ""
 DEEP_RESEARCH_SYNTHESIZER_PROMPT = ""
 DATABASE_DOC_PROMPT = ""
+DATABASE_TABLES_PROMPT = ""
+DATABASE_CATEGORIES_PROMPT = ""
+DATABASE_RELATIONS_PROMPT = ""
 MERMAID_REPAIR_PROMPT = ""
 # Docgen pipeline (Wave F): consolidated section contracts + router +
 # orchestrator. DOCGEN_SECTIONS_PROMPT is the RAW parsed file;
@@ -386,8 +394,13 @@ PROMPT_FILES: Dict[str, str] = {
     "docgen_judge.md": "DOCGEN_JUDGE_PROMPT",
     "spec_agent_system.md": "SPEC_AGENT_SYSTEM_PROMPT",
     "spec_enrich_task.md": "SPEC_ENRICH_TASK_PROMPT",
-    # Wave E (database reverse-engineering + LangGraph deep research).
+    # Wave E (database reverse-engineering + LangGraph deep research). The
+    # tables/categories prompts are consumed via load_prompt_file() at call
+    # time by api.docgen.database; loaded here for admin hot-reload + visibility.
     "database_doc.md": "DATABASE_DOC_PROMPT",
+    "database_tables.md": "DATABASE_TABLES_PROMPT",
+    "database_categories.md": "DATABASE_CATEGORIES_PROMPT",
+    "database_relations.md": "DATABASE_RELATIONS_PROMPT",
     "deep_research_planner.md": "DEEP_RESEARCH_PLANNER_PROMPT",
     "deep_research_researcher.md": "DEEP_RESEARCH_RESEARCHER_PROMPT",
     "deep_research_synthesizer.md": "DEEP_RESEARCH_SYNTHESIZER_PROMPT",
@@ -541,6 +554,13 @@ DEEP_RESEARCH_SYNTHESIZER_PROMPT = load_prompt_file(
     "deep_research_synthesizer.md", DEEP_RESEARCH_SYNTHESIZER_PROMPT
 )
 DATABASE_DOC_PROMPT = load_prompt_file("database_doc.md", DATABASE_DOC_PROMPT)
+DATABASE_TABLES_PROMPT = load_prompt_file("database_tables.md", DATABASE_TABLES_PROMPT)
+DATABASE_CATEGORIES_PROMPT = load_prompt_file(
+    "database_categories.md", DATABASE_CATEGORIES_PROMPT
+)
+DATABASE_RELATIONS_PROMPT = load_prompt_file(
+    "database_relations.md", DATABASE_RELATIONS_PROMPT
+)
 
 MERMAID_REPAIR_PROMPT = load_prompt_file("mermaid_repair.md", MERMAID_REPAIR_PROMPT)
 VERIFICATION_GUARD = load_prompt_file("_verification_guard.md", VERIFICATION_GUARD)

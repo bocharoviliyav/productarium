@@ -45,11 +45,17 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 #: Payload format version — a bump invalidates every stored entry.
+#: v3: the DB-RE restructure reshaped the payload — the walk now also carries
+#: ``fk_edges``, the category collections (views/triggers/routines/sequences/
+#: types with sources), the sql-pack evidence merged into table meta, and
+#: ``tools_used``/``unavailable`` — v2 payloads lack the FK graph and the
+#: category evidence the renderer/provenance now require, so they must not
+#: be replayed.
 #: v2: ``_call_tool`` now unwraps MCP content-block/TextContent envelopes and
 #: ``_parse_names``/``_render_search_full`` drill into inner result
 #: collections — v1 payloads may hold envelope-shredded garbage and must not
 #: be replayed.
-CACHE_FORMAT_VERSION = 2
+CACHE_FORMAT_VERSION = 3
 
 _CACHE_DIR_NAME = "introspection_cache"
 #: Default TTL: long enough to cover reruns/repairs of a multi-hour job,

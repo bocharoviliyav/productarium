@@ -2469,6 +2469,21 @@ async def generate_codebase_docs(
         except Exception as e:
             logger.debug("Docgen product knowledge retrieval skipped for %s: %s", pid, e)
 
+    # Cross-context (DB-RE restructure): append the product's documented
+    # database digest (schemas, top tables by FK-degree) so codebase docs are
+    # grounded in the schema. Explicitly marked as NOT repo paths so the
+    # citation guard never treats these identifiers as file citations.
+    if pid:
+        try:
+            from api.docgen.database import db_context_enabled, product_database_context
+
+            if db_context_enabled():
+                db_ctx = product_database_context(pid, max_chars=4000)
+                if db_ctx:
+                    readme = (readme or "") + f"\n\n{db_ctx}\n"
+        except Exception as e:  # context is never fatal
+            logger.debug("Docgen database context skipped for %s: %s", pid, e)
+
     # Always split the codebase into token-budget chunks: they feed the
     # FALLBACK standard-LLM path (single call / map-reduce) when the agent
     # path cannot run.

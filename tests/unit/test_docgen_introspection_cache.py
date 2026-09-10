@@ -280,8 +280,10 @@ class TestGenerateFlowCache:
         # Кэш-хит: ни resolve, ни один MCP tool call не повторился.
         assert len(resolve_log) == 1
         assert _tool_call_count(tools) == calls_after_first
-        # Документ собран из закэшированной схемы без обращения к MCP.
-        assert entity2.generated_docs == "DB DOCS"
+        # Документ собран из закэшированной схемы без обращения к MCP:
+        # overview несёт LLM-текст поверх детерминированных фактов.
+        assert "DB DOCS" in entity2.generated_docs
+        assert "# Database: Main DB" in entity2.generated_docs
         assert entity2.pages["page_overview"]["provenance"]["introspection_cache"] == "hit"
         assert entity2.pages["page_overview"]["provenance"]["tools_used"] == {
             "schemas": "list_schemas",

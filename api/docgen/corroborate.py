@@ -254,11 +254,15 @@ def build_identifier_grounding(
 
 def grounding_from_introspection(info: Optional[Dict[str, Any]]) -> Set[str]:
     """Database grounding: schema/table names + identifiers from the
-    introspected per-table definitions (the ``_introspect`` payload:
-    ``{"schemas": [...], "tables": {full: {table, definition, …}}}``).
+    introspected payload (``_introspect``): schemas, per-table definitions
+    (columns live inside them) and — since the DB RE restructure — the FK
+    edge names and every category collection (views, triggers, routines,
+    sequences, types with their sources/meta).
 
     Function/trigger/column names live inside the definitions, so the word
     harvest over them grounds exactly the names the MCP surface reported.
+    Every collection is read defensively: an older cached payload (or a
+    hand-built fixture) without a collection simply contributes nothing.
     """
     tokens: Set[str] = set()
     if not isinstance(info, dict):
@@ -277,4 +281,30 @@ def grounding_from_introspection(info: Optional[Dict[str, Any]]) -> Set[str]:
                 definition = meta.get("definition") or ""
                 if isinstance(definition, str):
                     tokens.update(_WORD_RE.findall(definition))
+    for edge in info.get("fk_edges") or []:
+        if isinstance(edge, dict):
+            for key in ("from", "to", "constraint"):
+                value = edge.get(key)
+                if isinstance(value, str) and value:
+                    tokens.update(_WORD_RE.findall(value))
+    for collection in (
+        "views", "triggers", "routines", "sequences", "types",
+    ):
+        entries = info.get(collection) or {}
+        if not isinstance(entries, dict):
+            continue
+        for full, meta in entries.items():
+            tokens.add(str(full))
+            if isinstance(meta, dict):
+                bare = meta.get("name")
+                if isinstance(bare, str) and bare:
+                    tokens.add(bare)
+                source = meta.get("source") or meta.get("definition") or ""
+                if isinstance(source, str):
+                    tokens.update(_WORD_RE.findall(source))
+                meta_blob = meta.get("meta")
+                if isinstance(meta_blob, dict):
+                    for value in meta_blob.values():
+                        if isinstance(value, str):
+                            tokens.update(_WORD_RE.findall(value))
     return tokens
