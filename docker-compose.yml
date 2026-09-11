@@ -80,64 +80,64 @@ services:
       start_period: 30s
 
   # --- Keycloak database (separate postgres) ---
-  kkdb:
-    container_name: kkdb
-    image: postgres:17
-    environment:
-      - POSTGRES_USER=${KEYCLOAK_DB_USER:-keycloak}
-      - POSTGRES_PASSWORD=${KEYCLOAK_DB_PASSWORD:-keycloak}
-      - POSTGRES_DB=${KEYCLOAK_DB_NAME:-keycloak}
-    volumes:
-      - keycloak_pg_data:/var/lib/postgresql/data
-    # Host port 5433 maps to the container's default postgres port 5432.
-      # Keycloak connects to kkdb:5432 internally (KC_DB_URL below), so the
-      # container MUST listen on 5432 — do NOT add `command: postgres -p 5433`,
-      # which would make postgres listen on 5433 and break Keycloak's connection.
-    ports:
-      - "5433:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${KEYCLOAK_DB_USER:-keycloak} -d ${KEYCLOAK_DB_NAME:-keycloak}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-    networks:
-      - app-network
+  # kkdb:
+  #   container_name: kkdb
+  #   image: postgres:17
+  #   environment:
+  #     - POSTGRES_USER=${KEYCLOAK_DB_USER:-keycloak}
+  #     - POSTGRES_PASSWORD=${KEYCLOAK_DB_PASSWORD:-keycloak}
+  #     - POSTGRES_DB=${KEYCLOAK_DB_NAME:-keycloak}
+  #   volumes:
+  #     - keycloak_pg_data:/var/lib/postgresql/data
+  #   # Host port 5433 maps to the container's default postgres port 5432.
+  #     # Keycloak connects to kkdb:5432 internally (KC_DB_URL below), so the
+  #     # container MUST listen on 5432 — do NOT add `command: postgres -p 5433`,
+  #     # which would make postgres listen on 5433 and break Keycloak's connection.
+  #   ports:
+  #     - "5433:5432"
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U ${KEYCLOAK_DB_USER:-keycloak} -d ${KEYCLOAK_DB_NAME:-keycloak}"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   restart: unless-stopped
+  #   networks:
+  #     - app-network
 
   # --- Keycloak (OIDC provider) ---
-  keycloak:
-    container_name: keycloak
-    image: quay.io/keycloak/keycloak:26.3
-    depends_on:
-      kkdb:
-        condition: service_healthy
-    command: ["start-dev", "--import-realm"]
-    environment:
-      - KEYCLOAK_ADMIN=${KEYCLOAK_ADMIN:-admin}
-      - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD:-change-me}
-      - KC_DB=postgres
-      - KC_DB_URL=jdbc:postgresql://kkdb:5432/${KEYCLOAK_DB_NAME:-keycloak}
-      - KC_DB_USERNAME=${KEYCLOAK_DB_USER:-keycloak}
-      - KC_DB_PASSWORD=${KEYCLOAK_DB_PASSWORD:-keycloak}
-    volumes:
-      - keycloak_data:/opt/keycloak/data
-      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
-    ports:
-      - "8080:8080"
-    healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080; echo -e 'GET /health/ready HTTP/1.1\r\nhost: localhost\r\nConnection: close\r\n\r' >&3; cat <&3 | head -1 | grep -q '200'"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
-    networks:
-      - app-network
+  # keycloak:
+  #   container_name: keycloak
+  #   image: quay.io/keycloak/keycloak:26.3
+  #   depends_on:
+  #     kkdb:
+  #       condition: service_healthy
+  #   command: ["start-dev", "--import-realm"]
+  #   environment:
+  #     - KEYCLOAK_ADMIN=${KEYCLOAK_ADMIN:-admin}
+  #     - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD:-change-me}
+  #     - KC_DB=postgres
+  #     - KC_DB_URL=jdbc:postgresql://kkdb:5432/${KEYCLOAK_DB_NAME:-keycloak}
+  #     - KC_DB_USERNAME=${KEYCLOAK_DB_USER:-keycloak}
+  #     - KC_DB_PASSWORD=${KEYCLOAK_DB_PASSWORD:-keycloak}
+  #   volumes:
+  #     - keycloak_data:/opt/keycloak/data
+  #     - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+  #   ports:
+  #     - "8080:8080"
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080; echo -e 'GET /health/ready HTTP/1.1\r\nhost: localhost\r\nConnection: close\r\n\r' >&3; cat <&3 | head -1 | grep -q '200'"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 10
+  #     start_period: 30s
+  #   restart: unless-stopped
+  #   networks:
+  #     - app-network
 
 volumes:
   postgres_data:
-  keycloak_pg_data:
-  keycloak_data:
+  # keycloak_pg_data:
+  # keycloak_data:
   productarium_state:
 
 networks:
