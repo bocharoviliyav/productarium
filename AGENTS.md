@@ -131,7 +131,7 @@ Hermetic in-memory SQLite and mocked LLMs (no external Postgres or model server 
 ---
 
 ## Reflection and Iteration (Adversarial Review Mindset)
-Before delivering any solution, mentally execute three adversarial review passes (or spawn subagents for large-scale changes):
+Before delivering any solution, execute three adversarial review passes (spawn subagents):
 1. **Pass 1 — Code Review (Simplicity & Minimalism)**:
    - Did I write the absolute minimum code needed?
    - Can any helper function, type, or abstraction be eliminated?
