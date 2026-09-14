@@ -18,11 +18,12 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from sqlalchemy.orm import selectinload
 
 from api.db import SessionLocal
+from api.docgen._common import JobCancelledError
 from api.models import ProductORM
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,23 @@ _JOBS_LOCK = threading.Lock()
 def job_key(product_id: str, entity_type: str, entity_id: str) -> Tuple[str, str, str]:
     """Canonical dedup/serialization key: one active job per product entity."""
     return (product_id, entity_type, entity_id)
+
+
+def request_cancel(job_id: str) -> bool:
+    """Flag a queued/running job for cooperative cancellation.
+
+    The worker's pipelines poll the flag at safe checkpoints (between clone /
+    planning / per-unit LLM calls) and raise ``JobCancelledError``, which rolls
+    the artifact back to its pre-run version WITHOUT appending a new one.
+    Returns False for unknown/finished jobs.
+    """
+    with _JOBS_LOCK:
+        job = _docgen_jobs.get(job_id)
+        if job is None or job.get("status") not in ("queued", "running"):
+            return False
+        job["cancel_requested"] = True
+        logger.info("Docgen job %s: cancellation requested", job_id)
+        return True
 
 
 # --- Progress model -----------------------------------------------------------
@@ -308,6 +326,7 @@ def _register_job(key: Tuple[str, str, str]) -> str:
         "finished_at": None,
         "error": None,
         "docs_chars": None,
+        "cancel_requested": False,
     }
     return job_id
 
@@ -353,19 +372,39 @@ def submit_job(
     entity_id: str,
     model: Optional[str],
     language: Optional[str],
+    force_pages: Optional[List[str]] = None,
 ) -> None:
     """Submit the job to the worker thread pool.
 
     ``language`` may be None/invalid (the deprecated request field): the
     worker resolves the effective language from the admin
     ``generation.language`` setting when the job STARTS, so a switch in the
-    admin panel applies to jobs that were still queued.
+    admin panel applies to jobs that were still queued. ``force_pages`` (per-
+    page regeneration) limits the run to those pages: codebase units are
+    forced past diff-reuse, database pages are merged at persist.
     """
     _docgen_executor.submit(
         _run_docgen_job,
-        job_id, product_id, entity_type, entity_id, model, language,
+        job_id, product_id, entity_type, entity_id, model, language, force_pages,
     )
     logger.info("Submitted docgen job %s for %s %s", job_id, entity_type, entity_id)
+
+
+def request_cancel_for_entity(
+    product_id: str, entity_type: str, entity_id: str
+) -> Optional[str]:
+    """Flag the entity's ACTIVE job for cancellation; returns its job_id.
+
+    None when no queued/running job exists for the entity (idempotent cancel).
+    """
+    key = job_key(product_id, entity_type, entity_id)
+    with _JOBS_LOCK:
+        for job in _docgen_jobs.values():
+            if job.get("key") == key and job.get("status") in ("queued", "running"):
+                job["cancel_requested"] = True
+                logger.info("Docgen job %s: cancellation requested", job["job_id"])
+                return job["job_id"]
+    return None
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -407,6 +446,7 @@ async def _run_docgen_job_async(
     entity_id: str,
     model: Optional[str],
     language: str,
+    force_pages: Optional[List[str]] = None,
 ) -> None:
     """Async body of a docgen job: loads the entity in a FRESH DB session
     (the request session is closed by now), generates docs, commits, and
@@ -465,20 +505,43 @@ async def _run_docgen_job_async(
         if p_orm is None:
             raise ValueError("Product not found")
 
+        # Cooperative cancellation: pipelines poll this closure at safe
+        # checkpoints; a queued job that was cancelled before start raises at
+        # its first checkpoint (before any expensive work).
+        def should_cancel() -> bool:
+            return bool(job.get("cancel_requested"))
+
+        collections = {
+            "codebase": p_orm.codebases,
+            "spec": p_orm.specs,
+            "database": p_orm.databases,
+        }
+        if entity_type not in collections:
+            raise ValueError(f"Unsupported docgen entity_type: {entity_type}")
+        entity = next(
+            (e for e in collections[entity_type] if e.id == entity_id), None
+        )
+        if entity is None:
+            raise ValueError(f"{entity_type.capitalize()} not found")
+
+        # Vault-style versioning: bootstrap a v1 snapshot of legacy docs BEFORE
+        # the run (committed eagerly — survives a failed run), then append the
+        # generated result as a NEW immutable version in the final commit.
+        from api.repositories import doc_version_repo
+
+        doc_version_repo.ensure_baseline_version(db, entity_type, entity)
+        db.commit()
+
         if entity_type == "codebase":
-            entity = next((c for c in p_orm.codebases if c.id == entity_id), None)
-            if entity is None:
-                raise ValueError("Codebase not found")
             from api.docgen.codebase import generate_codebase_docs
             docs = await generate_codebase_docs(
                 entity, p_orm, model=model,
                 language=language or "ru",
                 progress=progress_cb,
+                should_cancel=should_cancel,
+                force_units=force_pages,
             )
         elif entity_type == "spec":
-            entity = next((s for s in p_orm.specs if s.id == entity_id), None)
-            if entity is None:
-                raise ValueError("Spec not found")
             # SpecORM.kind is the real column ("openapi" | "asyncapi").
             spec_kind = (getattr(entity, "kind", None) or "openapi").lower()
             from api.docgen.spec import generate_openapi_docs, generate_asyncapi_docs
@@ -487,26 +550,29 @@ async def _run_docgen_job_async(
                     entity, p_orm, model=model,
                     language=language or "ru",
                     progress=progress_cb,
+                    should_cancel=should_cancel,
                 )
             else:
                 docs = await generate_openapi_docs(
                     entity, p_orm, model=model,
                     language=language or "ru",
                     progress=progress_cb,
+                    should_cancel=should_cancel,
                 )
-        elif entity_type == "database":
-            entity = next((d for d in p_orm.databases if d.id == entity_id), None)
-            if entity is None:
-                raise ValueError("Database not found")
+        else:
             from api.docgen.database import generate_database_docs
             docs = await generate_database_docs(
                 entity, p_orm, model=model,
                 language=language or "ru",
                 progress=progress_cb,
+                should_cancel=should_cancel,
+                force_pages=force_pages,
             )
-        else:
-            raise ValueError(f"Unsupported docgen entity_type: {entity_type}")
 
+        doc_version_repo.append_version(
+            db, entity_type, entity,
+            source="generate", model=model, job_id=job_id,
+        )
         db.commit()
         job["status"] = "succeeded"
         # Display is decoupled from memory indexing: docs are already committed,
@@ -519,6 +585,49 @@ async def _run_docgen_job_async(
         job["docs_chars"] = len(docs or "")
         report_progress(job_id, phase="done")
         logger.info("Docgen job %s succeeded for %s %s", job_id, entity_type, entity_id)
+    except JobCancelledError:
+        # Cancellation: no version is appended; the artifact is restored to its
+        # pre-run (current) version — mid-run checkpoints may have committed
+        # partial docs onto the row (see _checkpoint_partial_docs).
+        try:
+            db.rollback()
+            p2 = (
+                db.query(ProductORM)
+                .options(
+                    selectinload(ProductORM.codebases),
+                    selectinload(ProductORM.specs),
+                    selectinload(ProductORM.databases),
+                )
+                .filter(ProductORM.id == product_id)
+                .first()
+            )
+            coll = ({
+                "codebase": p2.codebases,
+                "spec": p2.specs,
+                "database": p2.databases,
+            }.get(entity_type) or []) if p2 is not None else []
+            ent = next((e for e in coll if e.id == entity_id), None)
+            if ent is not None:
+                doc_version_repo.restore_entity_from_current_version(
+                    db, entity_type, ent
+                )
+                db.commit()
+        except Exception:  # pragma: no cover - restore is best-effort
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            logger.warning(
+                "Post-cancel restore failed for %s %s; partial docs may remain "
+                "until the next generation",
+                entity_type, entity_id, exc_info=True,
+            )
+        job["status"] = "cancelled"
+        job["indexing_status"] = "cancelled"
+        job["indexing_message"] = "Генерация отменена; предыдущая версия восстановлена."
+        job["error"] = None
+        job["finished_at"] = time.time()
+        logger.info("Docgen job %s cancelled for %s %s", job_id, entity_type, entity_id)
     except ValueError as e:
         try:
             db.rollback()
@@ -569,6 +678,7 @@ def _run_docgen_job(
     entity_id: str,
     model: Optional[str],
     language: str,
+    force_pages: Optional[List[str]] = None,
 ) -> None:
     """Worker-thread entry point: runs the async job in a brand-new event loop
     so the heavy sync work (git clone, file read, LLM calls) never touches the
@@ -585,7 +695,8 @@ def _run_docgen_job(
             with lock_for_entity(entity_type, entity_id):
                 loop.run_until_complete(
                     _run_docgen_job_async(
-                        job_id, product_id, entity_type, entity_id, model, language
+                        job_id, product_id, entity_type, entity_id, model, language,
+                        force_pages,
                     )
                 )
         except EntityBusyError:

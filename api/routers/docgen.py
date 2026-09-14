@@ -13,7 +13,7 @@ thread (see ``api.docgen.jobs``). The status endpoint polls the job registry.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -27,6 +27,7 @@ from api.docgen.jobs import (
     active_jobs_for_product,
     create_or_get_job,
     get_job,
+    request_cancel_for_entity,
     submit_job,
 )
 from api.models import ProductORM, UserORM
@@ -57,6 +58,7 @@ class GenerateDocRequest(BaseModel):
 def _start_generate(
     db: Session, product_id: str, entity_type: str, entity_id: str,
     request_data: GenerateDocRequest, user_id: str,
+    force_pages: Optional[List[str]] = None,
 ) -> JSONResponse:
     # P1-17: per-user token bucket on the expensive generate operation.
     # Checked before any DB work so an exhausted client is shed cheaply.
@@ -87,7 +89,7 @@ def _start_generate(
         # at job start (api.docgen.jobs._run_docgen_job_async).
         submit_job(
             job_id, product_id, entity_type, entity_id,
-            request_data.model, request_data.language,
+            request_data.model, request_data.language, force_pages=force_pages,
         )
     job = get_job(job_id)
     return JSONResponse(
@@ -138,6 +140,73 @@ async def get_spec_docgen_status(
     _product: ProductORM = Depends(require_product_access("ro")),
 ):
     return _get_status(product_id, "spec", spec_id, job_id)
+
+
+_SEGMENT_TO_TYPE = {
+    "codebases": "codebase",
+    "specs": "spec",
+    "databases": "database",
+}
+_CANCEL_SEGMENTS = _SEGMENT_TO_TYPE
+
+
+@router.post("/{product_id}/{segment}/{entity_id}/generate/cancel")
+async def cancel_docgen_generation(
+    product_id: str, segment: str, entity_id: str,
+    _product: ProductORM = Depends(require_product_access("rw")),
+):
+    """Cooperatively cancel the entity's ACTIVE docgen job.
+
+    The worker aborts at its next checkpoint: NO new doc version is appended
+    and the artifact is restored to its current version. Idempotent —
+    ``cancelled: false`` when there was nothing to stop.
+    """
+    entity_type = _CANCEL_SEGMENTS.get(segment)
+    if entity_type is None:
+        raise HTTPException(status_code=404, detail="Unknown artifact type")
+    job_id = request_cancel_for_entity(product_id, entity_type, entity_id)
+    if job_id is None:
+        return {"cancelled": False, "job_id": None}
+    return {"cancelled": True, "job_id": job_id}
+
+
+@router.post(
+    "/{product_id}/{segment}/{entity_id}/pages/{page_id}/regenerate"
+)
+async def regenerate_docgen_page(
+    product_id: str, segment: str, entity_id: str, page_id: str,
+    request_data: GenerateDocRequest, db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("rw")),
+    user: UserORM = Depends(get_current_user),
+):
+    """Per-page regeneration (codebase / database artifacts).
+
+    Re-runs generation for ONE page: unchanged codebase units still come back
+    via diff-reuse, the database flow merges only the forced page at persist.
+    The judge issues stored on the page feed the prompt as reviewer notes.
+    The result lands as a NEW doc version (like any generation).
+    """
+    entity_type = _SEGMENT_TO_TYPE.get(segment)
+    if entity_type not in ("codebase", "database"):
+        raise HTTPException(
+            status_code=400,
+            detail="Per-page regeneration is only available for codebases and databases",
+        )
+    p_orm = product_repo.load_product_orm(db, product_id)
+    if p_orm is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    collection = (
+        p_orm.codebases if entity_type == "codebase" else p_orm.databases
+    )
+    entity = next((e for e in collection if e.id == entity_id), None)
+    if not entity:
+        raise HTTPException(status_code=404, detail=f"{entity_type.capitalize()} not found")
+    if page_id not in (entity.pages or {}):
+        raise HTTPException(status_code=404, detail="Page not found")
+    return _start_generate(
+        db, product_id, entity_type, entity_id, request_data, user.id,
+        force_pages=[page_id],
+    )
 
 
 @router.get("/{product_id}/docgen/active")

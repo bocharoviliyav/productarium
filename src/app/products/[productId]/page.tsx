@@ -14,6 +14,7 @@ import {
   GitBranch,
   Lightning,
   LinkSimple,
+  StopCircle,
   PencilSimple,
   Plus,
   Sparkle,
@@ -127,6 +128,9 @@ export default function ProductDetailPage() {
   const [generating, setGenerating] = useState<Record<string, DocgenJob>>({});
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [linksOpen, setLinksOpen] = useState(false);
+  // Pending "Generate" confirmation — set by the card buttons, executed by
+  // the confirm modal (avoids accidental expensive regenerations).
+  const [confirmGen, setConfirmGen] = useState<{ type: GenerateType; entityId: string } | null>(null);
 
   const { notify } = useNotifications();
   const { messages, fmt } = useLanguage();
@@ -226,6 +230,17 @@ export default function ProductDetailPage() {
         }
         if (st.status === "failed") {
           throw new Error(st.error || st.indexing_message || (t.genFailed ?? "Generation failed."));
+        }
+        // Cancelled by the user: the backend restored the previous version
+        // and reindexed — a quiet info toast, not an error.
+        if (st.status === "cancelled") {
+          notify({
+            tone: "info",
+            title: t.genTitle ?? "Generation",
+            message: st.indexing_message || (t.genCancelled ?? "Generation cancelled."),
+          });
+          await fetchProduct();
+          return;
         }
       }
       throw new Error(t.genTimeout ?? "Generation timed out.");
@@ -521,6 +536,29 @@ export default function ProductDetailPage() {
       setGenerating((g) => (g[entityId]?.jobId === null ? withoutKey(g, entityId) : g));
     }
     await runDocgenJob(type, entityId, jobId);
+  };
+
+  // Cooperative cancel: flag the job server-side; the poller above observes
+  // the terminal "cancelled" status (previous version restored). Idempotent
+  // and safe to call while the initial POST /generate is still pending only
+  // once a job id exists — the Stop button is disabled until then.
+  const handleCancelGenerate = async (type: GenerateType, entityId: string) => {
+    if (!product) return;
+    try {
+      const res = await fetch(
+        `/api/products/${product.id}/${entityPath(type)}/${entityId}/generate/cancel`,
+        {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        },
+      );
+      if (!res.ok) throw new Error(`Failed to cancel (${res.status})`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : (t.cancelFailed ?? "Failed to cancel.");
+      notify({ tone: "error", title: t.genTitle ?? "Generation", message: msg });
+    }
   };
 
   // Card label while generating: "3/7 · System Architecture" in the sections
@@ -920,6 +958,33 @@ export default function ProductDetailPage() {
               </form>
             </Modal>
 
+            {/* Generate confirmation — new immutable version on every run */}
+            <Modal
+              open={Boolean(confirmGen)}
+              onClose={() => setConfirmGen(null)}
+              title={t.confirmGenTitle ?? "Generate documentation?"}
+              footer={null}
+            >
+              <p className="text-sm text-muted">
+                {t.confirmGenText ?? "A new documentation version will be generated."}
+              </p>
+              <div className="mt-6 flex items-center justify-end gap-2">
+                <Button variant="ghost" onClick={() => setConfirmGen(null)}>
+                  {tc.cancel ?? "Cancel"}
+                </Button>
+                <Button
+                  onClick={() => {
+                    const g = confirmGen;
+                    setConfirmGen(null);
+                    if (g) void handleGenerate(g.type, g.entityId);
+                  }}
+                >
+                  <Lightning size={16} weight="fill" />
+                  {t.generate ?? "Generate"}
+                </Button>
+              </div>
+            </Modal>
+
             {/* Two-column: (specs + knowledge tree) | main content */}
             <div className="mt-12 grid grid-cols-1 gap-8 lg:grid-cols-[320px_1fr]">
               <aside className="lg:sticky lg:top-20 lg:self-start">
@@ -1092,15 +1157,26 @@ export default function ProductDetailPage() {
                                     {t.openDocs ?? "Open"}
                                     <ArrowRight size={14} weight="bold" />
                                   </button>
-                                  <Button
-                                    size="sm"
-                                    variant="subtle"
-                                    onClick={() => handleGenerate("codebase", c.id)}
-                                    disabled={isGenerating}
-                                  >
-                                    {isGenerating ? <Spinner /> : <Lightning size={14} weight="fill" />}
-                                    {isGenerating ? (t.generating ?? "Generating…") : (t.generate ?? "Generate")}
-                                  </Button>
+                                  {isGenerating ? (
+                                    <Button
+                                      size="sm"
+                                      variant="subtle"
+                                      onClick={() => handleCancelGenerate("codebase", c.id)}
+                                      disabled={!gen?.jobId}
+                                    >
+                                      <StopCircle size={14} weight="fill" />
+                                      {t.stopGeneration ?? "Stop"}
+                                    </Button>
+                                  ) : (
+                                    <Button
+                                      size="sm"
+                                      variant="subtle"
+                                      onClick={() => setConfirmGen({ type: "codebase", entityId: c.id })}
+                                    >
+                                      <Lightning size={14} weight="fill" />
+                                      {t.generate ?? "Generate"}
+                                    </Button>
+                                  )}
                                 </div>
                               </Card>
                             </Reveal>
@@ -1227,17 +1303,26 @@ export default function ProductDetailPage() {
                                     {t.openDocs ?? "Open"}
                                     <ArrowRight size={14} weight="bold" />
                                   </button>
-                                  <Button
-                                    size="sm"
-                                    variant="subtle"
-                                    onClick={() => handleGenerate("database", d.id)}
-                                    disabled={isGenerating}
-                                  >
-                                    {isGenerating ? <Spinner /> : <Lightning size={14} weight="fill" />}
-                                    {isGenerating
-                                      ? (t.reverseEngineering ?? "Reverse-engineering…")
-                                      : (t.reverseEngineer ?? "Reverse-engineer")}
-                                  </Button>
+                                  {isGenerating ? (
+                                    <Button
+                                      size="sm"
+                                      variant="subtle"
+                                      onClick={() => handleCancelGenerate("database", d.id)}
+                                      disabled={!gen?.jobId}
+                                    >
+                                      <StopCircle size={14} weight="fill" />
+                                      {t.stopGeneration ?? "Stop"}
+                                    </Button>
+                                  ) : (
+                                    <Button
+                                      size="sm"
+                                      variant="subtle"
+                                      onClick={() => setConfirmGen({ type: "database", entityId: d.id })}
+                                    >
+                                      <Lightning size={14} weight="fill" />
+                                      {t.generate ?? "Generate"}
+                                    </Button>
+                                  )}
                                 </div>
                               </Card>
                             </Reveal>

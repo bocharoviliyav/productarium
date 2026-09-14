@@ -21,6 +21,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
+  ArrowCounterClockwise,
   ArrowLeft,
   Eye,
   FileText,
@@ -38,6 +39,7 @@ import {
   EmptyState,
   Input,
   Label,
+  Modal,
   Reveal,
   SectionHeader,
   Select,
@@ -47,6 +49,8 @@ import {
   cn,
 } from "@/components/ui";
 import {
+  type DocVersionDetail,
+  type DocVersionList,
   type Product,
   type Spec,
   type SpecKind,
@@ -65,7 +69,7 @@ interface SpecEditorProps {
 export function SpecEditor({ productId, specId }: SpecEditorProps) {
   const router = useRouter();
   const { notify } = useNotifications();
-  const { messages } = useLanguage();
+  const { messages, fmt } = useLanguage();
   const t = messages?.specEditor ?? {};
   const tArt = messages?.artifactTypes ?? {};
   const tc = messages?.common ?? {};
@@ -90,6 +94,17 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
   // P2-28: latest dirty flag for fetch guards (refetch must not clobber a
   // draft just because the language bundle finished loading).
   const dirtyRef = useRef(false);
+
+  // Doc versions (immutable history): list + selected archived version.
+  const [versions, setVersions] = useState<DocVersionList | null>(null);
+  const [viewVersion, setViewVersion] = useState<number | null>(null);
+  const [versionDetail, setVersionDetail] = useState<DocVersionDetail | null>(null);
+  const [confirmRestore, setConfirmRestore] = useState<number | null>(null);
+  const [restoring, setRestoring] = useState(false);
+
+  const viewingArchive = viewVersion !== null;
+  // Archived versions are read-only; the preview renders their snapshot.
+  const displayContent = viewingArchive ? (versionDetail?.content ?? "") : content;
 
   // New specs edit immediately; existing specs open in preview-only view and
   // switch to editing (split) when the user clicks Edit.
@@ -148,6 +163,102 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
     if (isNew) return;
     fetchAll();
   }, [fetchAll, isNew]);
+
+  // Version history: best-effort list — a failure just hides the selector.
+  const fetchVersions = useCallback(async () => {
+    if (isNew || !specId) return;
+    try {
+      const res = await fetch(
+        `/api/products/${productId}/specs/${specId}/versions`,
+        { credentials: "include", cache: "no-store" },
+      );
+      if (!res.ok) return;
+      setVersions((await res.json()) as DocVersionList);
+    } catch {
+      /* best-effort */
+    }
+  }, [productId, specId, isNew]);
+
+  useEffect(() => {
+    setVersions(null);
+    setViewVersion(null);
+    setVersionDetail(null);
+    fetchVersions();
+  }, [fetchVersions]);
+
+  // Archived snapshot (read-only): fetched on select, dropped on deselect.
+  useEffect(() => {
+    if (viewVersion === null) {
+      setVersionDetail(null);
+      return;
+    }
+    let cancelled = false;
+    setVersionDetail(null);
+    void (async () => {
+      try {
+        const res = await fetch(
+          `/api/products/${productId}/specs/${specId}/versions/${viewVersion}`,
+          { credentials: "include", cache: "no-store" },
+        );
+        if (!res.ok) throw new Error(String(res.status));
+        const d = (await res.json()) as DocVersionDetail;
+        if (!cancelled) setVersionDetail(d);
+      } catch {
+        if (!cancelled) {
+          notify({
+            tone: "error",
+            title: t.versionsTitle ?? "Versions",
+            message: t.versionsLoadFailed ?? "Failed to load version.",
+          });
+          setViewVersion(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [viewVersion, productId, specId]);
+
+  // Rollback: writes the archived snapshot back and appends a new rollback
+  // version. The draft is replaced by the restored content (no stale edits).
+  const handleRestore = async (version: number) => {
+    if (isNew || !specId || restoring) return;
+    setConfirmRestore(null);
+    setRestoring(true);
+    try {
+      const res = await fetch(
+        `/api/products/${productId}/specs/${specId}/versions/${version}/restore`,
+        {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        },
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || `Rollback failed (${res.status})`);
+      }
+      setViewVersion(null);
+      notify({
+        tone: "success",
+        title: t.versionsTitle ?? "Versions",
+        message: t.rollbackDone ?? "Rolled back.",
+      });
+      dirtyRef.current = false;
+      setDirty(false);
+      await fetchAll();
+      await fetchVersions();
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.versionsTitle ?? "Versions",
+        message: e instanceof Error ? e.message : (t.rollbackFailed ?? "Rollback failed."),
+      });
+    } finally {
+      setRestoring(false);
+    }
+  };
 
   const save = async () => {
     if (saving) return;
@@ -320,8 +431,46 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
                 {header}
               </h1>
             </div>
-            <div className="flex items-center gap-2">
-              {!isNew && !editing && (
+            <div className="flex flex-wrap items-center gap-2">
+              {!isNew && versions && versions.versions.length > 0 && (
+                <Select
+                  value={viewVersion === null ? "" : String(viewVersion)}
+                  onChange={(e) =>
+                    setViewVersion(e.target.value ? Number(e.target.value) : null)
+                  }
+                  disabled={editing}
+                  className="w-56 text-sm"
+                >
+                  <option value="">
+                    {fmt(t.currentVersion ?? "Current (v{n})", {
+                      n: String(versions.current_version ?? "—"),
+                    })}
+                  </option>
+                  {versions.versions.map((v) => (
+                    <option key={v.version} value={v.version}>
+                      {`v${v.version} · ${v.source}${v.created_at ? ` · ${new Date(v.created_at).toLocaleString()}` : ""}`}
+                    </option>
+                  ))}
+                </Select>
+              )}
+              {!isNew && viewingArchive && (
+                <>
+                  <Tag tone="yellow">
+                    {fmt(t.archivedVersion ?? "Version v{n} (archived)", { n: String(viewVersion) })}
+                  </Tag>
+                  <Button
+                    type="button"
+                    variant="subtle"
+                    size="sm"
+                    onClick={() => setConfirmRestore(viewVersion)}
+                    disabled={restoring}
+                  >
+                    <ArrowCounterClockwise size={14} weight="regular" />
+                    {t.rollback ?? "Rollback"}
+                  </Button>
+                </>
+              )}
+              {!isNew && !editing && !viewingArchive && (
                 <Button
                   type="button"
                   variant="subtle"
@@ -441,28 +590,34 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
               }
             />
 
-            {/* View (read-only): SpecViewer */}
+            {/* View (read-only): SpecViewer (archived version snapshot while browsing history) */}
             {!editing ? (
               <div className="px-4 pb-6 pt-2">
-                {content.trim() ? (
-                  <SpecViewer content={content} kind={spec?.kind} />
+                {viewingArchive && !versionDetail ? (
+                  <div className="flex items-center gap-2 py-8 text-sm text-muted">
+                    <Spinner /> {t.loadingVersion ?? "Loading version…"}
+                  </div>
+                ) : displayContent.trim() ? (
+                  <SpecViewer content={displayContent} kind={spec?.kind} />
                 ) : (
                   <EmptyState
                     icon={<FileText size={20} weight="regular" />}
                     title={t.noContent ?? "No content yet"}
                     description={t.noContentDesc ?? "Add the spec content from the edit button."}
                     action={
-                      <Button
-                        variant="subtle"
-                        size="sm"
-                        onClick={() => {
-                          setEditing(true);
-                          setView("split");
-                        }}
-                      >
-                        <PencilSimple size={14} weight="regular" />
-                        {t.edit ?? "Edit"}
-                      </Button>
+                      viewingArchive ? undefined : (
+                        <Button
+                          variant="subtle"
+                          size="sm"
+                          onClick={() => {
+                            setEditing(true);
+                            setView("split");
+                          }}
+                        >
+                          <PencilSimple size={14} weight="regular" />
+                          {t.edit ?? "Edit"}
+                        </Button>
+                      )
                     }
                   />
                 )}
@@ -525,6 +680,33 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
             )}
           </Card>
         </Reveal>
+
+        {/* Rollback confirmation — restores the snapshot as a new version */}
+        <Modal
+          open={confirmRestore !== null}
+          onClose={() => setConfirmRestore(null)}
+          title={t.rollbackConfirmTitle ?? "Roll back to this version?"}
+          footer={null}
+        >
+          <p className="text-sm text-muted">
+            {t.rollbackConfirmText ??
+              "The current spec will be replaced by this version; the rollback itself is saved as a new version."}
+          </p>
+          <div className="mt-6 flex items-center justify-end gap-2">
+            <Button variant="ghost" onClick={() => setConfirmRestore(null)}>
+              {tc.cancel ?? "Cancel"}
+            </Button>
+            <Button
+              onClick={() => {
+                if (confirmRestore !== null) void handleRestore(confirmRestore);
+              }}
+              disabled={restoring}
+            >
+              {restoring ? <Spinner /> : <ArrowCounterClockwise size={16} weight="regular" />}
+              {t.rollback ?? "Rollback"}
+            </Button>
+          </div>
+        </Modal>
       </main>
     </div>
   );

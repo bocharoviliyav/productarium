@@ -28,9 +28,14 @@ from api.db import get_db  # re-exported so routers import it from the repo
 from api.models import (
     CodebaseORM,
     DatabaseORM,
+    DocVersionORM,
     LinksORM,
     ProductORM,
     SpecORM,
+)
+from api.repositories.doc_version_repo import (
+    append_version,
+    ensure_baseline_version,
 )
 from api.schemas import Codebase, Database, Links, Product, ProductListItem, Spec
 
@@ -210,6 +215,7 @@ def orm_to_product(p_orm: ProductORM) -> Product:
                 has_token=bool(c.token),
                 generated_docs=c.generated_docs,
                 pages=c.pages,
+                current_version=c.current_version,
                 verified=c.verified,
                 verified_by=c.verified_by,
                 verified_at=c.verified_at,
@@ -223,6 +229,7 @@ def orm_to_product(p_orm: ProductORM) -> Product:
                 name=s.name,
                 kind=s.kind,
                 content=s.content,
+                current_version=s.current_version,
                 verified=s.verified,
                 verified_by=s.verified_by,
                 verified_at=s.verified_at,
@@ -251,6 +258,7 @@ def orm_to_product(p_orm: ProductORM) -> Product:
                 mcp_server_id=d.mcp_server_id,
                 generated_docs=d.generated_docs,
                 pages=d.pages,
+                current_version=d.current_version,
                 verified=d.verified,
                 verified_by=d.verified_by,
                 verified_at=d.verified_at,
@@ -470,6 +478,8 @@ def _upsert_product_locked(db: Session, product: Product) -> ProductORM:
                 "verified_at": row.verified_at,
                 # Only CodebaseORM carries a git token column.
                 "token": row.token if model is CodebaseORM else None,
+                # Version pointer is server-owned (doc_versions history).
+                "current_version": getattr(row, "current_version", None),
             }
 
     # Verified state is server-owned (review #4): capture the STORED
@@ -481,6 +491,7 @@ def _upsert_product_locked(db: Session, product: Product) -> ProductORM:
         d.id: (d.verified, d.verified_by, d.verified_at)
         for d in p_orm.databases
     }
+    prev_db_version = {d.id: d.current_version for d in p_orm.databases}
 
     for model in (CodebaseORM, SpecORM, LinksORM, DatabaseORM):
         db.query(model).filter(model.product_id == product.id).delete(
@@ -518,6 +529,7 @@ def _upsert_product_locked(db: Session, product: Product) -> ProductORM:
         orm.verified, orm.verified_by, orm.verified_at = (
             verified, verified_by, verified_at,
         )
+        orm.current_version = prev_db_version.get(d.id)
         orm.product_id = product.id
         db.add(orm)
 
@@ -527,9 +539,12 @@ def _upsert_product_locked(db: Session, product: Product) -> ProductORM:
 
 
 def delete_product(db: Session, product_id: str) -> None:
-    """Delete a product (children cascade). No-op if missing."""
+    """Delete a product (children + doc version history cascade). No-op if missing."""
     p_orm = db.get(ProductORM, product_id)
     if p_orm is not None:
+        db.query(DocVersionORM).filter(
+            DocVersionORM.product_id == product_id
+        ).delete(synchronize_session=False)
         db.delete(p_orm)
         db.commit()
 
@@ -548,10 +563,14 @@ def _restore_server_state(orm, prev) -> None:
         orm.verified = prev.get("verified") or False
         orm.verified_by = prev.get("verified_by")
         orm.verified_at = prev.get("verified_at")
+        if hasattr(orm, "current_version"):
+            orm.current_version = prev.get("current_version")
     else:
         orm.verified = prev.verified
         orm.verified_by = prev.verified_by
         orm.verified_at = prev.verified_at
+        if hasattr(orm, "current_version"):
+            orm.current_version = getattr(prev, "current_version", None)
 
 
 # --- Per-type add / delete --------------------------------------------------
@@ -582,6 +601,9 @@ def _delete_child(db: Session, product_id: str, entity_id: str, model, collectio
         existing = next((x for x in getattr(p_orm, collection) if x.id == entity_id), None)
         if existing is not None:
             getattr(p_orm, collection).remove(existing)
+            db.query(DocVersionORM).filter(
+                DocVersionORM.entity_id == entity_id
+            ).delete(synchronize_session=False)
             db.commit()
         db.refresh(p_orm)
         return orm_to_product(p_orm)
@@ -661,6 +683,7 @@ def update_database_content(
     if database is None:
         raise ValueError("Database not found")
 
+    ensure_baseline_version(db, "database", database)
     indexed_text: Optional[str] = None
 
     if pages is not None:
@@ -695,6 +718,7 @@ def update_database_content(
             "Provide one of: pages, (page_id + content), or generated_docs"
         )
 
+    append_version(db, "database", database, source="edit")
     db.commit()
     db.refresh(p_orm)
     return orm_to_product(p_orm), indexed_text
@@ -724,6 +748,7 @@ def update_codebase_content(
         if codebase is None:
             raise ValueError("Codebase not found")
 
+        ensure_baseline_version(db, "codebase", codebase)
         indexed_text: Optional[str] = None
 
         if pages is not None:
@@ -756,6 +781,7 @@ def update_codebase_content(
                 "Provide one of: pages, (page_id + content), or generated_docs"
             )
 
+        append_version(db, "codebase", codebase, source="edit")
         db.commit()
         db.refresh(p_orm)
         return orm_to_product(p_orm), indexed_text
@@ -772,7 +798,9 @@ def update_spec_content(
         spec = next((s for s in p_orm.specs if s.id == spec_id), None)
         if spec is None:
             raise ValueError("Spec not found")
+        ensure_baseline_version(db, "spec", spec)
         spec.content = content
+        append_version(db, "spec", spec, source="edit")
         db.commit()
         db.refresh(p_orm)
         return orm_to_product(p_orm), content

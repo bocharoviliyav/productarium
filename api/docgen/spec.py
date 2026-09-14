@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from api.utils import setup_logging
 from api.utils.llm_helpers import (  # noqa: E402
@@ -35,6 +35,7 @@ from api.utils.llm_helpers import (  # noqa: E402
 from api.formats.mermaid import run_repair_loop
 from api.prompts import load_prompt_file
 from api.docgen._common import (
+    _check_cancel,
     _clean_llm_text,
     _close_owned_llm,
     _with_verification_guard,
@@ -649,6 +650,8 @@ class SpecDocState(TypedDict, total=False):
     model: Optional[str]
     base_url: Optional[str]
     api_key: Optional[str]
+    # cooperative cancellation (callable flag; None in tests/legacy callers)
+    should_cancel: Optional[Any]
     # node outputs
     parsed: Optional[dict]
     skeleton: str
@@ -669,6 +672,7 @@ def _parse_node(state: SpecDocState) -> Dict[str, Any]:
 
 async def _enrich_node(state: SpecDocState) -> Dict[str, Any]:
     """Agent node: react agent over ``spec_lookup`` → standard LLM → skeleton."""
+    _check_cancel(state.get("should_cancel"))
     spec_kind = state.get("spec_kind", "Spec")
     skeleton = state.get("skeleton", "")
     content = state.get("content", "")
@@ -720,6 +724,8 @@ async def _enrich_node(state: SpecDocState) -> Dict[str, Any]:
 
 async def _guard_node(state: SpecDocState) -> Dict[str, Any]:
     """Verification node: mermaid repair → secret masking → judge → persist."""
+    # Pre-persist checkpoint: nothing is written onto the spec after Stop.
+    _check_cancel(state.get("should_cancel"))
     docs = state.get("docs", "")
     model = state.get("model")
     base_url = state.get("base_url")
@@ -818,6 +824,7 @@ async def _generate_spec_doc(
     model: Optional[str],
     language: str,
     progress: Optional[Any] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> str:
     """Shared flow for openapi/asyncapi: parse → enrich (agent) → guard.
 
@@ -828,6 +835,8 @@ async def _generate_spec_doc(
     content = (getattr(spec, "content", "") or "").strip()
     if not content:
         raise ValueError(f"{spec_kind} spec has empty content.")
+    # Cancellation checkpoint: catches jobs cancelled while queued.
+    _check_cancel(should_cancel)
 
     # Resolve admin docgen config (models.docgen.*) so the LLM enrichment hits
     # the configured gateway. Per-request model override wins.
@@ -846,6 +855,7 @@ async def _generate_spec_doc(
         "model": model,
         "base_url": r_base_url,
         "api_key": r_api_key,
+        "should_cancel": should_cancel,
     }
 
     emit_progress(progress, phase="planning")
@@ -892,6 +902,7 @@ async def generate_openapi_docs(
     spec: Any, product: Any,
     model: Optional[str] = None, language: str = "ru",
     progress: Optional[Any] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> str:
     """Generate OpenAPI documentation (LangGraph parse → enrich → guard)."""
     return await _generate_spec_doc(
@@ -901,6 +912,7 @@ async def generate_openapi_docs(
         render_skeleton=_render_openapi_skeleton,
         model=model, language=language,
         progress=progress,
+        should_cancel=should_cancel,
     )
 
 
@@ -908,6 +920,7 @@ async def generate_asyncapi_docs(
     spec: Any, product: Any,
     model: Optional[str] = None, language: str = "ru",
     progress: Optional[Any] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> str:
     """Generate AsyncAPI documentation (LangGraph parse → enrich → guard)."""
     return await _generate_spec_doc(
@@ -917,4 +930,5 @@ async def generate_asyncapi_docs(
         render_skeleton=_render_asyncapi_skeleton,
         model=model, language=language,
         progress=progress,
+        should_cancel=should_cancel,
     )

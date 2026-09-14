@@ -118,7 +118,7 @@ class TestRunDocgenJobAsyncCodebase:
         monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
 
         # Mock generate_codebase_docs
-        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None, **kwargs):
             return "Generated docs content"
         import api.docgen.codebase as codebase_mod
         monkeypatch.setattr(codebase_mod, "generate_codebase_docs", fake_generate)
@@ -181,7 +181,7 @@ class TestRunDocgenJobAsyncSpec:
 
         monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
 
-        async def fake_generate(spec, product, model=None, language="ru", progress=None):
+        async def fake_generate(spec, product, model=None, language="ru", progress=None, **kwargs):
             return "Spec docs"
         import api.docgen.spec as spec_mod
         monkeypatch.setattr(spec_mod, "generate_openapi_docs", fake_generate)
@@ -217,14 +217,14 @@ class TestRunDocgenJobAsyncSpec:
         # jobs.py reads the REAL SpecORM.kind column; the row above carries
         # kind="asyncapi", so the asyncapi branch is exercised honestly.
 
-        async def fake_async_generate(spec, product, model=None, language="ru", progress=None):
+        async def fake_async_generate(spec, product, model=None, language="ru", progress=None, **kwargs):
             return "AsyncAPI docs"
         import api.docgen.spec as spec_mod
         monkeypatch.setattr(spec_mod, "generate_asyncapi_docs", fake_async_generate)
 
         # Also patch openapi to ensure it's NOT called
         openapi_called = {"v": False}
-        async def fake_openapi_generate(spec, product, model=None, language="ru", progress=None):
+        async def fake_openapi_generate(spec, product, model=None, language="ru", progress=None, **kwargs):
             openapi_called["v"] = True
             return "OpenAPI docs"
         monkeypatch.setattr(spec_mod, "generate_openapi_docs", fake_openapi_generate)
@@ -320,7 +320,7 @@ class TestRunDocgenJobAsyncErrors:
 
         monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
 
-        async def boom_generate(artifact, product, model=None, language="ru", progress=None):
+        async def boom_generate(artifact, product, model=None, language="ru", progress=None, **kwargs):
             raise RuntimeError("Generator exploded")
         import api.docgen.codebase as codebase_mod
         monkeypatch.setattr(codebase_mod, "generate_codebase_docs", boom_generate)
@@ -362,7 +362,7 @@ class TestRunDocgenJob:
 
         monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
 
-        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None, **kwargs):
             return "Thread docs"
         import api.docgen.codebase as codebase_mod
         monkeypatch.setattr(codebase_mod, "generate_codebase_docs", fake_generate)
@@ -396,7 +396,7 @@ class TestRunDocgenJob:
 
         monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
 
-        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None, **kwargs):
             return "Drain docs"
         import api.docgen.codebase as codebase_mod
         monkeypatch.setattr(codebase_mod, "generate_codebase_docs", fake_generate)
@@ -438,7 +438,7 @@ class TestSubmitJob:
 
         monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
 
-        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None, **kwargs):
             return "Submit docs"
         import api.docgen.codebase as codebase_mod
         monkeypatch.setattr(codebase_mod, "generate_codebase_docs", fake_generate)
@@ -551,7 +551,7 @@ class TestProgressCallbackDispatch:
 
         seen = {}
 
-        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None, **kwargs):
             seen["progress"] = progress
             if progress:
                 progress(phase="cloning")

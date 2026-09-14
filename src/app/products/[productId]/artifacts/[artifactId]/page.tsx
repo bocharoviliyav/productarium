@@ -1,16 +1,19 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import {
+  ArrowCounterClockwise,
   ArrowLeft,
   Database as DatabaseIcon,
   FileText,
   GitBranch,
+  Lightning,
   LinkSimple,
   PencilSimple,
   Plus,
+  StopCircle,
   Trash,
 } from "@phosphor-icons/react";
 import { AppHeader } from "@/components/AppHeader";
@@ -28,8 +31,10 @@ import {
   EmptyState,
   IconButton,
   Input,
+  Modal,
   Reveal,
   SectionHeader,
+  Select,
   Spinner,
   Tag,
   Textarea,
@@ -39,6 +44,8 @@ import {
   type ArtifactPage,
   type Codebase,
   type Database,
+  type DocVersionDetail,
+  type DocVersionList,
   type EntityKind,
   type LinkItem,
   type Links,
@@ -60,7 +67,7 @@ export default function EntityDocsViewer() {
   const { productId, artifactId } = params;
   const router = useRouter();
   const { notify } = useNotifications();
-  const { messages } = useLanguage();
+  const { messages, fmt } = useLanguage();
   const t = messages?.artifact ?? {};
   const tc = messages?.common ?? {};
   const tArt = messages?.artifactTypes ?? {};
@@ -78,6 +85,27 @@ export default function EntityDocsViewer() {
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+
+  // Doc versions (immutable history): list + selected archived version.
+  const [versions, setVersions] = useState<DocVersionList | null>(null);
+  const [viewVersion, setViewVersion] = useState<number | null>(null);
+  const [versionDetail, setVersionDetail] = useState<DocVersionDetail | null>(null);
+  // Per-page regeneration: confirm modal + locally polled job.
+  const [confirmRegen, setConfirmRegen] = useState(false);
+  const [regenJob, setRegenJob] = useState<string | null>(null);
+  const [regenStarting, setRegenStarting] = useState(false);
+  // Rollback confirm + in-flight restore.
+  const [confirmRestore, setConfirmRestore] = useState<number | null>(null);
+  const [restoring, setRestoring] = useState(false);
+
+  // Silences poller toasts once the viewer unmounts.
+  const viewerAbortRef = useRef(false);
+  useEffect(() => {
+    viewerAbortRef.current = false;
+    return () => {
+      viewerAbortRef.current = true;
+    };
+  }, []);
 
   const fetchProduct = useCallback(async () => {
     setIsLoading(true);
@@ -139,15 +167,80 @@ export default function EntityDocsViewer() {
     [entity, kind],
   );
 
-  useEffect(() => {
-    if (pages.length > 0 && !activePageId) {
-      setActivePageId(pages[0].id);
+  // Version history (codebase/database): best-effort list — a failure just
+  // leaves the selector hidden.
+  const fetchVersions = useCallback(async () => {
+    if (kind !== "codebase" && kind !== "database") return;
+    try {
+      const res = await fetch(
+        `/api/products/${productId}/${entityPath(kind)}/${artifactId}/versions`,
+        { credentials: "include", cache: "no-store" },
+      );
+      if (!res.ok) return;
+      setVersions((await res.json()) as DocVersionList);
+    } catch {
+      /* best-effort */
     }
-  }, [pages, activePageId]);
+  }, [productId, artifactId, kind]);
+
+  useEffect(() => {
+    setVersions(null);
+    setViewVersion(null);
+    setVersionDetail(null);
+    fetchVersions();
+  }, [fetchVersions]);
+
+  // Archived snapshot (read-only): fetched on select, dropped on deselect.
+  useEffect(() => {
+    if (viewVersion === null || !kind) {
+      setVersionDetail(null);
+      return;
+    }
+    let cancelled = false;
+    setVersionDetail(null);
+    void (async () => {
+      try {
+        const res = await fetch(
+          `/api/products/${productId}/${entityPath(kind)}/${artifactId}/versions/${viewVersion}`,
+          { credentials: "include", cache: "no-store" },
+        );
+        if (!res.ok) throw new Error(String(res.status));
+        const d = (await res.json()) as DocVersionDetail;
+        if (!cancelled) setVersionDetail(d);
+      } catch {
+        if (!cancelled) {
+          notify({
+            tone: "error",
+            title: t.versionsTitle ?? "Versions",
+            message: t.versionsLoadFailed ?? "Failed to load version.",
+          });
+          setViewVersion(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [viewVersion, productId, artifactId, kind, notify]);
+
+  const archivePages = useMemo(
+    () => (versionDetail ? normalizePages(versionDetail.pages) : []),
+    [versionDetail],
+  );
+  const viewingArchive = viewVersion !== null;
+  const displayPages = viewingArchive ? archivePages : pages;
+
+  // Keep the active page valid across version switches: reset to the first
+  // page whenever the selection disappears from the display set.
+  useEffect(() => {
+    if (displayPages.length > 0 && !displayPages.some((p) => p.id === activePageId)) {
+      setActivePageId(displayPages[0].id);
+    }
+  }, [displayPages, activePageId]);
 
   const activePage = useMemo(
-    () => pages.find((p) => p.id === activePageId) ?? null,
-    [pages, activePageId],
+    () => displayPages.find((p) => p.id === activePageId) ?? null,
+    [displayPages, activePageId],
   );
 
   // Nested page tree: a page whose `parent` references another page in the
@@ -155,10 +248,10 @@ export default function EntityDocsViewer() {
   // matches the backend's canonical section order). Legacy flat pages and
   // orphaned `parent` references render top-level exactly as before.
   const pageTree = useMemo(() => {
-    const ids = new Set(pages.map((p) => p.id));
+    const ids = new Set(displayPages.map((p) => p.id));
     const childrenByParent = new Map<string, ArtifactPage[]>();
     const roots: ArtifactPage[] = [];
-    for (const p of pages) {
+    for (const p of displayPages) {
       const parent = p.parent?.trim();
       if (parent && parent !== p.id && ids.has(parent)) {
         const list = childrenByParent.get(parent) ?? [];
@@ -169,7 +262,7 @@ export default function EntityDocsViewer() {
       }
     }
     return { roots, childrenByParent };
-  }, [pages]);
+  }, [displayPages]);
 
   const isCodebase = kind === "codebase";
   const isDatabase = kind === "database";
@@ -184,10 +277,12 @@ export default function EntityDocsViewer() {
     codebase?.generated_docs || databaseEntity?.generated_docs || pages.length > 0,
   );
   const hasRawContent = Boolean(spec?.content || linksEntity?.content);
+  // Archived versions are read-only — editing targets the current version.
   const canEdit =
-    (isCodebase && hasDocs) ||
-    (isDatabase && hasDocs) ||
-    ((isSpec || isLinks) && hasRawContent);
+    !viewingArchive &&
+    ((isCodebase && hasDocs) ||
+      (isDatabase && hasDocs) ||
+      ((isSpec || isLinks) && hasRawContent));
 
   useEffect(() => {
     if (editing) return;
@@ -319,6 +414,152 @@ export default function EntityDocsViewer() {
 
   const empty = (isCodebase || isDatabase) ? !hasDocs : !hasRawContent;
 
+  // Per-page regeneration: the forced page rides through the normal docgen
+  // job (diff-reuse for the rest) and lands as a NEW doc version.
+  const handleRegeneratePage = async () => {
+    if (!kind || !activePage || regenJob || regenStarting) return;
+    setConfirmRegen(false);
+    setRegenStarting(true);
+    const base = `/api/products/${productId}/${entityPath(kind)}/${artifactId}`;
+    try {
+      const res = await fetch(
+        `${base}/pages/${encodeURIComponent(activePage.id)}/regenerate`,
+        {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        },
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || `Generation failed (${res.status})`);
+      }
+      const jobId = data.job_id ?? null;
+      if (!jobId) {
+        await fetchProduct();
+        return;
+      }
+      notify({
+        tone: "info",
+        title: t.regeneratePage ?? "Regenerate page",
+        message: t.pageRegenStarted ?? "Page regeneration started…",
+      });
+      setRegenJob(jobId);
+      const maxWaitMs = 30 * 60 * 1000;
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < maxWaitMs) {
+        await new Promise((r) => setTimeout(r, 2000));
+        if (viewerAbortRef.current) return;
+        const stRes = await fetch(
+          `${base}/generate/status?job_id=${encodeURIComponent(jobId)}`,
+          { credentials: "include", cache: "no-store" },
+        );
+        if (!stRes.ok) throw new Error(`Status failed (${stRes.status})`);
+        const st = await stRes.json().catch(() => ({}));
+        if (st.status === "succeeded") {
+          notify({
+            tone: "success",
+            title: t.regeneratePage ?? "Regenerate page",
+            message: st.indexing_message || (t.pageRegenDone ?? "Page regenerated."),
+          });
+          await fetchProduct();
+          await fetchVersions();
+          return;
+        }
+        if (st.status === "failed") {
+          throw new Error(st.error || st.indexing_message || (t.pageRegenFailed ?? "Page regeneration failed."));
+        }
+        if (st.status === "cancelled") {
+          notify({
+            tone: "info",
+            title: t.regeneratePage ?? "Regenerate page",
+            message: st.indexing_message || (t.pageRegenCancelled ?? "Regeneration cancelled."),
+          });
+          await fetchProduct();
+          return;
+        }
+      }
+      throw new Error(t.pageRegenFailed ?? "Page regeneration timed out.");
+    } catch (e) {
+      if (!viewerAbortRef.current) {
+        notify({
+          tone: "error",
+          title: t.regeneratePage ?? "Regenerate page",
+          message: e instanceof Error ? e.message : (t.pageRegenFailed ?? "Page regeneration failed."),
+        });
+      }
+    } finally {
+      if (!viewerAbortRef.current) {
+        setRegenJob(null);
+        setRegenStarting(false);
+      }
+    }
+  };
+
+  // Cooperative cancel of the per-page regen job (the worker restores the
+  // current version — no new version is appended).
+  const handleCancelRegen = async () => {
+    if (!kind || !regenJob) return;
+    try {
+      const res = await fetch(
+        `/api/products/${productId}/${entityPath(kind)}/${artifactId}/generate/cancel`,
+        {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        },
+      );
+      if (!res.ok) throw new Error(`Failed to cancel (${res.status})`);
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.regeneratePage ?? "Regenerate page",
+        message: e instanceof Error ? e.message : "Failed to cancel.",
+      });
+    }
+  };
+
+  // Rollback: writes the archived snapshot back and appends a new rollback
+  // version; the returned Product replaces local state wholesale.
+  const handleRestore = async (version: number) => {
+    if (!kind || restoring) return;
+    setConfirmRestore(null);
+    setRestoring(true);
+    try {
+      const res = await fetch(
+        `/api/products/${productId}/${entityPath(kind)}/${artifactId}/versions/${version}/restore`,
+        {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        },
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || `Rollback failed (${res.status})`);
+      }
+      setProduct(data as Product);
+      setViewVersion(null);
+      notify({
+        tone: "success",
+        title: t.versionsTitle ?? "Versions",
+        message: t.rollbackDone ?? "Rolled back.",
+      });
+      await fetchVersions();
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.versionsTitle ?? "Versions",
+        message: e instanceof Error ? e.message : (t.rollbackFailed ?? "Rollback failed."),
+      });
+    } finally {
+      setRestoring(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-canvas text-ink">
       <AppHeader />
@@ -378,7 +619,45 @@ export default function EntityDocsViewer() {
                     </h1>
                   </div>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  {(isCodebase || isDatabase) && versions && versions.versions.length > 0 && (
+                    <Select
+                      value={viewVersion === null ? "" : String(viewVersion)}
+                      onChange={(e) =>
+                        setViewVersion(e.target.value ? Number(e.target.value) : null)
+                      }
+                      disabled={editing || regenStarting || regenJob !== null}
+                      className="w-56 text-sm"
+                    >
+                      <option value="">
+                        {fmt(t.currentVersion ?? "Current (v{n})", {
+                          n: String(versions.current_version ?? "—"),
+                        })}
+                      </option>
+                      {versions.versions.map((v) => (
+                        <option key={v.version} value={v.version}>
+                          {`v${v.version} · ${v.source}${v.created_at ? ` · ${new Date(v.created_at).toLocaleString()}` : ""}`}
+                        </option>
+                      ))}
+                    </Select>
+                  )}
+                  {viewingArchive && (
+                    <>
+                      <Tag tone="yellow">
+                        {fmt(t.archivedVersion ?? "Version v{n} (archived)", { n: String(viewVersion) })}
+                      </Tag>
+                      <Button
+                        type="button"
+                        variant="subtle"
+                        size="sm"
+                        onClick={() => setConfirmRestore(viewVersion)}
+                        disabled={restoring}
+                      >
+                        <ArrowCounterClockwise size={14} weight="regular" />
+                        {t.rollback ?? "Rollback"}
+                      </Button>
+                    </>
+                  )}
                   {canEdit && !editing && (
                     <Button type="button" variant="subtle" size="sm" onClick={startEditing}>
                       <PencilSimple size={14} weight="regular" />
@@ -621,10 +900,48 @@ export default function EntityDocsViewer() {
                   )}
                 </aside>
 
-                <div className="flex flex-col gap-8">
-                  {!editing && activePage?.provenance ? (
-                    <ProvenancePanel provenance={activePage.provenance} />
-                  ) : null}
+                <div className="flex min-w-0 flex-col gap-8">
+                  <div className="flex flex-col gap-4">
+                    {!editing && !viewingArchive && activePage?.provenance ? (
+                      <ProvenancePanel provenance={activePage.provenance} />
+                    ) : null}
+                    {(isCodebase || isDatabase) && !editing && (
+                      <div className="flex items-center justify-end gap-2">
+                        {regenStarting || regenJob ? (
+                          <>
+                            <span className="flex items-center gap-2 font-mono text-xs text-muted">
+                              <Spinner className="h-3.5 w-3.5" />
+                              {t.regeneratingPage ?? "Regenerating page…"}
+                            </span>
+                            {regenJob && (
+                              <Button
+                                type="button"
+                                variant="subtle"
+                                size="sm"
+                                onClick={handleCancelRegen}
+                              >
+                                <StopCircle size={14} weight="fill" />
+                                {t.stopGeneration ?? "Stop"}
+                              </Button>
+                            )}
+                          </>
+                        ) : (
+                          activePage &&
+                          !viewingArchive && (
+                            <Button
+                              type="button"
+                              variant="subtle"
+                              size="sm"
+                              onClick={() => setConfirmRegen(true)}
+                            >
+                              <Lightning size={14} weight="fill" />
+                              {t.regeneratePage ?? "Regenerate page"}
+                            </Button>
+                          )
+                        )}
+                      </div>
+                    )}
+                  </div>
                   <Card className="p-6 md:p-10">
                     {editing ? (
                       <div className="flex flex-col gap-4">
@@ -659,6 +976,7 @@ export default function EntityDocsViewer() {
                         </h2>
                         <Markdown
                           content={
+                            (viewingArchive ? versionDetail?.generated_docs : undefined) ||
                             codebase?.generated_docs ||
                             databaseEntity?.generated_docs ||
                             ""
@@ -672,6 +990,55 @@ export default function EntityDocsViewer() {
             )}
           </>
         )}
+
+        {/* Per-page regeneration confirmation */}
+        <Modal
+          open={confirmRegen}
+          onClose={() => setConfirmRegen(false)}
+          title={t.confirmPageRegenTitle ?? "Regenerate page?"}
+          footer={null}
+        >
+          <p className="text-sm text-muted">
+            {t.confirmPageRegenText ??
+              "A new documentation version will be generated for this page."}
+          </p>
+          <div className="mt-6 flex items-center justify-end gap-2">
+            <Button variant="ghost" onClick={() => setConfirmRegen(false)}>
+              {tc.cancel ?? "Cancel"}
+            </Button>
+            <Button onClick={() => void handleRegeneratePage()}>
+              <Lightning size={16} weight="fill" />
+              {t.regeneratePage ?? "Regenerate page"}
+            </Button>
+          </div>
+        </Modal>
+
+        {/* Rollback confirmation — restores the snapshot as a new version */}
+        <Modal
+          open={confirmRestore !== null}
+          onClose={() => setConfirmRestore(null)}
+          title={t.rollbackConfirmTitle ?? "Roll back to this version?"}
+          footer={null}
+        >
+          <p className="text-sm text-muted">
+            {t.rollbackConfirmText ??
+              "The current documentation will be replaced by this version; the rollback itself is saved as a new version."}
+          </p>
+          <div className="mt-6 flex items-center justify-end gap-2">
+            <Button variant="ghost" onClick={() => setConfirmRestore(null)}>
+              {tc.cancel ?? "Cancel"}
+            </Button>
+            <Button
+              onClick={() => {
+                if (confirmRestore !== null) void handleRestore(confirmRestore);
+              }}
+              disabled={restoring}
+            >
+              {restoring ? <Spinner /> : <ArrowCounterClockwise size={16} weight="regular" />}
+              {t.rollback ?? "Rollback"}
+            </Button>
+          </div>
+        </Modal>
       </main>
     </div>
   );

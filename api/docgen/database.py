@@ -69,13 +69,14 @@ import os
 import re
 import time
 from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from api.utils import setup_logging
 from api.utils.llm_helpers import cap as _cap
 from api.formats.mermaid import run_repair_loop
 from api.prompts import LANGUAGE_NAMES, load_prompt_file
 from api.docgen._common import (
+    _check_cancel,
     _close_owned_llm,
     _product_dataset,
     _index_in_background,
@@ -2574,9 +2575,11 @@ def build_database_doc_prompt(
     schema_dump: str,
     language: str = "ru",
     product_context: str = "",
+    reviewer_notes: Optional[str] = None,
 ) -> str:
     """Build the overview enrichment prompt; ``language`` selects the OUTPUT
-    language (per-request, mirrors the spec flow)."""
+    language (per-request, mirrors the spec flow). ``reviewer_notes`` carries
+    the judge issues stored on the previous page version (per-page regen)."""
     template = load_prompt_file("database_doc.md", _DATABASE_DOC_FALLBACK)
     for var, value in (
         ("database_name", database_name),
@@ -2587,6 +2590,12 @@ def build_database_doc_prompt(
         ("language_name", LANGUAGE_NAMES.get(language, language)),
     ):
         template = template.replace("{" + var + "}", str(value))
+    if reviewer_notes:
+        template += (
+            "\n\n<reviewer_notes>\nПредыдущая версия страницы получила "
+            "замечания проверяющего — обязательно исправь их:\n"
+            + reviewer_notes + "\n</reviewer_notes>"
+        )
     return template
 
 
@@ -3078,6 +3087,8 @@ async def generate_database_docs(
     model: Optional[str] = None,
     language: str = "ru",
     progress: Optional[Any] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    force_pages: Optional[List[str]] = None,
 ) -> str:
     """Reverse-engineer a database via MCP tools and document it.
 
@@ -3094,6 +3105,19 @@ async def generate_database_docs(
     )
     name = getattr(entity, "name", None) or "Database"
     dsn_masked = getattr(entity, "dsn_masked", None) or ""
+
+    # Per-page regeneration: only the forced pages are swapped in at persist;
+    # the overview's stored judge issues ride into its prompt as notes.
+    old_pages = entity.pages if isinstance(getattr(entity, "pages", None), dict) else {}
+    reviewer_notes = ""
+    if force_pages and "page_overview" in force_pages:
+        issues = (
+            ((old_pages.get("page_overview") or {}).get("provenance") or {})
+            .get("judge", {})
+            .get("issues")
+            or []
+        )
+        reviewer_notes = "\n".join(f"- {i}" for i in issues if str(i).strip())
 
     emit_progress(progress, phase="planning")
     # 1-2) Introspection, CACHE-FIRST (2.3b). The walk over a huge schema is
@@ -3175,6 +3199,9 @@ async def generate_database_docs(
             section_done="introspection", section_seconds=0.0,
         )
 
+    # Cancellation checkpoint (post-introspection / pre-enrichment).
+    _check_cancel(should_cancel)
+
     # 3) Deterministic skeleton (overview facts + tables root evidence).
     overview_md, tables_md = _render_skeleton(entity, info)
     skeleton = "\n\n".join(
@@ -3197,6 +3224,7 @@ async def generate_database_docs(
             schema_dump=dump,
             language=language,
             product_context=product_context,
+            reviewer_notes=reviewer_notes or None,
         ),
         model,
         base_url=r_base_url,
@@ -3249,6 +3277,9 @@ async def generate_database_docs(
                 "database docgen: %d relation(s) inferred by column-name "
                 "evidence (marked as inferences)", len(inferred),
             )
+
+    # Cancellation checkpoint (post-enrichment).
+    _check_cancel(should_cancel)
 
     # 5) Page tree (viewer contract) from evidence + enrichment.
     pages, order = _render_page_tree(
@@ -3401,6 +3432,14 @@ async def generate_database_docs(
     pages["page_tables"]["provenance"]["db_context"] = _db_context_payload(info)
 
     # 8) Persist (viewer contract) + background indexing.
+    _check_cancel(should_cancel)  # pre-persist: nothing written after Stop
+    if force_pages and old_pages:
+        # Per-page regen: keep the stored pages, swap in only the forced ones
+        # (with their fresh provenance); old-only pages append at the end.
+        merged = dict(old_pages)
+        merged.update({p: pages[p] for p in force_pages if p in pages})
+        order = list(order) + [p for p in merged if p not in order]
+        pages = merged
     emit_progress(progress, phase="indexing")
     docs = _assemble_docs(pages, order)
     _persist_artifact(entity, docs, pages)

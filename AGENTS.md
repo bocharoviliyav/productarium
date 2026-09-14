@@ -192,6 +192,7 @@ graph TD
 | **Data Models & Schemas** | SQLAlchemy 2.0 ORM models, Pydantic DTOs | `api/models.py`<br>`api/schemas.py` | `product_repo.py`, all routers |
 | **Entity Repository** | Single source for Product, Codebase, Spec, Links, Database DB queries | `api/repositories/product_repo.py` | `routers/products.py`, `routers/databases.py`, `docgen/` |
 | **Auth & Security** | JWT tokens, bcrypt, Keycloak OIDC, RBAC & product grants, secret encryption | `api/auth/deps.py`<br>`api/auth/local.py`<br>`api/auth/tokens.py`<br>`api/config/settings.py` | All protected routers, MCP secrets |
+| **Doc Versioning (Vault-style)** | Immutable doc version snapshots (`productarium_doc_versions`), baseline bootstrap, append/restore, `current_version` pointers, version REST endpoints | `api/repositories/doc_version_repo.py`<br>`api/routers/doc_versions.py` | `docgen/jobs.py`, `routers/products.py`, `routers/databases.py`, `routers/docgen.py` |
 | **DocGen: Codebase** | DeepAgents repo exploration, prompt synthesis, verification pipeline | `api/docgen/codebase.py`<br>`api/docgen/verification.py`<br>`api/docgen/jobs.py` | `routers/docgen.py`, `models.py:Codebase` |
 | **DocGen: Database (RE)** | MCP introspection walk, role classifier, SQL catalog packs, LLM enrichment | `api/docgen/database.py`<br>`api/docgen/introspection_cache.py` | `routers/databases.py`, `models.py:Database` |
 | **DocGen: Spec** | OpenAPI/AsyncAPI parsing, Markdown skeleton, LangGraph enrichment | `api/docgen/spec.py` | `routers/docgen.py`, `models.py:Spec` |
@@ -222,6 +223,9 @@ graph TD
    - **Database RE**: Outbound MCP walk (`api/docgen/database.py`) -> Catalog introspection -> Table/relation schemas -> Batched LLM enrichment (`DB_DOCGEN_ENRICH_BATCH`) -> ER diagrams.
    - **Spec**: stdlib parse -> Skeleton -> LangGraph enrichment.
 4. **Memory Ingestion**: Background vector indexing into `knowledge_chunks` via `api/memory/pgvector_backend.py`.
+5. **Versioning**: Worker bootstraps a v1 baseline snapshot before the run (`ensure_baseline_version`) and appends an immutable version after (`append_version`, source=`generate`); content edits append source=`edit`; restore appends source=`rollback` (`api/repositories/doc_version_repo.py`).
+6. **Cancellation**: `POST .../generate/cancel` sets `cancel_requested`; pipelines poll `should_cancel` checkpoints and raise `JobCancelledError` -> rollback + restore artifact from current version, job status `cancelled` (no version appended).
+7. **Per-page Regeneration**: `POST .../pages/{page_id}/regenerate` (codebases/databases only) submits a job with `force_pages=[page_id]`; codebase maps pages to `force_units` with judge-issue reviewer notes, database regenerates and merges only the forced page into old `pages`.
 
 ### C. Expert Agent Chat & Deep Research Flow
 1. **Client Stream**: `POST /api/products/{id}/ask` with SSE event-stream.

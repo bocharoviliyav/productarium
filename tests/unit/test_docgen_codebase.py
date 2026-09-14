@@ -1906,6 +1906,45 @@ class TestDocgenAgentFlow:
         assert prov2["regen"] == "reused-unchanged"
         assert prov2["fingerprint"] == first_fingerprint
 
+    def test_diff_regen_reuses_but_heals_legacy_defects(
+        self, fake_artifact, fake_product, fake_repo_dir, monkeypatch
+    ):
+        """Reused units are re-healed: a page persisted before the preamble
+        strip / truncation heal existed loses its defects on diff-regen."""
+        orchestrator1 = _FakeOrchestrator(
+            {sid: "FIRST RUN CONTENT `main.py`" for sid in cb.SECTION_ORDER}
+        )
+        self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator1)
+        asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
+
+        # Simulate a LEGACY stored page (pre-fix generation): meta preamble +
+        # body + a mermaid block cut off mid-diagram by a token limit.
+        fake_artifact.pages["page_overview"]["content"] = (
+            "Now let me generate the final overview section:\n\n"
+            "FIRST RUN CONTENT `main.py`\n\n"
+            "```mermaid\nflowchart TD\n  A --> B"
+        )
+
+        orchestrator2 = _FakeOrchestrator(
+            {sid: "SECOND RUN MUTATED" for sid in cb.SECTION_ORDER}
+        )
+        monkeypatch.setattr(
+            cb, "_build_orchestrator_agent",
+            lambda chat, specs, system_prompt: orchestrator2,
+        )
+
+        asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
+
+        assert orchestrator2.calls == 0  # sources unchanged → full reuse
+        healed = fake_artifact.pages["page_overview"]["content"]
+        assert "Now let me generate" not in healed  # preamble stripped
+        assert "```mermaid" not in healed  # dangling fence tail dropped
+        assert "FIRST RUN CONTENT" in healed  # body kept
+        assert (
+            fake_artifact.pages["page_overview"]["provenance"]["regen"]
+            == "reused-unchanged"
+        )
+
     def test_diff_regen_after_source_change(
         self, fake_artifact, fake_product, fake_repo_dir, monkeypatch
     ):
@@ -3029,6 +3068,58 @@ class TestUnitsAgentFlow:
         assert "MUTATED" not in result
         prov = fake_artifact.pages["page_functional__auth"]["provenance"]
         assert prov["regen"] == "reused-unchanged"
+
+    def test_force_units_regenerates_only_forced_page_with_judge_notes(
+        self, fake_artifact, fake_product, fake_repo_dir, monkeypatch
+    ):
+        """Per-page regeneration: force_units bypasses diff-reuse for the forced
+        unit ONLY; its stored judge issues ride into the subagent prompt as
+        reviewer notes (appended AFTER the hashed parts); everything else is
+        reused verbatim — one dispatch, no mutation of siblings."""
+        self._patch_units_flow(
+            monkeypatch, fake_repo_dir,
+            orchestrator=_FakeOrchestrator(self._texts()),
+        )
+        asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
+
+        # Stored judge issues on the overview page feed the next run's prompt.
+        fake_artifact.pages["page_overview"]["provenance"]["judge"] = {
+            "verdict": "inconsistent",
+            "issues": ["Diagram mismatch", "Stale table list"],
+        }
+
+        captured: Dict[str, Any] = {}
+
+        def capture_specs(chat, specs, system_prompt):
+            captured["specs"] = specs
+            return orchestrator2
+
+        orchestrator2 = _FakeOrchestrator(
+            self._texts(parent_body="FORCED {sid} citing `main.py`.")
+        )
+        self._patch_units_flow(monkeypatch, fake_repo_dir, builder=capture_specs)
+
+        asyncio.run(cb.generate_codebase_docs(
+            fake_artifact, fake_product, force_units=["page_overview"]
+        ))
+
+        # Only the forced unit dispatched; it regenerated with fresh text...
+        assert [s["name"] for s in captured["specs"]] == ["section-overview"]
+        overview = fake_artifact.pages["page_overview"]
+        assert "FORCED overview" in overview["content"]
+        assert overview["provenance"]["regen"] == "generated"
+        # ...and its judge issues rode into the subagent system prompt.
+        assert "Diagram mismatch" in captured["specs"][0]["system_prompt"]
+        assert "Stale table list" in captured["specs"][0]["system_prompt"]
+        # Every other parent and child was reused verbatim.
+        for sid in cb.SECTION_ORDER[1:]:
+            page = fake_artifact.pages[f"page_{sid}"]
+            assert "PARENT" in page["content"]
+            assert page["provenance"]["regen"] == "reused-unchanged"
+        for uid in self._CHILD_IDS:
+            page = fake_artifact.pages[f"page_{uid}"]
+            assert "CHILD" in page["content"]
+            assert page["provenance"]["regen"] == "reused-unchanged"
 
     def test_reused_parent_keeps_children_and_drop_applies_on_regen(
         self, fake_artifact, fake_product, fake_repo_dir, monkeypatch

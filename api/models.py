@@ -30,7 +30,17 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, Text, TypeDecorator
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    TypeDecorator,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 logger = logging.getLogger(__name__)
@@ -220,6 +230,9 @@ class CodebaseORM(Base):
     )
     verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+    # Active documentation version (productarium_doc_versions.version);
+    # NULL until the first snapshot (pre-versioning legacy artifacts).
+    current_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
     )
@@ -263,6 +276,8 @@ class SpecORM(Base):
     )
     verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+    # Active documentation version (specs snapshot their single `content`).
+    current_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
     )
@@ -376,6 +391,8 @@ class DatabaseORM(Base):
     )
     verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+    # Active documentation version (productarium_doc_versions.version).
+    current_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
     )
@@ -390,6 +407,42 @@ class DatabaseORM(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
         return f"<DatabaseORM id={self.id!r} name={self.name!r}>"
+
+
+class DocVersionORM(Base):
+    """Immutable documentation snapshot of one artifact (Vault KV-v2 style).
+
+    Every successful generation, manual edit and rollback APPENDS a row; the
+    artifact row's ``current_version`` points at the active snapshot. Payload
+    columns are filled per entity type: codebase/database store
+    ``generated_docs`` + ``pages``; spec stores its single ``content``. The
+    vector memory stays keyed to the artifact (delete-then-insert by
+    source_id), so only the CURRENT version is searchable.
+    """
+
+    __tablename__ = "productarium_doc_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "entity_type", "entity_id", "version", name="uq_doc_version_entity"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    product_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # codebase | database | spec
+    entity_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # baseline | generate | edit | rollback
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    model: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    job_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    generated_docs: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    pages: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
 
 
 class KnowledgeNodeORM(Base):

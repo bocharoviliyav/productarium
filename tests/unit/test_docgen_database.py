@@ -2375,6 +2375,64 @@ class TestGenerateDatabaseDocs:
         assert "- `public.users`" in result
         assert entity.pages["page_tables"]["provenance"]["caps"]["max_subpages"] == 1
 
+    def test_force_pages_merges_only_forced_page(self, monkeypatch):
+        """Per-page regen: only the forced page is swapped in at persist (with
+        fresh provenance); every OTHER stored page survives verbatim and
+        old-only page ids append at the end of the assembly order."""
+        old_pages = {
+            "page_overview": {
+                "id": "page_overview", "title": "Overview",
+                "content": "OLD OVERVIEW", "filePaths": [],
+                "importance": "medium", "relatedPages": ["page_tables"],
+                "provenance": {"judge": {
+                    "verdict": "inconsistent",
+                    "issues": ["Diagram mismatch"],
+                }},
+            },
+            "page_tables": {
+                "id": "page_tables", "title": "Tables",
+                "content": "OLD TABLES", "filePaths": [],
+                "importance": "medium", "relatedPages": [],
+            },
+            "page_extra": {
+                "id": "page_extra", "title": "Extra",
+                "content": "OLD EXTRA", "filePaths": [],
+                "importance": "low", "relatedPages": [],
+            },
+        }
+        entity = _fake_entity(pages=old_pages)
+        captured: list = []
+
+        async def fake_llm(prompt, model, base_url=None, api_key=None):
+            captured.append(prompt)
+            return "NEW OVERVIEW"
+
+        _patch_generation(monkeypatch, llm_text="NEW OVERVIEW")
+        monkeypatch.setattr(db_doc_mod, "_llm_or_none", fake_llm)
+
+        result = asyncio.run(db_doc_mod.generate_database_docs(
+            entity, _fake_product(), force_pages=["page_overview"]
+        ))
+
+        # Forced page regenerated with fresh provenance + LLM text…
+        assert "NEW OVERVIEW" in entity.pages["page_overview"]["content"]
+        assert (
+            entity.pages["page_overview"]["provenance"]["generator"]
+            == "standard-llm"
+        )
+        # …and its stored judge issues rode into the enrichment prompt.
+        assert "<reviewer_notes>" in captured[0]
+        assert "Diagram mismatch" in captured[0]
+        # Non-forced stored pages survive verbatim; freshly generated
+        # non-forced pages (the table subpages) are dropped from the tree.
+        assert entity.pages["page_tables"]["content"] == "OLD TABLES"
+        assert entity.pages["page_extra"]["content"] == "OLD EXTRA"
+        assert not any(p.startswith("page_tbl_") for p in entity.pages)
+        # Assembly: fresh overview + stored survivors + old-only tail.
+        assert "NEW OVERVIEW" in result
+        assert "OLD TABLES" in result
+        assert result.rindex("OLD EXTRA") > result.rindex("OLD TABLES")
+
 
 # ============================================================================
 # jobs.py database dispatch
@@ -2398,7 +2456,8 @@ class TestJobsDatabaseDispatch:
 
         import api.docgen.database as database_mod
 
-        async def fake_generate(entity, product, model=None, language="ru", progress=None):
+        async def fake_generate(entity, product, model=None, language="ru",
+                                progress=None, **kwargs):
             entity.generated_docs = "DB docs"
             return "DB docs"
 
@@ -2433,7 +2492,8 @@ class TestJobsDatabaseDispatch:
 
         import api.docgen.database as database_mod
 
-        async def fake_generate(entity, product, model=None, language="ru", progress=None):
+        async def fake_generate(entity, product, model=None, language="ru",
+                                progress=None, **kwargs):
             raise ValueError("MCP server unreachable")
 
         monkeypatch.setattr(database_mod, "generate_database_docs", fake_generate)

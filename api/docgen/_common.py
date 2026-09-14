@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from api.utils import setup_logging
 from api.utils.llm_helpers import (  # noqa: E402
@@ -100,6 +100,17 @@ def _clean_llm_text(text: Optional[str]) -> str:
 def _repo_name_from_url(repo_url: str) -> str:
     name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
     return name or repo_url
+
+
+class JobCancelledError(RuntimeError):
+    """Cooperative cancellation — raised at pipeline checkpoints once the
+    job's cancel flag is set (the artifact keeps its pre-run version)."""
+
+
+def _check_cancel(should_cancel: Optional[Callable[[], bool]]) -> None:
+    """Raise :class:`JobCancelledError` when cancellation was requested."""
+    if should_cancel is not None and should_cancel():
+        raise JobCancelledError("Generation cancelled by user")
 
 
 def emit_progress(progress: Optional[Any], **fields: Any) -> None:

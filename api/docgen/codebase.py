@@ -56,7 +56,7 @@ import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from langchain_core.callbacks import AsyncCallbackHandler
 
@@ -82,6 +82,7 @@ from api.docgen.verification import (
     verify_section,
 )
 from api.docgen._common import (
+    _check_cancel,
     _checkpoint_partial_docs,
     _clean_llm_text,
     _with_verification_guard,
@@ -2501,6 +2502,15 @@ def _assemble_markdown(
     return markdown
 
 
+def _reviewer_notes_block(notes: str) -> str:
+    """Judge issues from the PREVIOUS page version, appended AFTER the
+    hashed prompt parts — a forced rerun must not invalidate diff-reuse."""
+    return (
+        "\n\n## Замечания проверяющего к предыдущей версии страницы "
+        "(обязательно исправь):\n" + notes + "\n"
+    )
+
+
 def _raise_if_all_sections_unavailable(sections: Dict[str, str]) -> None:
     """Raise ValueError when EVERY section is the unavailable placeholder.
 
@@ -2530,6 +2540,8 @@ async def generate_codebase_docs(
     model: Optional[str] = None,
     language: str = "ru",
     progress: Optional[Any] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    force_units: Optional[List[str]] = None,
 ) -> str:
     """Generate the wiki (7 parent sections + subpages) and return markdown.
 
@@ -2576,6 +2588,8 @@ async def generate_codebase_docs(
         raise ValueError("Codebase artifact has no repo_url; cannot generate docs.")
     # P0-1: reject dangerous clone sources before any git invocation.
     validate_repo_url(repo_url)
+    # Cancellation checkpoint (pre-clone): catches jobs cancelled while queued.
+    _check_cancel(should_cancel)
     repo_type = getattr(artifact, "repo_type", None) or "github"
     # P0-2: the stored token is Fernet ciphertext (or legacy plaintext) —
     # decrypt before use; never log the value.
@@ -2622,6 +2636,8 @@ async def generate_codebase_docs(
         [(getattr(d, "meta_data", None) or {}).get("file_path", "") for d in documents]
     )
     readme = _read_readme(repo_dir)
+    # Cancellation checkpoint (post-clone / pre-planning).
+    _check_cancel(should_cancel)
 
     # --- Cross-context: specs / DB / product knowledge -----------------------
     # Blocks render as SEPARATE brief parts (each with its own budget) so a
@@ -2735,6 +2751,20 @@ async def generate_codebase_docs(
         if isinstance(content, str) and content.strip():
             old_sections[sid] = content
 
+    # Per-page regeneration: force these units past diff-reuse; their stored
+    # judge issues ride into the prompt as reviewer notes.
+    forced_units = {
+        p[len("page_"):]
+        for p in (force_units or [])
+        if isinstance(p, str) and p.startswith("page_")
+    }
+    judge_notes: Dict[str, str] = {}
+    for uid in forced_units:
+        issues = ((old_pages.get(f"page_{uid}") or {}).get("provenance") or {}).get("judge", {}).get("issues") or []
+        notes = "\n".join(f"- {i}" for i in issues if str(i).strip())
+        if notes:
+            judge_notes[uid] = notes
+
     # Stored children are recovered BEFORE the parent plan: the parent prompt
     # hash signs the OLD child set, so a full-reuse run never needs the
     # decomposer (or the orchestrator) at all. Child identity (kind/focus)
@@ -2809,7 +2839,7 @@ async def generate_codebase_docs(
     # there is something to dispatch — a parent section or a pass-A child;
     # a full-reuse run stays LLM-free.
     chat: Optional[Any] = None
-    if (sections_to_generate or pass_a_pending) and _deepagents_available():
+    if (sections_to_generate or pass_a_pending or forced_units) and _deepagents_available():
         try:
             from api.llm.client import build_chat_model
             from api.config.timeout import resolve_docgen_llm_concurrency
@@ -2958,6 +2988,8 @@ async def generate_codebase_docs(
             for unit in units
         }
         reuse_map: Dict[str, str] = {**regen_plan.reuse, **child_reuse}
+        for uid in forced_units:
+            reuse_map.pop(uid, None)  # forced pages always regenerate
         units_to_generate = [u.unit_id for u in units if u.unit_id not in reuse_map]
         if reuse_map:
             logger.info(
@@ -2996,6 +3028,9 @@ async def generate_codebase_docs(
                 for u in units
                 if u.unit_id in units_to_generate
             }
+            for uid, notes in judge_notes.items():
+                if uid in system_prompts:
+                    system_prompts[uid] += _reviewer_notes_block(notes)
             dispatches = {
                 u.unit_id: _section_dispatch_message(u.unit_id, u.title, repo_name)
                 for u in units
@@ -3100,6 +3135,7 @@ async def generate_codebase_docs(
                     agent_files.setdefault(uid, []).extend(files)
 
         for unit in units:
+            _check_cancel(should_cancel)  # between per-unit LLM calls
             uid = unit.unit_id
             files_used: List[str] = []
             mermaid_stats: Dict[str, int] = {}
@@ -3107,13 +3143,25 @@ async def generate_codebase_docs(
             t_unit = time.monotonic()
 
             if uid in reuse_map:
-                # Diff regeneration: sources unchanged → keep the previous
-                # unit verbatim (it was already mermaid-verified and guarded
-                # on the previous run).
-                content = reuse_map[uid]
+                # Diff regeneration: sources unchanged → reuse the previous
+                # unit, re-healing defects persisted before the preamble
+                # strip / truncation heal / mermaid repair existed. All
+                # healers are idempotent on clean content, so repeat runs
+                # stay byte-stable.
+                content = _clean_llm_text(reuse_map[uid])
                 regen_status = "reused-unchanged"
                 old_prov = get_stored_provenance(old_pages.get(f"page_{uid}"))
                 files_used = list(old_prov.get("source_files") or [])
+                content = await _heal_truncated_unit(uid, content, llm)
+                try:
+                    content, mermaid_stats = await run_repair_loop(
+                        content, repair_llm
+                    )
+                except Exception as e:  # pragma: no cover - never break reuse
+                    logger.warning(
+                        "Mermaid repair loop failed for reused unit %s: %s",
+                        uid, e,
+                    )
             else:
                 content = agent_units.get(uid, "")
                 files_used = list(agent_files.get(uid, []))
@@ -3146,6 +3194,8 @@ async def generate_codebase_docs(
                             ),
                         ),
                     )
+                    if uid in judge_notes:
+                        fallback_prompt += _reviewer_notes_block(judge_notes[uid])
                     content = await _generate_section_text(fallback_prompt, codebase_chunks, llm)
                     regen_status = "legacy-fallback"
                     files_used = []
@@ -3397,6 +3447,9 @@ async def generate_codebase_docs(
     diff_summary = diff_sections(old_sections, sections)
     logger.info("Codebase docgen section diff vs previous docs: %s", diff_summary)
 
+    # Cancellation checkpoint (pre-persist): nothing is written or indexed
+    # after this point once the user pressed Stop.
+    _check_cancel(should_cancel)
     markdown = _assemble_markdown(repo_name, unit_contents, language, units=units)
 
     emit_progress(progress, phase="indexing")

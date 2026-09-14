@@ -19,6 +19,7 @@ the test DB.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import threading
 import time
@@ -510,3 +511,219 @@ class TestActiveDocgenEndpoint:
         )
         resp = client.get("/api/products/any/docgen/active")
         assert resp.status_code == 401
+
+
+# ============================================================================
+# Doc versioning + cancellation + per-page regeneration
+# ============================================================================
+def _seed_legacy(db_mod):
+    """Seed a codebase that ALREADY carries pre-versioning docs."""
+    from api.models import CodebaseORM, ProductORM
+
+    with db_mod.SessionLocal() as db:
+        db.add(ProductORM(id="prod_1", name="Acme"))
+        db.flush()
+        db.add(CodebaseORM(
+            id="art_1", product_id="prod_1", name="svc",
+            repo_url="https://github.com/x/y", repo_type="github",
+            source="manual", generated_docs="# legacy",
+            pages={"page_overview": {
+                "id": "page_overview", "title": "Overview", "content": "# legacy",
+                "filePaths": [], "importance": "medium", "relatedPages": [],
+            }},
+        ))
+        db.commit()
+
+
+def _poll_terminal(client, job_id, deadline=15):
+    last = None
+    stop = time.time() + deadline
+    while time.time() < stop:
+        s = client.get(
+            "/api/products/prod_1/codebases/art_1/generate/status",
+            params={"job_id": job_id},
+        )
+        last = s.json()
+        if last["status"] in ("succeeded", "failed", "cancelled"):
+            return last
+        time.sleep(0.1)
+    return last
+
+
+def _doc_versions(db_mod):
+    from api.models import DocVersionORM
+
+    with db_mod.SessionLocal() as db:
+        rows = (
+            db.query(DocVersionORM)
+            .filter(DocVersionORM.entity_id == "art_1")
+            .order_by(DocVersionORM.version)
+            .all()
+        )
+        return [(r.version, r.source, r.job_id, r.generated_docs) for r in rows]
+
+
+class TestDocgenVersioning:
+    def _fake_pipeline(self, monkeypatch, docs, kwargs_sink=None):
+        import api.docgen.codebase as adg
+
+        async def _fake(artifact, product, **kwargs):
+            if kwargs_sink is not None:
+                kwargs_sink.update(kwargs)
+            artifact.generated_docs = docs
+            artifact.pages = {"page_overview": {"content": docs}}
+            return artifact.generated_docs
+
+        monkeypatch.setattr(adg, "generate_codebase_docs", _fake)
+
+    def test_generate_appends_doc_version(self, monkeypatch):
+        db_mod = _setup_db()
+        _seed(db_mod)  # no legacy docs -> no baseline snapshot
+        _app, client = _build_app(db_mod, monkeypatch)
+        self._fake_pipeline(monkeypatch, "# fresh")
+
+        resp = client.post(
+            "/api/products/prod_1/codebases/art_1/generate",
+            json={"language": "en"},
+        )
+        job_id = resp.json()["job_id"]
+        last = _poll_terminal(client, job_id)
+        assert last["status"] == "succeeded", last
+
+        assert _doc_versions(db_mod) == [(1, "generate", job_id, "# fresh")]
+        from api.models import CodebaseORM
+
+        with db_mod.SessionLocal() as db:
+            assert db.get(CodebaseORM, "art_1").current_version == 1
+
+    def test_legacy_docs_get_baseline_then_generate(self, monkeypatch):
+        db_mod = _setup_db()
+        _seed_legacy(db_mod)
+        _app, client = _build_app(db_mod, monkeypatch)
+        self._fake_pipeline(monkeypatch, "# v2")
+
+        resp = client.post(
+            "/api/products/prod_1/codebases/art_1/generate",
+            json={"language": "en"},
+        )
+        job_id = resp.json()["job_id"]
+        last = _poll_terminal(client, job_id)
+        assert last["status"] == "succeeded", last
+
+        versions = _doc_versions(db_mod)
+        assert [(v[0], v[1], v[3]) for v in versions] == [
+            (1, "baseline", "# legacy"), (2, "generate", "# v2"),
+        ]
+        assert versions[1][2] == job_id
+        from api.models import CodebaseORM
+
+        with db_mod.SessionLocal() as db:
+            assert db.get(CodebaseORM, "art_1").current_version == 2
+
+    def test_cancel_restores_previous_version(self, monkeypatch):
+        from api.docgen._common import JobCancelledError
+        from api.models import CodebaseORM
+
+        db_mod = _setup_db()
+        _seed(db_mod)
+        _app, client = _build_app(db_mod, monkeypatch)
+
+        # Run 1 succeeds and lands as v1.
+        self._fake_pipeline(monkeypatch, "# run1")
+        job1 = client.post(
+            "/api/products/prod_1/codebases/art_1/generate",
+            json={"language": "en"},
+        ).json()["job_id"]
+        assert _poll_terminal(client, job1)["status"] == "succeeded"
+
+        # Run 2 mutates the artifact in-flight, then honours the cancel flag.
+        import api.docgen.codebase as adg
+
+        async def _cancelable(artifact, product, **kwargs):
+            artifact.generated_docs = "# partial run2"
+            artifact.pages = None
+            should_cancel = kwargs.get("should_cancel")
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if should_cancel and should_cancel():
+                    raise JobCancelledError("cancelled")
+                await asyncio.sleep(0.02)
+            artifact.generated_docs = "# run2 finished"
+            return artifact.generated_docs
+
+        monkeypatch.setattr(adg, "generate_codebase_docs", _cancelable)
+        resp = client.post(
+            "/api/products/prod_1/codebases/art_1/generate",
+            json={"language": "en"},
+        )
+        job2 = resp.json()["job_id"]
+
+        cancel = client.post(
+            "/api/products/prod_1/codebases/art_1/generate/cancel"
+        )
+        assert cancel.status_code == 200
+        assert cancel.json() == {"cancelled": True, "job_id": job2}
+
+        last = _poll_terminal(client, job2)
+        assert last["status"] == "cancelled", last
+        assert last["error"] is None
+
+        # The artifact keeps its pre-run version; NO version was appended.
+        with db_mod.SessionLocal() as db:
+            art = db.get(CodebaseORM, "art_1")
+            assert art.generated_docs == "# run1"
+            assert art.current_version == 1
+        assert _doc_versions(db_mod) == [(1, "generate", job1, "# run1")]
+
+    def test_cancel_without_active_job_is_idempotent_false(self, monkeypatch):
+        db_mod = _setup_db()
+        _seed(db_mod)
+        _app, client = _build_app(db_mod, monkeypatch)
+        r = client.post(
+            "/api/products/prod_1/codebases/art_1/generate/cancel"
+        )
+        assert r.status_code == 200
+        assert r.json() == {"cancelled": False, "job_id": None}
+
+    def test_page_regenerate_forwards_force_pages(self, monkeypatch):
+        db_mod = _setup_db()
+        _seed_legacy(db_mod)
+        _app, client = _build_app(db_mod, monkeypatch)
+        kwargs_sink: dict = {}
+        self._fake_pipeline(monkeypatch, "# regenerated", kwargs_sink=kwargs_sink)
+
+        resp = client.post(
+            "/api/products/prod_1/codebases/art_1/pages/page_overview/regenerate",
+            json={},
+        )
+        assert resp.status_code == 202
+        job_id = resp.json()["job_id"]
+        last = _poll_terminal(client, job_id)
+        assert last["status"] == "succeeded", last
+
+        # The worker forwarded the page id to the codebase pipeline.
+        assert kwargs_sink.get("force_units") == ["page_overview"]
+        # The per-page rerun lands as a NEW doc version (baseline + generate).
+        assert [(v[0], v[1]) for v in _doc_versions(db_mod)] == [
+            (1, "baseline"), (2, "generate"),
+        ]
+
+    def test_page_regenerate_unknown_page_404(self, monkeypatch):
+        db_mod = _setup_db()
+        _seed_legacy(db_mod)
+        _app, client = _build_app(db_mod, monkeypatch)
+        r = client.post(
+            "/api/products/prod_1/codebases/art_1/pages/page_ghost/regenerate",
+            json={},
+        )
+        assert r.status_code == 404
+
+    def test_page_regenerate_specs_segment_400(self, monkeypatch):
+        db_mod = _setup_db()
+        _seed(db_mod)
+        _app, client = _build_app(db_mod, monkeypatch)
+        r = client.post(
+            "/api/products/prod_1/specs/any/pages/page_overview/regenerate",
+            json={},
+        )
+        assert r.status_code == 400

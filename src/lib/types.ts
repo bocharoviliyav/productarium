@@ -94,6 +94,8 @@ export interface Codebase {
   has_token?: boolean;
   generated_docs?: string | null;
   pages?: ArtifactPages;
+  /** Active doc version (Vault-style immutable history); null = legacy, no versions yet. */
+  current_version?: number | null;
   verified?: boolean;
   verified_by?: string | null;
   verified_at?: string | null;
@@ -107,6 +109,8 @@ export interface Spec {
   name: string;
   kind: SpecKind;
   content?: string | null;
+  /** Active doc version; null = legacy, no versions yet. */
+  current_version?: number | null;
   verified?: boolean;
   verified_by?: string | null;
   verified_at?: string | null;
@@ -145,10 +149,42 @@ export interface Database {
   mcp_server_name?: string | null;
   generated_docs?: string | null;
   pages?: ArtifactPages;
+  /** Active doc version; null = legacy, no versions yet. */
+  current_version?: number | null;
   verified?: boolean;
   verified_by?: string | null;
   verified_at?: string | null;
   source?: ArtifactSource;
+}
+
+/* ------------------------------------------------------------------ */
+/* Doc versions (immutable history, /versions endpoints)                */
+/* ------------------------------------------------------------------ */
+
+/** One entry of the version list (desc order; `is_current` marks the live one). */
+export interface DocVersionItem {
+  version: number;
+  /** baseline | generate | edit | rollback */
+  source: string;
+  model?: string | null;
+  job_id?: string | null;
+  created_at?: string | null;
+  is_current?: boolean;
+}
+
+/** GET /{segment}/{id}/versions envelope. */
+export interface DocVersionList {
+  entity_type: string;
+  entity_id: string;
+  current_version?: number | null;
+  versions: DocVersionItem[];
+}
+
+/** Full snapshot of one version (spec payloads carry `content`). */
+export interface DocVersionDetail extends DocVersionItem {
+  generated_docs?: string | null;
+  pages?: ArtifactPages;
+  content?: string | null;
 }
 
 /* ------------------------------------------------------------------ */

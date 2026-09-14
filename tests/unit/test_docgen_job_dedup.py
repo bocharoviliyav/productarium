@@ -285,7 +285,7 @@ class TestWorkerEntityLockSerializes:
 
         import api.docgen.codebase as codebase_mod
 
-        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None, **kwargs):
             with guard:
                 overlap["now"] += 1
                 overlap["max"] = max(overlap["max"], overlap["now"])
@@ -337,7 +337,7 @@ class TestWorkerEntityLockSerializes:
 
         import api.docgen.codebase as codebase_mod
 
-        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None, **kwargs):
             return "ok"
 
         monkeypatch.setattr(codebase_mod, "generate_codebase_docs", fake_generate)

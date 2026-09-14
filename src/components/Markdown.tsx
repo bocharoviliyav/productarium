@@ -270,7 +270,7 @@ const Markdown: React.FC<MarkdownProps> = ({ content }) => {
   }), []);
 
   return (
-    <div className="prose prose-base dark:prose-invert max-w-none px-2 py-4">
+    <div className="prose prose-base dark:prose-invert max-w-none break-words px-2 py-4">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema]]}

@@ -244,6 +244,10 @@ def init_db() -> bool:
 _SCHEMA_COLUMN_SHIMS: tuple = (
     ("databases", "db_type", "VARCHAR(32)"),
     ("mcp_servers", "preset_key", "VARCHAR(32)"),
+    # Documentation versioning pointer (productarium_doc_versions).
+    ("codebases", "current_version", "INTEGER"),
+    ("databases", "current_version", "INTEGER"),
+    ("specs", "current_version", "INTEGER"),
 )
 
 

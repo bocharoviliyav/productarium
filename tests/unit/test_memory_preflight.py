@@ -256,7 +256,7 @@ class TestWorkerIntegration:
 
         called = {"v": False}
 
-        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None, **kwargs):
             called["v"] = True
             return "docs"
 
@@ -287,7 +287,7 @@ class TestWorkerIntegration:
 
         monkeypatch.setattr(preflight_mod, "preflight_embedder", _skip)
 
-        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None, **kwargs):
             return "docs"
 
         import api.docgen.codebase as codebase_mod
@@ -314,7 +314,7 @@ class TestWorkerIntegration:
 
         monkeypatch.setattr(preflight_mod, "preflight_embedder", _buggy)
 
-        async def fake_generate(artifact, product, model=None, language="ru", progress=None):
+        async def fake_generate(artifact, product, model=None, language="ru", progress=None, **kwargs):
             return "docs"
 
         import api.docgen.codebase as codebase_mod

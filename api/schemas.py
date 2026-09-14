@@ -35,6 +35,7 @@ class Codebase(BaseModel):
     has_token: bool = False
     generated_docs: Optional[str] = None
     pages: Optional[Dict[str, Any]] = None
+    current_version: Optional[int] = None
     verified: bool = False
     verified_by: Optional[str] = None
     verified_at: Optional[datetime] = None
@@ -46,6 +47,7 @@ class Spec(BaseModel):
     name: str
     kind: str = "openapi"  # openapi|asyncapi
     content: Optional[str] = None
+    current_version: Optional[int] = None
     verified: bool = False
     verified_by: Optional[str] = None
     verified_at: Optional[datetime] = None
@@ -85,6 +87,7 @@ class Database(BaseModel):
     mcp_server_id: Optional[str] = None
     generated_docs: Optional[str] = None
     pages: Optional[Dict[str, Any]] = None
+    current_version: Optional[int] = None
     verified: bool = False
     verified_by: Optional[str] = None
     verified_at: Optional[datetime] = None
