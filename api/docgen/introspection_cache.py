@@ -45,6 +45,12 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 #: Payload format version — a bump invalidates every stored entry.
+#: v4: the walk is multi-schema for Oracle (ALL_* bulk walk via the sql
+#: tool, quoted-alias catalog queries), filters PostgreSQL system schemas
+#: (pg_*/information_schema) and extension-owned objects (pg_depend
+#: deptype 'e'), and the SQL packs are AUTHORITATIVE for their categories —
+#: v3 payloads carry single-schema Oracle tables and extension-noisy
+#: categories and must not be replayed.
 #: v3: the DB-RE restructure reshaped the payload — the walk now also carries
 #: ``fk_edges``, the category collections (views/triggers/routines/sequences/
 #: types with sources), the sql-pack evidence merged into table meta, and

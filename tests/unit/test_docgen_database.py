@@ -20,7 +20,9 @@ Covers (post-restructure contract: root pages + per-entity subpages):
 - Batched enrichment (``_enrich_table_descriptions`` / ``_enrich_categories``
   / ``_infer_relations``) — strict JSON, name validation, budgets.
 - Cross-context (``_db_context_payload`` / ``product_database_context``).
-- ``_introspect`` (schemas → tables → structure → categories → SQL pack).
+- ``_introspect`` (schemas → tables → structure → categories → SQL pack;
+  oracle cross-schema bulk walk, PG system-schema filtering,
+  pack-authoritative category replacement).
 - ``_tools_for_pinned_server`` (binding/allowlist/unreachable rules).
 - ``generate_database_docs`` (happy path, skeleton fallback, masking,
   corroborate, judge, provenance + indexing, honest ValueErrors).
@@ -952,6 +954,18 @@ class TestRowsFromSqlResult:
             {"table_name": "users", "n": "3"},
         ]
 
+    def test_pipe_cell_escapes_unescaped(self):
+        # oracle-mcp-server escapes "|" inside cells (PL/SQL "||" concat,
+        # defaults); a naive split would shred the row.
+        text = "| name | def |\n| --- | --- |\n| concat | 'a' \\|\\| 'b' |"
+        assert db_doc_mod._rows_from_sql_result(text) == [
+            {"name": "concat", "def": "'a' || 'b'"},
+        ]
+
+    def test_split_pipe_row_trims_and_unescapes(self):
+        assert db_doc_mod._split_pipe_row(" | a | b | ") == ["a", "b"]
+        assert db_doc_mod._split_pipe_row("|x \\| y|z|") == ["x | y", "z"]
+
     def test_error_and_empty(self):
         assert db_doc_mod._rows_from_sql_result("ERROR: boom") == []
         assert db_doc_mod._rows_from_sql_result("") == []
@@ -1024,6 +1038,19 @@ class TestBuildToolArgs:
             "stmt": "SELECT 1",
         }
         assert db_doc_mod._sql_args(FakeTool("q"), "SELECT 1") == {"sql": "SELECT 1"}
+
+    def test_sql_args_max_rows_mapping(self):
+        tool = FakeTool("run_sql_query", {"sql": {}, "max_rows": {}})
+        assert db_doc_mod._sql_args(tool, "SELECT 1", max_rows=5000) == {
+            "sql": "SELECT 1", "max_rows": 5000,
+        }
+        assert db_doc_mod._sql_args(
+            FakeTool("q", {"sql": {}, "limit": {}}), "SELECT 1", max_rows=10
+        ) == {"sql": "SELECT 1", "limit": 10}
+        # No cap-shaped declared arg → no invented key.
+        assert db_doc_mod._sql_args(
+            FakeTool("q", {"sql": {}}), "SELECT 1", max_rows=10
+        ) == {"sql": "SELECT 1"}
 
 
 # ============================================================================
@@ -1499,6 +1526,178 @@ class TestSqlPackWalk:
         info = asyncio.run(db_doc_mod._introspect(roles, engine=None))
         assert not sql.calls
         assert info["fk_edges"] == []
+
+
+# ============================================================================
+# Oracle cross-schema bulk walk (ALL_* catalog via the read-only sql tool)
+# ============================================================================
+class TestOracleBulkWalk:
+    """Enterprise layouts: every owner's tables in 1+N catalog queries."""
+
+    def _sql(self):
+        def responder(a):
+            q = str(a.get("sql") or "")
+            if "GROUP BY owner" in q:
+                # The NOT IN filter drops system owners server-side already.
+                return "| owner |\n| --- |\n| APP |\n| TENANT_A |"
+            if "all_tab_columns" in q:
+                head = (
+                    "| table_schema | table_name | column_id | column_name"
+                    " | data_type | nullable | data_default | num_rows |"
+                    "\n| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+                )
+                if "'APP'" in q:
+                    # BIN$ row proves the recyclebin filter.
+                    return head + (
+                        "| APP | ORDERS | 1 | ID | NUMBER | N |  | 42 |\n"
+                        "| APP | ORDERS | 2 | NOTE | VARCHAR2 | Y | 'n/a' | 42 |\n"
+                        "| APP | BIN$legacy== | 1 | OLD | NUMBER | Y |  |  |"
+                    )
+                return head + "| TENANT_A | USERS | 1 | EMAIL | VARCHAR2 | N |  | 7 |"
+            if "all_tab_comments" in q and "'APP'" in q:
+                return "| table_name | comments |\n| --- | --- |\n| ORDERS | Customer orders |"
+            if "all_tab_comments" in q:
+                return "| table_name | comments |\n| --- | --- |\n| USERS | Tenant users |"
+            return "ERROR: unsupported query in test"
+
+        return FakeTool("run_sql_query", {"sql": {}, "max_rows": {}}, responder)
+
+    def test_bulk_walk_replaces_single_schema_listing(self):
+        sql = self._sql()
+        search = FakeTool(
+            "search_tables_schema", {"pattern": {}},
+            lambda a: json.dumps({"tables": [{"table_name": "WRONG"}]}),
+        )
+        roles = db_doc_mod.preset_adapter_roles([search, sql], db_type="oracle")
+        info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
+
+        assert info["schemas"] == ["APP", "TENANT_A"]
+        assert set(info["tables"]) == {"APP.ORDERS", "TENANT_A.USERS"}
+        orders = info["tables"]["APP.ORDERS"]
+        assert [c["name"] for c in orders["columns"]] == ["ID", "NOTE"]
+        assert orders["columns"][0]["nullable"] is False
+        assert orders["columns"][1]["default"] == "'n/a'"
+        assert orders["row_count"] == 42
+        assert orders["comment"] == "Customer orders"
+        assert info["tables"]["TENANT_A.USERS"]["comment"] == "Tenant users"
+        # The single-schema listing tool was never consulted.
+        assert search.calls == []
+        assert info["tools_used"]["tables"] == "run_sql_query[sql]"
+        assert info["unavailable"] == []
+        # Wide catalog calls carry an explicit row cap — the server default
+        # (100) silently truncated e.g. all_source line rows.
+        cols_calls = [c for c in sql.calls if "all_tab_columns" in c["sql"]]
+        assert cols_calls and all(
+            c["max_rows"] == db_doc_mod._ORA_MAX_ROWS for c in cols_calls
+        )
+        owners_call = next(c for c in sql.calls if "GROUP BY owner" in c["sql"])
+        assert owners_call["max_rows"] == db_doc_mod.MAX_SCHEMAS
+
+    def test_bulk_failure_falls_back_to_adapter_walk(self):
+        sql = FakeTool("run_sql_query", {"sql": {}}, "ERROR: ORA-00942")
+        search = FakeTool(
+            "search_tables_schema", {"pattern": {}},
+            lambda a: json.dumps({"tables": [{"table_name": "EMP"}]}),
+        )
+        roles = db_doc_mod.preset_adapter_roles([search, sql], db_type="oracle")
+        info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
+        assert sql.calls  # the bulk walk was attempted first
+        assert set(info["tables"]) == {"EMP"}
+        assert info["tools_used"]["tables"].startswith("search_tables_schema")
+        assert {"pattern": "%"} in search.calls
+
+    def test_sql_only_surface_completes_the_bulk_walk(self):
+        sql = self._sql()
+        roles = db_doc_mod._classify_introspection_tools([sql])
+        assert roles["sql"] and not roles["tables"]
+        # No table-listing tool at all — the bulk walk alone must suffice
+        # (no "No table-listing MCP tool" ValueError).
+        info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
+        assert set(info["tables"]) == {"APP.ORDERS", "TENANT_A.USERS"}
+        assert info["tools_used"]["tables"] == "run_sql_query"
+
+
+# ============================================================================
+# PG system-schema filtering (all user schemas, no pg_* noise)
+# ============================================================================
+class TestPgSchemaFiltering:
+    def test_predicate(self):
+        assert db_doc_mod._pg_user_schema("public")
+        assert db_doc_mod._pg_user_schema("Tenant_A")
+        assert not db_doc_mod._pg_user_schema("pg_catalog")
+        assert not db_doc_mod._pg_user_schema("pg_toast_temp_1")
+        assert not db_doc_mod._pg_user_schema("information_schema")
+        assert not db_doc_mod._pg_user_schema("")
+
+    def test_system_schemas_never_listed(self):
+        listed = []
+
+        def tables_responder(a):
+            listed.append(a.get("schema"))
+            return json.dumps([{"table_name": f"t_{a.get('schema')}"}])
+
+        tools = [
+            FakeTool("list_schemas", {}, json.dumps(
+                ["public", "pg_catalog", "information_schema", "pg_toast", "tenant_a"]
+            )),
+            FakeTool("list_tables", {"schema": {}}, tables_responder),
+            FakeTool(
+                "describe_table", {"schema": {}, "table": {}},
+                lambda a: "CREATE TABLE x (id int);",
+            ),
+        ]
+        roles = db_doc_mod._classify_introspection_tools(tools)
+        info = asyncio.run(db_doc_mod._introspect(roles, engine="postgresql"))
+        assert info["schemas"] == ["public", "tenant_a"]
+        assert listed == ["public", "tenant_a"]
+        assert set(info["tables"]) == {"public.t_public", "tenant_a.t_tenant_a"}
+
+
+# ============================================================================
+# Pack-authoritative category replacement (extension noise vs user objects)
+# ============================================================================
+class TestPackReplace:
+    def _tools(self):
+        def sql_responder(a):
+            q = str(a.get("query") or a.get("sql") or "")
+            if "pg_get_functiondef" in q:
+                return json.dumps({"columns": [
+                    "schema_name", "routine_name", "kind", "source",
+                ], "rows": [["public", "do_thing", "PROCEDURE",
+                             "CREATE PROCEDURE do_thing() LANGUAGE sql AS $$…$$"]]})
+            # Every other pack query answers ok-but-empty: the pg_depend
+            # filter means the catalog genuinely has no user objects there.
+            return json.dumps({"columns": [], "rows": []})
+
+        routines = FakeTool(
+            "list_routines", {},
+            json.dumps({"results": [
+                {"name": "halfvec_cosine", "schema": "public"},  # pgvector
+            ]}),
+        )
+        sql = FakeTool("run_sql_query", {"query": {}}, sql_responder)
+        return _default_tools() + [routines, sql], sql
+
+    def test_pack_rows_replace_extension_noisy_adapter_listing(self):
+        tools, _ = self._tools()
+        roles = db_doc_mod._classify_introspection_tools(tools)
+        info = asyncio.run(db_doc_mod._introspect(roles, engine="postgresql"))
+        # The adapter's extension-shipped routine is replaced by the pack's
+        # authoritative (pg_depend-filtered) catalog rows.
+        assert set(info["routines"]) == {"public.do_thing"}
+        assert info["routines"]["public.do_thing"]["kind"] == "PROCEDURE"
+        assert info["routines"]["public.do_thing"]["source"].startswith(
+            "CREATE PROCEDURE"
+        )
+        assert info["tools_used"]["routines"] == "run_sql_query"
+        # Ok-but-empty pack answers are the authoritative zero — the
+        # category keeps no adapter noise and gains no unavailable marker.
+        assert info["triggers"] == {}
+        assert "routines" not in info["unavailable"]
+        # Non-category pack collections report emptiness explicitly.
+        assert info["unavailable"] == [
+            "sql:fk_edges", "sql:indexes", "sql:matviews",
+        ]
 
 
 # ============================================================================

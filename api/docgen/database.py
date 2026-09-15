@@ -24,6 +24,9 @@ Stages:
    detail, uniform across PostgreSQL/MySQL/MariaDB/SQL Server/SQLite) and
    oracle-mcp-server's ``search_tables_schema``/``get_table_schema`` +
    ``get_pl_sql_objects``/``get_object_source``/constraints/indexes/types.
+   Oracle engines with a sql tool take a cross-schema BULK walk first
+   (ALL_* owners → columns/comments per schema) — the pinned server caches
+   one schema, which misses the enterprise multi-schema layout.
    When the engine is detectable (``db_type``, masked DSN scheme, or the
    oracle tool surface) AND a read-only ``sql`` tool exists, a fixed pack
    of SELECT-only catalog queries (``information_schema``/``pg_catalog``
@@ -110,8 +113,9 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 # Budgets (introspection walk + render/enrich knobs)
 # --------------------------------------------------------------------------- #
-#: Max schemas introspected per database (extra schemas are noted + skipped).
-MAX_SCHEMAS = 20
+#: Max schemas introspected per database (enterprise multitenant
+#: databases carry hundreds; extras past the cap are skipped).
+MAX_SCHEMAS = 200
 #: Max tables introspected per schema (extra tables are listed by name only).
 MAX_TABLES_PER_SCHEMA = 100
 #: Max characters of one table definition kept in the doc/evidence.
@@ -443,13 +447,23 @@ def _build_tool_args(
     return out
 
 
-def _sql_args(tool: Any, query: str) -> Dict[str, Any]:
-    """Map a SQL string onto the sql-role tool's declared argument names."""
+def _sql_args(
+    tool: Any, query: str, max_rows: Optional[int] = None
+) -> Dict[str, Any]:
+    """Map a SQL string (and an optional row cap) onto the sql tool's args."""
+    out: Dict[str, Any] = {}
+    sql_arg: Optional[str] = None
     for arg in _tool_arg_names(tool):
-        if arg.lower() in ("sql", "query", "statement", "q"):
-            return {arg: query}
-    declared = _tool_arg_names(tool)
-    return {declared[0]: query} if declared else {"sql": query}
+        low = arg.lower()
+        if low in ("sql", "query", "statement", "q"):
+            sql_arg = sql_arg or arg
+        elif max_rows is not None and ("max_row" in low or low == "limit"):
+            out[arg] = max_rows
+    if sql_arg is None:
+        declared = _tool_arg_names(tool)
+        sql_arg = declared[0] if declared else "sql"
+    out[sql_arg] = query
+    return out
 
 
 def _block_text(block: Any) -> str:
@@ -580,6 +594,12 @@ def _ora_not_system(column: str) -> str:
     return f"{column} NOT IN (" + ", ".join(f"'{s}'" for s in _ORACLE_SYSTEM_OWNERS) + ")"
 
 
+def _pg_user_schema(name: str) -> bool:
+    """True for user-visible PG schemas (system namespaces are noise)."""
+    low = (name or "").strip().lower()
+    return bool(low) and not low.startswith("pg_") and low != "information_schema"
+
+
 #: PostgreSQL catalog pack: FK edges, indexes, triggers, sequences,
 #: materialized views, composite types and routine sources. Pure SELECTs.
 _PG_SQL_PACK: Dict[str, str] = {
@@ -610,7 +630,10 @@ _PG_SQL_PACK: Dict[str, str] = {
         "JOIN pg_class c ON c.oid = t.tgrelid "
         "JOIN pg_namespace n ON n.oid = c.relnamespace "
         "JOIN pg_proc p ON p.oid = t.tgfoid "
-        "WHERE NOT t.tgisinternal AND " + _pg_not_system("n.nspname")
+        "WHERE NOT t.tgisinternal AND " + _pg_not_system("n.nspname") + " "
+        # Extension-owned trigger functions (TimescaleDB, …) are not user code.
+        "AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+        "WHERE d.objid = p.oid AND d.deptype = 'e')"
     ),
     "sequences": (
         "SELECT schemaname AS schema_name, sequencename AS sequence_name, "
@@ -633,6 +656,9 @@ _PG_SQL_PACK: Dict[str, str] = {
         "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 "
         "AND NOT a.attisdropped "
         "WHERE c.relkind = 'c' AND " + _pg_not_system("n.nspname") + " "
+        # Extension-shipped composite types (pgvector …) are not user types.
+        "AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+        "WHERE d.objid = t.oid AND d.deptype = 'e') "
         "GROUP BY n.nspname, t.typname"
     ),
     "routines": (
@@ -640,17 +666,59 @@ _PG_SQL_PACK: Dict[str, str] = {
         "CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END AS kind, "
         "pg_get_functiondef(p.oid) AS source "
         "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
-        "WHERE " + _pg_not_system("n.nspname")
+        "WHERE " + _pg_not_system("n.nspname") + " "
+        # Extension-shipped functions (pgvector lives in public) are noise:
+        # only pg_depend membership separates them from user code.
+        "AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+        "WHERE d.objid = p.oid AND d.deptype = 'e')"
     ),
 }
 
+#: Row cap for Oracle catalog queries: ``run_sql_query`` defaults to 100
+#: rows, which silently truncates wide catalogs (all_source line rows!).
+#: The effective ceiling is the manager's tool-result char cap.
+_ORA_MAX_ROWS = 5_000
+#: Owner names interpolated into the bulk queries below are catalog-derived
+#: (all_tables.owner), never user input; this charset regex additionally
+#: excludes quotes/semicolons, so the interpolated literal is inert.
+_ORA_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_$#]{1,128}$")
+
+#: Oracle bulk walk over the ALL_* catalog: one owners query, then columns +
+#: comments per owner (BIN$ = recyclebin leftovers, never documentation).
+#: Aliases are QUOTED lowercase — Oracle uppercases unquoted aliases, and
+#: the rendered pipe-table headers must match the parser's row keys.
+#: Deliberate, guarded exception to the constants-only packs: ``{owner}`` is
+#: filled from the catalog itself (regex above) and re-checked by the
+#: read-only guard before every call.
+_ORA_OWNERS_QUERY = (
+    'SELECT owner AS "owner" FROM all_tables WHERE ' + _ora_not_system("owner")
+    + " GROUP BY owner ORDER BY owner"
+)
+_ORA_COLUMNS_QUERY = (
+    'SELECT c.owner AS "table_schema", c.table_name AS "table_name", '
+    'c.column_id AS "column_id", c.column_name AS "column_name", '
+    'c.data_type AS "data_type", c.nullable AS "nullable", '
+    'c.data_default AS "data_default", t.num_rows AS "num_rows" '
+    "FROM all_tab_columns c "
+    "JOIN all_tables t ON t.owner = c.owner AND t.table_name = c.table_name "
+    "WHERE c.owner = '{owner}' AND t.table_name NOT LIKE 'BIN$%' "
+    "ORDER BY c.table_name, c.column_id"
+)
+_ORA_COMMENTS_QUERY = (
+    'SELECT table_name AS "table_name", comments AS "comments" '
+    "FROM all_tab_comments "
+    "WHERE owner = '{owner}' AND comments IS NOT NULL"
+)
+
 #: Oracle catalog pack over the ALL_* views (works with any role's grants).
 #: Routine/trigger sources arrive LINE-based and are regrouped by the walk.
+# Aliases are QUOTED lowercase so the rendered pipe-table headers match
+# the parser's row keys (Oracle uppercases unquoted aliases).
 _ORACLE_SQL_PACK: Dict[str, str] = {
     "fk_edges": (
-        "SELECT ac.owner AS table_schema, ac.table_name AS table_name, "
-        "a.constraint_name AS constraint_name, ac.column_name AS column_name, "
-        "rc.table_name AS foreign_table, rc.column_name AS foreign_column "
+        'SELECT ac.owner AS "table_schema", ac.table_name AS "table_name", '
+        'a.constraint_name AS "constraint_name", ac.column_name AS "column_name", '
+        'rc.table_name AS "foreign_table", rc.column_name AS "foreign_column" '
         "FROM all_constraints a "
         "JOIN all_cons_columns ac ON ac.owner = a.owner "
         "AND ac.constraint_name = a.constraint_name "
@@ -660,9 +728,9 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
         "WHERE a.constraint_type = 'R' AND " + _ora_not_system("a.owner")
     ),
     "indexes": (
-        "SELECT i.table_owner AS table_schema, i.table_name AS table_name, "
-        "i.index_name AS index_name, c.column_name AS column_name, "
-        "c.column_position AS column_position, i.uniqueness AS uniqueness "
+        'SELECT i.table_owner AS "table_schema", i.table_name AS "table_name", '
+        'i.index_name AS "index_name", c.column_name AS "column_name", '
+        'c.column_position AS "column_position", i.uniqueness AS "uniqueness" '
         "FROM all_indexes i "
         "JOIN all_ind_columns c ON c.index_owner = i.owner "
         "AND c.index_name = i.index_name "
@@ -670,27 +738,37 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
         "ORDER BY i.table_owner, i.table_name, i.index_name, c.column_position"
     ),
     "triggers": (
-        "SELECT owner AS schema_name, trigger_name, table_name, "
-        "triggering_event, trigger_type, status AS enabled "
+        'SELECT owner AS "schema_name", trigger_name AS "trigger_name", '
+        'table_name AS "table_name", '
+        'triggering_event AS "triggering_event", trigger_type AS "trigger_type", '
+        'status AS "enabled" '
         "FROM all_triggers WHERE " + _ora_not_system("owner")
     ),
     "sequences": (
-        "SELECT sequence_owner AS schema_name, sequence_name, "
-        "min_value, max_value, increment_by, cycle_flag "
+        'SELECT sequence_owner AS "schema_name", sequence_name AS "sequence_name", '
+        'min_value AS "min_value", max_value AS "max_value", '
+        'increment_by AS "increment_by", cycle_flag AS "cycle_flag" '
         "FROM all_sequences WHERE " + _ora_not_system("sequence_owner")
     ),
     "matviews": (
-        "SELECT owner AS schema_name, mview_name AS view_name, "
-        "query AS view_definition FROM all_mviews "
+        'SELECT owner AS "schema_name", mview_name AS "view_name", '
+        'query AS "view_definition" FROM all_mviews '
         "WHERE " + _ora_not_system("owner")
     ),
+    # Names only: all_views.TEXT is a LONG column (no SUBSTR/aggregation) —
+    # definitions come from the capped per-object source fetch.
+    "views": (
+        'SELECT owner AS "schema_name", view_name AS "name" '
+        "FROM all_views WHERE " + _ora_not_system("owner")
+    ),
     "types": (
-        "SELECT owner AS schema_name, type_name, typecode "
+        'SELECT owner AS "schema_name", type_name AS "type_name", '
+        'typecode AS "typecode" '
         "FROM all_types WHERE " + _ora_not_system("owner")
     ),
     "routines": (
-        "SELECT owner AS schema_name, name AS object_name, "
-        "type AS object_type, line, text AS line_text "
+        'SELECT owner AS "schema_name", name AS "object_name", '
+        'type AS "object_type", line AS "line", text AS "line_text" '
         "FROM all_source "
         "WHERE type IN ('FUNCTION', 'PROCEDURE', 'PACKAGE', "
         "'PACKAGE BODY', 'TRIGGER', 'TYPE', 'TYPE BODY') "
@@ -1048,7 +1126,9 @@ def _build_oracle_roles(tools: List[Any]) -> Optional[Dict[str, List[Any]]]:
         query = str(args.get("sql") or "")
         if not _assert_readonly_sql(query):
             return "ERROR: rejected non-read-only SQL (only SELECT is allowed)."
-        return await _call_tool(sql_t, _sql_args(sql_t, query))
+        return await _call_tool(
+            sql_t, _sql_args(sql_t, query, max_rows=args.get("max_rows"))
+        )
 
     lister_name = getattr(lister, "name", "oracle_tool")
     describer_name = getattr(
@@ -1124,7 +1204,7 @@ def _build_oracle_roles(tools: List[Any]) -> Optional[Dict[str, List[Any]]]:
         roles["sql"] = [_AdaptedTool(
             f"{sql_t.name}[sql]",
             "Read-only catalog queries via oracle-mcp-server",
-            {"sql": {"type": "string"}}, _sql,
+            {"sql": {"type": "string"}, "max_rows": {"type": "integer"}}, _sql,
         )]
     return roles
 
@@ -1316,15 +1396,32 @@ def _rows_from_sql_result(text: str) -> List[Dict[str, Any]]:
     return []
 
 
+_PIPE_SPLIT_RE = re.compile(r"(?<!\\)\|")
+
+
+def _split_pipe_row(line: str) -> List[str]:
+    """Cells of one rendered table row, ``\\|`` escapes unescaped.
+
+    The oracle-mcp-server formatter escapes ``|`` inside cells (PL/SQL
+    ``||`` concatenation, defaults); a naive split shreds such rows.
+    """
+    cells = _PIPE_SPLIT_RE.split(line.strip())
+    if cells and not cells[0].strip():
+        cells = cells[1:]
+    if cells and not cells[-1].strip():
+        cells = cells[:-1]
+    return [c.strip().replace("\\|", "|") for c in cells]
+
+
 def _parse_pipe_table(text: str) -> List[Dict[str, Any]]:
     """Rows from a rendered ``| a | b |`` table (text tool fallback)."""
     lines = [l for l in (text or "").splitlines() if l.strip().startswith("|")]
     if len(lines) < 2:
         return []
-    header = [c.strip() for c in lines[0].strip().strip("|").split("|")]
+    header = _split_pipe_row(lines[0])
     rows: List[Dict[str, Any]] = []
     for line in lines[1:]:
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        cells = _split_pipe_row(line)
         if cells and set("".join(cells)) <= {"-", " ", ":"}:
             continue  # separator row
         if len(cells) == len(header):
@@ -1640,6 +1737,94 @@ def _join_line_rows(
     return list(groups.values())
 
 
+async def _oracle_bulk_tables(
+    sql_tool: Any, bounded_call: Callable[..., str], errors: List[str]
+) -> Optional[Tuple[List[str], Dict[str, Dict[str, Any]]]]:
+    """Cross-schema table walk via the read-only sql tool (ALL_* catalog).
+
+    oracle-mcp-server caches ONE connected schema (TARGET_SCHEMA or the
+    login user), so its per-table tools cannot see an enterprise
+    multi-schema layout; the ALL_* catalog is the only cross-schema
+    surface. Two calls per schema replace thousands of single-schema
+    probes. Returns ``None`` when the surface cannot serve the catalog
+    queries — the caller falls back to the adapter walk.
+    """
+
+    async def _q(sql: str, max_rows: int) -> List[Dict[str, Any]]:
+        return _rows_from_sql_result(
+            await bounded_call(
+                sql_tool, _sql_args(sql_tool, sql, max_rows=max_rows)
+            )
+        )
+
+    owner_rows = await _q(_ORA_OWNERS_QUERY, MAX_SCHEMAS)
+    owners = [
+        str(row.get("owner") or "") for row in owner_rows
+        if _ORA_IDENTIFIER_RE.match(str(row.get("owner") or ""))
+    ][:MAX_SCHEMAS]
+    if not owners:
+        return None
+
+    tables: Dict[str, Dict[str, Any]] = {}
+    for owner in owners:
+        rows = await _q(_ORA_COLUMNS_QUERY.format(owner=owner), _ORA_MAX_ROWS)
+        if not rows:
+            errors.append(f"no all_tab_columns rows for schema {owner}")
+            continue
+        columns: Dict[str, List[Dict[str, Any]]] = {}
+        counts: Dict[str, int] = {}
+        for row in rows:
+            tname = str(row.get("table_name") or "")
+            if not tname or tname.startswith("BIN$"):
+                continue
+            default = row.get("data_default")
+            columns.setdefault(tname, []).append({
+                "name": str(row.get("column_name") or ""),
+                "type": str(row.get("data_type") or "?"),
+                "nullable": str(row.get("nullable") or "").upper() == "Y",
+                "default": None if default in (None, "") else str(default),
+            })
+            num = str(row.get("num_rows") or "")
+            if num.isdigit():
+                counts[tname] = int(num)
+        comments = {
+            str(r.get("table_name") or ""): str(r.get("comments") or "")
+            for r in await _q(
+                _ORA_COMMENTS_QUERY.format(owner=owner), MAX_TABLES_PER_SCHEMA
+            )
+            if r.get("comments")
+        }
+        for tname in sorted(columns)[:MAX_TABLES_PER_SCHEMA]:
+            # Controlled render — re-parsed by _parse_table_definition so the
+            # bulk path and the adapter path share one structure parser.
+            definition = [
+                f"table {owner}.{tname}"
+                + (f" — ~{counts[tname]} rows" if tname in counts else ""),
+                "| column | type | null | default |",
+                "| --- | --- | --- | --- |",
+            ]
+            definition.extend(
+                "| {} | {} | {} | {} |".format(
+                    c["name"], c["type"],
+                    "YES" if c["nullable"] else "NO",
+                    "-" if c["default"] is None else c["default"],
+                )
+                for c in columns[tname]
+            )
+            if comments.get(tname):
+                definition.append(f"comment: {comments[tname]}")
+            entry: Dict[str, Any] = {
+                "schema": owner,
+                "table": tname,
+                "definition": _cap("\n".join(definition), MAX_DEFINITION_CHARS),
+            }
+            entry.update(_parse_table_definition(entry["definition"]))
+            tables[f"{owner}.{tname}"] = entry
+    if not tables:
+        return None
+    return owners, tables
+
+
 # --------------------------------------------------------------------------- #
 # Introspection walk: schemas → tables → structure → categories → SQL pack
 # --------------------------------------------------------------------------- #
@@ -1654,12 +1839,15 @@ async def _introspect(
     "fk_edges": [{from, from_cols, to, to_cols, constraint, kind}],
     "views"/"triggers"/"routines"/"sequences"/"types": {full: {schema,
     name, kind, source?, meta?}}, "tools_used": {role: name},
-    "unavailable": [role…]}``. Raises ValueError when the surface cannot
-    produce a schema at all — an honest failure instead of empty docs.
+    "unavailable": [role…]}``. Oracle engines with a sql role take the
+    cross-schema ``_oracle_bulk_tables`` path first. Raises ValueError when
+    the surface cannot produce a schema at all — an honest failure instead
+    of empty docs.
     """
     tools_used: Dict[str, str] = {}
     unavailable: List[str] = []
     schema_names: List[str] = []
+    errors: List[str] = []
     calls = 0
 
     async def _bounded_call(tool: Any, args: Dict[str, Any]) -> str:
@@ -1673,59 +1861,86 @@ async def _introspect(
         calls += 1
         return await _call_tool(tool, args)
 
-    schema_tool = roles["schemas"][0] if roles.get("schemas") else None
-    if schema_tool is not None:
-        tools_used["schemas"] = getattr(schema_tool, "name", "")
-        raw = await _bounded_call(schema_tool, _build_tool_args(schema_tool))
-        schema_names = _parse_names(raw, "schemas", "databases")[:MAX_SCHEMAS]
+    sql_tool = roles["sql"][0] if roles.get("sql") else None
 
-    table_tool = roles["tables"][0] if roles.get("tables") else None
-    if table_tool is None:
-        raise ValueError(
-            "No table-listing MCP tool found (expected a tool named like "
-            "'list_tables'/'search_tables'); cannot introspect the database."
-        )
-    tools_used["tables"] = getattr(table_tool, "name", "")
+    # Oracle: cross-schema BULK walk over the ALL_* catalog — the pinned
+    # server caches one schema, so per-table tools miss the enterprise
+    # multi-schema layout. Tried before the table-tool check below: a
+    # sql-only surface is a complete walk too. None → adapter/generic path.
+    bulk: Optional[Tuple[List[str], Dict[str, Dict[str, Any]]]] = None
+    if engine == "oracle" and sql_tool is not None:
+        bulk = await _oracle_bulk_tables(sql_tool, _bounded_call, errors)
+        if bulk is not None:
+            schema_names, tables = bulk
+            tools_used["tables"] = getattr(sql_tool, "name", "")
+            logger.info(
+                "oracle bulk walk: %d schema(s), %d table(s) via the "
+                "read-only sql tool",
+                len(schema_names), len(tables),
+            )
 
-    describer = roles["describe"][0] if roles.get("describe") else None
-    ddl_tool = roles["ddl"][0] if roles.get("ddl") else None
-    if describer is not None:
-        tools_used["describe"] = getattr(describer, "name", "")
-    if ddl_tool is not None:
-        tools_used["ddl"] = getattr(ddl_tool, "name", "")
+    if bulk is None:
+        schema_tool = roles["schemas"][0] if roles.get("schemas") else None
+        if schema_tool is not None:
+            tools_used["schemas"] = getattr(schema_tool, "name", "")
+            raw = await _bounded_call(
+                schema_tool, _build_tool_args(schema_tool)
+            )
+            schema_names = _parse_names(raw, "schemas", "databases")
+            if engine == "postgresql":
+                # dbhub lists pg_catalog/information_schema/pg_toast* —
+                # system namespaces, never documentation targets.
+                schema_names = [
+                    s for s in schema_names if _pg_user_schema(s)
+                ]
+            schema_names = schema_names[:MAX_SCHEMAS]
 
-    scopes: List[Optional[str]] = schema_names or [None]
-    tables: Dict[str, Dict[str, Any]] = {}
-    errors: List[str] = []
-    for schema in scopes:
-        raw = await _bounded_call(
-            table_tool, _build_tool_args(table_tool, schema=schema)
-        )
-        table_names = _parse_names(raw, "tables", "results", "rows")[:MAX_TABLES_PER_SCHEMA]
-        if not table_names:
-            errors.append(f"no tables listed for schema {schema or '(default)'}")
-            continue
-        for table_name in table_names:
-            full = f"{schema}.{table_name}" if schema else table_name
-            definition = ""
-            if describer is not None:
-                definition = await _bounded_call(
-                    describer,
-                    _build_tool_args(describer, schema=schema, table=table_name),
-                )
-            if (not definition or definition.startswith("ERROR:")) and ddl_tool is not None:
-                definition = await _bounded_call(
-                    ddl_tool,
-                    _build_tool_args(ddl_tool, schema=schema, table=table_name),
-                )
-            entry: Dict[str, Any] = {
-                "schema": schema,
-                "table": table_name,
-                "definition": _cap(definition or "", MAX_DEFINITION_CHARS),
-            }
-            for key, value in _parse_table_definition(definition).items():
-                entry[key] = value
-            tables[full] = entry
+        table_tool = roles["tables"][0] if roles.get("tables") else None
+        if table_tool is None:
+            raise ValueError(
+                "No table-listing MCP tool found (expected a tool named like "
+                "'list_tables'/'search_tables'); cannot introspect the database."
+            )
+        tools_used["tables"] = getattr(table_tool, "name", "")
+
+        describer = roles["describe"][0] if roles.get("describe") else None
+        ddl_tool = roles["ddl"][0] if roles.get("ddl") else None
+        if describer is not None:
+            tools_used["describe"] = getattr(describer, "name", "")
+        if ddl_tool is not None:
+            tools_used["ddl"] = getattr(ddl_tool, "name", "")
+
+        scopes: List[Optional[str]] = schema_names or [None]
+        tables = {}
+        for schema in scopes:
+            raw = await _bounded_call(
+                table_tool, _build_tool_args(table_tool, schema=schema)
+            )
+            table_names = _parse_names(raw, "tables", "results", "rows")[:MAX_TABLES_PER_SCHEMA]
+            if not table_names:
+                errors.append(f"no tables listed for schema {schema or '(default)'}")
+                continue
+            for table_name in table_names:
+                full = f"{schema}.{table_name}" if schema else table_name
+                definition = ""
+                if describer is not None:
+                    definition = await _bounded_call(
+                        describer,
+                        _build_tool_args(describer, schema=schema, table=table_name),
+                    )
+                if (not definition or definition.startswith("ERROR:")) and ddl_tool is not None:
+                    definition = await _bounded_call(
+                        ddl_tool,
+                        _build_tool_args(ddl_tool, schema=schema, table=table_name),
+                    )
+                entry: Dict[str, Any] = {
+                    "schema": schema,
+                    "table": table_name,
+                    "definition": _cap(definition or "", MAX_DEFINITION_CHARS),
+                }
+                for key, value in _parse_table_definition(definition).items():
+                    entry[key] = value
+                tables[full] = entry
     if not tables:
         detail = "; ".join(errors[:3]) or "unknown reason"
         raise ValueError(
@@ -1756,6 +1971,11 @@ async def _introspect(
         tables,
         key=lambda f: (-len(tables[f].get("columns") or []), f),
     )[:_fk_evidence_tables()]
+    if bulk is not None:
+        # The oracle per-table evidence tools operate on the ONE cached
+        # schema — wrong-schema answers after a cross-schema walk; the SQL
+        # pack supplies constraints/indexes globally instead.
+        evidence_tables = []
 
     constraints_tool = roles["constraints"][0] if roles.get("constraints") else None
     if constraints_tool is not None:
@@ -1858,7 +2078,8 @@ async def _introspect(
                     "related",
                 )
 
-    # Category listings (adapter roles; SQL packs merge below).
+    # Category listings (adapter roles; the SQL pack below may REPLACE
+    # them: adapter surfaces are single-schema and/or extension-noisy).
     categories: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for cat in _CATEGORIES:
         entries = await _collect_category(cat, roles, _bounded_call)
@@ -1870,38 +2091,17 @@ async def _introspect(
             unavailable.append(cat)
         categories[cat] = entries
 
-    # Per-object source fetch (oracle get_object_source & friends), capped.
-    source_tool = roles["source"][0] if roles.get("source") else None
-    if source_tool is not None:
-        tools_used["source"] = getattr(source_tool, "name", "")
-        budget = _source_objects()
-        declared = _tool_arg_names(source_tool)
-        for cat in _CATEGORIES:
-            if budget <= 0:
-                break
-            for full, meta in categories[cat].items():
-                if budget <= 0:
-                    break
-                if meta.get("source"):
-                    continue
-                args = _build_tool_args(source_tool, table=meta.get("name") or full)
-                if "object_type" in declared:
-                    args["object_type"] = (
-                        meta.get("kind")
-                        if cat == "routines"
-                        else _SOURCE_TYPE_BY_CATEGORY.get(cat, "")
-                    )
-                raw = await _bounded_call(source_tool, args)
-                budget -= 1
-                if raw and not raw.startswith("ERROR:"):
-                    meta["source"] = _cap(raw, MAX_DEFINITION_CHARS)
-
     # Read-only SQL catalog packs (engine known + sql tool present): fill FK
-    # edges, indexes, triggers, sequences, matviews, types and routine sources.
-    sql_tool = roles["sql"][0] if roles.get("sql") else None
+    # edges, indexes and the category collections. Pack rows are AUTHORITATIVE
+    # for their categories — the adapter listings are single-schema subsets
+    # (oracle preset) or carry extension noise (pgvector functions in public),
+    # so a successful-but-empty pack answer replaces them too (an
+    # extension-only catalog genuinely has no user objects).
     pack = _PG_SQL_PACK if engine == "postgresql" else (
         _ORACLE_SQL_PACK if engine == "oracle" else None
     )
+    pack_categories: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    pack_matviews: Dict[str, Dict[str, Any]] = {}
     if sql_tool is not None and pack:
         tools_used["sql"] = getattr(sql_tool, "name", "")
         for name, query in pack.items():
@@ -1910,10 +2110,19 @@ async def _introspect(
             if not _assert_readonly_sql(query):  # pragma: no cover - constants
                 logger.warning("SQL pack query %r failed the read-only guard", name)
                 continue
-            raw = await _bounded_call(sql_tool, _sql_args(sql_tool, query))
+            raw = await _bounded_call(
+                sql_tool,
+                _sql_args(
+                    sql_tool, query,
+                    max_rows=_ORA_MAX_ROWS if engine == "oracle" else None,
+                ),
+            )
             rows = _rows_from_sql_result(raw)
             if not rows:
-                if raw and not raw.startswith("ERROR:"):
+                ok = bool(raw) and not raw.startswith("ERROR:")
+                if ok and name in _CATEGORIES:
+                    pack_categories.setdefault(name, {})  # catalog says: empty
+                elif ok:
                     unavailable.append(f"sql:{name}")
                 continue
             if name == "fk_edges":
@@ -1979,7 +2188,7 @@ async def _introspect(
                     definition = row.get("definition") or row.get("line_text")
                     if isinstance(definition, str) and definition.strip():
                         trig_meta["source"] = definition
-                    categories["triggers"].setdefault(full, trig_meta)
+                    pack_categories.setdefault("triggers", {})[full] = trig_meta
             elif name == "sequences":
                 for row in rows:
                     schema = str(row.get("schema_name") or "") or None
@@ -1987,7 +2196,7 @@ async def _introspect(
                     if not sname:
                         continue
                     full = f"{schema}.{sname}" if schema else sname
-                    categories["sequences"].setdefault(full, {
+                    pack_categories.setdefault("sequences", {})[full] = {
                         "schema": schema, "name": sname, "kind": "SEQUENCE",
                         "meta": {
                             k: str(v) for k, v in (
@@ -1998,7 +2207,19 @@ async def _introspect(
                                 ("start_value", row.get("start_value")),
                             ) if v not in (None, "")
                         },
-                    })
+                    }
+            elif name == "views":
+                # Oracle names-only listing; definitions come from the capped
+                # per-object source fetch below.
+                for row in rows:
+                    schema = str(row.get("schema_name") or "") or None
+                    vname = str(row.get("name") or row.get("view_name") or "")
+                    if not vname:
+                        continue
+                    full = f"{schema}.{vname}" if schema else vname
+                    pack_categories.setdefault("views", {})[full] = {
+                        "schema": schema, "name": vname, "kind": "VIEW",
+                    }
             elif name == "matviews":
                 for row in rows:
                     schema = str(row.get("schema_name") or "") or None
@@ -2012,7 +2233,7 @@ async def _introspect(
                     definition = row.get("view_definition") or row.get("definition")
                     if isinstance(definition, str) and definition.strip():
                         view_meta["source"] = definition
-                    categories["views"].setdefault(full, view_meta)
+                    pack_matviews[full] = view_meta
             elif name == "types":
                 for row in rows:
                     schema = str(row.get("schema_name") or "") or None
@@ -2026,7 +2247,7 @@ async def _introspect(
                     attrs = row.get("attributes") or row.get("typecode")
                     if attrs:
                         type_meta["meta"] = {"attributes": str(attrs)}
-                    categories["types"].setdefault(full, type_meta)
+                    pack_categories.setdefault("types", {})[full] = type_meta
             elif name == "routines":
                 merged_rows = (
                     _join_line_rows(
@@ -2048,7 +2269,43 @@ async def _introspect(
                     source = row.get("source") or row.get("line_text")
                     if isinstance(source, str) and source.strip():
                         routine_meta["source"] = _cap(source, MAX_DEFINITION_CHARS)
-                    categories["routines"].setdefault(full, routine_meta)
+                    pack_categories.setdefault("routines", {})[full] = routine_meta
+
+        # Authoritative replacement; matviews merge AFTERWARDS so the fresh
+        # views dict cannot wipe them.
+        for cat, entries in pack_categories.items():
+            categories[cat] = entries
+            tools_used[cat] = getattr(sql_tool, "name", "")
+        for full, meta in pack_matviews.items():
+            categories["views"].setdefault(full, meta)
+        unavailable = [u for u in unavailable if u not in pack_categories]
+
+    # Per-object source fetch (oracle get_object_source & friends), capped —
+    # runs AFTER the pack so pack-added name-only objects get sources too.
+    source_tool = roles["source"][0] if roles.get("source") else None
+    if source_tool is not None:
+        tools_used["source"] = getattr(source_tool, "name", "")
+        budget = _source_objects()
+        declared = _tool_arg_names(source_tool)
+        for cat in _CATEGORIES:
+            if budget <= 0:
+                break
+            for full, meta in categories[cat].items():
+                if budget <= 0:
+                    break
+                if meta.get("source"):
+                    continue
+                args = _build_tool_args(source_tool, table=meta.get("name") or full)
+                if "object_type" in declared:
+                    args["object_type"] = (
+                        meta.get("kind")
+                        if cat == "routines"
+                        else _SOURCE_TYPE_BY_CATEGORY.get(cat, "")
+                    )
+                raw = await _bounded_call(source_tool, args)
+                budget -= 1
+                if raw and not raw.startswith("ERROR:"):
+                    meta["source"] = _cap(raw, MAX_DEFINITION_CHARS)
 
     return {
         "schemas": schema_names,
