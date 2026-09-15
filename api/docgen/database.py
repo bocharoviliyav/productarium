@@ -582,7 +582,10 @@ _PG_SYSTEM_SCHEMAS = ("pg_catalog", "information_schema", "pg_toast")
 _ORACLE_SYSTEM_OWNERS = (
     "SYS", "SYSTEM", "XDB", "MDSYS", "CTXSYS", "ORDSYS", "OUTLN", "DBSNMP",
     "WMSYS", "EXFSYS", "OLAPSYS", "ORDDATA", "LBACSYS", "AUDSYS",
-    "GSMADMIN_INTERNAL", "OJVMSYS", "DBSFWUSER", "DVSYS",
+    "GSMADMIN_INTERNAL", "OJVMSYS", "DBSFWUSER", "DVSYS", "APPQOSSYS",
+    "GSMCATUSER", "GSMUSER", "DIP", "ORACLE_OCM", "MDDATA",
+    "REMOTE_SCHEDULER_AGENT", "SYSBACKUP", "SYSDG", "SYSKM", "SYSRAC",
+    "DVF", "DV_OWNER", "DV_ACCTMGR",
 )
 
 
@@ -690,6 +693,12 @@ _ORA_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_$#]{1,128}$")
 #: Deliberate, guarded exception to the constants-only packs: ``{owner}`` is
 #: filled from the catalog itself (regex above) and re-checked by the
 #: read-only guard before every call.
+#: NULL CELLS ARE FORBIDDEN in every selected expression: the pinned
+#: oracle-mcp-server's formatter crashes on ANY None cell (its _escape
+#: returns a bare string for None while the caller unpacks a 2-tuple), so
+#: the whole result becomes "Unexpected error executing query: …" and
+#: parses to zero rows. Hence NVL() wherever a catalog column is nullable
+#: (data_default — a LONG on top of that — is simply not selected).
 _ORA_OWNERS_QUERY = (
     'SELECT owner AS "owner" FROM all_tables WHERE ' + _ora_not_system("owner")
     + " GROUP BY owner ORDER BY owner"
@@ -698,7 +707,7 @@ _ORA_COLUMNS_QUERY = (
     'SELECT c.owner AS "table_schema", c.table_name AS "table_name", '
     'c.column_id AS "column_id", c.column_name AS "column_name", '
     'c.data_type AS "data_type", c.nullable AS "nullable", '
-    'c.data_default AS "data_default", t.num_rows AS "num_rows" '
+    'NVL(t.num_rows, 0) AS "num_rows" '
     "FROM all_tab_columns c "
     "JOIN all_tables t ON t.owner = c.owner AND t.table_name = c.table_name "
     "WHERE c.owner = '{owner}' AND t.table_name NOT LIKE 'BIN$%' "
@@ -741,15 +750,19 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
         'SELECT owner AS "schema_name", trigger_name AS "trigger_name", '
         'table_name AS "table_name", '
         'triggering_event AS "triggering_event", trigger_type AS "trigger_type", '
-        'status AS "enabled" '
+        'NVL(status, "?") AS "enabled" '
         "FROM all_triggers WHERE " + _ora_not_system("owner")
     ),
     "sequences": (
         'SELECT sequence_owner AS "schema_name", sequence_name AS "sequence_name", '
-        'min_value AS "min_value", max_value AS "max_value", '
+        'NVL(TO_CHAR(min_value), "-") AS "min_value", '
+        'NVL(TO_CHAR(max_value), "-") AS "max_value", '
         'increment_by AS "increment_by", cycle_flag AS "cycle_flag" '
         "FROM all_sequences WHERE " + _ora_not_system("sequence_owner")
     ),
+    # all_mviews.query is a LONG — NVL is illegal on LONG, so a NULL query
+    # there crashes the pinned formatter and the matview pack degrades to
+    # empty ("sql:matviews" unavailable; non-fatal by design).
     "matviews": (
         'SELECT owner AS "schema_name", mview_name AS "view_name", '
         'query AS "view_definition" FROM all_mviews '
@@ -763,12 +776,14 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
     ),
     "types": (
         'SELECT owner AS "schema_name", type_name AS "type_name", '
-        'typecode AS "typecode" '
+        'NVL(typecode, "?") AS "typecode" '
         "FROM all_types WHERE " + _ora_not_system("owner")
     ),
     "routines": (
         'SELECT owner AS "schema_name", name AS "object_name", '
-        'type AS "object_type", line AS "line", text AS "line_text" '
+        'type AS "object_type", line AS "line", '
+        # Blank ALL_SOURCE lines can be NULL — NVL or the whole pack dies.
+        'NVL(text, " ") AS "line_text" '
         "FROM all_source "
         "WHERE type IN ('FUNCTION', 'PROCEDURE', 'PACKAGE', "
         "'PACKAGE BODY', 'TRIGGER', 'TYPE', 'TYPE BODY') "
@@ -1074,7 +1089,16 @@ def _build_oracle_roles(tools: List[Any]) -> Optional[Dict[str, List[Any]]]:
 
     async def _list_tables(args: Dict[str, Any]) -> str:
         if search is not None:
-            return await _call_oracle(search, pattern="%")
+            raw = await _call_oracle(search, pattern="%")
+            if _parse_names(raw, "tables", "results", "rows"):
+                return raw
+            # The pinned server answers with PROSE ("Found N tables …\nTable:
+            # X\nColumns: …"), capped at 20 — scrape the table names and
+            # re-emit them as the JSON shape the walk's parser expects.
+            names = re.findall(r"^Table:\s+(\S+)", _unwrap_untrusted(raw), re.MULTILINE)
+            if names:
+                return json.dumps({"tables": [{"table_name": n} for n in names]})
+            return raw
         return await _call_oracle(multi)  # bulk dump; names parsed best-effort
 
     async def _describe(args: Dict[str, Any]) -> str:
@@ -1394,6 +1418,20 @@ def _rows_from_sql_result(text: str) -> List[Dict[str, Any]]:
     if isinstance(data, list):
         return [r for r in data if isinstance(r, dict)]
     return []
+
+
+# The pinned oracle-mcp-server wraps EVERY run_sql_query result (tables,
+# empty results, errors) in an anti-injection envelope; the payload proper
+# lives between the <untrusted-data-{uid}> tags with < / > HTML-escaped.
+_UNTRUSTED_RE = re.compile(
+    r"<untrusted-data-[0-9a-f-]+>\n?(.*?)\n?</untrusted-data-", re.DOTALL
+)
+
+
+def _unwrap_untrusted(text: str) -> str:
+    """Strip the oracle-mcp-server untrusted-data envelope (no-op elsewhere)."""
+    m = _UNTRUSTED_RE.search(text or "")
+    return m.group(1).strip() if m else (text or "")
 
 
 _PIPE_SPLIT_RE = re.compile(r"(?<!\\)\|")
@@ -1750,14 +1788,13 @@ async def _oracle_bulk_tables(
     queries — the caller falls back to the adapter walk.
     """
 
-    async def _q(sql: str, max_rows: int) -> List[Dict[str, Any]]:
-        return _rows_from_sql_result(
-            await bounded_call(
-                sql_tool, _sql_args(sql_tool, sql, max_rows=max_rows)
-            )
+    async def _q(sql: str, max_rows: int) -> Tuple[str, List[Dict[str, Any]]]:
+        raw = await bounded_call(
+            sql_tool, _sql_args(sql_tool, sql, max_rows=max_rows)
         )
+        return raw, _rows_from_sql_result(raw)
 
-    owner_rows = await _q(_ORA_OWNERS_QUERY, MAX_SCHEMAS)
+    _, owner_rows = await _q(_ORA_OWNERS_QUERY, MAX_SCHEMAS)
     owners = [
         str(row.get("owner") or "") for row in owner_rows
         if _ORA_IDENTIFIER_RE.match(str(row.get("owner") or ""))
@@ -1767,9 +1804,15 @@ async def _oracle_bulk_tables(
 
     tables: Dict[str, Dict[str, Any]] = {}
     for owner in owners:
-        rows = await _q(_ORA_COLUMNS_QUERY.format(owner=owner), _ORA_MAX_ROWS)
+        raw, rows = await _q(_ORA_COLUMNS_QUERY.format(owner=owner), _ORA_MAX_ROWS)
         if not rows:
-            errors.append(f"no all_tab_columns rows for schema {owner}")
+            # The WHY travels with the error: empty result, server-side ORA-*,
+            # or the pinned formatter's None-cell crash all look identical
+            # to "zero rows" once the envelope is stripped away.
+            errors.append(
+                f"no all_tab_columns rows for schema {owner} "
+                f"({_cap(_unwrap_untrusted(raw), 120)!r})"
+            )
             continue
         columns: Dict[str, List[Dict[str, Any]]] = {}
         counts: Dict[str, int] = {}
@@ -1785,13 +1828,17 @@ async def _oracle_bulk_tables(
                 "default": None if default in (None, "") else str(default),
             })
             num = str(row.get("num_rows") or "")
-            if num.isdigit():
+            # NVL(num_rows, 0): 0 = no optimizer stats, not an empty table —
+            # claim a row count only when stats actually exist.
+            if num.isdigit() and int(num) > 0:
                 counts[tname] = int(num)
         comments = {
             str(r.get("table_name") or ""): str(r.get("comments") or "")
-            for r in await _q(
-                _ORA_COMMENTS_QUERY.format(owner=owner), MAX_TABLES_PER_SCHEMA
-            )
+            for r in (
+                await _q(
+                    _ORA_COMMENTS_QUERY.format(owner=owner), MAX_TABLES_PER_SCHEMA
+                )
+            )[1]
             if r.get("comments")
         }
         for tname in sorted(columns)[:MAX_TABLES_PER_SCHEMA]:
