@@ -62,12 +62,14 @@ COPY --from=py312 /usr/local/bin/python3.12 /usr/local/bin/python3.12
 COPY --from=py312 /usr/local/lib/python3.12 /usr/local/lib/python3.12
 COPY --from=py312 /usr/local/lib/libpython3.12.so.1.0 /usr/local/lib/libpython3.12.so.1.0
 
+# The pinned checkout is MCP v1 code (``mcp.server.fastmcp``); upstream leaves
+# ``mcp`` unpinned and v2 removed that module, so the pin is mandatory.
 RUN ldconfig && python3.12 --version \
     && mkdir -p /opt/mcp \
     && uv venv /opt/mcp/oracle --python /usr/local/bin/python3.12 \
     && git clone https://github.com/danielmeppiel/oracle-mcp-server /opt/mcp/oracle/app \
     && git -C /opt/mcp/oracle/app checkout 37ce2ead4e8caa274eb9442b44aff7f7a59573dd \
-    && uv pip install --python /opt/mcp/oracle/bin/python --no-cache -e /opt/mcp/oracle/app \
+    && uv pip install --python /opt/mcp/oracle/bin/python --no-cache -e /opt/mcp/oracle/app "mcp<2" \
     && rm -rf /opt/mcp/oracle/app/.git
 
 # Update certificates if custom ones were provided and copied successfully
