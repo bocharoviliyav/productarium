@@ -79,8 +79,10 @@ from api.utils.llm_helpers import cap as _cap
 from api.formats.mermaid import run_repair_loop
 from api.prompts import LANGUAGE_NAMES, load_prompt_file
 from api.docgen._common import (
+    JobCancelledError,
     _carry_page_verify_flags,
     _check_cancel,
+    _clean_llm_text,
     _close_owned_llm,
     _product_dataset,
     _index_in_background,
@@ -122,6 +124,9 @@ MAX_SCHEMAS = 100_000
 MAX_TABLES_PER_SCHEMA = 100_000
 #: Max characters of one table definition kept in the doc/evidence.
 MAX_DEFINITION_CHARS = 8_000
+#: Full source kept for the deep-unit agents when the rendered page caps
+#: at MAX_DEFINITION_CHARS — pages stay readable, agents lose nothing.
+_SOURCE_FULL_CHARS = 500_000
 #: Max characters of the raw schema dump handed to the LLM.
 MAX_SCHEMA_DUMP_CHARS = 120_000
 #: Max characters of the product-knowledge context block inside prompts.
@@ -139,15 +144,47 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-#: Overall wall-clock budget for one introspection walk (DoS guard, review
-# #4: per-call limits alone let a slow MCP surface occupy a docgen worker
-# for hours). Env-overridable; default 30 minutes — a multi-schema Oracle
-# monolith legitimately needs tens of paged catalog queries.
-INTROSPECTION_TIMEOUT_SECONDS = _env_float("DB_INTROSPECTION_TIMEOUT_SECONDS", 1800.0)
-#: Hard cap on MCP tool calls during one walk (schema listings + per-table
-#: definitions + category probes combined) so huge schemas cannot loop
-#: unboundedly.
-MAX_TOOL_CALLS = 2_000
+#: Legacy defaults of the two walk budgets — the LIVE values resolve through
+#: the timeout registry (``db_max_tool_calls`` / ``db_introspection_timeout``;
+#: admin store > env > default) with night-scale defaults (20 000 calls /
+#: 6 h) for full-coverage Oracle walks. The constants stay as import seams.
+INTROSPECTION_TIMEOUT_SECONDS = _env_float("DB_INTROSPECTION_TIMEOUT_SECONDS", 21600.0)
+MAX_TOOL_CALLS = 20_000
+
+
+def _max_tool_calls() -> int:
+    """Live MCP tool-call budget for one walk (registry)."""
+    from api.config.timeout import resolve_db_max_tool_calls
+
+    return resolve_db_max_tool_calls()
+
+
+def _introspection_timeout() -> float:
+    """Live wall-clock budget for one walk (registry)."""
+    from api.config.timeout import resolve_db_introspection_timeout
+
+    return resolve_db_introspection_timeout()
+
+
+def _deep_units_enabled() -> bool:
+    """Per-entity deep documentation units (registry gate)."""
+    from api.config.timeout import resolve_db_deep_units_enabled
+
+    return resolve_db_deep_units_enabled()
+
+
+def _entity_mcp_enabled() -> bool:
+    """MCP enrichment tools for deep-unit agents (registry gate)."""
+    from api.config.timeout import resolve_db_entity_mcp_enabled
+
+    return resolve_db_entity_mcp_enabled()
+
+
+def _unit_bundle_chars() -> int:
+    """Char cap of one deep unit's inline context bundle (registry)."""
+    from api.config.timeout import resolve_db_unit_bundle_chars
+
+    return resolve_db_unit_bundle_chars()
 
 
 # Admin-tunable render/enrich knobs over the timeout registry (admin store >
@@ -269,7 +306,7 @@ def _cache_budgets() -> Dict[str, Any]:
         "max_tables_per_schema": MAX_TABLES_PER_SCHEMA,
         "max_definition_chars": MAX_DEFINITION_CHARS,
         "max_schema_dump_chars": MAX_SCHEMA_DUMP_CHARS,
-        "max_tool_calls": MAX_TOOL_CALLS,
+        "max_tool_calls": _max_tool_calls(),
         "fk_evidence_tables": _fk_evidence_tables(),
         "source_objects": _source_objects(),
     }
@@ -711,9 +748,17 @@ _PG_SQL_PACK: Dict[str, str] = {
 #: under the cap. The old single 5_000-row ask was silently chopped
 #: mid-table by the cap and the parser lost everything after the cut.
 _ORA_PAGE_ROWS = 1_200
-#: Sanity ceiling on pages per query (72k rows) — bounds worst-case walk
-#: time; anything wider is documentation noise anyway.
-_ORA_MAX_PAGES = 60
+#: Page size for LINE-based source queries (ALL_SOURCE): a source line can
+#: run long, and a 1 200-line page chopped mid-way by the manager's char cap
+#: parses as a SHORT page — the walk would stop early and silently lose the
+#: rest of the catalog. 400 rows keeps a page safely under the cap.
+_ORA_SOURCE_PAGE_ROWS = 400
+#: Page size for scheduler listings (job/program actions up to 400 chars).
+_ORA_SCHED_PAGE_ROWS = 200
+#: Sanity ceiling on pages per query (600k rows at 1 200/page) — bounds
+#: worst-case walk time; the real bounds are the registry budgets
+#: (``db_max_tool_calls`` + the wall-clock timeout).
+_ORA_MAX_PAGES = 500
 #: Owner names interpolated into the bulk queries below are catalog-derived
 #: (all_tables.owner), never user input; this charset regex additionally
 #: excludes quotes/semicolons, so the interpolated literal is inert.
@@ -751,6 +796,12 @@ _ORA_COMMENTS_QUERY = (
     "FROM all_tab_comments "
     "WHERE owner = '{owner}' AND comments IS NOT NULL"
 )
+_ORA_COL_COMMENTS_QUERY = (
+    'SELECT table_name AS "table_name", column_name AS "column_name", '
+    'comments AS "comments" '
+    "FROM all_col_comments "
+    "WHERE owner = '{owner}' AND comments IS NOT NULL"
+)
 
 #: The pinned server's effective schema (TARGET_SCHEMA or the login user):
 #: ``get_object_source`` resolves every object against it (DBMS_METADATA
@@ -764,6 +815,36 @@ _ORA_SESSION_SCHEMA_QUERY = (
 #: Routine/trigger sources arrive LINE-based and are regrouped by the walk.
 # Aliases are QUOTED lowercase so the rendered pipe-table headers match
 # the parser's row keys (Oracle uppercases unquoted aliases).
+#: Multi-line text fields are flattened (REPLACE over CHR(10)/CHR(13)) and
+#: head-capped (SUBSTR) — a raw newline inside a pipe-table cell would break
+#: the row parser and silently drop the whole page of rows.
+def _ora_flat(expr: str, cap: int) -> str:
+    return (
+        f"NVL(SUBSTR(REPLACE(REPLACE({expr}, CHR(13), ' '), CHR(10), ' '), "
+        f"1, {cap}), '-')"
+    )
+
+
+#: Page size per pack query (default ``_ORA_PAGE_ROWS``): line-based source
+#: queries and scheduler listings shrink so one page always fits the
+#: manager's char cap — a chopped page parses as SHORT and the walk stops.
+_ORA_PACK_PAGE_ROWS: Dict[str, int] = {
+    "routines": _ORA_SOURCE_PAGE_ROWS,
+    "packages": _ORA_SOURCE_PAGE_ROWS,
+    "type_bodies": _ORA_SOURCE_PAGE_ROWS,
+    "trigger_sources": _ORA_SOURCE_PAGE_ROWS,
+    "jobs": _ORA_SCHED_PAGE_ROWS,
+    "programs": _ORA_SCHED_PAGE_ROWS,
+}
+
+#: Pack entries that are NOT categories: their rows merge into table meta or
+#: ride as evidence — an authoritative EMPTY answer is a valid "none exist",
+#: not an availability gap.
+_ORA_PACK_AUX = frozenset({
+    "fk_edges", "indexes", "constraints", "dependencies",
+    "type_bodies", "trigger_sources", "matviews",
+})
+
 _ORACLE_SQL_PACK: Dict[str, str] = {
     "fk_edges": (
         'SELECT ac.owner AS "table_schema", ac.table_name AS "table_name", '
@@ -787,12 +868,47 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
         "WHERE " + _ora_not_system("i.table_owner") + " "
         "ORDER BY i.table_owner, i.table_name, i.index_name, c.column_position"
     ),
+    # PK/UNIQUE/CHECK constraints (FKs ride via fk_edges). search_condition is
+    # a LONG — not selected; the constraint name + columns still document it.
+    "constraints": (
+        'SELECT a.owner AS "table_schema", a.table_name AS "table_name", '
+        'a.constraint_name AS "constraint_name", '
+        'a.constraint_type AS "constraint_type", '
+        'ac.column_name AS "column_name", ac.position AS "position" '
+        "FROM all_constraints a "
+        "JOIN all_cons_columns ac ON ac.owner = a.owner "
+        "AND ac.constraint_name = a.constraint_name "
+        "WHERE a.constraint_type IN ('P', 'U', 'C') "
+        "AND " + _ora_not_system("a.owner") + " "
+        "ORDER BY a.owner, a.table_name, a.constraint_name, ac.position"
+    ),
+    # Object dependency graph (view → table, package → table, …).
+    "dependencies": (
+        'SELECT owner AS "owner", name AS "name", NVL(type, "?") AS "type", '
+        'NVL(referenced_owner, "?") AS "ref_owner", '
+        'referenced_name AS "ref_name", '
+        'NVL(referenced_type, "?") AS "ref_type" '
+        "FROM all_dependencies "
+        "WHERE " + _ora_not_system("owner") + " "
+        "AND referenced_name IS NOT NULL "
+        "AND NVL(referenced_type, 'NON-EXISTENT') <> 'NON-EXISTENT' "
+        "ORDER BY owner, name"
+    ),
     "triggers": (
         'SELECT owner AS "schema_name", trigger_name AS "trigger_name", '
         'table_name AS "table_name", '
         'triggering_event AS "triggering_event", trigger_type AS "trigger_type", '
-        'NVL(status, "?") AS "enabled" '
+        'NVL(status, "?") AS "enabled", '
+        + _ora_flat("description", 400) + ' AS "description" '
         "FROM all_triggers WHERE " + _ora_not_system("owner")
+    ),
+    # Trigger bodies: line-based, merged into the triggers metadata above.
+    "trigger_sources": (
+        'SELECT owner AS "schema_name", name AS "trigger_name", '
+        # Blank ALL_SOURCE lines can be NULL — NVL or the whole pack dies.
+        'NVL(text, " ") AS "line_text" '
+        "FROM all_source WHERE type = 'TRIGGER' AND "
+        + _ora_not_system("owner") + " ORDER BY owner, name, line"
     ),
     "sequences": (
         'SELECT sequence_owner AS "schema_name", sequence_name AS "sequence_name", '
@@ -801,13 +917,18 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
         'increment_by AS "increment_by", cycle_flag AS "cycle_flag" '
         "FROM all_sequences WHERE " + _ora_not_system("sequence_owner")
     ),
-    # all_mviews.query is a LONG — NVL is illegal on LONG, so a NULL query
-    # there crashes the pinned formatter and the matview pack degrades to
-    # empty ("sql:matviews" unavailable; non-fatal by design).
+    # all_mviews.query is a LONG: selecting it crashes the pinned formatter
+    # and the whole matview category degrades to empty. Metadata only — the
+    # definition (when the source tool resolves it) arrives via source fetch.
     "matviews": (
         'SELECT owner AS "schema_name", mview_name AS "view_name", '
-        'query AS "view_definition" FROM all_mviews '
-        "WHERE " + _ora_not_system("owner")
+        'NVL(refresh_mode, "?") AS "refresh_mode", '
+        'NVL(refresh_method, "?") AS "refresh_method", '
+        'NVL(build_mode, "?") AS "build_mode", '
+        "NVL(TO_CHAR(last_refresh_date, 'YYYY-MM-DD HH24:MI'), '-') "
+        'AS "last_refresh", '
+        'NVL(updatable, "?") AS "updatable" '
+        "FROM all_mviews WHERE " + _ora_not_system("owner")
     ),
     # Names only: all_views.TEXT is a LONG column (no SUBSTR/aggregation) —
     # definitions come from the capped per-object source fetch.
@@ -820,16 +941,54 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
         'NVL(typecode, "?") AS "typecode" '
         "FROM all_types WHERE " + _ora_not_system("owner")
     ),
+    # TYPE / TYPE BODY sources: line-based, merged into the types metadata.
+    "type_bodies": (
+        'SELECT owner AS "schema_name", name AS "type_name", '
+        'type AS "object_type", '
+        'NVL(text, " ") AS "line_text" '
+        "FROM all_source WHERE type IN ('TYPE', 'TYPE BODY') AND "
+        + _ora_not_system("owner") + " ORDER BY owner, name, type, line"
+    ),
+    # Split per object type: one giant ALL_SOURCE pass over every type × every
+    # schema overflowed pages (see _ORA_PACK_PAGE_ROWS) and its early
+    # short-page stop silently truncated the catalog.
     "routines": (
         'SELECT owner AS "schema_name", name AS "object_name", '
         'type AS "object_type", line AS "line", '
-        # Blank ALL_SOURCE lines can be NULL — NVL or the whole pack dies.
         'NVL(text, " ") AS "line_text" '
         "FROM all_source "
-        "WHERE type IN ('FUNCTION', 'PROCEDURE', 'PACKAGE', "
-        "'PACKAGE BODY', 'TRIGGER', 'TYPE', 'TYPE BODY') "
+        "WHERE type IN ('FUNCTION', 'PROCEDURE') "
         "AND " + _ora_not_system("owner") + " "
         "ORDER BY owner, type, name, line"
+    ),
+    # Spec + body merge into ONE package entry (spec source first, body after).
+    "packages": (
+        'SELECT owner AS "schema_name", name AS "object_name", '
+        'type AS "object_type", line AS "line", '
+        'NVL(text, " ") AS "line_text" '
+        "FROM all_source "
+        "WHERE type IN ('PACKAGE', 'PACKAGE BODY') "
+        "AND " + _ora_not_system("owner") + " "
+        "ORDER BY owner, name, type, line"
+    ),
+    "jobs": (
+        'SELECT owner AS "schema_name", job_name AS "job_name", '
+        'NVL(job_type, "?") AS "job_type", '
+        + _ora_flat("job_action", 400) + ' AS "job_action", '
+        'NVL(state, "?") AS "state", NVL(enabled, "?") AS "enabled", '
+        + _ora_flat("repeat_interval", 200) + ' AS "repeat_interval", '
+        'NVL(schedule_type, "?") AS "schedule_type", '
+        "NVL(TO_CHAR(last_start_date, 'YYYY-MM-DD HH24:MI'), '-') "
+        'AS "last_start" '
+        "FROM all_scheduler_jobs WHERE " + _ora_not_system("owner")
+    ),
+    "programs": (
+        'SELECT owner AS "schema_name", program_name AS "program_name", '
+        'NVL(program_type, "?") AS "program_type", '
+        + _ora_flat("program_action", 400) + ' AS "program_action", '
+        'NVL(enabled, "?") AS "enabled", '
+        'NVL(TO_CHAR(number_of_arguments), "0") AS "arguments" '
+        "FROM all_scheduler_programs WHERE " + _ora_not_system("owner")
     ),
 }
 
@@ -1712,25 +1871,36 @@ def _edges_from_fk_rows(
 
 
 # --------------------------------------------------------------------------- #
-# Category collections (views / triggers / routines / sequences / types)
+# Category collections (views / triggers / routines / packages / sequences /
+# types / jobs / programs)
 # --------------------------------------------------------------------------- #
-_CATEGORIES = ("views", "triggers", "routines", "sequences", "types")
+_CATEGORIES = (
+    "views", "triggers", "routines", "packages", "sequences", "types",
+    "jobs", "programs",
+)
 _CATEGORY_TITLES = {
     "views": "Views",
     "triggers": "Triggers",
     "routines": "Procedures & Functions",
+    "packages": "Packages",
     "sequences": "Sequences",
     "types": "Types",
+    "jobs": "Scheduler Jobs",
+    "programs": "Scheduler Programs",
 }
 _CATEGORY_PREFIX = {
     "views": "view", "triggers": "trg", "routines": "rtn",
-    "sequences": "seq", "types": "typ",
+    "packages": "pkg", "sequences": "seq", "types": "typ",
+    "jobs": "job", "programs": "prg",
 }
-#: ``object_type`` value for the oracle source tool (routines use their kind).
+#: ``object_type`` value for the oracle source tool (routines and packages
+#: use their kind; jobs/programs have no source-tool representation).
 _SOURCE_TYPE_BY_CATEGORY = {
     "views": "VIEW", "triggers": "TRIGGER",
     "sequences": "SEQUENCE", "types": "TYPE",
 }
+#: Categories the oracle source tool can serve with a kind-derived type.
+_SOURCE_KIND_CATEGORIES = frozenset({"routines", "packages"})
 _SOURCE_META_KEYS = ("definition", "source", "ddl", "query", "text", "create_statement")
 
 
@@ -1831,14 +2001,21 @@ def _ora_page_query(query: str, lo: int, hi: int) -> str:
 
 
 async def _paged_rows(
-    sql_tool: Any, bounded_call: Callable[..., str], query: str
+    sql_tool: Any,
+    bounded_call: Callable[..., str],
+    query: str,
+    page_rows: int = _ORA_PAGE_ROWS,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """All rows of a catalog query, fetched in char-cap-safe pages.
 
+    ``page_rows`` shrinks the page for wide/line-based queries (see
+    ``_ORA_PACK_PAGE_ROWS``) so one page always fits the manager's char cap —
+    a chopped page parses as SHORT and the early stop would drop the rest.
     Stops on the first short page (or the page ceiling). Returns the LAST
     raw response — diagnostics for the caller's error messages — plus the
     aggregated rows.
     """
+    page_rows = max(1, int(page_rows))
     rows: List[Dict[str, Any]] = []
     raw = ""
     for page in range(_ORA_MAX_PAGES):
@@ -1847,14 +2024,14 @@ async def _paged_rows(
             _sql_args(
                 sql_tool,
                 _ora_page_query(
-                    query, page * _ORA_PAGE_ROWS, (page + 1) * _ORA_PAGE_ROWS
+                    query, page * page_rows, (page + 1) * page_rows
                 ),
-                max_rows=_ORA_PAGE_ROWS,
+                max_rows=page_rows,
             ),
         )
         chunk = _rows_from_sql_result(raw)
         rows.extend(chunk)
-        if len(chunk) < _ORA_PAGE_ROWS:
+        if len(chunk) < page_rows:
             break
     return raw, rows
 
@@ -1954,6 +2131,14 @@ async def _oracle_bulk_tables(
             )[1]
             if r.get("comments")
         }
+        col_comments = {
+            (str(r.get("table_name") or ""), str(r.get("column_name") or "")):
+                str(r.get("comments") or "")
+            for r in (
+                await _q(_ORA_COL_COMMENTS_QUERY.format(owner=owner))
+            )[1]
+            if r.get("comments")
+        }
         for tname in sorted(columns):
             # Controlled render — re-parsed by _parse_table_definition so the
             # bulk path and the adapter path share one structure parser.
@@ -1979,6 +2164,10 @@ async def _oracle_bulk_tables(
                 "definition": _cap("\n".join(definition), MAX_DEFINITION_CHARS),
             }
             entry.update(_parse_table_definition(entry["definition"]))
+            for col in entry.get("columns") or []:
+                note = col_comments.get((tname, str(col.get("name") or "")))
+                if note:
+                    col["comment"] = note
             tables[f"{owner}.{tname}"] = entry
     if not tables:
         return None
@@ -1997,25 +2186,28 @@ async def _introspect(
     ``{"schemas": [...], "tables": {full: {schema, table, definition,
     columns?, indexes?, comment?, row_count?, constraints?}},
     "fk_edges": [{from, from_cols, to, to_cols, constraint, kind}],
-    "views"/"triggers"/"routines"/"sequences"/"types": {full: {schema,
-    name, kind, source?, meta?}}, "tools_used": {role: name},
-    "unavailable": [role…]}``. Oracle engines with a sql role take the
-    cross-schema ``_oracle_bulk_tables`` path first. Raises ValueError when
-    the surface cannot produce a schema at all — an honest failure instead
-    of empty docs.
+    "dependencies": [{from, from_type, to, to_type}],
+    "views"/"triggers"/"routines"/"packages"/"sequences"/"types"/"jobs"/
+    "programs": {full: {schema, name, kind, source?, meta?}},
+    "tools_used": {role: name}, "unavailable": [role…]}``.
+    Oracle engines with a sql role take the cross-schema
+    ``_oracle_bulk_tables`` path first. Raises ValueError when the surface
+    cannot produce a schema at all — an honest failure instead of empty docs.
     """
     tools_used: Dict[str, str] = {}
     unavailable: List[str] = []
     schema_names: List[str] = []
     errors: List[str] = []
+    dependencies: List[Dict[str, Any]] = []
     calls = 0
+    tool_budget = _max_tool_calls()
 
     async def _bounded_call(tool: Any, args: Dict[str, Any]) -> str:
         """Call counter around :func:`_call_tool` (hard cap, review #4)."""
         nonlocal calls
-        if calls >= MAX_TOOL_CALLS:
+        if calls >= tool_budget:
             return (
-                f"ERROR: introspection tool-call budget ({MAX_TOOL_CALLS}) "
+                f"ERROR: introspection tool-call budget ({tool_budget}) "
                 "exceeded; call skipped."
             )
         calls += 1
@@ -2262,6 +2454,7 @@ async def _introspect(
     )
     pack_categories: Dict[str, Dict[str, Dict[str, Any]]] = {}
     pack_matviews: Dict[str, Dict[str, Any]] = {}
+    pack_counts: Dict[str, int] = {}
     if sql_tool is not None and pack:
         tools_used["sql"] = getattr(sql_tool, "name", "")
         for name, query in pack.items():
@@ -2271,12 +2464,16 @@ async def _introspect(
                 logger.warning("SQL pack query %r failed the read-only guard", name)
                 continue
             if engine == "oracle":
-                raw, rows = await _paged_rows(sql_tool, _bounded_call, query)
+                raw, rows = await _paged_rows(
+                    sql_tool, _bounded_call, query,
+                    page_rows=_ORA_PACK_PAGE_ROWS.get(name, _ORA_PAGE_ROWS),
+                )
             else:
                 raw = await _bounded_call(
                     sql_tool, _sql_args(sql_tool, query)
                 )
                 rows = _rows_from_sql_result(raw)
+            pack_counts[name] = len(rows)
             if not rows:
                 ok = bool(raw) and not raw.startswith("ERROR:")
                 if ok:
@@ -2285,7 +2482,9 @@ async def _introspect(
                     ok = not _looks_like_server_error(_unwrap_untrusted(raw))
                 if ok and name in _CATEGORIES:
                     pack_categories.setdefault(name, {})  # catalog says: empty
-                elif ok:
+                elif ok and name not in _ORA_PACK_AUX:
+                    unavailable.append(f"sql:{name}")
+                elif not ok:
                     unavailable.append(f"sql:{name}")
                 continue
             if name == "fk_edges":
@@ -2323,14 +2522,55 @@ async def _introspect(
                     existing = {i["name"]: i for i in (meta.get("indexes") or [])}
                     existing.setdefault(idx["name"], idx)
                     meta["indexes"] = list(existing.values())
-            elif name == "triggers":
-                merged_rows = (
-                    _join_line_rows(
-                        rows, ("schema_name", "trigger_name"), text_key="line_text",
+            elif name == "constraints":
+                # PK/UNIQUE/CHECK grouped per constraint; column order arrives
+                # from the query's ORDER BY … position.
+                grouped_c: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+                for row in rows:
+                    schema = str(row.get("table_schema") or "") or None
+                    table = str(row.get("table_name") or "")
+                    cname = str(row.get("constraint_name") or "")
+                    if not table or not cname:
+                        continue
+                    g = grouped_c.setdefault(
+                        (schema or "", table, cname),
+                        {"name": cname, "type": str(row.get("constraint_type") or ""), "columns": []},
                     )
-                    if engine == "oracle" else rows
-                )
-                for row in merged_rows:
+                    col = row.get("column_name")
+                    if isinstance(col, str) and col and col not in g["columns"]:
+                        g["columns"].append(col)
+                type_names = {"P": "PRIMARY KEY", "U": "UNIQUE", "C": "CHECK"}
+                for (_schema, table, cname), con in grouped_c.items():
+                    meta = tables.get(_qualify_name(_schema or None, table, tables))
+                    if meta is None:
+                        continue
+                    con["type"] = type_names.get(con["type"], con["type"])
+                    existing = {c["name"]: c for c in (meta.get("constraints") or [])}
+                    existing.setdefault(con["name"], con)
+                    meta["constraints"] = list(existing.values())
+            elif name == "dependencies":
+                seen_deps: set = set()
+                for row in rows:
+                    owner = str(row.get("owner") or "")
+                    obj = str(row.get("name") or "")
+                    ref_owner = str(row.get("ref_owner") or "")
+                    ref = str(row.get("ref_name") or "")
+                    if not owner or not obj or not ref:
+                        continue
+                    # References INTO system owners (SYS.STANDARD et al.) are
+                    # universal noise — every PL/SQL object has them.
+                    if not _ora_user_owner(ref_owner):
+                        continue
+                    frm, to = f"{owner}.{obj}", f"{ref_owner}.{ref}"
+                    if frm == to or (frm, to) in seen_deps:
+                        continue
+                    seen_deps.add((frm, to))
+                    dependencies.append({
+                        "from": frm, "from_type": str(row.get("type") or "?"),
+                        "to": to, "to_type": str(row.get("ref_type") or "?"),
+                    })
+            elif name == "triggers":
+                for row in rows:
                     schema = str(row.get("schema_name") or "") or None
                     tname = str(row.get("trigger_name") or "")
                     if not tname:
@@ -2345,13 +2585,36 @@ async def _introspect(
                                 ("type", row.get("trigger_type")),
                                 ("function", row.get("function_name")),
                                 ("status", row.get("enabled") or row.get("status")),
-                            ) if v not in (None, "")
+                                ("description", row.get("description")),
+                            ) if v not in (None, "", "-")
                         },
                     }
                     definition = row.get("definition") or row.get("line_text")
                     if isinstance(definition, str) and definition.strip():
                         trig_meta["source"] = definition
                     pack_categories.setdefault("triggers", {})[full] = trig_meta
+            elif name == "trigger_sources":
+                for row in _join_line_rows(
+                    rows, ("schema_name", "trigger_name"), text_key="line_text",
+                ):
+                    schema = str(row.get("schema_name") or "") or None
+                    tname = str(row.get("trigger_name") or "")
+                    source = str(row.get("line_text") or "")
+                    if not tname or not source.strip():
+                        continue
+                    full = f"{schema}.{tname}" if schema else tname
+                    entry = pack_categories.setdefault("triggers", {}).get(full)
+                    if entry is None:
+                        pack_categories["triggers"][full] = {
+                            "schema": schema, "name": tname, "kind": "TRIGGER",
+                            "source": _cap(source, MAX_DEFINITION_CHARS),
+                        }
+                    elif not entry.get("source"):
+                        entry["source"] = _cap(source, MAX_DEFINITION_CHARS)
+                    if len(source) > MAX_DEFINITION_CHARS:
+                        pack_categories["triggers"][full]["source_full"] = _cap(
+                            source, _SOURCE_FULL_CHARS
+                        )
             elif name == "sequences":
                 for row in rows:
                     schema = str(row.get("schema_name") or "") or None
@@ -2396,6 +2659,17 @@ async def _introspect(
                     definition = row.get("view_definition") or row.get("definition")
                     if isinstance(definition, str) and definition.strip():
                         view_meta["source"] = definition
+                    extras = {
+                        k: str(v) for k, v in (
+                            ("refresh_mode", row.get("refresh_mode")),
+                            ("refresh_method", row.get("refresh_method")),
+                            ("build_mode", row.get("build_mode")),
+                            ("last_refresh", row.get("last_refresh")),
+                            ("updatable", row.get("updatable")),
+                        ) if v not in (None, "", "-")
+                    }
+                    if extras:
+                        view_meta["meta"] = extras
                     pack_matviews[full] = view_meta
             elif name == "types":
                 for row in rows:
@@ -2411,6 +2685,29 @@ async def _introspect(
                     if attrs:
                         type_meta["meta"] = {"attributes": str(attrs)}
                     pack_categories.setdefault("types", {})[full] = type_meta
+            elif name == "type_bodies":
+                # TYPE spec + TYPE BODY merge into one entry, like packages.
+                for row in _join_line_rows(
+                    rows, ("schema_name", "type_name"), text_key="line_text",
+                ):
+                    schema = str(row.get("schema_name") or "") or None
+                    tname = str(row.get("type_name") or "")
+                    source = str(row.get("line_text") or "")
+                    if not tname or not source.strip():
+                        continue
+                    full = f"{schema}.{tname}" if schema else tname
+                    entry = pack_categories.setdefault("types", {}).get(full)
+                    if entry is None:
+                        pack_categories["types"][full] = {
+                            "schema": schema, "name": tname, "kind": "TYPE",
+                            "source": _cap(source, MAX_DEFINITION_CHARS),
+                        }
+                    elif not entry.get("source"):
+                        entry["source"] = _cap(source, MAX_DEFINITION_CHARS)
+                    if len(source) > MAX_DEFINITION_CHARS:
+                        pack_categories["types"][full]["source_full"] = _cap(
+                            source, _SOURCE_FULL_CHARS
+                        )
             elif name == "routines":
                 merged_rows = (
                     _join_line_rows(
@@ -2432,7 +2729,74 @@ async def _introspect(
                     source = row.get("source") or row.get("line_text")
                     if isinstance(source, str) and source.strip():
                         routine_meta["source"] = _cap(source, MAX_DEFINITION_CHARS)
+                        if len(source) > MAX_DEFINITION_CHARS:
+                            routine_meta["source_full"] = _cap(source, _SOURCE_FULL_CHARS)
                     pack_categories.setdefault("routines", {})[full] = routine_meta
+            elif name == "packages":
+                # Spec + body arrive as consecutive line groups (ORDER BY …
+                # type, line); one join WITHOUT type_key concatenates them
+                # into a single entry — spec first.
+                for row in _join_line_rows(
+                    rows, ("schema_name", "object_name"), text_key="line_text",
+                ):
+                    schema = str(row.get("schema_name") or "") or None
+                    pname = str(row.get("object_name") or "")
+                    source = str(row.get("line_text") or "")
+                    if not pname or not source.strip():
+                        continue
+                    full = f"{schema}.{pname}" if schema else pname
+                    pkg_meta: Dict[str, Any] = {
+                        "schema": schema, "name": pname, "kind": "PACKAGE",
+                        "source": _cap(source, MAX_DEFINITION_CHARS),
+                    }
+                    if len(source) > MAX_DEFINITION_CHARS:
+                        pkg_meta["source_full"] = _cap(source, _SOURCE_FULL_CHARS)
+                    pack_categories.setdefault("packages", {})[full] = pkg_meta
+            elif name == "jobs":
+                for row in rows:
+                    schema = str(row.get("schema_name") or "") or None
+                    jname = str(row.get("job_name") or "")
+                    if not jname:
+                        continue
+                    full = f"{schema}.{jname}" if schema else jname
+                    meta = {
+                        k: str(v) for k, v in (
+                            ("type", row.get("job_type")),
+                            ("state", row.get("state")),
+                            ("enabled", row.get("enabled")),
+                            ("action", row.get("job_action")),
+                            ("repeat_interval", row.get("repeat_interval")),
+                            ("schedule_type", row.get("schedule_type")),
+                            ("last_start", row.get("last_start")),
+                        ) if v not in (None, "", "-")
+                    }
+                    entry: Dict[str, Any] = {
+                        "schema": schema, "name": jname, "kind": "JOB",
+                    }
+                    if meta:
+                        entry["meta"] = meta
+                    pack_categories.setdefault("jobs", {})[full] = entry
+            elif name == "programs":
+                for row in rows:
+                    schema = str(row.get("schema_name") or "") or None
+                    prname = str(row.get("program_name") or "")
+                    if not prname:
+                        continue
+                    full = f"{schema}.{prname}" if schema else prname
+                    meta = {
+                        k: str(v) for k, v in (
+                            ("type", row.get("program_type")),
+                            ("enabled", row.get("enabled")),
+                            ("action", row.get("program_action")),
+                            ("arguments", row.get("arguments")),
+                        ) if v not in (None, "", "-")
+                    }
+                    entry: Dict[str, Any] = {
+                        "schema": schema, "name": prname, "kind": "PROGRAM",
+                    }
+                    if meta:
+                        entry["meta"] = meta
+                    pack_categories.setdefault("programs", {})[full] = entry
 
         # Maintenance owners that slipped past the SQL-side NOT IN (APEX
         # releases, resurrected legacy accounts) are dropped before the
@@ -2482,6 +2846,10 @@ async def _introspect(
             budget = None if source_cap <= 0 else source_cap
             declared = _tool_arg_names(source_tool)
             for cat in _CATEGORIES:
+                # jobs/programs have no source-tool representation; categories
+                # without a mapped object_type would only buy server errors.
+                if cat not in _SOURCE_TYPE_BY_CATEGORY and cat not in _SOURCE_KIND_CATEGORIES:
+                    continue
                 if budget is not None and budget <= 0:
                     break
                 for full, meta in categories[cat].items():
@@ -2498,7 +2866,7 @@ async def _introspect(
                     if "object_type" in declared:
                         args["object_type"] = (
                             meta.get("kind")
-                            if cat == "routines"
+                            if cat in _SOURCE_KIND_CATEGORIES
                             else _SOURCE_TYPE_BY_CATEGORY.get(cat, "")
                         )
                     raw = await _bounded_call(source_tool, args)
@@ -2510,11 +2878,19 @@ async def _introspect(
                         and not _looks_like_server_error(_unwrap_untrusted(raw))
                     ):
                         meta["source"] = _cap(raw, MAX_DEFINITION_CHARS)
+                        if len(raw) > MAX_DEFINITION_CHARS:
+                            meta["source_full"] = _cap(raw, _SOURCE_FULL_CHARS)
 
+    if pack_counts:
+        logger.info(
+            "oracle pack rows fetched %s",
+            " ".join(f"{k}={v}" for k, v in sorted(pack_counts.items())),
+        )
     return {
         "schemas": schema_names,
         "tables": tables,
         "fk_edges": fk_edges,
+        "dependencies": dependencies,
         **{cat: categories[cat] for cat in _CATEGORIES},
         "tools_used": tools_used,
         "unavailable": unavailable,
@@ -2713,15 +3089,48 @@ class _Slugger:
 
 
 def _render_structure_table(columns: List[Dict[str, Any]]) -> List[str]:
-    out = ["| column | type | null | default |", "| --- | --- | --- | --- |"]
+    comments = any(c.get("comment") for c in columns)
+    head = (
+        "| column | type | null | default | comment |"
+        if comments else "| column | type | null | default |"
+    )
+    out = [head, "| " + " | ".join(["---"] * (head.count("|") - 1)) + " |"]
     for c in columns:
         default = c.get("default")
-        out.append("| {} | {} | {} | {} |".format(
+        cells = [
             c.get("name") or "?",
             c.get("type") or "?",
             "YES" if c.get("nullable") else "NO",
             "-" if default is None else str(default),
-        ))
+        ]
+        if comments:
+            cells.append(str(c.get("comment") or "-").replace("|", "\\|"))
+        out.append("| " + " | ".join(cells) + " |")
+    return out
+
+
+#: Visible dependency lines per block; the rest folds away.
+_DEPS_VISIBLE = 20
+
+
+def _dependency_blocks(
+    full: str, deps_index: Dict[str, Dict[str, List[str]]]
+) -> List[str]:
+    """«Depends on» / «Referenced by» blocks for one object's page."""
+    entry = deps_index.get(full) or {}
+    out: List[str] = []
+    for title, key in (("Depends on", "out"), ("Referenced by", "in")):
+        lines = entry.get(key) or []
+        if not lines:
+            continue
+        visible, hidden = rank_split(lines, key=lambda r: 0, keep=_DEPS_VISIBLE)
+        out.extend([f"## {title}", ""])
+        out.extend(visible)
+        if hidden:
+            hidden_list = list(hidden)
+            out.append("")
+            out.extend(fold("Remaining", hidden_list, count=len(hidden_list)))
+        out.append("")
     return out
 
 
@@ -2748,6 +3157,7 @@ def _render_table_subpage(
     desc: Dict[str, Any],
     edges: List[Dict[str, Any]],
     triggers: Dict[str, Dict[str, Any]],
+    deps_index: Optional[Dict[str, Dict[str, List[str]]]] = None,
 ) -> str:
     """One table child page: description + structure + evidence blocks."""
     out: List[str] = [f"## `{full}`", ""]
@@ -2785,6 +3195,8 @@ def _render_table_subpage(
         out.extend(["## Relations", ""])
         out.extend(_edge_line(e) for e in touching)
         out.append("")
+    if deps_index:
+        out.extend(_dependency_blocks(full, deps_index))
 
     bare = (meta.get("table") or "").lower()
     table_triggers = [
@@ -2806,6 +3218,17 @@ def _render_table_subpage(
     return "\n".join(out).strip()
 
 
+def _first_sentence(text: str, limit: int = 160) -> str:
+    """Terse root-row description: first sentence, hard char-capped."""
+    for sep in (". ", "! ", "? "):
+        idx = text.find(sep)
+        if idx != -1:
+            text = text[: idx + 1]
+            break
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[: limit - 1] + "…" if len(text) > limit else text
+
+
 def _render_tables_root(
     info: Dict[str, Any],
     descriptions: Dict[str, Dict[str, Any]],
@@ -2822,7 +3245,7 @@ def _render_tables_root(
             if full in table_page_ids else f"- `{full}`"
         )
         if purpose:
-            row += f" — {purpose}"
+            row += f" — {_first_sentence(str(purpose))}"
         rows.append(row)
     visible, hidden = rank_split(rows, key=lambda r: 0, keep=_TABLES_ROOT_VISIBLE)
     out: List[str] = ["## Tables", "", f"{len(tables)} table(s)", ""]
@@ -2858,7 +3281,11 @@ def _render_category_root(
 
 
 def _render_category_subpage(
-    cat: str, full: str, meta: Dict[str, Any], purpose: str
+    cat: str,
+    full: str,
+    meta: Dict[str, Any],
+    purpose: str,
+    deps_index: Optional[Dict[str, Dict[str, List[str]]]] = None,
 ) -> str:
     out: List[str] = [f"## `{full}`", ""]
     if purpose:
@@ -2875,6 +3302,8 @@ def _render_category_subpage(
         for key in sorted(flat_meta):
             out.append(f"| {key} | {str(flat_meta[key])[:300]} |")
         out.append("")
+    if deps_index:
+        out.extend(_dependency_blocks(full, deps_index))
     source = (meta.get("source") or "").strip()
     if source and not source.startswith("ERROR:"):
         out.extend(["## Source", "", "```sql", source, "```", ""])
@@ -2899,7 +3328,21 @@ def _render_page_tree(
     tables: Dict[str, Any] = info.get("tables") or {}
     edges = info.get("fk_edges") or []
     triggers = info.get("triggers") or {}
-    slugger = _Slugger()
+
+    # Dependency adjacency (ALL_DEPENDENCIES): both directions per object.
+    deps_index: Dict[str, Dict[str, List[str]]] = {}
+    for dep in info.get("dependencies") or []:
+        frm, to = dep.get("from"), dep.get("to")
+        if not frm or not to:
+            continue
+        out_line = f"- `{to}`" + (
+            f" ({dep['to_type']})" if dep.get("to_type") not in (None, "?") else ""
+        )
+        in_line = f"- `{frm}`" + (
+            f" ({dep['from_type']})" if dep.get("from_type") not in (None, "?") else ""
+        )
+        deps_index.setdefault(frm, {"out": [], "in": []})["out"].append(out_line)
+        deps_index.setdefault(to, {"out": [], "in": []})["in"].append(in_line)
 
     pages: Dict[str, Any] = {}
     order: List[str] = ["page_overview"]
@@ -2921,12 +3364,12 @@ def _render_page_tree(
         "relatedPages": ["page_tables"],
     }
 
-    # Table subpages: ranked, capped (0 = unlimited); surplus stays as folded
-    # root rows.
-    cap = _subpage_cap()
-    ranked = _ranked_tables(info)
-    subpaged = ranked if cap <= 0 else ranked[:cap]
-    table_page_ids = {full: f"page_tbl_{slugger(full)}" for full in subpaged}
+    # Subpage ids come from _subpage_units — the single source of truth
+    # shared with the deep-unit pipeline and the force_pages filter (cap
+    # semantics + slug sequence stay identical by construction).
+    units = _subpage_units(info)
+    subpaged = [full for cat, full, _pid in units if cat == "tables"]
+    table_page_ids = {full: pid for cat, full, pid in units if cat == "tables"}
     pages["page_tables"] = {
         "id": "page_tables",
         "title": "Tables",
@@ -2943,26 +3386,32 @@ def _render_page_tree(
         if frm in table_page_ids and to in table_page_ids:
             neighbors[frm].add(table_page_ids[to])
             neighbors[to].add(table_page_ids[frm])
-    for full in subpaged:
+    for cat, full, pid in units:
+        if cat != "tables":
+            continue
         meta = tables.get(full) or {}
-        pages[table_page_ids[full]] = {
-            "id": table_page_ids[full],
+        pages[pid] = {
+            "id": pid,
             # Schema-qualified: with hundreds of same-named tables across
             # schemas, a bare "USERS" is ambiguous in the nav and search.
             "title": full,
             "content": _render_table_subpage(
-                full, meta, descriptions.get(full) or {}, edges, triggers
+                full, meta, descriptions.get(full) or {}, edges, triggers,
+                deps_index,
             ),
             "parent": "page_tables",
             "filePaths": [],
             "importance": "medium",
             "relatedPages": sorted(neighbors.get(full) or ()),
         }
-        order.append(table_page_ids[full])
+        order.append(pid)
 
-    # Category roots + children (only with evidence), sharing the same cap
-    # (0 = unlimited: every category object gets its subpage).
-    remaining = None if cap <= 0 else max(0, cap - len(subpaged))
+    # Category roots + children (only with evidence); children ride the same
+    # shared cap through _subpage_units (0 = unlimited).
+    units_by_cat: Dict[str, List[Tuple[str, str]]] = {}
+    for cat, full, pid in units:
+        if cat != "tables":
+            units_by_cat.setdefault(cat, []).append((full, pid))
     for cat in _CATEGORIES:
         entries = info.get(cat) or {}
         if not entries:
@@ -2977,28 +3426,24 @@ def _render_page_tree(
             "relatedPages": ["page_tables"],
         }
         order.append(root_id)
-        if remaining is not None and remaining <= 0:
-            continue
-        children = sorted(entries) if remaining is None else sorted(entries)[:remaining]
-        if remaining is not None:
-            remaining -= len(children)
-        prefix = _CATEGORY_PREFIX[cat]
-        child_ids = {full: f"page_{prefix}_{slugger(full)}" for full in children}
-        for full in children:
-            meta = entries[full] or {}
-            pages[child_ids[full]] = {
-                "id": child_ids[full],
+        for full, pid in units_by_cat.get(cat, []):
+            pages[pid] = {
+                "id": pid,
                 "title": full,  # schema-qualified, same as table subpages
                 "content": _render_category_subpage(
-                    cat, full, meta, (cat_descs.get(cat) or {}).get(full, "")
+                    cat, full, entries[full] or {},
+                    (cat_descs.get(cat) or {}).get(full, ""),
+                    deps_index,
                 ),
                 "parent": root_id,
                 "filePaths": [],
                 "importance": "low",
                 "relatedPages": [],
             }
-            order.append(child_ids[full])
-        pages[root_id]["relatedPages"] = sorted(child_ids.values())
+            order.append(pid)
+        pages[root_id]["relatedPages"] = sorted(
+            pid for _full, pid in units_by_cat.get(cat, [])
+        )
     return pages, order
 
 
@@ -3549,6 +3994,573 @@ async def _infer_relations(
 
 
 # --------------------------------------------------------------------------- #
+# Deep per-entity units (one agent per documented object)
+# --------------------------------------------------------------------------- #
+#: entity_source page size (lines per call).
+_UNIT_SOURCE_PAGE_LINES = 400
+#: Dependency names kept inline in a bundle (full graph via db_lookup).
+_UNIT_DEPS_HEAD = 10
+#: Inline source head inside a bundle (the full source rides entity_source).
+_UNIT_SOURCE_HEAD_CHARS = 800
+
+
+def _subpage_units(info: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+    """``(cat, full, page_id)`` for every rendered subpage, in render order.
+
+    cat is ``"tables"`` for table subpages. Mirrors the cap semantics + slug
+    sequence of :func:`_render_page_tree` (which consumes the same list), so
+    the deep pipeline, the render and the force_pages filter address one
+    id space.
+    """
+    cap = _subpage_cap()
+    slugger = _Slugger()
+    ranked = _ranked_tables(info)
+    subpaged = ranked if cap <= 0 else ranked[:cap]
+    units = [
+        ("tables", full, f"page_tbl_{slugger(full)}") for full in subpaged
+    ]
+    remaining = None if cap <= 0 else max(0, cap - len(subpaged))
+    for cat in _CATEGORIES:
+        entries = info.get(cat) or {}
+        if not entries:
+            continue
+        if remaining is not None and remaining <= 0:
+            continue
+        children = sorted(entries) if remaining is None else sorted(entries)[:remaining]
+        if remaining is not None:
+            remaining -= len(children)
+        prefix = _CATEGORY_PREFIX[cat]
+        units.extend(
+            (cat, full, f"page_{prefix}_{slugger(full)}") for full in children
+        )
+    return units
+
+
+def _unit_dep_lines(
+    info: Dict[str, Any], full: str
+) -> Tuple[List[str], List[str]]:
+    """Raw dependency names: (depends-on, referenced-by)."""
+    out: List[str] = []
+    into: List[str] = []
+    for dep in info.get("dependencies") or []:
+        if dep.get("from") == full and dep.get("to"):
+            out.append(str(dep["to"]))
+        elif dep.get("to") == full and dep.get("from"):
+            into.append(str(dep["from"]))
+    return out, into
+
+
+def _unit_bundle(info: Dict[str, Any], cat: str, full: str) -> str:
+    """Inline evidence bundle for one deep unit (char-capped by the registry)."""
+    meta = (
+        (info.get("tables") or {}).get(full)
+        if cat == "tables" else (info.get(cat) or {}).get(full)
+    ) or {}
+    lines: List[str] = [f"object: {full}"]
+    kind = meta.get("kind") or ("TABLE" if cat == "tables" else cat)
+    lines.append(f"kind: {kind}")
+    if meta.get("comment"):
+        lines.append(f"comment: {meta['comment']}")
+    if isinstance(meta.get("row_count"), int):
+        lines.append(f"row_count: ~{meta['row_count']}")
+    if cat == "tables":
+        columns = meta.get("columns") or []
+        if columns:
+            lines.append("columns:")
+            lines.extend(
+                "- {} ({}){}".format(
+                    c.get("name") or "?", c.get("type") or "?",
+                    f" — {c['comment']}" if c.get("comment") else "",
+                )
+                for c in columns
+            )
+        constraints = meta.get("constraints") or []
+        if constraints:
+            lines.append("constraints:")
+            lines.extend(
+                "- {} {}: {}".format(
+                    c.get("name") or "?", c.get("type") or "?",
+                    ", ".join(x for x in (c.get("columns") or []) if x),
+                )
+                for c in constraints
+            )
+        indexes = meta.get("indexes") or []
+        if indexes:
+            lines.append("indexes:")
+            lines.extend(
+                "- {} ({}){}".format(
+                    i.get("name") or "?",
+                    ", ".join(x for x in (i.get("columns") or []) if x),
+                    " UNIQUE" if i.get("unique") else "",
+                )
+                for i in indexes
+            )
+        edge_lines = _table_edge_lines(full, info.get("fk_edges") or [])
+        if edge_lines:
+            lines.append("foreign keys:")
+            lines.extend(f"- {e}" for e in edge_lines)
+        bare = (meta.get("table") or "").lower()
+        trig = sorted(
+            t for t, tm in (info.get("triggers") or {}).items()
+            if isinstance(tm, dict)
+            and str((tm.get("meta") or {}).get("table") or "").lower()
+            in (bare, full.lower())
+        )
+        if trig:
+            lines.append("triggers: " + ", ".join(f"`{t}`" for t in trig))
+    else:
+        for key in sorted(meta.get("meta") or {}):
+            lines.append(f"{key}: {str(meta['meta'][key])[:200]}")
+    deps_out, deps_in = _unit_dep_lines(info, full)
+    if deps_out:
+        lines.append("depends on: " + ", ".join(deps_out[:_UNIT_DEPS_HEAD]))
+    if deps_in:
+        lines.append("referenced by: " + ", ".join(deps_in[:_UNIT_DEPS_HEAD]))
+    source = meta.get("source_full") or meta.get("source") or (
+        meta.get("definition") if cat == "tables" else ""
+    )
+    if isinstance(source, str) and source.strip() and not source.startswith("ERROR:"):
+        lines.append("source head:")
+        lines.append(_cap(source, _UNIT_SOURCE_HEAD_CHARS))
+    return _cap("\n".join(lines), _unit_bundle_chars())
+
+
+def _unit_sources(info: Dict[str, Any]) -> Dict[str, str]:
+    """full name → full source/definition text available to unit agents."""
+    sources: Dict[str, str] = {}
+    for full, meta in (info.get("tables") or {}).items():
+        d = meta.get("definition") or ""
+        if isinstance(d, str) and d.strip() and not d.startswith("ERROR:"):
+            sources[full] = d
+    for cat in _CATEGORIES:
+        for full, meta in (info.get(cat) or {}).items():
+            s = meta.get("source_full") or meta.get("source") or ""
+            if isinstance(s, str) and s.strip() and not s.startswith("ERROR:"):
+                sources[full] = s
+    return sources
+
+
+def _resolve_unit_object(
+    info: Dict[str, Any], name: str
+) -> Optional[Tuple[str, str]]:
+    """Case-insensitive resolve of an object name → (cat, full)."""
+    tables = info.get("tables") or {}
+    if name in tables:
+        return "tables", name
+    for cat in _CATEGORIES:
+        if name in (info.get(cat) or {}):
+            return cat, name
+    low = name.lower()
+    for cat in ("tables", *_CATEGORIES):
+        for candidate in (info.get(cat) or {}):
+            if candidate.lower() == low or candidate.lower().endswith("." + low):
+                return cat, candidate
+    return None
+
+
+def build_entity_tools(info: Dict[str, Any]) -> List[Any]:
+    """Read-only entity_source / db_lookup tools over the introspected payload."""
+    from langchain_core.tools import tool
+
+    sources = _unit_sources(info)
+    names_head = ", ".join(sorted(sources)[:30])
+
+    @tool
+    def entity_source(full_name: str, from_line: int = 1, to_line: int = 0) -> str:
+        """Read one page of a catalog object's source (SQL/PLSQL), 1-based lines.
+
+        ``full_name`` is a schema-qualified object name from the evidence;
+        one call returns up to 400 consecutive numbered lines. Omit
+        ``to_line`` to read a 400-line window from ``from_line``.
+        """
+        target = (full_name or "").strip()
+        text = sources.get(target)
+        if text is None:
+            resolved = _resolve_unit_object(info, target)
+            text = sources.get(resolved[1]) if resolved else None
+        if text is None:
+            return (
+                f"ERROR: no source available for {full_name!r}. Objects with "
+                f"source: {names_head}"
+            )
+        lines = text.split("\n")
+        lo = max(1, int(from_line))
+        hi = (
+            min(len(lines), lo + _UNIT_SOURCE_PAGE_LINES - 1)
+            if int(to_line) <= 0 else max(lo, min(len(lines), int(to_line)))
+        )
+        window = "\n".join(
+            f"{n}: {lines[n - 1]}" for n in range(lo, hi + 1)
+        )
+        return f"{target}: lines {lo}-{hi} of {len(lines)}\n{window}"
+
+    @tool
+    def db_lookup(full_name: str, what: str = "structure") -> str:
+        """Inspect a neighboring database object from the introspected catalog.
+
+        ``what=structure`` returns the object's evidence bundle (columns,
+        constraints, indexes, metadata, source head); ``what=dependencies``
+        returns what it depends on and what references it.
+        """
+        resolved = _resolve_unit_object(info, (full_name or "").strip())
+        if resolved is None:
+            tables_head = ", ".join(sorted(info.get("tables") or {})[:15])
+            return (
+                f"ERROR: unknown object {full_name!r}. Known tables head: "
+                f"{tables_head}"
+            )
+        cat, name = resolved
+        if (what or "").strip().lower().startswith("dep"):
+            deps_out, deps_in = _unit_dep_lines(info, name)
+            return _cap(
+                f"{name}: depends on: "
+                + (", ".join(deps_out[:40]) or "—")
+                + "; referenced by: "
+                + (", ".join(deps_in[:40]) or "—"),
+                4000,
+            )
+        return _unit_bundle(info, cat, name)
+
+    return [entity_source, db_lookup]
+
+
+_DATABASE_ENTITY_FALLBACK = (
+    "You are a database documentation agent. Document exactly ONE object: "
+    "`{entity_name}` ({entity_kind}) of the database `{database_name}`.\n\n"
+    "<bundle>\n{bundle}\n</bundle>\n\n"
+    "<product_context>\n{product_context}\n</product_context>\n\n"
+    "Tools: `entity_source` reads this object's full source page by page; "
+    "`db_lookup` inspects neighboring objects (structure, dependencies). "
+    "Verify facts with the tools before writing them.\n\n"
+    "Output contract — your FINAL message:\n"
+    "1. One short paragraph (1-3 sentences): the object's business purpose.\n"
+    "2. Optionally a `## Notes` section: usage patterns, caveats, lifecycle, "
+    "relations to other objects — facts from the bundle/tools only.\n"
+    "Do NOT restate column lists, constraints, indexes or DDL — the page "
+    "renders them automatically. Do not invent identifiers; mark assumptions "
+    "explicitly. Write in {language_name} (technical terms in English)."
+)
+
+
+def build_database_entity_prompt(
+    *,
+    database_name: str,
+    entity_name: str,
+    entity_kind: str,
+    bundle: str,
+    product_context: str = "",
+    language: str = "ru",
+) -> str:
+    """Build one deep unit's agent system prompt."""
+    template = load_prompt_file(
+        "database_entity.md", _DATABASE_ENTITY_FALLBACK, language=language
+    )
+    for var, value in (
+        ("database_name", database_name),
+        ("entity_name", entity_name),
+        ("entity_kind", entity_kind),
+        ("bundle", bundle or "(unavailable)"),
+        ("product_context", product_context or "(no product context available)"),
+        ("language_name", LANGUAGE_NAMES.get(language, language)),
+    ):
+        template = template.replace("{" + var + "}", str(value))
+    return template
+
+
+def _final_agent_text(result: Any) -> str:
+    """Extract the final AIMessage text from a deepagents invoke result.
+
+    Local copy of the codebase-flow helper: ``codebase`` imports THIS module
+    (``product_database_context``), so importing from there would cycle.
+    """
+    messages = getattr(result, "messages", None) or (
+        result.get("messages") if isinstance(result, dict) else None
+    ) or []
+    for message in reversed(list(messages)):
+        if getattr(message, "type", "") != "ai":
+            continue
+        content = getattr(message, "content", "")
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+            content = "".join(parts)
+        if isinstance(content, str) and content.strip():
+            return content
+    return ""
+
+
+def _entity_fingerprint(
+    info: Dict[str, Any],
+    cat: str,
+    full: str,
+    *,
+    model: str,
+    language: str,
+    prompt_template: str,
+) -> str:
+    """Stable per-entity fingerprint: a match reuses the stored page (no LLM)."""
+    meta = (
+        (info.get("tables") or {}).get(full)
+        if cat == "tables" else (info.get(cat) or {}).get(full)
+    ) or {}
+    touching = [
+        {k: e.get(k) for k in ("from", "to", "from_cols", "to_cols", "kind")}
+        for e in (info.get("fk_edges") or [])
+        if e.get("from") == full or e.get("to") == full
+    ]
+    deps_out, deps_in = _unit_dep_lines(info, full)
+    bare = (meta.get("table") or "").lower()
+    trig = sorted(
+        t for t, tm in (info.get("triggers") or {}).items()
+        if isinstance(tm, dict)
+        and str((tm.get("meta") or {}).get("table") or "").lower()
+        in (bare, full.lower())
+    )
+    payload = {
+        "entity": {
+            k: meta.get(k) for k in (
+                "kind", "comment", "row_count", "columns", "constraints",
+                "source", "definition", "meta",
+            )
+        },
+        "edges": touching,
+        "deps": [deps_out, deps_in],
+        "triggers": trig,
+        "model": model,
+        "language": language,
+        "prompt": hashlib.sha256(
+            prompt_template.encode("utf-8")
+        ).hexdigest()[:10],
+    }
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _split_entity_text(text: str) -> Tuple[str, str]:
+    """Split a unit document into (purpose paragraph, notes body)."""
+    m = re.search(r"^##\s+Notes\s*$", text, re.MULTILINE)
+    if m:
+        return text[:m.start()].strip(), text[m.end():].strip()
+    head, sep, rest = text.partition("\n\n")
+    return head.strip(), rest.strip() if sep else ""
+
+
+async def _run_deep_units(
+    info: Dict[str, Any],
+    *,
+    database_name: str,
+    product_id: Any,
+    model: Optional[str],
+    base_url: Optional[str],
+    api_key: Optional[str],
+    language: str,
+    product_context: str,
+    old_pages: Dict[str, Any],
+    force_pages: Optional[List[str]],
+    progress: Optional[Any] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> Optional[Dict[str, Any]]:
+    """One deep agent per documented object (python-parallel, bounded).
+
+    Returns ``None`` when the path is unavailable (imports/model build). Per
+    unit failures never raise — they land in ``failed``; a majority of
+    failures flips ``fallback`` so the caller runs the batch enrichment.
+    Fingerprint-matching stored pages are reused wholesale (no LLM call).
+    """
+    try:
+        from deepagents import create_deep_agent
+
+        from api.config.timeout import (
+            resolve_docgen_llm_concurrency,
+            resolve_docgen_unit_recursion_limit,
+        )
+        from api.llm.client import build_chat_model
+    except Exception as e:  # pragma: no cover - import guard
+        logger.warning("database deep units unavailable (%s); batch path.", e)
+        return None
+    units = _subpage_units(info)
+    if force_pages:
+        wanted = set(force_pages)
+        units = [u for u in units if u[2] in wanted]
+    if not units:
+        return None
+    try:
+        chat = build_chat_model(
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            llm_concurrency=resolve_docgen_llm_concurrency(),
+        )
+    except Exception as e:
+        logger.warning("database deep units: chat model unavailable (%s).", e)
+        return None
+
+    mcp_tools: List[Any] = []
+    if _entity_mcp_enabled() and product_id:
+        try:
+            from api.mcp.manager import gather_mcp_agent_tools
+
+            mcp_tools = await gather_mcp_agent_tools(str(product_id))
+        except Exception as e:  # pragma: no cover - gather is never-fatal
+            logger.warning("deep units: MCP tools unavailable (%s).", e)
+    entity_tools = build_entity_tools(info)
+
+    template = load_prompt_file(
+        "database_entity.md", _DATABASE_ENTITY_FALLBACK, language=language
+    )
+
+    texts: Dict[str, str] = {}
+    fingerprints: Dict[str, str] = {}
+    failed: Dict[str, str] = {}
+    reused: List[str] = []
+    runnable: List[Tuple[str, str, str]] = []
+    forced = set(force_pages or ())
+    for cat, full, pid in units:
+        fp = _entity_fingerprint(
+            info, cat, full, model=model or "", language=language,
+            prompt_template=template,
+        )
+        fingerprints[pid] = fp
+        old_fp = ((old_pages.get(pid) or {}).get("provenance") or {}).get(
+            "entity_fingerprint"
+        )
+        if old_fp == fp and pid not in forced:
+            reused.append(pid)
+            continue
+        runnable.append((cat, full, pid))
+
+    total = len(units)
+    done = 0
+    emit_progress(
+        progress, phase="sections", current_section="deep-units",
+        sections_total=total, sections_done=len(reused),
+    )
+    semaphore = asyncio.Semaphore(resolve_docgen_llm_concurrency())
+
+    async def _one(cat: str, full: str, pid: str) -> None:
+        nonlocal done
+        async with semaphore:
+            _check_cancel(should_cancel)
+            meta = (
+                (info.get("tables") or {}).get(full)
+                if cat == "tables" else (info.get(cat) or {}).get(full)
+            ) or {}
+            system_prompt = build_database_entity_prompt(
+                database_name=database_name,
+                entity_name=full,
+                entity_kind=str(meta.get("kind") or cat),
+                bundle=_unit_bundle(info, cat, full),
+                product_context=product_context,
+                language=language,
+            )
+            agent = create_deep_agent(
+                model=chat,
+                tools=[*entity_tools, *mcp_tools],
+                system_prompt=system_prompt,
+            )
+            try:
+                result = await agent.ainvoke(
+                    {"messages": [("user", f"Write the documentation page for `{full}` now.")]},
+                    config={"recursion_limit": resolve_docgen_unit_recursion_limit()},
+                )
+                text = _clean_llm_text(_final_agent_text(result))
+            except JobCancelledError:
+                raise
+            except Exception as e:
+                failed[pid] = f"{type(e).__name__}: {e}".split("\n")[0][:200]
+                text = ""
+            if len(text) >= 40:
+                texts[pid] = text
+            else:
+                failed[pid] = failed.get(pid) or "agent returned no usable text"
+        done += 1
+        emit_progress(
+            progress, phase="sections", current_section="deep-units",
+            sections_total=total, sections_done=len(reused) + done,
+        )
+
+    results = await asyncio.gather(
+        *(_one(*unit) for unit in runnable), return_exceptions=True,
+    )
+    cancelled = next(
+        (r for r in results if isinstance(r, JobCancelledError)), None
+    )
+    if cancelled is not None:
+        raise cancelled
+    for item in results:
+        if isinstance(item, BaseException):
+            logger.warning("database deep unit agent failed: %s", item)
+    out = {
+        "texts": texts,
+        "fingerprints": fingerprints,
+        "failed": failed,
+        "reused": reused,
+        "total": total,
+        "fallback": len(failed) > total // 2,
+    }
+    logger.info(
+        "database deep units: %d unit(s): %d documented, %d reused, "
+        "%d failed%s",
+        total, len(texts), len(reused), len(failed),
+        " (fallback to batch enrichment)" if out["fallback"] else "",
+    )
+    return out
+
+
+def _coverage_section(
+    info: Dict[str, Any],
+    deep_result: Optional[Dict[str, Any]],
+    descriptions: Dict[str, Dict[str, Any]],
+    cat_descs: Dict[str, Dict[str, str]],
+) -> str:
+    """Honest per-category coverage report appended to the overview."""
+    mode = (
+        "deep units" if deep_result is not None else "batch"
+    ) + (
+        " (fallback: batch)" if deep_result and deep_result.get("fallback") else ""
+    )
+    lines = [
+        "## Coverage", "",
+        "| category | found | documented | mode |",
+        "| --- | --- | --- | --- |",
+    ]
+    rows = [("tables", len(info.get("tables") or {}), len(descriptions))]
+    rows.extend(
+        (cat, len(info.get(cat) or {}), len(cat_descs.get(cat) or {}))
+        for cat in _CATEGORIES
+    )
+    for cat, found, done_count in rows:
+        if found:
+            lines.append(f"| {cat} | {found} | {done_count} | {mode} |")
+    if deep_result:
+        lines.append("")
+        lines.append(
+            "deep units: {total} total, {done} documented, {reused} reused, "
+            "{failed} failed".format(
+                total=deep_result["total"],
+                done=len(deep_result["texts"]),
+                reused=len(deep_result["reused"]),
+                failed=len(deep_result["failed"]),
+            )
+        )
+        failures = deep_result.get("failed") or {}
+        for pid, reason in list(failures.items())[:10]:
+            lines.append(f"- `{pid}`: {reason}")
+    unavailable = info.get("unavailable") or []
+    if unavailable:
+        lines.extend([
+            "",
+            "unavailable queries/tools: "
+            + ", ".join(f"`{u}`" for u in unavailable[:10]),
+        ])
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
 # Provenance helpers
 # --------------------------------------------------------------------------- #
 def _schema_fingerprint(info: Dict[str, Any]) -> str:
@@ -3653,15 +4665,16 @@ async def generate_database_docs(
             current_section="introspection",
         )
         t_introspect = time.monotonic()
+        walk_budget = _introspection_timeout()
         try:
             info = await asyncio.wait_for(
                 _introspect(roles, engine=_detect_engine(entity, tools)),
-                timeout=INTROSPECTION_TIMEOUT_SECONDS,
+                timeout=walk_budget,
             )
         except asyncio.TimeoutError:
             raise ValueError(
                 "Database introspection exceeded the overall time budget of "
-                f"{int(INTROSPECTION_TIMEOUT_SECONDS)}s; the MCP surface is too "
+                f"{int(walk_budget)}s; the MCP surface is too "
                 "slow — pin a faster server or narrow the scope and retry."
             )
         emit_progress(
@@ -3715,7 +4728,42 @@ async def generate_database_docs(
     enrich_source = "standard-llm" if llm_overview else "skeleton"
     descriptions: Dict[str, Dict[str, Any]] = {}
     cat_descs: Dict[str, Dict[str, str]] = {}
-    if llm_overview:
+    deep_result: Optional[Dict[str, Any]] = None
+    run_deep = _deep_units_enabled() and llm_overview
+    if run_deep:
+        # One deep agent per documented object replaces the description
+        # batches; per-unit failures degrade honestly (Coverage section),
+        # a majority failure falls back to the batch path below.
+        deep_result = await _run_deep_units(
+            info,
+            database_name=name,
+            product_id=product_id,
+            model=model,
+            base_url=r_base_url,
+            api_key=r_api_key,
+            language=language,
+            product_context=product_context,
+            old_pages=old_pages,
+            force_pages=force_pages,
+            progress=progress,
+            should_cancel=should_cancel,
+        )
+    if deep_result and not deep_result["fallback"]:
+        for cat, full, pid in _subpage_units(info):
+            text = deep_result["texts"].get(pid)
+            if not text:
+                continue
+            purpose, notes = _split_entity_text(text)
+            if cat == "tables":
+                entry = {"purpose": purpose}
+                if notes:
+                    entry["notes"] = notes
+                descriptions[full] = entry
+            else:
+                cat_descs.setdefault(cat, {})[full] = (
+                    purpose + (f"\n\n{notes}" if notes else "")
+                )
+    if llm_overview and (deep_result is None or deep_result["fallback"]):
         # The overview worked — the batches are worth their tokens. A dead
         # LLM after a good overview simply leaves the deterministic render.
         try:
@@ -3742,6 +4790,7 @@ async def generate_database_docs(
             )
         except Exception as e:  # pragma: no cover - enrichment is never fatal
             logger.warning("database docgen: category enrichment failed: %s", e)
+    if llm_overview:
         try:
             inferred = await _infer_relations(
                 info,
@@ -3768,6 +4817,14 @@ async def generate_database_docs(
         entity, info,
         {"overview": llm_overview, "tables": descriptions, "categories": cat_descs},
     )
+    if deep_result:
+        # Fingerprint-matching units keep their stored page wholesale — same
+        # evidence + same prompt ⇒ the same page; no LLM tokens spent. Their
+        # stored provenance (and verify flags) stay intact.
+        for pid in deep_result.get("reused") or []:
+            old = old_pages.get(pid)
+            if old:
+                pages[pid] = old
 
     # 6) Guard: mermaid repair → secret masking → corroborate → judge.
     emit_progress(progress, phase="verifying")
@@ -3834,6 +4891,14 @@ async def generate_database_docs(
         except Exception as e:  # pragma: no cover - guard must never break gen
             logger.warning("Database corroborate filter failed: %s", e)
 
+    # Coverage transparency: per-category found/documented/mode, deep-unit
+    # outcome and every unavailable query ride on the overview — no blind
+    # spots presented as complete documentation.
+    pages["page_overview"]["content"] = (
+        (pages["page_overview"]["content"] or "").rstrip()
+        + "\n\n" + _coverage_section(info, deep_result, descriptions, cat_descs)
+    )
+
     judge_verdict = None
     if judge_enabled() and llm_overview:
         try:
@@ -3860,16 +4925,28 @@ async def generate_database_docs(
         "fk_evidence_tables": _fk_evidence_tables(),
         "source_objects": _source_objects(),
     }
+    if deep_result:
+        caps["deep_units"] = {
+            "total": deep_result["total"],
+            "done": len(deep_result["texts"]),
+            "reused": len(deep_result["reused"]),
+            "failed": len(deep_result["failed"]),
+        }
+    reused_pages = set((deep_result or {}).get("reused") or [])
+    deep_text_pages = set((deep_result or {}).get("texts") or {})
     prompt_file_by_root: Dict[str, str] = {
         "page_overview": "database_doc.md",
         "page_tables": "database_tables.md",
         **{f"page_{cat}": "database_categories.md" for cat in _CATEGORIES},
     }
     for page_id in order:
+        if page_id in reused_pages:
+            continue  # wholesale reuse keeps the stored page + provenance
         page = pages[page_id]
         is_child = bool(page.get("parent"))
         prompt_file = (
-            "introspection" if is_child
+            "database_entity.md" if page_id in deep_text_pages
+            else "introspection" if is_child
             else prompt_file_by_root.get(page_id, "introspection")
         )
         if page_id == "page_overview":
@@ -3886,6 +4963,7 @@ async def generate_database_docs(
             regen = "skeleton"
         generator = enrich_source if page_id == "page_overview" else (
             "standard-llm" if page_id == "page_tables" and descriptions
+            else "deep-units" if page_id in deep_text_pages
             else "introspection"
         )
         prov = build_section_provenance(
@@ -3903,6 +4981,8 @@ async def generate_database_docs(
             ) if page_id == "page_overview" else None,
         )
         prov["generator"] = generator
+        if deep_result and page_id in (deep_result.get("fingerprints") or {}):
+            prov["entity_fingerprint"] = deep_result["fingerprints"][page_id]
         prov["tools_used"] = dict(info.get("tools_used") or {})
         prov["schema_fingerprint"] = fingerprint
         prov["schema_fingerprint_source"] = "mcp_introspection"

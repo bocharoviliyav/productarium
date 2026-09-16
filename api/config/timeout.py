@@ -381,6 +381,57 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         unit="objects",
         group="Databases",
     ),
+    # Full-coverage Oracle walks: night-scale budgets. The walk is bounded by
+    # BOTH knobs; a "сутки"-long run is legitimate, so the defaults dwarf the
+    # old constants (2000 calls / 1800s) while the floors keep a typo from
+    # disabling the guards entirely.
+    TimeoutKey(
+        key="db_max_tool_calls",
+        env_var="DB_MAX_TOOL_CALLS",
+        default=20000.0,
+        floor=500.0,
+        label="Database RE: max MCP tool calls per walk",
+        unit="calls",
+        group="Databases",
+    ),
+    TimeoutKey(
+        key="db_introspection_timeout",
+        env_var="DB_INTROSPECTION_TIMEOUT_SECONDS",
+        default=21600.0,
+        floor=300.0,
+        label="Database RE: introspection walk wall-clock budget",
+        unit="seconds",
+        group="Databases",
+    ),
+    # Deep per-entity documentation units (one agent subagent per table / view
+    # / job / …). 0/1 toggles read through ``resolve_timeout_bool``.
+    TimeoutKey(
+        key="db_deep_units_enabled",
+        env_var="DB_DEEP_UNITS_ENABLED",
+        default=1.0,
+        floor=0.0,
+        label="Database docgen: per-entity deep units",
+        unit="0/1",
+        group="Databases",
+    ),
+    TimeoutKey(
+        key="db_entity_mcp_enabled",
+        env_var="DB_ENTITY_MCP_ENABLED",
+        default=1.0,
+        floor=0.0,
+        label="Database deep units: MCP enrichment tools",
+        unit="0/1",
+        group="Databases",
+    ),
+    TimeoutKey(
+        key="db_unit_bundle_chars",
+        env_var="DB_UNIT_BUNDLE_CHARS",
+        default=8000.0,
+        floor=1000.0,
+        label="Database deep units: context bundle cap",
+        unit="chars",
+        group="Databases",
+    ),
 ]
 
 # Fast lookup by key + by env var.
@@ -767,6 +818,39 @@ def resolve_db_source_objects() -> int:
     return resolve_timeout_int("db_source_objects")
 
 
+def resolve_db_max_tool_calls() -> int:
+    """Hard cap on MCP tool calls during one database RE walk.
+
+    Walk-affecting budget: participates in the introspection cache key.
+    Night-scale default (20000) for full-coverage Oracle monoliths.
+    """
+    return resolve_timeout_int("db_max_tool_calls")
+
+
+def resolve_db_introspection_timeout() -> float:
+    """Wall-clock budget for one database introspection walk (seconds).
+
+    Replaces the module constant in ``api.docgen.database``; 6h default so a
+    full ALL_* walk of an enterprise Oracle fits a single night run.
+    """
+    return resolve_timeout("db_introspection_timeout")
+
+
+def resolve_db_deep_units_enabled() -> bool:
+    """Per-entity deep documentation units (agent subagent per entity)."""
+    return resolve_timeout_bool("db_deep_units_enabled")
+
+
+def resolve_db_entity_mcp_enabled() -> bool:
+    """MCP enrichment tools for the database deep-unit agents."""
+    return resolve_timeout_bool("db_entity_mcp_enabled")
+
+
+def resolve_db_unit_bundle_chars() -> int:
+    """Char cap of one deep unit's inline context bundle."""
+    return resolve_timeout_int("db_unit_bundle_chars")
+
+
 def sync_timeout_env() -> None:
     """Export admin-store timeout overrides to their canonical env vars.
 
@@ -852,6 +936,11 @@ __all__ = [
     "resolve_db_docgen_max_descriptions",
     "resolve_db_fk_evidence_tables",
     "resolve_db_source_objects",
+    "resolve_db_max_tool_calls",
+    "resolve_db_introspection_timeout",
+    "resolve_db_deep_units_enabled",
+    "resolve_db_entity_mcp_enabled",
+    "resolve_db_unit_bundle_chars",
     "sync_timeout_env",
     "get_timeout_resolved_view",
 ]

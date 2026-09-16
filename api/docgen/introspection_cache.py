@@ -45,6 +45,12 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 #: Payload format version — a bump invalidates every stored entry.
+#: v5: full-catalog Oracle walk — new pack categories (packages, jobs,
+#: programs), per-type source split (routines = FUNCTION/PROCEDURE only),
+#: trigger sources, type bodies, matview metadata (LONG-free), PK/UNIQUE/CHECK
+#: constraints merged into table meta, ALL_DEPENDENCIES graph, per-column
+#: comments and ``source_full`` overhangs for the deep units — v4 payloads
+#: lack these fields and must not be replayed.
 #: v4: the walk is multi-schema for Oracle (ALL_* bulk walk via the sql
 #: tool, quoted-alias catalog queries), filters PostgreSQL system schemas
 #: (pg_*/information_schema) and extension-owned objects (pg_depend
@@ -61,7 +67,7 @@ logger = logging.getLogger(__name__)
 #: ``_parse_names``/``_render_search_full`` drill into inner result
 #: collections — v1 payloads may hold envelope-shredded garbage and must not
 #: be replayed.
-CACHE_FORMAT_VERSION = 3
+CACHE_FORMAT_VERSION = 5
 
 _CACHE_DIR_NAME = "introspection_cache"
 #: Default TTL: long enough to cover reruns/repairs of a multi-hour job,

@@ -23,6 +23,12 @@ Covers (post-restructure contract: root pages + per-entity subpages):
 - ``_introspect`` (schemas → tables → structure → categories → SQL pack;
   oracle cross-schema bulk walk, PG system-schema filtering,
   pack-authoritative category replacement).
+- Oracle full-catalog pack (constraints, column comments, dependencies,
+  triggers+sources, matviews, types+bodies, packages, jobs, programs) and
+  the ok-empty vs server-error unavailable semantics.
+- Render extras: structure-table comment column, dependency blocks.
+- Deep per-entity units (bundle/tools/agent pipeline/fingerprints/coverage)
+  and their integration into ``generate_database_docs``.
 - ``_tools_for_pinned_server`` (binding/allowlist/unreachable rules).
 - ``generate_database_docs`` (happy path, skeleton fallback, masking,
   corroborate, judge, provenance + indexing, honest ValueErrors).
@@ -339,7 +345,7 @@ class TestMaskDsn:
 # ============================================================================
 class TestIntrospectionBudgets:
     def test_tool_call_cap_zero_fails_honestly(self, monkeypatch):
-        monkeypatch.setattr(db_doc_mod, "MAX_TOOL_CALLS", 0)
+        monkeypatch.setattr(db_doc_mod, "_max_tool_calls", lambda: 0)
         tools = [
             FakeTool("list_schemas", {}, '["public"]'),
             FakeTool(
@@ -354,7 +360,7 @@ class TestIntrospectionBudgets:
     def test_tool_call_cap_exhausted_mid_walk(self, monkeypatch):
         # Budget for the listing + ONE describe: the walk still completes;
         # the starved definition is the budget ERROR, not a real call.
-        monkeypatch.setattr(db_doc_mod, "MAX_TOOL_CALLS", 2)
+        monkeypatch.setattr(db_doc_mod, "_max_tool_calls", lambda: 2)
         tools = [
             FakeTool(
                 "list_tables", {},
@@ -373,7 +379,7 @@ class TestIntrospectionBudgets:
     def test_introspection_deadline_honest_failure(self, monkeypatch):
         # A slow MCP surface cannot occupy a docgen worker indefinitely:
         # the overall deadline turns into an honest FAILED job (ValueError).
-        monkeypatch.setattr(db_doc_mod, "INTROSPECTION_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(db_doc_mod, "_introspection_timeout", lambda: 0.05)
         tools = [
             FakeTool(
                 "list_tables", {"schema": {}},
@@ -1611,7 +1617,11 @@ class TestOracleBulkWalk:
                 return self._envelope(
                     "| table_name | comments |\n| --- | --- |\n| USERS | Tenant users |"
                 )
-            return "ERROR: unsupported query in test"
+            # Unknown pack queries answer ok-empty: those categories
+            # genuinely hold no user objects (authoritative-zero semantics).
+            return self._envelope(
+                "Query executed successfully, but returned no rows."
+            )
 
         return FakeTool("run_sql_query", {"sql": {}, "max_rows": {}}, responder)
 
@@ -1866,7 +1876,9 @@ class TestOracleBulkWalk:
         )
         info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
         assert set(info["views"]) == {"V1"}  # adapter listing survived
-        assert "sql:views" not in info["unavailable"]
+        # The failed pack query is reported: a visible gap, never a silent
+        # "documented everything" lie.
+        assert info["unavailable"] == ["sql:views"]
 
 
 # ============================================================================
@@ -1946,10 +1958,246 @@ class TestPackReplace:
         # category keeps no adapter noise and gains no unavailable marker.
         assert info["triggers"] == {}
         assert "routines" not in info["unavailable"]
-        # Non-category pack collections report emptiness explicitly.
-        assert info["unavailable"] == [
-            "sql:fk_edges", "sql:indexes", "sql:matviews",
+        # Aux pack answers (fk_edges/indexes/matviews) are evidence merges,
+        # not categories: an ok-empty there is a valid "none exist", silent.
+        assert info["unavailable"] == []
+
+
+# ============================================================================
+# Oracle full-catalog pack (v5: every ALL_* category in one walk)
+# ============================================================================
+class TestOracleFullCatalogPack:
+    """One ``run_sql_query`` surface, every catalog query answered with
+    paging-aware envelopes — asserts the full-coverage wiring end to end."""
+
+    _OK_EMPTY = "Query executed successfully, but returned no rows."
+
+    def _envelope(self, text):
+        return TestOracleBulkWalk._envelope(text)
+
+    def _page(self, q, header, rows):
+        lo = int(re.search(r'"rnum" > (\d+)', q).group(1))
+        hi = int(re.search(r"ROWNUM <= (\d+)", q).group(1))
+        chunk = rows[lo:hi]
+        if not chunk:
+            return self._envelope(self._OK_EMPTY)
+        return self._envelope(header + "\n".join(chunk))
+
+    def _make_sql(self, *, jobs_response=None, routine_rows=None):
+        routine_rows = routine_rows if routine_rows is not None else [
+            "| APP | CALC_TOTAL | FUNCTION | CREATE FUNCTION CALC_TOTAL ... |",
+            "| APP | DO_SYNC | PROCEDURE | CREATE PROCEDURE DO_SYNC ... |",
         ]
+
+        def responder(a):
+            q = str(a.get("sql") or "")
+            if "GROUP BY owner" in q:
+                return self._page(q, "| owner |\n| --- |\n", ["| APP |"])
+            if "all_tab_columns" in q:
+                return self._page(q, (
+                    "| table_schema | table_name | column_id | column_name"
+                    " | data_type | nullable | num_rows |"
+                    "\n| --- | --- | --- | --- | --- | --- | --- |\n"
+                ), [
+                    "| APP | ORDERS | 1 | ID | NUMBER | N | 42 |",
+                    "| APP | ORDERS | 2 | NOTE | VARCHAR2 | Y | 42 |",
+                ])
+            if "all_tab_comments" in q:
+                return self._page(
+                    q, "| table_name | comments |\n| --- | --- |\n",
+                    ["| ORDERS | Customer orders |"],
+                )
+            if "all_col_comments" in q:
+                return self._page(
+                    q,
+                    "| table_name | column_name | comments |\n| --- | --- | --- |\n",
+                    ["| ORDERS | NOTE | Free-form note |"],
+                )
+            if "constraint_type = 'R'" in q:
+                return self._envelope(self._OK_EMPTY)
+            if "all_constraints" in q:
+                return self._page(q, (
+                    "| table_schema | table_name | constraint_name"
+                    " | constraint_type | column_name | position |"
+                    "\n| --- | --- | --- | --- | --- | --- |\n"
+                ), [
+                    "| APP | ORDERS | ORD_PK | P | ID | 1 |",
+                    "| APP | ORDERS | ORD_NOTE_UK | U | NOTE | 1 |",
+                    "| APP | ORDERS | ORD_NOTE_CK | C | NOTE | 1 |",
+                ])
+            if "all_indexes" in q:
+                return self._envelope(self._OK_EMPTY)
+            if "all_dependencies" in q:
+                return self._page(q, (
+                    "| owner | name | type | ref_owner | ref_name | ref_type |"
+                    "\n| --- | --- | --- | --- | --- | --- |\n"
+                ), [
+                    "| APP | V_ORDERS | VIEW | APP | ORDERS | TABLE |",
+                    "| APP | V_ORDERS | VIEW | SYS | STANDARD | PACKAGE |",
+                    "| APP | ORDERS | TABLE | APP | ORDERS | TABLE |",
+                    "| APP | V_ORDERS | VIEW | APP | ORDERS | TABLE |",
+                    "| APP | PKG_ORDERS | PACKAGE BODY | APP | ORDERS | TABLE |",
+                ])
+            if "all_triggers" in q:
+                return self._page(q, (
+                    "| schema_name | trigger_name | table_name"
+                    " | triggering_event | trigger_type | enabled | description |"
+                    "\n| --- | --- | --- | --- | --- | --- | --- |\n"
+                ), [
+                    "| APP | ORD_TRG | ORDERS | INSERT | BEFORE EACH ROW"
+                    " | ENABLED | act on ORD_TRG |",
+                    "| APP | SKIP_TRG | ORDERS | UPDATE | - | ENABLED | - |",
+                ])
+            if "type = 'TRIGGER'" in q:
+                return self._page(
+                    q,
+                    "| schema_name | trigger_name | line_text |\n| --- | --- | --- |\n",
+                    [
+                        "| APP | ORD_TRG | BEGIN |",
+                        "| APP | ORD_TRG | END; |",
+                        "| APP | ORPHAN_TRG | BEGIN NULL; END; |",
+                    ],
+                )
+            if "all_mviews" in q:
+                return self._page(q, (
+                    "| schema_name | view_name | refresh_mode | refresh_method"
+                    " | build_mode | last_refresh | updatable |"
+                    "\n| --- | --- | --- | --- | --- | --- | --- |\n"
+                ), ["| APP | MV_STATS | DEMAND | FORCE | COMPLETE | 2026-01-01 | Y |"])
+            if "all_views" in q:
+                return self._page(
+                    q, "| schema_name | name |\n| --- | --- |\n",
+                    ["| APP | V_ORDERS |"],
+                )
+            if "all_types" in q:
+                return self._page(
+                    q, "| schema_name | type_name | typecode |\n| --- | --- | --- |\n",
+                    ["| APP | ADDRESS_T | OBJECT |"],
+                )
+            if "'TYPE', 'TYPE BODY'" in q:
+                return self._page(
+                    q,
+                    "| schema_name | type_name | object_type | line_text |"
+                    "\n| --- | --- | --- | --- |\n",
+                    [
+                        "| APP | ADDRESS_T | TYPE | CREATE TYPE ADDRESS_T AS OBJECT |",
+                        "| APP | SECRET_T | TYPE BODY | CREATE TYPE BODY SECRET_T |",
+                    ],
+                )
+            if "'FUNCTION', 'PROCEDURE'" in q:
+                return self._page(
+                    q,
+                    "| schema_name | object_name | object_type | line_text |"
+                    "\n| --- | --- | --- | --- |\n",
+                    routine_rows,
+                )
+            if "'PACKAGE', 'PACKAGE BODY'" in q:
+                return self._page(
+                    q,
+                    "| schema_name | object_name | object_type | line_text |"
+                    "\n| --- | --- | --- | --- |\n",
+                    [
+                        "| APP | PKG_ORDERS | PACKAGE | SPEC |",
+                        "| APP | PKG_ORDERS | PACKAGE BODY | BODY |",
+                    ],
+                )
+            if "all_scheduler_jobs" in q:
+                if jobs_response is not None:
+                    return jobs_response
+                return self._page(q, (
+                    "| schema_name | job_name | job_type | job_action | state"
+                    " | enabled | repeat_interval | schedule_type | last_start |"
+                    "\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
+                ), [
+                    "| APP | NIGHTLY_JOB | STORED_PROCEDURE | DO_SYNC; | SUCCEEDED"
+                    " | TRUE | FREQ=DAILY | CALENDAR | 2026-01-01 |",
+                ])
+            if "all_scheduler_programs" in q:
+                return self._page(q, (
+                    "| schema_name | program_name | program_type | program_action"
+                    " | enabled | arguments |"
+                    "\n| --- | --- | --- | --- | --- | --- |\n"
+                ), ["| APP | SYNC_PROG | STORED_PROCEDURE | DO_SYNC | TRUE | 0 |"])
+            return self._envelope(self._OK_EMPTY)
+
+        return FakeTool("run_sql_query", {"sql": {}, "max_rows": {}}, responder)
+
+    def test_full_catalog_pack_covers_every_category(self):
+        sql = self._make_sql()
+        roles = db_doc_mod._classify_introspection_tools([sql])
+        info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
+
+        assert info["schemas"] == ["APP"]
+        orders = info["tables"]["APP.ORDERS"]
+        # Column comments from ALL_COL_COMMENTS merged onto the column dicts.
+        assert orders["columns"][1]["comment"] == "Free-form note"
+        # P/U/C constraints grouped in catalog order with readable types.
+        assert orders["constraints"] == [
+            {"name": "ORD_PK", "type": "PRIMARY KEY", "columns": ["ID"]},
+            {"name": "ORD_NOTE_UK", "type": "UNIQUE", "columns": ["NOTE"]},
+            {"name": "ORD_NOTE_CK", "type": "CHECK", "columns": ["NOTE"]},
+        ]
+        # System/self/duplicate dependencies dropped; user deps kept in order.
+        assert info["dependencies"] == [
+            {"from": "APP.V_ORDERS", "from_type": "VIEW",
+             "to": "APP.ORDERS", "to_type": "TABLE"},
+            {"from": "APP.PKG_ORDERS", "from_type": "PACKAGE BODY",
+             "to": "APP.ORDERS", "to_type": "TABLE"},
+        ]
+        # Trigger meta listing + line-joined sources + orphan source rows.
+        assert set(info["triggers"]) == {
+            "APP.ORD_TRG", "APP.SKIP_TRG", "APP.ORPHAN_TRG",
+        }
+        assert info["triggers"]["APP.ORD_TRG"]["source"].strip() == "BEGIN\nEND;"
+        assert info["triggers"]["APP.ORD_TRG"]["meta"]["description"] == "act on ORD_TRG"
+        assert "description" not in info["triggers"]["APP.SKIP_TRG"]["meta"]
+        assert info["triggers"]["APP.ORPHAN_TRG"]["source"]
+        # Views stay names-only; matviews join as kind MATERIALIZED VIEW + meta.
+        assert info["views"]["APP.V_ORDERS"].get("kind") == "VIEW"
+        assert "source" not in info["views"]["APP.V_ORDERS"]
+        assert info["views"]["APP.MV_STATS"]["kind"] == "MATERIALIZED VIEW"
+        assert info["views"]["APP.MV_STATS"]["meta"]["refresh_mode"] == "DEMAND"
+        # Types from ALL_TYPES + body-only types created from ALL_SOURCE.
+        assert info["types"]["APP.ADDRESS_T"]["source"].startswith("CREATE TYPE")
+        assert info["types"]["APP.SECRET_T"]["source"].startswith("CREATE TYPE BODY")
+        # Routines split per object kind; package spec+body joined into one.
+        assert info["routines"]["APP.CALC_TOTAL"]["kind"] == "FUNCTION"
+        assert info["routines"]["APP.DO_SYNC"]["kind"] == "PROCEDURE"
+        assert set(info["packages"]) == {"APP.PKG_ORDERS"}
+        pkg_src = info["packages"]["APP.PKG_ORDERS"]["source"]
+        assert pkg_src.index("SPEC") < pkg_src.index("BODY")
+        # Scheduler jobs and programs with their metadata.
+        assert info["jobs"]["APP.NIGHTLY_JOB"]["kind"] == "JOB"
+        assert info["jobs"]["APP.NIGHTLY_JOB"]["meta"]["type"] == "STORED_PROCEDURE"
+        assert info["programs"]["APP.SYNC_PROG"]["kind"] == "PROGRAM"
+        assert info["programs"]["APP.SYNC_PROG"]["meta"]["action"] == "DO_SYNC"
+        # Every category came from the single read-only sql tool, no gaps.
+        assert info["tools_used"]["views"] == "run_sql_query"
+        assert info["unavailable"] == []
+
+    def test_pack_server_error_marks_query_unavailable(self):
+        sql = self._make_sql(jobs_response=self._envelope(
+            "Database error: ORA-01031: insufficient privileges"
+        ))
+        roles = db_doc_mod._classify_introspection_tools([sql])
+        info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
+        # A server error is never an authoritative empty: the query is listed
+        # as unavailable and the category stays honest (no fabricated rows).
+        assert info["unavailable"] == ["sql:jobs"]
+        assert info["jobs"] == {}
+
+    def test_long_routine_source_keeps_full_overhang(self):
+        long_line = "X" * 9000
+        sql = self._make_sql(routine_rows=[
+            f"| APP | BIG_FN | FUNCTION | {long_line} |",
+        ])
+        roles = db_doc_mod._classify_introspection_tools([sql])
+        info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
+        big = info["routines"]["APP.BIG_FN"]
+        # Context-truncated page source + the untruncated overhang for tools.
+        assert len(big["source_full"]) == 9001  # line + trailing join newline
+        assert len(big["source"]) < len(big["source_full"])
+        assert "обрезано" in big["source"]
 
 
 # ============================================================================
@@ -2093,6 +2341,79 @@ class TestRenderCategoryPages:
 
 
 # ============================================================================
+# Render extras: comment column, dependency blocks, first sentence
+# ============================================================================
+class TestRenderDepsAndComments:
+    def test_structure_table_comment_column(self):
+        cols = [
+            {"name": "a", "type": "int", "nullable": True, "default": None,
+             "comment": "x | y"},
+            {"name": "b", "type": "int", "nullable": False, "default": "0"},
+        ]
+        lines = db_doc_mod._render_structure_table(cols)
+        assert lines[0] == "| column | type | null | default | comment |"
+        assert lines[1] == "| --- | --- | --- | --- | --- |"
+        assert "x \\| y" in lines[2]
+        assert lines[3].endswith("| - |")  # no comment → dash, not empty cell
+
+    def test_structure_table_without_comments_stays_four_columns(self):
+        lines = db_doc_mod._render_structure_table(
+            [{"name": "a", "type": "int", "nullable": True, "default": None}]
+        )
+        assert lines[0] == "| column | type | null | default |"
+        assert lines[1] == "| --- | --- | --- | --- |"
+        assert lines[2] == "| a | int | YES | - |"
+
+    def test_dependency_blocks_both_directions_and_fold(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_DEPS_VISIBLE", 1)
+        lines = db_doc_mod._dependency_blocks("OBJ", {
+            "OBJ": {"out": ["- `B`", "- `C`"], "in": ["- `A` (VIEW)"]},
+        })
+        text = "\n".join(lines)
+        assert "## Depends on" in text and "- `B`" in text
+        assert "<details" in text  # the second out-edge is folded away
+        assert "## Referenced by" in text and "- `A` (VIEW)" in text
+
+    def test_page_tree_renders_dependency_sections(self):
+        info = _sample_info(
+            tables={
+                "APP.ORDERS": {
+                    "schema": "APP", "table": "ORDERS", "columns": [],
+                },
+            },
+            fk_edges=[],
+            views={"APP.V_ORDERS": {
+                "schema": "APP", "name": "V_ORDERS", "kind": "VIEW",
+            }},
+            dependencies=[
+                {"from": "APP.ORDERS", "from_type": None,
+                 "to": "APP.V_ORDERS", "to_type": "?"},
+                {"from": "APP.V_ORDERS", "from_type": "VIEW",
+                 "to": "APP.SEQ", "to_type": "SEQUENCE"},
+            ],
+        )
+        pages, _ = db_doc_mod._render_page_tree(
+            _fake_entity(), info, {"overview": None, "tables": {}, "categories": {}},
+        )
+        orders_page = pages["page_tbl_app_orders"]["content"]
+        view_page = pages["page_view_app_v_orders"]["content"]
+        # Unknown types (None / "?") suppress the "(type)" suffix.
+        assert "## Depends on" in orders_page
+        assert "- `APP.V_ORDERS`" in orders_page
+        assert "(SEQUENCE)" not in orders_page and "(?)" not in orders_page
+        assert "## Referenced by" in view_page
+        assert "- `APP.ORDERS`" in view_page
+        assert "## Depends on" in view_page
+        assert "- `APP.SEQ` (SEQUENCE)" in view_page
+
+    def test_first_sentence(self):
+        assert db_doc_mod._first_sentence("One. Two.") == "One."
+        assert db_doc_mod._first_sentence("a\n  b") == "a b"
+        clipped = db_doc_mod._first_sentence("w" * 200)
+        assert len(clipped) == 160 and clipped.endswith("…")
+
+
+# ============================================================================
 # _render_page_tree (parent / relatedPages / caps / fold / assembly)
 # ============================================================================
 class TestPageTree:
@@ -2208,6 +2529,61 @@ class TestPageTree:
         assert parts[1].startswith("## Tables")
         assert parts[2].startswith("## `public.orders`")
         assert parts[3].startswith("## `public.users`")
+
+
+class TestSubpageUnits:
+    def test_units_follow_cap_tables_first(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_subpage_cap", lambda: 1)
+        info = _sample_info(views={
+            "public.session_stats": {
+                "schema": "public", "name": "session_stats", "kind": "VIEW",
+            },
+        })
+        units = db_doc_mod._subpage_units(info)
+        assert units == [("tables", "public.orders", "page_tbl_public_orders")]
+
+    def test_cap_zero_all_units(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_subpage_cap", lambda: 0)
+        info = _sample_info(views={
+            "public.session_stats": {
+                "schema": "public", "name": "session_stats", "kind": "VIEW",
+            },
+        })
+        units = db_doc_mod._subpage_units(info)
+        assert [u[2] for u in units] == [
+            "page_tbl_public_orders", "page_tbl_public_users",
+            "page_view_public_session_stats",
+        ]
+
+    def test_slug_collisions_get_numeric_suffix(self):
+        # "public.users" and "public_users" slug identically: the second
+        # entry must not silently overwrite the first subpage id.
+        info = _sample_info(views={
+            "public.users": {"schema": "public", "name": "users"},
+            "public_users": {"schema": "public", "name": "public_users"},
+        })
+        units = db_doc_mod._subpage_units(info)
+        # One slug space across tables AND categories: the table subpage
+        # already took "public_users", so the views continue the sequence.
+        assert [u[2] for u in units] == [
+            "page_tbl_public_orders", "page_tbl_public_users",
+            "page_view_public_users_2", "page_view_public_users_3",
+        ]
+
+    def test_ids_match_rendered_children(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_subpage_cap", lambda: 0)
+        info = _sample_info(views={
+            "public.session_stats": {
+                "schema": "public", "name": "session_stats", "kind": "VIEW",
+            },
+        })
+        pages, _ = db_doc_mod._render_page_tree(
+            _fake_entity(), info, {"overview": None, "tables": {}, "categories": {}},
+        )
+        units = db_doc_mod._subpage_units(info)
+        assert {u[2] for u in units} == {
+            p for p in pages if p.startswith(("page_tbl_", "page_view_"))
+        }
 
 
 # ============================================================================
@@ -2434,6 +2810,306 @@ class TestBatchedEnrichment:
 
 
 # ============================================================================
+# Deep per-entity units: bundles, tools, fingerprints, agent pipeline
+# ============================================================================
+class TestDeepUnitHelpers:
+    def _info(self):
+        return _sample_info(dependencies=[{
+            "from": "public.orders", "from_type": None,
+            "to": "public.users", "to_type": None,
+        }])
+
+    def test_unit_bundle_tables(self):
+        info = self._info()
+        orders = db_doc_mod._unit_bundle(info, "tables", "public.orders")
+        assert orders.startswith("object: public.orders")
+        assert "kind: TABLE" in orders
+        assert "columns:" in orders
+        assert "- id (integer)" in orders and "- user_id (integer)" in orders
+        assert "foreign keys:" in orders and "public.users" in orders
+        assert "depends on: public.users" in orders
+        assert "source head:" in orders and "CREATE TABLE orders" in orders
+        users = db_doc_mod._unit_bundle(info, "tables", "public.users")
+        assert "constraints:" in users and "users_pkey" in users
+        assert "referenced by: public.orders" in users
+
+    def test_unit_bundle_comment_and_category_meta(self):
+        info = _sample_info(views={
+            "public.v": {
+                "schema": "public", "name": "v", "kind": "VIEW",
+                "meta": {"refresh_mode": "DEMAND"}, "source": "SELECT 1",
+            },
+        })
+        bundle = db_doc_mod._unit_bundle(info, "views", "public.v")
+        assert "kind: VIEW" in bundle
+        assert "refresh_mode: DEMAND" in bundle  # meta keys as sorted lines
+        assert "source head:" in bundle
+        info["tables"]["public.users"]["columns"][0]["comment"] = "PK"
+        users = db_doc_mod._unit_bundle(info, "tables", "public.users")
+        assert "- id (integer) — PK" in users
+
+    def test_unit_bundle_char_cap(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_unit_bundle_chars", lambda: 400)
+        info = _sample_info()
+        info["tables"]["public.users"]["definition"] = "D" * 5000
+        bundle = db_doc_mod._unit_bundle(info, "tables", "public.users")
+        assert len(bundle) <= 440  # cap + truncation marker
+        assert "обрезано" in bundle
+
+    def test_unit_sources_prefer_full_overhang(self):
+        info = _sample_info(views={
+            "public.v": {
+                "schema": "public", "name": "v", "kind": "VIEW",
+                "source": "short", "source_full": "much longer source",
+            },
+        })
+        sources = db_doc_mod._unit_sources(info)
+        assert sources["public.v"] == "much longer source"
+        assert sources["public.users"] == (
+            "CREATE TABLE users (id integer PRIMARY KEY);"
+        )
+
+    def test_resolve_unit_object(self):
+        info = _sample_info(views={
+            "public.v": {"schema": "public", "name": "v", "kind": "VIEW"},
+        })
+        resolve = db_doc_mod._resolve_unit_object
+        assert resolve(info, "public.orders") == ("tables", "public.orders")
+        assert resolve(info, "ORDERS") == ("tables", "public.orders")  # suffix
+        assert resolve(info, "V") == ("views", "public.v")
+        assert resolve(info, "ghost") is None
+
+    def test_entity_fingerprint_stable_and_sensitive(self):
+        info = self._info()
+        kw = {"model": "m1", "language": "ru", "prompt_template": "t"}
+        fp = db_doc_mod._entity_fingerprint(info, "tables", "public.orders", **kw)
+        assert len(fp) == 16
+        assert fp == db_doc_mod._entity_fingerprint(
+            info, "tables", "public.orders", **kw
+        )
+        # Sensitive to the model (a different writer ≠ the same page)…
+        assert fp != db_doc_mod._entity_fingerprint(
+            info, "tables", "public.orders",
+            model="m2", language="ru", prompt_template="t",
+        )
+        # …to changed evidence (column comment)…
+        commented = self._info()
+        commented["tables"]["public.orders"]["columns"][0]["comment"] = "note"
+        assert fp != db_doc_mod._entity_fingerprint(
+            commented, "tables", "public.orders", **kw
+        )
+        # …and to dependencies touching the object.
+        assert fp != db_doc_mod._entity_fingerprint(
+            _sample_info(), "tables", "public.orders", **kw
+        )
+
+    def test_split_entity_text(self):
+        split = db_doc_mod._split_entity_text
+        assert split("Para.\n\n## Notes\nN.") == ("Para.", "N.")
+        assert split("Only paragraph.") == ("Only paragraph.", "")
+        assert split("Para.\n\nNotes without header") == (
+            "Para.", "Notes without header",
+        )
+
+    def test_final_agent_text_variants(self):
+        final = db_doc_mod._final_agent_text
+        result = SimpleNamespace(messages=[
+            SimpleNamespace(type="human", content="hi"),
+            SimpleNamespace(type="ai", content=[{"text": "part-"}, "tail"]),
+            SimpleNamespace(type="ai", content=""),
+        ])
+        assert final(result) == "part-tail"  # last NON-empty ai message
+        assert final({"messages": [
+            SimpleNamespace(type="ai", content="dict ok")
+        ]}) == "dict ok"
+        assert final(SimpleNamespace(messages=[])) == ""
+
+    def test_build_database_entity_prompt(self):
+        prompt = db_doc_mod.build_database_entity_prompt(
+            database_name="Main DB", entity_name="public.users",
+            entity_kind="TABLE", bundle="BUNDLE", product_context="CTX",
+            language="en",
+        )
+        assert "public.users" in prompt and "BUNDLE" in prompt and "CTX" in prompt
+        # Every placeholder replaced — a literal "{x}" would mean a broken
+        # template reached the agent.
+        for var in ("database_name", "entity_name", "entity_kind", "bundle",
+                    "product_context", "language_name"):
+            assert "{" + var + "}" not in prompt
+
+    def test_entity_tools_source_windows(self):
+        info = _sample_info(views={
+            "public.v": {
+                "schema": "public", "name": "v", "kind": "VIEW",
+                "source": "\n".join(f"line{i}" for i in range(1, 6)),
+            },
+        })
+        entity_source, _db_lookup = db_doc_mod.build_entity_tools(info)
+
+        out = entity_source.invoke(
+            {"full_name": "public.v", "from_line": 2, "to_line": 4}
+        )
+        assert "lines 2-4 of 5" in out
+        assert "2: line2" in out and "4: line4" in out
+        assert "5: line5" not in out
+
+        assert "lines 1-5 of 5" in entity_source.invoke({"full_name": "public.v"})
+        assert entity_source.invoke({"full_name": "ghost"}).startswith("ERROR")
+
+    def test_entity_tools_db_lookup(self):
+        info = self._info()
+        _src, db_lookup = db_doc_mod.build_entity_tools(info)
+        assert db_lookup.invoke(
+            {"full_name": "public.users"}
+        ).startswith("object: public.users")
+        deps = db_lookup.invoke(
+            {"full_name": "public.users", "what": "dependencies"}
+        )
+        assert "depends on: —" in deps  # nothing upstream (em dash = empty)
+        assert "referenced by: public.orders" in deps
+        assert db_lookup.invoke({"full_name": "ghost"}).startswith("ERROR")
+
+
+class TestRunDeepUnits:
+    """Hermetic pipeline: deepagents + chat model faked at the module
+    attributes the function imports lazily."""
+
+    @staticmethod
+    def _patch_stack(monkeypatch, respond):
+        import deepagents
+        from api.llm import client as llm_client
+
+        created = {"prompts": [], "tools": []}
+
+        def fake_create(*, model, tools, system_prompt, **kw):
+            created["prompts"].append(system_prompt)
+            created["tools"].append(list(tools))
+
+            class FakeAgent:
+                async def ainvoke(self, payload, config=None):
+                    message = payload["messages"][0][1]
+                    name = re.search(r"for `(.*?)`", message).group(1)
+                    return SimpleNamespace(messages=[
+                        SimpleNamespace(type="ai", content=respond(name))
+                    ])
+
+            return FakeAgent()
+
+        monkeypatch.setattr(deepagents, "create_deep_agent", fake_create)
+        monkeypatch.setattr(llm_client, "build_chat_model", lambda **kw: object())
+        monkeypatch.setattr(db_doc_mod, "_entity_mcp_enabled", lambda: False)
+        return created
+
+    def _run(self, info, *, old_pages=None, force_pages=None):
+        return asyncio.run(db_doc_mod._run_deep_units(
+            info, database_name="Main DB", product_id="p1", model="m",
+            base_url=None, api_key=None, language="ru", product_context="",
+            old_pages=old_pages or {}, force_pages=force_pages,
+        ))
+
+    def test_happy_path_documents_every_unit(self, monkeypatch):
+        created = self._patch_stack(
+            monkeypatch,
+            lambda name: f"Назначение объекта {name} — длинный абзац.",
+        )
+        pids = {"page_tbl_public_orders", "page_tbl_public_users"}
+        out = self._run(_sample_info())
+
+        assert out["total"] == 2
+        assert set(out["texts"]) == pids
+        assert out["texts"]["page_tbl_public_orders"].startswith("Назначение")
+        assert out["failed"] == {} and out["reused"] == []
+        assert out["fallback"] is False
+        assert set(out["fingerprints"]) == pids
+        assert all(len(fp) == 16 for fp in out["fingerprints"].values())
+        # One agent per unit; the system prompt names the entity.
+        assert len(created["prompts"]) == 2
+        assert any("public.orders" in p for p in created["prompts"])
+        # MCP gate off → exactly the two entity tools.
+        assert all(len(t) == 2 for t in created["tools"])
+
+    def test_fingerprint_reuse_skips_llm_and_force_reruns(self, monkeypatch):
+        created = self._patch_stack(monkeypatch, lambda name: "x" * 60)
+        info = _sample_info()
+        first = self._run(info)
+        old_pages = {
+            pid: {"provenance": {"entity_fingerprint": fp}}
+            for pid, fp in first["fingerprints"].items()
+        }
+
+        second = self._run(info, old_pages=old_pages)
+        assert set(second["reused"]) == set(first["fingerprints"])
+        assert second["texts"] == {}
+        assert len(created["prompts"]) == 2  # no new agents
+
+        forced = "page_tbl_public_orders"
+        third = self._run(info, old_pages=old_pages, force_pages=[forced])
+        assert third["reused"] == []  # a forced page is never satisfied by reuse
+        assert set(third["texts"]) == {forced}
+        assert third["total"] == 1  # units filtered to the forced page
+        assert len(created["prompts"]) == 3
+
+    def test_majority_failure_flips_fallback(self, monkeypatch):
+        def boom(name):
+            raise RuntimeError("agent blew up")
+
+        self._patch_stack(monkeypatch, boom)
+        out = self._run(_sample_info())
+        assert out["fallback"] is True
+        assert out["texts"] == {}
+        assert set(out["failed"]) == {
+            "page_tbl_public_orders", "page_tbl_public_users",
+        }
+        assert "RuntimeError" in out["failed"]["page_tbl_public_orders"]
+
+    def test_short_text_fails_without_majority(self, monkeypatch):
+        texts = {"public.orders": "short", "public.users": "u" * 60}
+        self._patch_stack(monkeypatch, texts.__getitem__)
+        out = self._run(_sample_info())
+        assert out["fallback"] is False  # 1 of 2 failed is not a majority
+        assert set(out["failed"]) == {"page_tbl_public_orders"}
+        assert set(out["texts"]) == {"page_tbl_public_users"}
+
+    def test_cancellation_propagates(self, monkeypatch):
+        cancel = db_doc_mod.JobCancelledError
+
+        def stop(name):
+            raise cancel("stop")
+
+        self._patch_stack(monkeypatch, stop)
+        with pytest.raises(cancel):
+            self._run(_sample_info())
+
+    def test_force_filter_no_match_returns_none(self, monkeypatch):
+        self._patch_stack(monkeypatch, lambda name: "x" * 60)
+        assert self._run(_sample_info(), force_pages=["page_ghost"]) is None
+
+    def test_model_build_failure_returns_none(self, monkeypatch):
+        from api.llm import client as llm_client
+
+        def boom(**kw):
+            raise RuntimeError("no model")
+
+        monkeypatch.setattr(llm_client, "build_chat_model", boom)
+        assert self._run(_sample_info()) is None
+
+    def test_mcp_tools_attached_when_enabled(self, monkeypatch):
+        import api.mcp.manager as mcp_manager
+
+        created = self._patch_stack(monkeypatch, lambda name: "x" * 60)
+        monkeypatch.setattr(db_doc_mod, "_entity_mcp_enabled", lambda: True)
+
+        async def fake_gather(product_id):
+            assert product_id == "p1"
+            return [FakeTool("mcp_probe")]
+
+        monkeypatch.setattr(mcp_manager, "gather_mcp_agent_tools", fake_gather)
+        out = self._run(_sample_info())
+        assert out["fallback"] is False
+        assert any(len(tools) == 3 for tools in created["tools"])
+
+
+# ============================================================================
 # Cross-context digest (DB docs → codebase briefs)
 # ============================================================================
 class TestDbContextPayload:
@@ -2605,6 +3281,35 @@ class TestToolsForPinnedServer:
         entity = _fake_entity(mcp_server_id="mcp_live")
         out = asyncio.run(db_doc_mod._resolve_mcp_tools(entity, "prod_pin"))
         assert [t.name for t in out] == ["list_tables"]
+
+
+# ============================================================================
+# Coverage section (per-category honesty report)
+# ============================================================================
+class TestCoverageSection:
+    def test_batch_mode_rows_and_unavailable(self):
+        info = _sample_info(views={}, unavailable=["sql:views"])
+        text = db_doc_mod._coverage_section(
+            info, None, {"public.users": {"purpose": "p"}}, {}
+        )
+        assert "| tables | 2 | 1 | batch |" in text
+        assert "| views |" not in text  # empty categories are omitted
+        assert "unavailable queries/tools: `sql:views`" in text
+        assert "deep units:" not in text
+
+    def test_deep_mode_summary_failures_and_fallback(self):
+        deep = {
+            "total": 2, "texts": {"p1": "t"}, "reused": ["p2"],
+            "failed": {"p3": "RuntimeError: boom"}, "fallback": True,
+        }
+        text = db_doc_mod._coverage_section(
+            _sample_info(), deep, {"public.users": {"purpose": "p"}}, {}
+        )
+        assert (
+            "deep units: 2 total, 1 documented, 1 reused, 1 failed" in text
+        )
+        assert "- `p3`: RuntimeError: boom" in text
+        assert "| tables | 2 | 1 | deep units (fallback: batch) |" in text
 
 
 # ============================================================================
@@ -2955,6 +3660,174 @@ class TestGenerateDatabaseDocs:
         assert "NEW OVERVIEW" in result
         assert "OLD TABLES" in result
         assert result.rindex("OLD EXTRA") > result.rindex("OLD TABLES")
+
+
+class TestGenerateDeepUnits:
+    """Deep-mode integration: texts→pages, fallback→batches, reuse, gate."""
+
+    @staticmethod
+    def _deep_result(**overrides):
+        out = {
+            "texts": {}, "fingerprints": {}, "failed": {},
+            "reused": [], "total": 0, "fallback": False,
+        }
+        out.update(overrides)
+        return out
+
+    def test_deep_texts_render_with_provenance(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_deep_units_enabled", lambda: True)
+        monkeypatch.setattr(db_doc_mod, "_entity_mcp_enabled", lambda: False)
+        pids = ("page_tbl_public_orders", "page_tbl_public_users")
+        deep = self._deep_result(
+            texts={
+                "page_tbl_public_orders": (
+                    "Заказы клиентов ядра.\n\n## Notes\nСм. users."
+                ),
+                "page_tbl_public_users": "Пользователи приложений, длинное описание.",
+            },
+            fingerprints={pid: pid[-16:] for pid in pids},
+            total=2,
+        )
+
+        async def fake_run(*a, **kw):
+            return deep
+
+        monkeypatch.setattr(db_doc_mod, "_run_deep_units", fake_run)
+        _patch_generation(monkeypatch, llm_text="OVERVIEW TEXT")
+        captured: list = []
+
+        async def fake_llm(prompt, model, base_url=None, api_key=None):
+            captured.append(prompt)
+            return "OVERVIEW TEXT"
+
+        monkeypatch.setattr(db_doc_mod, "_llm_or_none", fake_llm)
+        entity = _fake_entity()
+
+        result = asyncio.run(
+            db_doc_mod.generate_database_docs(entity, _fake_product())
+        )
+
+        # Deep texts became descriptions: purpose+notes on the subpages and
+        # first sentences on the tables root.
+        orders = entity.pages["page_tbl_public_orders"]["content"]
+        users = entity.pages["page_tbl_public_users"]["content"]
+        assert "Заказы клиентов ядра." in orders
+        assert "## Notes" in orders and "См. users." in orders
+        assert "Пользователи приложений, длинное описание." in users
+        assert "## Notes" not in users
+        assert "— Заказы клиентов ядра." in result
+        assert "— Пользователи приложений, длинное описание." in result
+        # Provenance: deep generator, entity prompt file, fingerprint, caps.
+        prov = entity.pages["page_tbl_public_users"]["provenance"]
+        assert prov["generator"] == "deep-units"
+        assert prov["prompt_file"] == "database_entity.md"
+        assert prov["entity_fingerprint"] == "page_tbl_public_users"[-16:]
+        assert prov["caps"]["deep_units"] == {
+            "total": 2, "done": 2, "reused": 0, "failed": 0,
+        }
+        # The batch prompts never ran: exactly two LLM calls remain — the
+        # overview and relation inference (the adapter walk yields no FK
+        # edges, so inference is legitimate; a batch call would be a third,
+        # description-stub prompt).
+        assert len(captured) == 2
+        assert '"from": "<' in captured[1]  # relations template marker
+        assert "deep units: 2 total, 2 documented, 0 reused, 0 failed" in result
+
+    def test_majority_fallback_runs_batch_enrichment(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_deep_units_enabled", lambda: True)
+        deep = self._deep_result(
+            total=2, fallback=True,
+            failed={
+                "page_tbl_public_orders": "RuntimeError: boom",
+                "page_tbl_public_users": "RuntimeError: boom",
+            },
+        )
+
+        async def fake_run(*a, **kw):
+            return deep
+
+        monkeypatch.setattr(db_doc_mod, "_run_deep_units", fake_run)
+        fake, captured = _dispatch_llm([
+            {"name": "public.users", "purpose": "Пользователи."},
+            {"name": "public.orders", "purpose": "Заказы."},
+        ])
+        _patch_generation(monkeypatch, llm_text="OVERVIEW TEXT")
+        monkeypatch.setattr(db_doc_mod, "_llm_or_none", fake)
+        entity = _fake_entity()
+
+        result = asyncio.run(
+            db_doc_mod.generate_database_docs(entity, _fake_product())
+        )
+
+        assert any("### `" in p for p in captured)  # batch path ran
+        assert "— Пользователи." in result
+        assert "fallback: batch" in entity.pages["page_overview"]["content"]
+        # No deep text arrived → children stay deterministic introspection.
+        assert (
+            entity.pages["page_tbl_public_users"]["provenance"]["generator"]
+            == "introspection"
+        )
+
+    def test_reused_pages_kept_wholesale(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_deep_units_enabled", lambda: True)
+        kept = "page_tbl_public_orders"
+        old_pages = {
+            kept: {
+                "id": kept, "title": "public.orders", "content": "OLD PAGE",
+                "filePaths": [], "importance": "medium", "relatedPages": [],
+                "provenance": {
+                    "entity_fingerprint": "fp1", "custom": "keep-me",
+                },
+            },
+        }
+        deep = self._deep_result(
+            texts={
+                "page_tbl_public_users": "Пользователи приложений, длинное описание.",
+            },
+            fingerprints={kept: "fp1", "page_tbl_public_users": "fp2"},
+            reused=[kept],
+            total=2,
+        )
+
+        async def fake_run(*a, **kw):
+            return deep
+
+        monkeypatch.setattr(db_doc_mod, "_run_deep_units", fake_run)
+        _patch_generation(monkeypatch, llm_text="OVERVIEW")
+        entity = _fake_entity(pages={kept: dict(old_pages[kept])})
+
+        result = asyncio.run(
+            db_doc_mod.generate_database_docs(entity, _fake_product())
+        )
+
+        # The stored page (content AND provenance) survives untouched.
+        assert entity.pages[kept]["content"] == "OLD PAGE"
+        assert entity.pages[kept]["provenance"] == {
+            "entity_fingerprint": "fp1", "custom": "keep-me",
+        }
+        assert "OLD PAGE" in result
+        # Fresh pages carry the deep generator + reuse-aware caps.
+        fresh = entity.pages["page_tbl_public_users"]["provenance"]
+        assert fresh["generator"] == "deep-units"
+        assert fresh["caps"]["deep_units"] == {
+            "total": 2, "done": 1, "reused": 1, "failed": 0,
+        }
+
+    def test_deep_gate_off_never_runs_units(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_deep_units_enabled", lambda: False)
+
+        async def nope(*a, **kw):
+            raise AssertionError("deep units must not run")
+
+        monkeypatch.setattr(db_doc_mod, "_run_deep_units", nope)
+        _patch_generation(monkeypatch, llm_text="docs")
+
+        result = asyncio.run(
+            db_doc_mod.generate_database_docs(_fake_entity(), _fake_product())
+        )
+
+        assert "## Tables" in result
+        assert "deep units:" not in result
 
 
 # ============================================================================

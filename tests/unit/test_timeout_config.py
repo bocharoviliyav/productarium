@@ -31,6 +31,11 @@ from api.config.timeout import (
     resolve_db_docgen_max_subpages,
     resolve_db_fk_evidence_tables,
     resolve_db_source_objects,
+    resolve_db_deep_units_enabled,
+    resolve_db_entity_mcp_enabled,
+    resolve_db_introspection_timeout,
+    resolve_db_max_tool_calls,
+    resolve_db_unit_bundle_chars,
     resolve_docgen_db_context_enabled,
     resolve_llm_rate_limit_rps,
     resolve_docgen_indexing_drain_seconds,
@@ -84,6 +89,11 @@ WRAPPER_TO_KEY = {
     "resolve_db_docgen_max_descriptions": "db_docgen_max_descriptions",
     "resolve_db_fk_evidence_tables": "db_fk_evidence_tables",
     "resolve_db_source_objects": "db_source_objects",
+    "resolve_db_max_tool_calls": "db_max_tool_calls",
+    "resolve_db_introspection_timeout": "db_introspection_timeout",
+    "resolve_db_deep_units_enabled": "db_deep_units_enabled",
+    "resolve_db_entity_mcp_enabled": "db_entity_mcp_enabled",
+    "resolve_db_unit_bundle_chars": "db_unit_bundle_chars",
 }
 
 
@@ -506,6 +516,48 @@ class TestTimeoutConfig(unittest.TestCase):
             self.assertEqual(resolve_db_source_objects(), 0)
             os.environ["LLM_RATE_LIMIT_RPS"] = "0"
             self.assertEqual(resolve_llm_rate_limit_rps(), 0.0)
+
+    def test_db_walk_budget_defaults(self):
+        # Night-scale defaults for full-coverage Oracle walks: 20k tool
+        # calls, 6h deadline; deep units ON with an 8000-char bundle cap.
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            self.assertEqual(resolve_db_max_tool_calls(), 20000)
+            self.assertEqual(resolve_db_introspection_timeout(), 21600.0)
+            self.assertIs(resolve_db_deep_units_enabled(), True)
+            self.assertIs(resolve_db_entity_mcp_enabled(), True)
+            self.assertEqual(resolve_db_unit_bundle_chars(), 8000)
+
+    def test_db_walk_budget_env_override(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["DB_MAX_TOOL_CALLS"] = "12345"
+            self.assertEqual(resolve_db_max_tool_calls(), 12345)
+            os.environ["DB_INTROSPECTION_TIMEOUT_SECONDS"] = "600"
+            self.assertEqual(resolve_db_introspection_timeout(), 600.0)
+            os.environ["DB_UNIT_BUNDLE_CHARS"] = "4000"
+            self.assertEqual(resolve_db_unit_bundle_chars(), 4000)
+
+    def test_db_walk_budget_floors(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            os.environ["DB_MAX_TOOL_CALLS"] = "1"
+            self.assertEqual(resolve_db_max_tool_calls(), 500)
+            os.environ["DB_INTROSPECTION_TIMEOUT_SECONDS"] = "1"
+            self.assertEqual(resolve_db_introspection_timeout(), 300.0)
+            os.environ["DB_UNIT_BUNDLE_CHARS"] = "1"
+            self.assertEqual(resolve_db_unit_bundle_chars(), 1000)
+
+    def test_db_deep_units_bool_off_words(self):
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            for off in ("false", "0", "no", "off"):
+                os.environ["DB_DEEP_UNITS_ENABLED"] = off
+                os.environ["DB_ENTITY_MCP_ENABLED"] = off
+                self.assertIs(resolve_db_deep_units_enabled(), False)
+                self.assertIs(resolve_db_entity_mcp_enabled(), False)
+            os.environ["DB_DEEP_UNITS_ENABLED"] = "true"
+            self.assertIs(resolve_db_deep_units_enabled(), True)
 
     def test_db_connect_check_wrapper(self):
         env_vars = [k.env_var for k in TIMEOUT_KEYS]

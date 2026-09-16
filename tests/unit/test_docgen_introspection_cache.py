@@ -155,6 +155,19 @@ class TestCacheKey:
             binding_ids=["b1", "b2"]
         )
 
+    def test_sensitive_to_walk_budgets(self):
+        # The night-scale walk knobs participate in the key: a budget change
+        # reshapes the payload and must not replay the old entry.
+        assert introspection_cache_key(
+            budgets={"max_tool_calls": 20000}
+        ) != introspection_cache_key(budgets={"max_tool_calls": 10})
+
+    def test_format_version_pinned(self):
+        # v5: full-catalog Oracle walk (packages/jobs/programs, constraints,
+        # dependencies, column comments, source_full overhangs). A stale
+        # version number would silently replay v4 payloads lacking the fields.
+        assert CACHE_FORMAT_VERSION == 5
+
     def test_ttl_env_default_and_parse(self, monkeypatch):
         monkeypatch.delenv("DB_INTROSPECTION_CACHE_TTL_SECONDS", raising=False)
         assert cache_ttl_seconds() == 7 * 24 * 3600.0

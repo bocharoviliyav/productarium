@@ -75,6 +75,10 @@ REPLACE_CONTRACT: dict[str, set[str]] = {
         "language_name", "product_context", "objects", "category_title",
     },
     "database_relations.md": {"language_name", "table_batch"},
+    "database_entity.md": {
+        "database_name", "entity_name", "entity_kind", "bundle",
+        "product_context", "language_name",
+    },
     # Misc generation.
     "product_summary.md": {"content", "product_name"},
     "openapi_doc.md": {"artifact_name", "content", "previous_content", "repo_name"},

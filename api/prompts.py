@@ -131,6 +131,7 @@ _UNWRAPPED_PROMPTS = frozenset({
     "database_tables.md",
     "database_categories.md",
     "database_relations.md",
+    "database_entity.md",
 })
 
 
@@ -207,6 +208,7 @@ DATABASE_DOC_PROMPT = ""
 DATABASE_TABLES_PROMPT = ""
 DATABASE_CATEGORIES_PROMPT = ""
 DATABASE_RELATIONS_PROMPT = ""
+DATABASE_ENTITY_PROMPT = ""
 MERMAID_REPAIR_PROMPT = ""
 # Docgen pipeline (Wave F): consolidated section contracts + router +
 # orchestrator. DOCGEN_SECTIONS_PROMPT is the RAW parsed file;
@@ -395,6 +397,7 @@ PROMPT_FILES: Dict[str, str] = {
     # tables/categories prompts are consumed via load_prompt_file() at call
     # time by api.docgen.database; loaded here for admin hot-reload + visibility.
     "database_doc.md": "DATABASE_DOC_PROMPT",
+    "database_entity.md": "DATABASE_ENTITY_PROMPT",
     "database_tables.md": "DATABASE_TABLES_PROMPT",
     "database_categories.md": "DATABASE_CATEGORIES_PROMPT",
     "database_relations.md": "DATABASE_RELATIONS_PROMPT",
@@ -557,6 +560,9 @@ DATABASE_CATEGORIES_PROMPT = load_prompt_file(
 )
 DATABASE_RELATIONS_PROMPT = load_prompt_file(
     "database_relations.md", DATABASE_RELATIONS_PROMPT
+)
+DATABASE_ENTITY_PROMPT = load_prompt_file(
+    "database_entity.md", DATABASE_ENTITY_PROMPT
 )
 
 MERMAID_REPAIR_PROMPT = load_prompt_file("mermaid_repair.md", MERMAID_REPAIR_PROMPT)
