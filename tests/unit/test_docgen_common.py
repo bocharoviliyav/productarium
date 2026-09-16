@@ -128,6 +128,36 @@ class TestCleanLlmText:
         text = "Plain prose answer without structure."
         assert c._clean_llm_text(text) == text
 
+    def test_colon_lead_wrapped_output_stripped(self):
+        # The live defect: a presentation sentence the preamble regex cannot
+        # match (starts with "The") glued to a whole-output ```markdown fence.
+        text = (
+            "The section is complete. Here is the final Markdown output:\n"
+            "```markdown\n# QA — Тестирование\n\nContent.\n```"
+        )
+        assert c._clean_llm_text(text) == "# QA — Тестирование\n\nContent."
+
+    def test_final_output_lead_stripped(self):
+        text = (
+            "The file is complete and correct. Here is the final output:\n"
+            "```\n# Arch\n```"
+        )
+        assert c._clean_llm_text(text) == "# Arch"
+
+    def test_prose_intro_before_fence_untouched(self):
+        # No colon-terminated lead → not a wrapper: intro and fence stay.
+        text = "Intro line\n\n```python\nprint('hi')\n```"
+        result = c._clean_llm_text(text)
+        assert "Intro line" in result
+        assert "print('hi')" in result
+
+    def test_unclosed_wrapper_lead_untouched(self):
+        # The fence does not CLOSE the text → not a whole-output wrapper.
+        text = "Here is the output:\n```python\nx = 1\n```\nTail text."
+        result = c._clean_llm_text(text)
+        assert "Tail text." in result
+        assert "x = 1" in result
+
 
 # ============================================================================
 # _carry_page_verify_flags

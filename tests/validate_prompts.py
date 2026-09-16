@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Lightweight validator for the Productarium prompt catalog (refs/prompts/).
+"""Lightweight validator for the Productarium prompt catalog
+(refs/prompts/<lang>/ for each lang in LANGS).
 
 Standalone: requires no third-party packages, no network, no model calls.
 Run:  python tests/validate_prompts.py
@@ -29,6 +30,10 @@ import sys
 from pathlib import Path
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "refs" / "prompts"
+
+#: Prompt languages — one subdirectory per lang, identical file sets
+#: (mirrors api.prompts.PROMPT_LANGUAGES).
+LANGS = ("ru", "en")
 
 # --- Expected placeholder contract (verified against consumer code) ----------
 # Value = set of placeholder names that MUST appear as literal {name} tokens;
@@ -63,7 +68,13 @@ REPLACE_CONTRACT: dict[str, set[str]] = {
     # Database reverse-engineering (api.docgen.database).
     "database_doc.md": {
         "database_name", "dsn_masked", "schema_dump", "skeleton", "language_name",
+        "product_context",
     },
+    "database_tables.md": {"language_name", "product_context", "table_batch"},
+    "database_categories.md": {
+        "language_name", "product_context", "objects", "category_title",
+    },
+    "database_relations.md": {"language_name", "table_batch"},
     # Misc generation.
     "product_summary.md": {"content", "product_name"},
     "openapi_doc.md": {"artifact_name", "content", "previous_content", "repo_name"},
@@ -147,52 +158,58 @@ def validate() -> Result:
         r.errors.append(f"prompts dir missing: {PROMPTS_DIR}")
         return r
 
-    present = {p.name for p in PROMPTS_DIR.glob("*.md")}
-    expected = (set(REPLACE_CONTRACT) | NO_PLACEHOLDER
-                | set(REPLACE_LOOSE) | IGNORE)
-    for missing in sorted(expected - present):
-        r.fail(missing, "expected prompt file is missing")
-
-    for fname in sorted(present):
-        if fname in IGNORE:
+    # README.md lives at refs/prompts/ root (not per-lang); the per-file
+    # IGNORE guard below still skips one if dropped into a lang dir.
+    expected = set(REPLACE_CONTRACT) | NO_PLACEHOLDER | set(REPLACE_LOOSE)
+    for lang in LANGS:
+        lang_dir = PROMPTS_DIR / lang
+        if not lang_dir.is_dir():
+            r.errors.append(f"prompts lang dir missing: {lang_dir}")
             continue
-        r.checked += 1
-        path = PROMPTS_DIR / fname
-        text = path.read_text(encoding="utf-8")
+        present = {p.name for p in lang_dir.glob("*.md")}
+        for missing in sorted(expected - present):
+            r.fail(f"{lang}/{missing}", "expected prompt file is missing")
 
-        if not text.strip():
-            r.fail(fname, "file is empty")
-            continue
-        if "�" in text:
-            r.fail(fname, "contains UTF-8 replacement char (broken encoding)")
-        if not check_fences(text):
-            r.fail(fname, "unbalanced ``` fenced blocks")
+        for fname in sorted(present):
+            label = f"{lang}/{fname}"
+            if fname in IGNORE:
+                continue
+            r.checked += 1
+            text = (lang_dir / fname).read_text(encoding="utf-8")
 
-        found = set(TOKEN_RE.findall(text))
+            if not text.strip():
+                r.fail(label, "file is empty")
+                continue
+            if "\ufffd" in text:
+                r.fail(label, "contains UTF-8 replacement char (broken encoding)")
+            if not check_fences(text):
+                r.fail(label, "unbalanced ``` fenced blocks")
 
-        if fname in NO_PLACEHOLDER:
-            if found:
-                r.fail(fname, f"unexpected placeholders present: {sorted(found)}")
-        elif fname in REPLACE_CONTRACT:
-            exp = REPLACE_CONTRACT[fname]
-            missing = exp - found
-            extra = found - exp
-            if missing:
-                r.fail(fname, f"missing placeholders: {sorted(missing)}")
-            if extra:
-                r.fail(fname, f"unexpected placeholder tokens: {sorted(extra)}")
-        elif fname in REPLACE_LOOSE:
-            exp = REPLACE_LOOSE[fname]
-            missing = exp - found
-            if missing:
-                r.fail(fname, f"missing expected placeholders: {sorted(missing)}")
-        else:
-            r.fail(fname, "not in any known contract group (add to validator)")
+            found = set(TOKEN_RE.findall(text))
 
-        if fname == "docgen_sections.md":
-            check_section_blocks(fname, text, r)
-        elif fname == "docgen_subpages.md":
-            check_subpage_blocks(fname, text, r)
+            if fname in NO_PLACEHOLDER:
+                if found:
+                    r.fail(label, f"unexpected placeholders present: {sorted(found)}")
+            elif fname in REPLACE_CONTRACT:
+                exp = REPLACE_CONTRACT[fname]
+                missing = exp - found
+                extra = found - exp
+                if missing:
+                    r.fail(label, f"missing placeholders: {sorted(missing)}")
+                if extra:
+                    r.fail(label, f"unexpected placeholder tokens: {sorted(extra)}")
+            elif fname in REPLACE_LOOSE:
+                exp = REPLACE_LOOSE[fname]
+                missing = exp - found
+                if missing:
+                    r.fail(label, f"missing expected placeholders: {sorted(missing)}")
+            else:
+                r.fail(label, "not in any known contract group (add to validator)")
+
+            if fname == "docgen_sections.md":
+                check_section_blocks(label, text, r)
+            elif fname == "docgen_subpages.md":
+                check_subpage_blocks(label, text, r)
 
     return r
 

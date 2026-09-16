@@ -114,11 +114,12 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 # Budgets (introspection walk + render/enrich knobs)
 # --------------------------------------------------------------------------- #
-#: Max schemas introspected per database (enterprise multitenant
-#: databases carry hundreds; extras past the cap are skipped).
-MAX_SCHEMAS = 200
-#: Max tables introspected per schema (extra tables are listed by name only).
-MAX_TABLES_PER_SCHEMA = 100
+#: Sanity ceilings only — the de-facto bounds are MAX_TOOL_CALLS and the
+#: wall-clock budget (the adapter path spends >=1 tool call per schema and
+#: >=2 per table; the Oracle bulk walk takes 2-3 paged calls per owner).
+#: Non-system entities are never truncated for coverage reasons.
+MAX_SCHEMAS = 100_000
+MAX_TABLES_PER_SCHEMA = 100_000
 #: Max characters of one table definition kept in the doc/evidence.
 MAX_DEFINITION_CHARS = 8_000
 #: Max characters of the raw schema dump handed to the LLM.
@@ -160,14 +161,14 @@ def _enrich_batch_size() -> int:
 
 
 def _subpage_cap() -> int:
-    """Max entity subpages rendered per database (surplus stays folded)."""
+    """Max entity subpages rendered per database; 0 = unlimited."""
     from api.config.timeout import resolve_db_docgen_max_subpages
 
     return resolve_db_docgen_max_subpages()
 
 
 def _max_descriptions() -> int:
-    """Max objects that get an LLM description per database run."""
+    """Max objects that get an LLM description per run; 0 = unlimited."""
     from api.config.timeout import resolve_db_docgen_max_descriptions
 
     return resolve_db_docgen_max_descriptions()
@@ -181,7 +182,7 @@ def _fk_evidence_tables() -> int:
 
 
 def _source_objects() -> int:
-    """Max non-table objects with fetched source/definition (walk budget)."""
+    """Max non-table objects with fetched source/definition; 0 = unlimited."""
     from api.config.timeout import resolve_db_source_objects
 
     return resolve_db_source_objects()
@@ -2475,13 +2476,16 @@ async def _introspect(
             effective = await _oracle_session_schema(sql_tool, _bounded_call)
             skip_sources = effective is None
         if not skip_sources:
-            budget = _source_objects()
+            # 0 = unlimited: fetch every source the server can resolve (the
+            # walk budget and the schema guard above remain the bounds).
+            source_cap = _source_objects()
+            budget = None if source_cap <= 0 else source_cap
             declared = _tool_arg_names(source_tool)
             for cat in _CATEGORIES:
-                if budget <= 0:
+                if budget is not None and budget <= 0:
                     break
                 for full, meta in categories[cat].items():
-                    if budget <= 0:
+                    if budget is not None and budget <= 0:
                         break
                     if meta.get("source"):
                         continue
@@ -2498,7 +2502,8 @@ async def _introspect(
                             else _SOURCE_TYPE_BY_CATEGORY.get(cat, "")
                         )
                     raw = await _bounded_call(source_tool, args)
-                    budget -= 1
+                    if budget is not None:
+                        budget -= 1
                     if (
                         raw
                         and not raw.startswith("ERROR:")
@@ -2916,10 +2921,11 @@ def _render_page_tree(
         "relatedPages": ["page_tables"],
     }
 
-    # Table subpages: ranked, capped; surplus stays as folded root rows.
+    # Table subpages: ranked, capped (0 = unlimited); surplus stays as folded
+    # root rows.
     cap = _subpage_cap()
     ranked = _ranked_tables(info)
-    subpaged = ranked[:cap]
+    subpaged = ranked if cap <= 0 else ranked[:cap]
     table_page_ids = {full: f"page_tbl_{slugger(full)}" for full in subpaged}
     pages["page_tables"] = {
         "id": "page_tables",
@@ -2954,8 +2960,9 @@ def _render_page_tree(
         }
         order.append(table_page_ids[full])
 
-    # Category roots + children (only with evidence), sharing the same cap.
-    remaining = max(0, cap - len(subpaged))
+    # Category roots + children (only with evidence), sharing the same cap
+    # (0 = unlimited: every category object gets its subpage).
+    remaining = None if cap <= 0 else max(0, cap - len(subpaged))
     for cat in _CATEGORIES:
         entries = info.get(cat) or {}
         if not entries:
@@ -2970,10 +2977,11 @@ def _render_page_tree(
             "relatedPages": ["page_tables"],
         }
         order.append(root_id)
-        if remaining <= 0:
+        if remaining is not None and remaining <= 0:
             continue
-        children = sorted(entries)[:remaining]
-        remaining -= len(children)
+        children = sorted(entries) if remaining is None else sorted(entries)[:remaining]
+        if remaining is not None:
+            remaining -= len(children)
         prefix = _CATEGORY_PREFIX[cat]
         child_ids = {full: f"page_{prefix}_{slugger(full)}" for full in children}
         for full in children:
@@ -3277,6 +3285,8 @@ def product_database_context(product_id: str, max_chars: int = 4000) -> str:
     text = (
         "### Контекст баз данных продукта (дополнительно — НЕ файлы "
         "репозитория; не цитировать как пути)\n"
+        "Документируй базу как слой сервиса только если код сервиса реально "
+        "к ней подключается.\n"
         + "\n".join(f"- {b}" for b in blocks)
     )
     return _cap(text, max_chars)
@@ -3354,7 +3364,10 @@ async def _enrich_table_descriptions(
     tables: Dict[str, Any] = info.get("tables") or {}
     edges = info.get("fk_edges") or []
     lower_map = {full.lower(): full for full in tables}
-    ranked = _ranked_tables(info)[:_max_descriptions()]
+    ranked = _ranked_tables(info)
+    cap = _max_descriptions()
+    if cap > 0:
+        ranked = ranked[:cap]
     if not ranked:
         return {}
     batch_size = _enrich_batch_size()
@@ -3432,50 +3445,61 @@ async def _enrich_categories(
     language: str,
     already_described: int,
 ) -> Dict[str, Dict[str, str]]:
-    """One strict-JSON call per non-empty category (within the description cap)."""
-    budget = max(0, _max_descriptions() - already_described)
+    """Strict-JSON description batches per non-empty category.
+
+    The description cap is 0 = unlimited; objects per LLM call follow the
+    shared batch knob — one giant prompt for hundreds of views would not
+    fit the server context.
+    """
+    cap = _max_descriptions()
+    budget = None if cap <= 0 else max(0, cap - already_described)
     out: Dict[str, Dict[str, str]] = {}
-    if budget <= 0:
+    if budget == 0:
         return out
+    batch_size = _enrich_batch_size()
     for cat in _CATEGORIES:
         entries = info.get(cat) or {}
         if not entries:
             continue
-        selected = sorted(entries)[:budget]
-        budget -= len(selected)
-        stub = "\n\n".join(
-            _category_stub(full, entries[full]) for full in selected
-        )
-        prompt = build_database_categories_prompt(
-            category_title=_CATEGORY_TITLES[cat],
-            objects=stub,
-            product_context=product_context,
-            language=language,
-        )
-        text = await _llm_or_none(
-            prompt, model, base_url=base_url, api_key=api_key
-        )
-        rows = _parse_json_array(text)
-        if not rows:
-            logger.warning(
-                "database docgen: category %s returned no valid JSON; "
-                "objects keep their deterministic render", cat,
-            )
-            continue
+        selected = sorted(entries) if budget is None else sorted(entries)[:budget]
+        if budget is not None:
+            budget -= len(selected)
         lower_map = {full.lower(): full for full in selected}
         cat_descs: Dict[str, str] = {}
-        for row in rows:
-            name = row.get("name")
-            if not isinstance(name, str):
+        for start in range(0, len(selected), batch_size):
+            chunk = selected[start:start + batch_size]
+            stub = "\n\n".join(
+                _category_stub(full, entries[full]) for full in chunk
+            )
+            prompt = build_database_categories_prompt(
+                category_title=_CATEGORY_TITLES[cat],
+                objects=stub,
+                product_context=product_context,
+                language=language,
+            )
+            text = await _llm_or_none(
+                prompt, model, base_url=base_url, api_key=api_key
+            )
+            rows = _parse_json_array(text)
+            if not rows:
+                logger.warning(
+                    "database docgen: category %s batch %d..%d returned no "
+                    "valid JSON; objects keep their deterministic render",
+                    cat, start, start + len(chunk),
+                )
                 continue
-            full = lower_map.get(name.strip().lower())
-            if full is None:
-                continue
-            if isinstance(row.get("purpose"), str) and row["purpose"].strip():
-                cat_descs[full] = row["purpose"].strip()
+            for row in rows:
+                name = row.get("name")
+                if not isinstance(name, str):
+                    continue
+                full = lower_map.get(name.strip().lower())
+                if full is None:
+                    continue
+                if isinstance(row.get("purpose"), str) and row["purpose"].strip():
+                    cat_descs[full] = row["purpose"].strip()
         if cat_descs:
             out[cat] = cat_descs
-        if budget <= 0:
+        if budget is not None and budget <= 0:
             break
     return out
 

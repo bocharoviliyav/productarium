@@ -2154,6 +2154,26 @@ class TestPageTree:
         assert "- `public.users`" in pages["page_tables"]["content"]
         assert "](page_tbl_public_users)" not in pages["page_tables"]["content"]
 
+    def test_subpage_cap_zero_renders_everything(self, monkeypatch):
+        # 0 = unlimited: tables never starve the categories — the old shared
+        # budget gave 880 tables all 200 slots and views zero subpages.
+        monkeypatch.setattr(db_doc_mod, "_subpage_cap", lambda: 0)
+        info = _sample_info(views={
+            "public.session_stats": {
+                "schema": "public", "name": "session_stats", "kind": "VIEW",
+            },
+        })
+        pages, order = db_doc_mod._render_page_tree(
+            _fake_entity(), info,
+            {"overview": None, "tables": {}, "categories": {}},
+        )
+        assert order == [
+            "page_overview", "page_tables",
+            "page_tbl_public_orders", "page_tbl_public_users",
+            "page_views", "page_view_public_session_stats",
+        ]
+        assert pages["page_view_public_session_stats"]["parent"] == "page_views"
+
     def test_category_roots_and_children(self):
         info = _sample_info(views={
             "public.session_stats": {
@@ -2318,6 +2338,57 @@ class TestBatchedEnrichment:
         ))
         assert out == {}
         assert called == []
+
+    def test_category_cap_zero_batches_all(self, monkeypatch):
+        # 0 = unlimited ignores already_described; hundreds of objects go
+        # through in batch-knob chunks, not one context-overflowing prompt.
+        monkeypatch.setattr(db_doc_mod, "_max_descriptions", lambda: 0)
+        monkeypatch.setattr(db_doc_mod, "_enrich_batch_size", lambda: 2)
+        captured = []
+
+        async def fake(prompt, model, base_url=None, api_key=None):
+            captured.append(prompt)
+            return "[]"
+
+        monkeypatch.setattr(db_doc_mod, "_llm_or_none", fake)
+        info = {"views": {
+            f"public.v{i}": {"schema": "public", "name": f"v{i}"}
+            for i in range(5)
+        }}
+        out = asyncio.run(db_doc_mod._enrich_categories(
+            info, product_context="", model=None, base_url=None,
+            api_key=None, language="ru", already_described=3,
+        ))
+        assert len(captured) == 3  # 5 objects / batch 2
+        assert captured[0].count("### `public.v") == 2
+        assert captured[2].count("### `public.v") == 1
+        assert out == {}
+
+    def test_description_cap_zero_covers_all_tables(self, monkeypatch):
+        monkeypatch.setattr(db_doc_mod, "_max_descriptions", lambda: 0)
+        monkeypatch.setattr(db_doc_mod, "_enrich_batch_size", lambda: 40)
+        captured = []
+
+        async def fake(prompt, model, base_url=None, api_key=None):
+            captured.append(prompt)
+            return "[]"
+
+        monkeypatch.setattr(db_doc_mod, "_llm_or_none", fake)
+        info = {
+            "schemas": [],
+            "tables": {
+                f"t{i}": {"schema": None, "table": f"t{i}", "definition": ""}
+                for i in (1, 2, 3)
+            },
+            "fk_edges": [],
+        }
+        out = asyncio.run(db_doc_mod._enrich_table_descriptions(
+            info, product_context="", model=None, base_url=None,
+            api_key=None, language="ru",
+        ))
+        assert len(captured) == 1
+        assert all(f"### `t{i}`" in captured[0] for i in (1, 2, 3))
+        assert out == {}
 
     def test_infer_relations_validates_endpoints(self, monkeypatch):
         async def fake(prompt, model, base_url=None, api_key=None):

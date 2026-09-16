@@ -1154,7 +1154,9 @@ _AGENT_SYSTEM_FALLBACK = (
     "with the repo tools. Ground every claim in files you actually read, "
     "cite sources as `path` or `path:line-line`, and finish with ONLY the "
     "requested section Markdown as your final message. Write the content in "
-    "{language_name}."
+    "{language_name}. Strict final-message format: the text starts with the "
+    "section's first `#` heading — no presentation phrases, no wrapping code "
+    "fence, nothing after the section ends."
 )
 _AGENT_SECTION_FALLBACK = (
     "# Task: generate the \"{section_title}\" wiki section\n\n"
@@ -1164,7 +1166,9 @@ _AGENT_SECTION_FALLBACK = (
     "<sections_list>\n{sections_list}\n</sections_list>\n\n"
     "<section_hints>\n{section_hints}\n</section_hints>\n\n"
     "<section_instruction>\n{section_instruction}\n</section_instruction>\n\n"
-    "Your final message must contain ONLY the finished section Markdown."
+    "Your final message must contain ONLY the finished section Markdown, "
+    "starting with its `#` heading: no presentation phrases, no wrapping "
+    "```markdown fence, nothing after the section ends."
 )
 _ORCHESTRATOR_FALLBACK = (
     "You are the documentation orchestrator for repository `{repo_name}`. "
@@ -3101,25 +3105,36 @@ async def generate_codebase_docs(
                 uid for uid in units_to_generate if not agent_units.get(uid)
             ]
             if missing:
-                try:
-                    dispatched, failed_tasks = _orchestration_dispatch_stats(result)
-                except Exception:  # pragma: no cover - diagnostics never break the run
-                    dispatched, failed_tasks = set(), {}
-                never_dispatched = [u for u in missing if u not in dispatched]
-                dispatched_failed = {
-                    u: err for u, err in failed_tasks.items() if u in missing
-                }
-                logger.warning(
-                    "Units missing after orchestration; python-parallel "
-                    "fallback for: %s (never dispatched: %s; dispatched but "
-                    "no usable text: %s)",
-                    missing, never_dispatched, sorted(dispatched_failed),
-                )
-                if dispatched_failed:
-                    logger.warning(
-                        "Orchestrator task failures: %s",
-                        dict(sorted(dispatched_failed.items())),
+                if result is None:
+                    # The orchestrated run raised outright (the exception was
+                    # already logged above); every missing unit is expected —
+                    # the python-parallel fallback recovers them. Not a
+                    # partial-failure diagnostic, so no scary WARNING here.
+                    logger.info(
+                        "Orchestrated run unavailable; dispatching %d unit(s) "
+                        "via the python-parallel fallback: %s",
+                        len(missing), missing,
                     )
+                else:
+                    try:
+                        dispatched, failed_tasks = _orchestration_dispatch_stats(result)
+                    except Exception:  # pragma: no cover - diagnostics never break the run
+                        dispatched, failed_tasks = set(), {}
+                    never_dispatched = [u for u in missing if u not in dispatched]
+                    dispatched_failed = {
+                        u: err for u, err in failed_tasks.items() if u in missing
+                    }
+                    logger.warning(
+                        "Units missing after orchestration; python-parallel "
+                        "fallback for: %s (never dispatched: %s; dispatched but "
+                        "no usable text: %s)",
+                        missing, never_dispatched, sorted(dispatched_failed),
+                    )
+                    if dispatched_failed:
+                        logger.warning(
+                            "Orchestrator task failures: %s",
+                            dict(sorted(dispatched_failed.items())),
+                        )
                 try:
                     p_texts, p_files = await _run_parallel_section_agents(
                         chat, repo_dir,

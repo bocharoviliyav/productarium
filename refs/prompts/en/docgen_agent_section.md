@@ -68,4 +68,6 @@ tools — explore on your own then.
 - End the section with a compact provenance block (in the output language):
   `### Провенанс и проверка` — key sources, assumptions ("Допущения"),
   gaps ("Пробелы"), and a 1-2 sentence confidence summary.
-- Your FINAL message must contain ONLY the finished section Markdown.
+- Final message: ONLY the section's Markdown, starting with its `#` heading;
+  no presentation phrases ("Here is…", "The section is complete"), no
+  wrapping ```markdown code fence, nothing after the section ends.

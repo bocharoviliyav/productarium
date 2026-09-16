@@ -36,7 +36,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Dict, Optional, Union
+import threading
+import time
+from typing import Any, Dict, Optional, Tuple, Union
 
 import httpx
 from langchain_openai import ChatOpenAI
@@ -235,6 +237,66 @@ def _resolve_credentials(
     )
 
 
+# --- Process-level LLM request spacing (rps) -------------------------------
+# The corporate AI gateway budgets REQUESTS PER SECOND per model; a concurrency
+# semaphore cannot express that (N concurrent calls can all START within one
+# second). Slots are reserved on the monotonic clock under a threading.Lock,
+# keyed by (base_url, model), and shared by EVERY event loop in the process
+# (the main FastAPI loop and the per-job docgen worker loops) — same pattern
+# as the embedder limiter in api/tools/rate_limiter.py. Settings resolve per
+# call through the timeout registry (``llm_rate_limit_rps``), so an admin save
+# applies without a restart.
+class _LLMRateLimiter:
+    """Queued monotonic slot reservation per (base_url, model)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._next_ok: Dict[Tuple[str, str], float] = {}
+
+    def reserve(self, key: Tuple[str, str], min_interval: float) -> float:
+        """Reserve the next call slot; return seconds the caller must wait.
+
+        Slots queue (the timestamp advances by ``min_interval`` per
+        reservation) so N concurrent callers get evenly spaced slots instead
+        of all firing at the same instant.
+        """
+        with self._lock:
+            now = time.monotonic()
+            next_ok = self._next_ok.get(key, 0.0)
+            if next_ok <= now:
+                self._next_ok[key] = now + min_interval
+                return 0.0
+            self._next_ok[key] = next_ok + min_interval
+            return next_ok - now
+
+
+_llm_rate_limiter = _LLMRateLimiter()
+
+# Bounded 429 retry inside _agenerate (linear backoff, same shape as the
+# GenerateLLM wrapper and the embedder limiter). _rate_backoff is a function
+# so tests can zero it out.
+_RATE_ATTEMPTS = 3
+
+
+def _rate_backoff(attempt: int) -> float:
+    return (attempt + 1) * 2.5
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """True for 429/rate-limit errors (class name or message, chain-walked)."""
+    seen = 0
+    current: Optional[BaseException] = exc
+    while current is not None and seen < 4:
+        if type(current).__name__ == "RateLimitError":
+            return True
+        msg = str(current).lower()
+        if "429" in msg or "rate limit" in msg or "too many requests" in msg:
+            return True
+        current = current.__cause__ or current.__context__
+        seen += 1
+    return False
+
+
 def strip_non_tool_message_names(messages: Any) -> Any:
     """Return ``messages`` with the optional ``name`` dropped from every
     non-tool message.
@@ -306,6 +368,24 @@ class ServerCompatChatOpenAI(ChatOpenAI):
     """
 
     _llm_semaphore: Optional[asyncio.Semaphore] = PrivateAttr(default=None)
+    # (base_url, model) key of the process-level rps slot queue; set by
+    # build_chat_model so the limiter budgets per endpoint+model, matching
+    # how gateways meter. None (hand-built instances) shares one "" queue.
+    _rate_key: Optional[Tuple[str, str]] = PrivateAttr(default=None)
+
+    async def _pace(self) -> None:
+        """Reserve the next rps slot for this (base_url, model) and wait it out."""
+        try:
+            from api.config.timeout import resolve_llm_rate_limit_rps
+
+            rps = resolve_llm_rate_limit_rps()
+        except Exception:  # pragma: no cover - registry is import-safe
+            return
+        if rps <= 0:
+            return
+        wait = _llm_rate_limiter.reserve(self._rate_key or ("", ""), 1.0 / rps)
+        if wait > 0:
+            await asyncio.sleep(wait)
 
     def _generate(self, messages, *args: Any, **kwargs: Any):
         return super()._generate(strip_non_tool_message_names(messages), *args, **kwargs)
@@ -313,10 +393,25 @@ class ServerCompatChatOpenAI(ChatOpenAI):
     async def _agenerate(self, messages, *args: Any, **kwargs: Any):
         cleaned = strip_non_tool_message_names(messages)
         sem = self._llm_semaphore
-        if sem is None:
-            return await super()._agenerate(cleaned, *args, **kwargs)
-        async with sem:
-            return await super()._agenerate(cleaned, *args, **kwargs)
+        # rps spacing before EVERY attempt (a retry re-fires a request too);
+        # a 429 gets a bounded linear-backoff retry before the error surfaces.
+        for attempt in range(_RATE_ATTEMPTS):
+            await self._pace()
+            try:
+                if sem is None:
+                    return await super()._agenerate(cleaned, *args, **kwargs)
+                async with sem:
+                    return await super()._agenerate(cleaned, *args, **kwargs)
+            except Exception as exc:
+                if attempt < _RATE_ATTEMPTS - 1 and _is_rate_limit_error(exc):
+                    backoff = _rate_backoff(attempt)
+                    logger.warning(
+                        "LLM call rate-limited (attempt %d/%d); sleeping %.1fs",
+                        attempt + 1, _RATE_ATTEMPTS, backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
 
     def _stream(self, messages, *args: Any, **kwargs: Any):
         yield from super()._stream(
@@ -325,6 +420,11 @@ class ServerCompatChatOpenAI(ChatOpenAI):
 
     async def _astream(self, messages, *args: Any, **kwargs: Any):
         cleaned = strip_non_tool_message_names(messages)
+        # rps spacing before the stream opens (an open stream holds a server
+        # connection exactly like a plain request). No mid-stream retry: a
+        # partially yielded stream cannot be retried without duplicating
+        # chunks — spacing removes the burst that causes 429s here.
+        await self._pace()
         sem = self._llm_semaphore
         if sem is None:
             async for chunk in super()._astream(cleaned, *args, **kwargs):
@@ -411,4 +511,5 @@ def build_chat_model(
     chat = ServerCompatChatOpenAI(**kwargs)
     if llm_concurrency is not None and llm_concurrency > 0:
         chat._llm_semaphore = asyncio.Semaphore(int(llm_concurrency))
+    chat._rate_key = (resolved_base_url, resolved_model)
     return chat

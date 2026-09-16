@@ -82,16 +82,48 @@ def _with_verification_guard(prompt: str) -> str:
 # Regex constants + strip_inline_line_numbers / strip_number_prefixes_from_block /
 # _safe_replace / _cap now live in api.utils.llm_helpers (dedup). _clean_llm_text
 # stays here (docgen variant) and calls the shared strip helper.
+def _strip_wrapper_lead(text: str) -> str:
+    """Drop a short chatter lead-in glued to a whole-output fenced wrapper.
+
+    The one wrapper shape the preamble stripper cannot see: a presentation
+    sentence ("The section is complete. Here is the final Markdown output:")
+    directly before a ``` fence. Structural rule, not phrase matching: at
+    most 2 short non-heading lines before the FIRST fence, the LAST lead
+    line must end with ":" (the introducing-output signature), and the
+    fence must CLOSE the text (whole-output wrapper). Anything else is
+    document content and stays.
+    """
+    lines = text.split("\n")
+    fence_idx = next(
+        (i for i, ln in enumerate(lines[:3]) if ln.lstrip().startswith("```")),
+        None,
+    )
+    if not fence_idx:
+        return text
+    lead = [ln for ln in lines[:fence_idx] if ln.strip()]
+    if not lead or len(lead) > 2:
+        return text
+    if any(len(ln.strip()) > 200 or ln.lstrip().startswith("#") for ln in lead):
+        return text
+    if not lead[-1].rstrip().endswith(":"):
+        return text
+    if not lines or lines[-1].strip() != "```":
+        return text
+    return "\n".join(lines[fence_idx + 1:-1]).strip()
+
+
 def _clean_llm_text(text: Optional[str]) -> str:
-    """Deterministic docgen cleaning: strip meta preamble and a wrapping
-    ```lang fence to a fixed point, then inline line-number prefixes inside
-    code blocks. The loop matters because each strip can reveal the other
-    shape ("preamble:\n```markdown\n…```" → fence survives a single pass)."""
+    """Deterministic docgen cleaning: strip a whole-output fenced wrapper
+    (with its chatter lead-in), meta preamble and a wrapping ```lang fence
+    to a fixed point, then inline line-number prefixes inside code blocks.
+    The loop matters because each strip can reveal the other shape
+    ("preamble:\n```markdown\n…```" → fence survives a single pass)."""
     if not text:
         return ""
     t = text.strip()
     for _ in range(3):
         prev = t
+        t = _strip_wrapper_lead(t)
         t = _strip_llm_preamble(t)
         if t.startswith("```"):
             t = re.sub(r"^```[a-zA-Z0-9]*\n?", "", t)

@@ -229,7 +229,10 @@ class TestLLMConcurrencySemaphore(unittest.TestCase):
             ]
             return await asyncio.gather(*tasks)
 
-        with patch.object(ChatOpenAI, "_agenerate", _fake_agenerate):
+        # rps spacing OFF for the concurrency measurement (µs intervals would
+        # serialize the burst); the limiter itself has its own test file.
+        with patch.object(ChatOpenAI, "_agenerate", _fake_agenerate), \
+                patch("api.config.timeout.resolve_llm_rate_limit_rps", lambda: 1e6):
             asyncio.run(_run())
         return state
 
@@ -285,7 +288,9 @@ class TestLLMConcurrencySemaphore(unittest.TestCase):
 
             return await asyncio.gather(*(_one(i) for i in range(n)))
 
-        with patch.object(ChatOpenAI, "_astream", _fake_astream):
+        # rps spacing OFF for the concurrency measurement (see _run_burst).
+        with patch.object(ChatOpenAI, "_astream", _fake_astream), \
+                patch("api.config.timeout.resolve_llm_rate_limit_rps", lambda: 1e6):
             asyncio.run(_run())
         return state
 

@@ -86,6 +86,19 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         label="LLM retry max time",
         group="LLM",
     ),
+    # Not a timeout: the process-wide requests-per-second ceiling for LLM
+    # calls (see api/llm/client.py). A concurrency semaphore cannot express
+    # an RPS limit — N concurrent calls can all START within one second and
+    # trip the gateway's per-second budget with 429.
+    TimeoutKey(
+        key="llm_rate_limit_rps",
+        env_var="LLM_RATE_LIMIT_RPS",
+        default=5.0,
+        floor=0.0,
+        label="LLM requests per second (process-wide)",
+        unit="requests/sec",
+        group="LLM",
+    ),
     # --- Docgen worker ---------------------------------------------------
     # Best-effort ceiling for draining leftover worker-loop tasks after the
     # docs are committed; a drain timeout is non-fatal by design.
@@ -328,28 +341,32 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         unit="tables per LLM call",
         group="Databases",
     ),
+    # 0 = unlimited on the three caps below: every non-system entity gets a
+    # subpage, a description batch and (where the server can resolve it) a
+    # source fetch. The walk stays bounded by MAX_TOOL_CALLS + the wall-clock
+    # budget, the render side only builds deterministic strings.
     TimeoutKey(
         key="db_docgen_max_subpages",
         env_var="DB_DOCGEN_MAX_SUBPAGES",
-        default=200.0,
-        floor=1.0,
-        label="Database docgen: max entity subpages",
+        default=0.0,
+        floor=0.0,
+        label="Database docgen: max entity subpages (0 = unlimited)",
         unit="pages",
         group="Databases",
     ),
     TimeoutKey(
         key="db_docgen_max_descriptions",
         env_var="DB_DOCGEN_MAX_DESCRIPTIONS",
-        default=250.0,
-        floor=1.0,
-        label="Database docgen: max LLM-described objects",
+        default=0.0,
+        floor=0.0,
+        label="Database docgen: max LLM-described objects (0 = unlimited)",
         unit="objects",
         group="Databases",
     ),
     TimeoutKey(
         key="db_fk_evidence_tables",
         env_var="DB_FK_EVIDENCE_TABLES",
-        default=300.0,
+        default=1000.0,
         floor=1.0,
         label="Database RE: tables probed for constraints/indexes",
         unit="tables",
@@ -358,9 +375,9 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
     TimeoutKey(
         key="db_source_objects",
         env_var="DB_SOURCE_OBJECTS",
-        default=100.0,
-        floor=1.0,
-        label="Database RE: objects with fetched source/definition",
+        default=0.0,
+        floor=0.0,
+        label="Database RE: objects with fetched source (0 = unlimited)",
         unit="objects",
         group="Databases",
     ),
@@ -511,6 +528,18 @@ def resolve_llm_request_timeout() -> float:
 def resolve_llm_retry_max_time() -> float:
     """Total backoff retry budget for transient errors on OpenAI clients (seconds)."""
     return resolve_timeout("llm_retry_max_time")
+
+
+def resolve_llm_rate_limit_rps() -> float:
+    """Process-wide LLM requests-per-second ceiling (0 = spacing disabled).
+
+    Enforced by ``ServerCompatChatOpenAI`` on every async call through any
+    chat instance built by :func:`api.llm.client.build_chat_model` — one
+    monotonic slot queue per (base_url, model), shared across all event
+    loops in the process. Read per call so an admin save applies without a
+    restart.
+    """
+    return resolve_timeout("llm_rate_limit_rps")
 
 
 def resolve_docgen_indexing_drain_seconds() -> float:
@@ -706,14 +735,18 @@ def resolve_db_docgen_enrich_batch() -> int:
 def resolve_db_docgen_max_subpages() -> int:
     """Max entity subpages (tables + category objects) rendered per database.
 
-    Above the cap the surplus stays on the category root page in a folded
-    (``<details>``) list — hidden, never dropped.
+    0 = unlimited (default). Above a finite cap the surplus stays on the
+    category root page in a folded (``<details>``) list — hidden, never
+    dropped.
     """
     return resolve_timeout_int("db_docgen_max_subpages")
 
 
 def resolve_db_docgen_max_descriptions() -> int:
-    """Max objects that get an LLM description per database run."""
+    """Max objects that get an LLM description per database run.
+
+    0 = unlimited (default); objects per LLM call follow the batch knob.
+    """
     return resolve_timeout_int("db_docgen_max_descriptions")
 
 
@@ -728,7 +761,8 @@ def resolve_db_fk_evidence_tables() -> int:
 def resolve_db_source_objects() -> int:
     """Max non-table objects (views/routines/triggers/…) with fetched source.
 
-    Walk-affecting budget: participates in the introspection cache key.
+    0 = unlimited (default). Walk-affecting budget: participates in the
+    introspection cache key.
     """
     return resolve_timeout_int("db_source_objects")
 
@@ -789,6 +823,7 @@ __all__ = [
     "resolve_timeout_int",
     "resolve_llm_request_timeout",
     "resolve_llm_retry_max_time",
+    "resolve_llm_rate_limit_rps",
     "resolve_expert_stream_timeout",
     "resolve_expert_recursion_limit",
     "resolve_docgen_indexing_drain_seconds",

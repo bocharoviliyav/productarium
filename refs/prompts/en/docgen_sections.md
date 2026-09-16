@@ -274,6 +274,11 @@ store collections, message payloads.
 
 ## Rules
 - Fields/types come from model/migration definitions only.
+- Document ONLY stores the service's CODE actually connects to (client
+  modules, connection strings, in-code configuration). A store mentioned
+  only in docker-compose/test configs or in the "product database context"
+  block with no references in the code is NOT a data layer of the service:
+  exclude it with a one-line note that no code references exist.
 - No database in the repo? State that explicitly and describe config/DTO
   data shapes instead, if any.
 </section>

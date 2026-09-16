@@ -131,6 +131,10 @@ every field, constraints, indexes, migrations.
 
 ## Rules
 - Fields/types/constraints come from model/migration definitions only.
+- Write this subpage ONLY if the service's code actually connects to the
+  layer (client/DSN/in-code config). A layer visible only in docker-compose/
+  test configs or in the product database digest with no code references is
+  not documented.
 - Very wide tables: list all fields, but compress audit-style columns into
   one row ("+ 12 audit columns — see `path`").
 - Non-relational stores: describe documents/keys/schemas in equivalent

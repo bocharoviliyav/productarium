@@ -57,8 +57,15 @@ yourself. Do not repeat content that the section contract does not ask for.
 Write the documentation content in {language_name}. Keep technical terms,
 file names, code identifiers, and API names in English.
 
-# Final message contract
+# Final message contract (strict format)
 
-Your FINAL message must contain ONLY the finished section's Markdown — no
-preamble, no explanations, no plan recap. Intermediate messages may be short
-working notes.
+Your final message is a machine-parsed document, not a reply to a person:
+- The FIRST character of the final message is the `#` of the section's first
+  contract heading.
+- Presentation phrases are FORBIDDEN anywhere: "Here is…", "The section is
+  complete", "Вот раздел…" — neither before nor after the section text.
+- NEVER wrap the whole section in a code fence (```markdown … ``` or any
+  other): this is a Markdown page, not code.
+- After the section's last line (including the provenance block) — nothing:
+  no wrap-ups, explanations, or questions.
+Intermediate messages may be short working notes.

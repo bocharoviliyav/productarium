@@ -32,6 +32,7 @@ from api.config.timeout import (
     resolve_db_fk_evidence_tables,
     resolve_db_source_objects,
     resolve_docgen_db_context_enabled,
+    resolve_llm_rate_limit_rps,
     resolve_docgen_indexing_drain_seconds,
     resolve_docgen_llm_concurrency,
     resolve_docgen_map_concurrency,
@@ -55,6 +56,7 @@ from api.config.timeout import (
 WRAPPER_TO_KEY = {
     "resolve_llm_request_timeout": "llm_request",
     "resolve_llm_retry_max_time": "llm_retry_max_time",
+    "resolve_llm_rate_limit_rps": "llm_rate_limit_rps",
     "resolve_docgen_indexing_drain_seconds": "docgen_indexing_drain",
     "resolve_docgen_map_concurrency": "docgen_map_concurrency",
     "resolve_docgen_unit_recursion_limit": "docgen_unit_recursion_limit",
@@ -470,10 +472,11 @@ class TestTimeoutConfig(unittest.TestCase):
         env_vars = [k.env_var for k in TIMEOUT_KEYS]
         with _EnvGuard(env_vars, []):
             self.assertEqual(resolve_db_docgen_enrich_batch(), 40)
-            self.assertEqual(resolve_db_docgen_max_subpages(), 200)
-            self.assertEqual(resolve_db_docgen_max_descriptions(), 250)
-            self.assertEqual(resolve_db_fk_evidence_tables(), 300)
-            self.assertEqual(resolve_db_source_objects(), 100)
+            # 0 = unlimited: non-system entities are never truncated.
+            self.assertEqual(resolve_db_docgen_max_subpages(), 0)
+            self.assertEqual(resolve_db_docgen_max_descriptions(), 0)
+            self.assertEqual(resolve_db_fk_evidence_tables(), 1000)
+            self.assertEqual(resolve_db_source_objects(), 0)
 
     def test_db_docgen_budget_env_override(self):
         env_vars = [k.env_var for k in TIMEOUT_KEYS]
@@ -486,15 +489,23 @@ class TestTimeoutConfig(unittest.TestCase):
             self.assertEqual(resolve_db_fk_evidence_tables(), 12)
 
     def test_db_docgen_budget_floors(self):
-        # A typo can't shrink a batch below its floor or kill all subpages.
+        # A typo can't shrink a batch below its floor; negative caps fall
+        # back to the default (0 = unlimited), and an explicit 0 on the
+        # 0=unlimited knobs survives (floor 0, not clamped to 1).
         env_vars = [k.env_var for k in TIMEOUT_KEYS]
         with _EnvGuard(env_vars, []):
             os.environ["DB_DOCGEN_ENRICH_BATCH"] = "1"
             self.assertEqual(resolve_db_docgen_enrich_batch(), 5)
             os.environ["DB_DOCGEN_MAX_SUBPAGES"] = "0"
-            self.assertEqual(resolve_db_docgen_max_subpages(), 1)
+            self.assertEqual(resolve_db_docgen_max_subpages(), 0)
+            os.environ["DB_DOCGEN_MAX_SUBPAGES"] = "7"
+            self.assertEqual(resolve_db_docgen_max_subpages(), 7)
             os.environ["DB_DOCGEN_MAX_DESCRIPTIONS"] = "-3"
-            self.assertEqual(resolve_db_docgen_max_descriptions(), 250)
+            self.assertEqual(resolve_db_docgen_max_descriptions(), 0)
+            os.environ["DB_SOURCE_OBJECTS"] = "0"
+            self.assertEqual(resolve_db_source_objects(), 0)
+            os.environ["LLM_RATE_LIMIT_RPS"] = "0"
+            self.assertEqual(resolve_llm_rate_limit_rps(), 0.0)
 
     def test_db_connect_check_wrapper(self):
         env_vars = [k.env_var for k in TIMEOUT_KEYS]
