@@ -124,9 +124,8 @@ MAX_DEFINITION_CHARS = 8_000
 MAX_SCHEMA_DUMP_CHARS = 120_000
 #: Max characters of the product-knowledge context block inside prompts.
 _MAX_PRODUCT_CONTEXT_CHARS = 8_000
-#: Overall wall-clock budget for one introspection walk (DoS guard, review
-# #4: per-call limits alone let a slow MCP surface occupy a docgen worker
-#: for hours). Env-overridable; default 15 minutes.
+
+
 def _env_float(name: str, default: float) -> float:
     """Import-time env parsing that never crashes on garbage values."""
     raw = (os.environ.get(name) or "").strip()
@@ -138,7 +137,11 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-INTROSPECTION_TIMEOUT_SECONDS = _env_float("DB_INTROSPECTION_TIMEOUT_SECONDS", 900.0)
+#: Overall wall-clock budget for one introspection walk (DoS guard, review
+# #4: per-call limits alone let a slow MCP surface occupy a docgen worker
+# for hours). Env-overridable; default 30 minutes — a multi-schema Oracle
+# monolith legitimately needs tens of paged catalog queries.
+INTROSPECTION_TIMEOUT_SECONDS = _env_float("DB_INTROSPECTION_TIMEOUT_SECONDS", 1800.0)
 #: Hard cap on MCP tool calls during one walk (schema listings + per-table
 #: definitions + category probes combined) so huge schemas cannot loop
 #: unboundedly.
@@ -586,7 +589,15 @@ _ORACLE_SYSTEM_OWNERS = (
     "GSMCATUSER", "GSMUSER", "DIP", "ORACLE_OCM", "MDDATA",
     "REMOTE_SCHEDULER_AGENT", "SYSBACKUP", "SYSDG", "SYSKM", "SYSRAC",
     "DVF", "DV_OWNER", "DV_ACCTMGR",
+    # Maintenance accounts present on legacy monoliths (Statspack, APEX,
+    # Workspace, OEM, OWB…).
+    "ANONYMOUS", "APEX_PUBLIC_USER", "FLOWS_FILES", "MGMT_VIEW", "SYSMAN",
+    "OWBSYS", "OWBSYS_AUDIT", "WKSYS", "WK_TEST", "WKPROXY",
+    "SI_INFORMTN_SCHEMA", "XS$NULL", "TSMSYS", "PERFSTAT",
 )
+#: APEX releases ship version-prefixed schemas (APEX_040200…) — a fixed
+#: tuple cannot cover them.
+_ORA_SYSTEM_OWNER_PREFIXES = ("APEX_", "FLOWS_")
 
 
 def _pg_not_system(column: str) -> str:
@@ -595,6 +606,21 @@ def _pg_not_system(column: str) -> str:
 
 def _ora_not_system(column: str) -> str:
     return f"{column} NOT IN (" + ", ".join(f"'{s}'" for s in _ORACLE_SYSTEM_OWNERS) + ")"
+
+
+def _ora_user_owner(owner: str) -> bool:
+    """True for USER Oracle owners — maintenance accounts are not docs.
+
+    Case-insensitive; authoritative counterpart of the SQL-side ``NOT IN``
+    (covers the version-prefixed APEX_/FLOWS_ schemas). An empty owner
+    means "no owner info" and passes — there is nothing to filter on.
+    """
+    up = (owner or "").strip().upper()
+    if not up:
+        return True
+    return up not in _ORACLE_SYSTEM_OWNERS and not up.startswith(
+        _ORA_SYSTEM_OWNER_PREFIXES
+    )
 
 
 def _pg_user_schema(name: str) -> bool:
@@ -677,10 +703,15 @@ _PG_SQL_PACK: Dict[str, str] = {
     ),
 }
 
-#: Row cap for Oracle catalog queries: ``run_sql_query`` defaults to 100
-#: rows, which silently truncates wide catalogs (all_source line rows!).
-#: The effective ceiling is the manager's tool-result char cap.
-_ORA_MAX_ROWS = 5_000
+#: Page size for Oracle catalog queries. The manager hard-caps every tool
+#: result (``MCP_TOOL_RESULT_MAX_CHARS``, 100k chars) and a rendered
+#: pipe-table row is ~60-100 chars, so ~1_200 rows/page keeps each page
+#: under the cap. The old single 5_000-row ask was silently chopped
+#: mid-table by the cap and the parser lost everything after the cut.
+_ORA_PAGE_ROWS = 1_200
+#: Sanity ceiling on pages per query (72k rows) — bounds worst-case walk
+#: time; anything wider is documentation noise anyway.
+_ORA_MAX_PAGES = 60
 #: Owner names interpolated into the bulk queries below are catalog-derived
 #: (all_tables.owner), never user input; this charset regex additionally
 #: excludes quotes/semicolons, so the interpolated literal is inert.
@@ -717,6 +748,14 @@ _ORA_COMMENTS_QUERY = (
     'SELECT table_name AS "table_name", comments AS "comments" '
     "FROM all_tab_comments "
     "WHERE owner = '{owner}' AND comments IS NOT NULL"
+)
+
+#: The pinned server's effective schema (TARGET_SCHEMA or the login user):
+#: ``get_object_source`` resolves every object against it (DBMS_METADATA
+#: has no cross-schema lookup there), so sources can only be fetched for
+#: objects whose owner matches it.
+_ORA_SESSION_SCHEMA_QUERY = (
+    "SELECT SYS_CONTEXT('USERENV', 'SESSION_USER') AS \"owner\" FROM dual"
 )
 
 #: Oracle catalog pack over the ALL_* views (works with any role's grants).
@@ -1775,6 +1814,82 @@ def _join_line_rows(
     return list(groups.values())
 
 
+def _ora_page_query(query: str, lo: int, hi: int) -> str:
+    """ROWNUM-window wrapper fetching one catalog page.
+
+    ``lo``/``hi`` are loop-counter ints only (never user input) — as inert
+    as the catalog-derived owner literals guarded by
+    ``_ORA_IDENTIFIER_RE``.
+    """
+    return (
+        'SELECT * FROM (SELECT inner_q.*, ROWNUM AS "rnum" '
+        f"FROM ({query}) inner_q WHERE ROWNUM <= {hi}) "
+        f'WHERE "rnum" > {lo}'
+    )
+
+
+async def _paged_rows(
+    sql_tool: Any, bounded_call: Callable[..., str], query: str
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """All rows of a catalog query, fetched in char-cap-safe pages.
+
+    Stops on the first short page (or the page ceiling). Returns the LAST
+    raw response — diagnostics for the caller's error messages — plus the
+    aggregated rows.
+    """
+    rows: List[Dict[str, Any]] = []
+    raw = ""
+    for page in range(_ORA_MAX_PAGES):
+        raw = await bounded_call(
+            sql_tool,
+            _sql_args(
+                sql_tool,
+                _ora_page_query(
+                    query, page * _ORA_PAGE_ROWS, (page + 1) * _ORA_PAGE_ROWS
+                ),
+                max_rows=_ORA_PAGE_ROWS,
+            ),
+        )
+        chunk = _rows_from_sql_result(raw)
+        rows.extend(chunk)
+        if len(chunk) < _ORA_PAGE_ROWS:
+            break
+    return raw, rows
+
+
+async def _oracle_session_schema(
+    sql_tool: Any, bounded_call: Callable[..., str]
+) -> Optional[str]:
+    """Which schema the MCP server resolves object names in (None = unknown)."""
+    raw = await bounded_call(
+        sql_tool, _sql_args(sql_tool, _ORA_SESSION_SCHEMA_QUERY)
+    )
+    for row in _rows_from_sql_result(raw):
+        value = str(row.get("owner") or "").strip().upper()
+        if value:
+            return value
+    return None
+
+
+_ORA_ERROR_HEAD_RE = re.compile(r"\bORA-\d{5}\b")
+
+
+def _looks_like_server_error(text: str) -> bool:
+    """Server-side failures arrive as plain text (never our ERROR: prefix).
+
+    oracle-mcp-server answers ``Database error: ORA-…`` / ``Unexpected
+    error executing query: …`` / ``Error retrieving object source: …`` —
+    none of that is documentation, so it must not be stored as one.
+    """
+    head = (text or "")[:400]
+    return bool(
+        "Database error" in head
+        or "Unexpected error" in head
+        or "Error retrieving" in head
+        or _ORA_ERROR_HEAD_RE.search(head)
+    )
+
+
 async def _oracle_bulk_tables(
     sql_tool: Any, bounded_call: Callable[..., str], errors: List[str]
 ) -> Optional[Tuple[List[str], Dict[str, Dict[str, Any]]]]:
@@ -1783,28 +1898,26 @@ async def _oracle_bulk_tables(
     oracle-mcp-server caches ONE connected schema (TARGET_SCHEMA or the
     login user), so its per-table tools cannot see an enterprise
     multi-schema layout; the ALL_* catalog is the only cross-schema
-    surface. Two calls per schema replace thousands of single-schema
+    surface. Two paged calls per schema replace thousands of single-schema
     probes. Returns ``None`` when the surface cannot serve the catalog
     queries — the caller falls back to the adapter walk.
     """
 
-    async def _q(sql: str, max_rows: int) -> Tuple[str, List[Dict[str, Any]]]:
-        raw = await bounded_call(
-            sql_tool, _sql_args(sql_tool, sql, max_rows=max_rows)
-        )
-        return raw, _rows_from_sql_result(raw)
+    async def _q(sql: str) -> Tuple[str, List[Dict[str, Any]]]:
+        return await _paged_rows(sql_tool, bounded_call, sql)
 
-    _, owner_rows = await _q(_ORA_OWNERS_QUERY, MAX_SCHEMAS)
+    _, owner_rows = await _q(_ORA_OWNERS_QUERY)
     owners = [
         str(row.get("owner") or "") for row in owner_rows
         if _ORA_IDENTIFIER_RE.match(str(row.get("owner") or ""))
+        and _ora_user_owner(str(row.get("owner") or ""))
     ][:MAX_SCHEMAS]
     if not owners:
         return None
 
     tables: Dict[str, Dict[str, Any]] = {}
     for owner in owners:
-        raw, rows = await _q(_ORA_COLUMNS_QUERY.format(owner=owner), _ORA_MAX_ROWS)
+        raw, rows = await _q(_ORA_COLUMNS_QUERY.format(owner=owner))
         if not rows:
             # The WHY travels with the error: empty result, server-side ORA-*,
             # or the pinned formatter's None-cell crash all look identical
@@ -1835,13 +1948,11 @@ async def _oracle_bulk_tables(
         comments = {
             str(r.get("table_name") or ""): str(r.get("comments") or "")
             for r in (
-                await _q(
-                    _ORA_COMMENTS_QUERY.format(owner=owner), MAX_TABLES_PER_SCHEMA
-                )
+                await _q(_ORA_COMMENTS_QUERY.format(owner=owner))
             )[1]
             if r.get("comments")
         }
-        for tname in sorted(columns)[:MAX_TABLES_PER_SCHEMA]:
+        for tname in sorted(columns):
             # Controlled render — re-parsed by _parse_table_definition so the
             # bulk path and the adapter path share one structure parser.
             definition = [
@@ -2157,16 +2268,19 @@ async def _introspect(
             if not _assert_readonly_sql(query):  # pragma: no cover - constants
                 logger.warning("SQL pack query %r failed the read-only guard", name)
                 continue
-            raw = await _bounded_call(
-                sql_tool,
-                _sql_args(
-                    sql_tool, query,
-                    max_rows=_ORA_MAX_ROWS if engine == "oracle" else None,
-                ),
-            )
-            rows = _rows_from_sql_result(raw)
+            if engine == "oracle":
+                raw, rows = await _paged_rows(sql_tool, _bounded_call, query)
+            else:
+                raw = await _bounded_call(
+                    sql_tool, _sql_args(sql_tool, query)
+                )
+                rows = _rows_from_sql_result(raw)
             if not rows:
                 ok = bool(raw) and not raw.startswith("ERROR:")
+                if ok:
+                    # A server-side ORA-*/formatter crash arrives as plain
+                    # text: an error is NOT an authoritative "empty".
+                    ok = not _looks_like_server_error(_unwrap_untrusted(raw))
                 if ok and name in _CATEGORIES:
                     pack_categories.setdefault(name, {})  # catalog says: empty
                 elif ok:
@@ -2318,6 +2432,20 @@ async def _introspect(
                         routine_meta["source"] = _cap(source, MAX_DEFINITION_CHARS)
                     pack_categories.setdefault("routines", {})[full] = routine_meta
 
+        # Maintenance owners that slipped past the SQL-side NOT IN (APEX
+        # releases, resurrected legacy accounts) are dropped before the
+        # authoritative replacement — they are not documentation.
+        if engine == "oracle":
+            for cat in pack_categories:
+                pack_categories[cat] = {
+                    f: m for f, m in pack_categories[cat].items()
+                    if _ora_user_owner(str(m.get("schema") or ""))
+                }
+            pack_matviews = {
+                f: m for f, m in pack_matviews.items()
+                if _ora_user_owner(str(m.get("schema") or ""))
+            }
+
         # Authoritative replacement; matviews merge AFTERWARDS so the fresh
         # views dict cannot wipe them.
         for cat, entries in pack_categories.items():
@@ -2332,27 +2460,50 @@ async def _introspect(
     source_tool = roles["source"][0] if roles.get("source") else None
     if source_tool is not None:
         tools_used["source"] = getattr(source_tool, "name", "")
-        budget = _source_objects()
-        declared = _tool_arg_names(source_tool)
-        for cat in _CATEGORIES:
-            if budget <= 0:
-                break
-            for full, meta in categories[cat].items():
+        # oracle-mcp-server resolves object names against ITS effective
+        # schema (DBMS_METADATA answers ORA-31603 for everything else; the
+        # tool has no owner argument). After a cross-schema bulk walk only
+        # that schema's objects can resolve — burning the source budget on
+        # the rest produced "sources" that were really error texts. When
+        # the schema cannot even be determined, skip oracle sources rather
+        # than gamble the budget (adapter path: objects carry no schema and
+        # the server is single-schema anyway — fetch as before).
+        effective: Optional[str] = None
+        skip_sources = False
+        if bulk is not None and engine == "oracle" and sql_tool is not None:
+            effective = await _oracle_session_schema(sql_tool, _bounded_call)
+            skip_sources = effective is None
+        if not skip_sources:
+            budget = _source_objects()
+            declared = _tool_arg_names(source_tool)
+            for cat in _CATEGORIES:
                 if budget <= 0:
                     break
-                if meta.get("source"):
-                    continue
-                args = _build_tool_args(source_tool, table=meta.get("name") or full)
-                if "object_type" in declared:
-                    args["object_type"] = (
-                        meta.get("kind")
-                        if cat == "routines"
-                        else _SOURCE_TYPE_BY_CATEGORY.get(cat, "")
-                    )
-                raw = await _bounded_call(source_tool, args)
-                budget -= 1
-                if raw and not raw.startswith("ERROR:"):
-                    meta["source"] = _cap(raw, MAX_DEFINITION_CHARS)
+                for full, meta in categories[cat].items():
+                    if budget <= 0:
+                        break
+                    if meta.get("source"):
+                        continue
+                    if (
+                        effective is not None
+                        and str(meta.get("schema") or "").upper() != effective
+                    ):
+                        continue  # would only buy an ORA-31603 from the server
+                    args = _build_tool_args(source_tool, table=meta.get("name") or full)
+                    if "object_type" in declared:
+                        args["object_type"] = (
+                            meta.get("kind")
+                            if cat == "routines"
+                            else _SOURCE_TYPE_BY_CATEGORY.get(cat, "")
+                        )
+                    raw = await _bounded_call(source_tool, args)
+                    budget -= 1
+                    if (
+                        raw
+                        and not raw.startswith("ERROR:")
+                        and not _looks_like_server_error(_unwrap_untrusted(raw))
+                    ):
+                        meta["source"] = _cap(raw, MAX_DEFINITION_CHARS)
 
     return {
         "schemas": schema_names,
@@ -2789,7 +2940,9 @@ def _render_page_tree(
         meta = tables.get(full) or {}
         pages[table_page_ids[full]] = {
             "id": table_page_ids[full],
-            "title": meta.get("table") or full,
+            # Schema-qualified: with hundreds of same-named tables across
+            # schemas, a bare "USERS" is ambiguous in the nav and search.
+            "title": full,
             "content": _render_table_subpage(
                 full, meta, descriptions.get(full) or {}, edges, triggers
             ),
@@ -2826,7 +2979,7 @@ def _render_page_tree(
             meta = entries[full] or {}
             pages[child_ids[full]] = {
                 "id": child_ids[full],
-                "title": meta.get("name") or full,
+                "title": full,  # schema-qualified, same as table subpages
                 "content": _render_category_subpage(
                     cat, full, meta, (cat_descs.get(cat) or {}).get(full, "")
                 ),

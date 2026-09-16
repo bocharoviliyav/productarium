@@ -6,6 +6,7 @@ import { useParams, useRouter } from "next/navigation";
 import {
   ArrowCounterClockwise,
   ArrowLeft,
+  CaretDown,
   Database as DatabaseIcon,
   FileText,
   GitBranch,
@@ -263,6 +264,17 @@ export default function EntityDocsViewer() {
     }
     return { roots, childrenByParent };
   }, [displayPages]);
+
+  // Collapsible nav groups: with hundreds of per-table subpages the nav is
+  // unreadable, so children stay hidden until the group opens; the group
+  // holding the active page auto-opens so deep links remain navigable.
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
+  const activeParent = activePage?.parent?.trim();
+  useEffect(() => {
+    if (activeParent) {
+      setOpenGroups((g) => (g[activeParent] ? g : { ...g, [activeParent]: true }));
+    }
+  }, [activeParent]);
 
   const isCodebase = kind === "codebase";
   const isDatabase = kind === "database";
@@ -847,22 +859,52 @@ export default function EntityDocsViewer() {
                       {pageTree.roots.map((p) => {
                         const isActive = p.id === activePageId;
                         const children = pageTree.childrenByParent.get(p.id) ?? [];
+                        const open = Boolean(openGroups[p.id]);
                         return (
                           <div key={p.id} className="flex flex-col gap-0.5">
-                            <button
-                              onClick={() => setActivePageId(p.id)}
-                              disabled={editing}
-                              className={cn(
-                                "rounded-md px-3 py-2 text-left text-sm transition-colors",
-                                "disabled:cursor-not-allowed disabled:opacity-50",
-                                isActive
-                                  ? "bg-surface-2 font-medium text-ink"
-                                  : "text-muted hover:bg-surface-2 hover:text-ink",
+                            <div className="flex items-center gap-1">
+                              {children.length > 0 ? (
+                                <button
+                                  type="button"
+                                  aria-expanded={open}
+                                  aria-label={p.title}
+                                  onClick={() =>
+                                    setOpenGroups((g) => ({ ...g, [p.id]: !open }))
+                                  }
+                                  className="shrink-0 rounded p-1 text-muted transition-colors hover:bg-surface-2 hover:text-ink"
+                                >
+                                  <CaretDown
+                                    size={12}
+                                    weight="bold"
+                                    className={cn(
+                                      "transition-transform",
+                                      !open && "-rotate-90",
+                                    )}
+                                  />
+                                </button>
+                              ) : (
+                                <span className="w-5 shrink-0" aria-hidden />
                               )}
-                            >
-                              {p.title}
-                            </button>
-                            {children.length > 0 && (
+                              <button
+                                onClick={() => setActivePageId(p.id)}
+                                disabled={editing}
+                                className={cn(
+                                  "flex-1 rounded-md px-2 py-2 text-left text-sm transition-colors",
+                                  "disabled:cursor-not-allowed disabled:opacity-50",
+                                  isActive
+                                    ? "bg-surface-2 font-medium text-ink"
+                                    : "text-muted hover:bg-surface-2 hover:text-ink",
+                                )}
+                              >
+                                {p.title}
+                                {children.length > 0 && (
+                                  <span className="ml-1.5 font-mono text-[11px] text-muted">
+                                    {children.length}
+                                  </span>
+                                )}
+                              </button>
+                            </div>
+                            {children.length > 0 && open && (
                               <div
                                 className="ml-3 flex flex-col gap-0.5 border-l border-divider pl-2"
                                 role="group"

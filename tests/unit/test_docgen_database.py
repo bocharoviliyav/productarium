@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from types import SimpleNamespace
 
@@ -1638,14 +1639,17 @@ class TestOracleBulkWalk:
         assert search.calls == []
         assert info["tools_used"]["tables"] == "run_sql_query[sql]"
         assert info["unavailable"] == []
-        # Wide catalog calls carry an explicit row cap — the server default
-        # (100) silently truncated e.g. all_source line rows.
+        # Catalog queries run paged (ROWNUM windows) with the page size as
+        # the row cap — a single wide ask was chopped by the tool-result
+        # char cap and the parser lost everything after the cut.
         cols_calls = [c for c in sql.calls if "all_tab_columns" in c["sql"]]
         assert cols_calls and all(
-            c["max_rows"] == db_doc_mod._ORA_MAX_ROWS for c in cols_calls
+            c["max_rows"] == db_doc_mod._ORA_PAGE_ROWS
+            and 'ROWNUM <=' in c["sql"]
+            for c in cols_calls
         )
         owners_call = next(c for c in sql.calls if "GROUP BY owner" in c["sql"])
-        assert owners_call["max_rows"] == db_doc_mod.MAX_SCHEMAS
+        assert owners_call["max_rows"] == db_doc_mod._ORA_PAGE_ROWS
 
     def test_bulk_failure_falls_back_to_adapter_walk(self):
         sql = FakeTool("run_sql_query", {"sql": {}}, "ERROR: ORA-00942")
@@ -1696,6 +1700,173 @@ class TestOracleBulkWalk:
         info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
         assert set(info["tables"]) == {"APP.ORDERS", "TENANT_A.USERS"}
         assert info["tools_used"]["tables"] == "run_sql_query"
+
+    @staticmethod
+    def _columns_page(q, col_rows):
+        # The ROWNUM window wrapper decides which rows a page carries.
+        lo = int(re.search(r'"rnum" > (\d+)', q).group(1))
+        hi = int(re.search(r"ROWNUM <= (\d+)", q).group(1))
+        head = (
+            "| table_schema | table_name | column_id | column_name"
+            " | data_type | nullable | num_rows |"
+            "\n| --- | --- | --- | --- | --- | --- | --- |\n"
+        )
+        page = col_rows[lo:hi]
+        if not page:
+            return TestOracleBulkWalk._envelope(
+                "Query executed successfully, but returned no rows."
+            )
+        return TestOracleBulkWalk._envelope(head + "\n".join(page))
+
+    def test_bulk_walk_pages_wide_columns_result(self):
+        # 700 tables x 3 columns = 2 100 rows > one page: nothing may be
+        # silently dropped (the old walk both sliced 100 tables per schema
+        # and let the tool-result char cap chop a single 5 000-row ask).
+        col_rows = [
+            f"| ALC | T{i:04d} | {cid} | {cname} | VARCHAR2 | Y | 0 |"
+            for i in range(700)
+            for cid, cname in (("1", "ID"), ("2", "NAME"), ("3", "NOTE"))
+        ]
+
+        def responder(a):
+            q = str(a.get("sql") or "")
+            if "GROUP BY owner" in q:
+                return self._envelope("| owner |\n| --- |\n| ALC |")
+            if "all_tab_columns" in q:
+                return self._columns_page(q, col_rows)
+            return self._envelope(
+                "Query executed successfully, but returned no rows."
+            )
+
+        sql = FakeTool("run_sql_query", {"sql": {}, "max_rows": {}}, responder)
+        roles = db_doc_mod._classify_introspection_tools([sql])
+        info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
+        assert len(info["tables"]) == 700
+        assert info["tables"]["ALC.T0000"]["columns"][0]["name"] == "ID"
+        assert info["tables"]["ALC.T0699"]["columns"][-1]["name"] == "NOTE"
+        pages = [c for c in sql.calls if "all_tab_columns" in c["sql"]]
+        assert len(pages) == 2
+
+    def test_maintenance_owners_never_walked(self):
+        # SYSMAN/APEX_*/PERFSTAT leak past the SQL-side NOT IN on legacy
+        # monoliths — the python-side owner filter is authoritative.
+        def responder(a):
+            q = str(a.get("sql") or "")
+            if "GROUP BY owner" in q:
+                return self._envelope(
+                    "| owner |\n| --- |\n| ALC |\n| SYSMAN |\n"
+                    "| APEX_040200 |\n| PERFSTAT |"
+                )
+            if "all_tab_columns" in q:
+                return self._columns_page(q, [
+                    "| ALC | T | 1 | ID | NUMBER | N | 5 |",
+                ])
+            return self._envelope(
+                "Query executed successfully, but returned no rows."
+            )
+
+        sql = FakeTool("run_sql_query", {"sql": {}, "max_rows": {}}, responder)
+        roles = db_doc_mod._classify_introspection_tools([sql])
+        info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
+        assert info["schemas"] == ["ALC"]
+        assert set(info["tables"]) == {"ALC.T"}
+        # Only ALC was worth a columns query — not three maintenance owners.
+        cols = [c for c in sql.calls if "all_tab_columns" in c["sql"]]
+        assert len(cols) == 1 and "'ALC'" in cols[0]["sql"]
+
+    def _source_guard_surface(self, session_owner, source_response):
+        def responder(a):
+            q = str(a.get("sql") or "")
+            if "GROUP BY owner" in q:
+                return self._envelope("| owner |\n| --- |\n| ALC |")
+            if "SESSION_USER" in q:
+                return self._envelope(
+                    f"| owner |\n| --- |\n| {session_owner} |"
+                )
+            if "all_views" in q:
+                return self._envelope(
+                    "| schema_name | name |\n| --- | --- |\n| ALC | V1 |"
+                )
+            if "all_tab_columns" in q:
+                return self._columns_page(q, [
+                    "| ALC | T | 1 | ID | NUMBER | N | 5 |",
+                ])
+            return self._envelope(
+                "Query executed successfully, but returned no rows."
+            )
+
+        sql = FakeTool("run_sql_query", {"sql": {}, "max_rows": {}}, responder)
+        search = FakeTool("search_tables_schema", {"search_term": {}}, "unused")
+        source = FakeTool(
+            "get_object_source",
+            {"object_type": {}, "object_name": {}},
+            source_response,
+        )
+        roles = db_doc_mod.preset_adapter_roles(
+            [search, sql, source], db_type="oracle"
+        )
+        return source, roles
+
+    def test_source_fetch_skipped_outside_server_schema(self):
+        # The server resolves every get_object_source against ITS schema
+        # (DBMS_METADATA has no owner argument) — cross-schema objects
+        # would only buy ORA-31603, so they are skipped, not fetched.
+        source, roles = self._source_guard_surface(
+            "SYSTEM", "CREATE VIEW V1 AS SELECT 1"
+        )
+        info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
+        assert set(info["views"]) == {"ALC.V1"}
+        assert source.calls == []  # ALC != SYSTEM → skipped
+        assert "source" not in info["views"]["ALC.V1"]
+
+    def test_source_error_text_never_becomes_source(self):
+        # "Error retrieving object source: ORA-31603 …" is plain text, not
+        # DDL — it must not be stored as the object's source.
+        source, roles = self._source_guard_surface(
+            "ALC",
+            self._envelope(
+                "Error retrieving object source: ORA-31603 object 'V1' "
+                "of type VIEW not found on schema 'SYSTEM'."
+            ),
+        )
+        info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
+        assert set(info["views"]) == {"ALC.V1"}
+        assert len(source.calls) == 1  # schema matches → attempted…
+        assert "source" not in info["views"]["ALC.V1"]  # …but rejected
+
+    def test_pack_database_error_is_not_authoritative_empty(self):
+        # An ORA-* answer must not replace the adapter listing with an
+        # authoritative "empty" (that would erase the category).
+        def responder(a):
+            q = str(a.get("sql") or "")
+            if "GROUP BY owner" in q:
+                return self._envelope("| owner |\n| --- |\n| ALC |")
+            if "all_views" in q:
+                return self._envelope("Database error: ORA-00904: invalid identifier")
+            if "all_tab_columns" in q:
+                return self._columns_page(q, [
+                    "| ALC | T | 1 | ID | NUMBER | N | 5 |",
+                ])
+            return self._envelope(
+                "Query executed successfully, but returned no rows."
+            )
+
+        sql = FakeTool("run_sql_query", {"sql": {}, "max_rows": {}}, responder)
+        search = FakeTool("search_tables_schema", {"search_term": {}}, "unused")
+        plsql = FakeTool(
+            "get_pl_sql_objects",
+            {"object_type": {}, "name_pattern": {}},
+            lambda a: json.dumps(
+                {"objects": [{"name": "V1"}]}
+                if "VIEW" in str(a.values()) else {"objects": []}
+            ),
+        )
+        roles = db_doc_mod.preset_adapter_roles(
+            [search, sql, plsql], db_type="oracle"
+        )
+        info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
+        assert set(info["views"]) == {"V1"}  # adapter listing survived
+        assert "sql:views" not in info["unavailable"]
 
 
 # ============================================================================
@@ -1948,7 +2119,8 @@ class TestPageTree:
         assert pages["page_tbl_public_users"]["relatedPages"] == [
             "page_tbl_public_orders"
         ]
-        assert pages["page_tbl_public_users"]["title"] == "users"
+        # Titles are schema-qualified: bare names collide across schemas.
+        assert pages["page_tbl_public_users"]["title"] == "public.users"
         # Root rows link to the subpages.
         assert "- [`public.users`](page_tbl_public_users)" in pages["page_tables"]["content"]
 
@@ -1998,7 +2170,7 @@ class TestPageTree:
         child = "page_view_public_session_stats"
         assert child in pages
         assert pages[child]["parent"] == "page_views"
-        assert pages[child]["title"] == "session_stats"
+        assert pages[child]["title"] == "public.session_stats"
         assert pages[child]["importance"] == "low"
         assert pages["page_views"]["relatedPages"] == [child]
         assert order[-2:] == ["page_views", child]
