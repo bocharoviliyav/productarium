@@ -11,7 +11,8 @@ Covers:
 - ``update_codebase_content`` (pages replace, page_id upsert new + existing,
   generated_docs replace, and the 'Provide one of' ValueError).
 - ``update_spec_content`` / ``update_links_content`` (happy + not-found).
-- ``verify_child``.
+- ``verify_child`` / ``verify_page`` (per-page flags: set, reset-on-edit,
+  wholesale-pages strip).
 - Error branches (product/codebase/spec/links not found).
 """
 
@@ -706,6 +707,79 @@ class TestVerifyChild:
         _seed_product(session)
         with pytest.raises(ValueError, match="Entity not found"):
             pr.verify_child(session, "prod_1", "nope", "codebases", "user_1")
+
+
+# --------------------------------------------------------------------------- #
+# verify_page (per-page verification; flags bind to exact content)
+# --------------------------------------------------------------------------- #
+class TestVerifyPage:
+    def _seed_codebase_with_pages(self, session):
+        _seed_product(session)
+        pages = {"p1": {"id": "p1", "title": "P1", "content": "old"}}
+        pr.add_codebase(session, "prod_1", _make_codebase(pages=pages))
+
+    def test_sets_flags_on_the_page(self, session):
+        self._seed_codebase_with_pages(session)
+        product = pr.verify_page(session, "prod_1", "cb_1", "codebases", "p1", "user_1")
+        page = product.codebases[0].pages["p1"]
+        assert page["verified"] is True
+        assert page["verified_by"] == "user_1"
+        assert page["verified_at"]
+
+    def test_verify_database_page(self, session):
+        _seed_product(session)
+        session.add(DatabaseORM(
+            id="db_1", product_id="prod_1", name="DB", source="manual",
+            pages={"page_overview": {"id": "page_overview", "title": "Overview", "content": "x"}},
+        ))
+        session.commit()
+        product = pr.verify_page(
+            session, "prod_1", "db_1", "databases", "page_overview", "user_1"
+        )
+        page = product.databases[0].pages["page_overview"]
+        assert page["verified"] is True
+        assert page["verified_by"] == "user_1"
+
+    def test_missing_page_raises(self, session):
+        self._seed_codebase_with_pages(session)
+        with pytest.raises(ValueError, match="Page not found"):
+            pr.verify_page(session, "prod_1", "cb_1", "codebases", "nope", "user_1")
+
+    def test_missing_product_raises(self, session):
+        with pytest.raises(ValueError, match="Product not found"):
+            pr.verify_page(session, "missing", "cb_1", "codebases", "p1", "user_1")
+
+    def test_content_change_resets_flags(self, session):
+        self._seed_codebase_with_pages(session)
+        pr.verify_page(session, "prod_1", "cb_1", "codebases", "p1", "user_1")
+        product, _ = pr.update_codebase_content(
+            session, "prod_1", "cb_1", page_id="p1", content="changed"
+        )
+        page = product.codebases[0].pages["p1"]
+        assert "verified" not in page
+        assert "verified_by" not in page
+        assert "verified_at" not in page
+
+    def test_identical_content_edit_keeps_flags(self, session):
+        self._seed_codebase_with_pages(session)
+        pr.verify_page(session, "prod_1", "cb_1", "codebases", "p1", "user_1")
+        product, _ = pr.update_codebase_content(
+            session, "prod_1", "cb_1", page_id="p1", content="old"
+        )
+        assert product.codebases[0].pages["p1"]["verified"] is True
+
+    def test_wholesale_pages_strip_client_flags(self, session):
+        self._seed_codebase_with_pages(session)
+        forged = {
+            "p1": {
+                "id": "p1", "title": "P1", "content": "x",
+                "verified": True, "verified_by": "evil", "verified_at": "t",
+            }
+        }
+        product, _ = pr.update_codebase_content(session, "prod_1", "cb_1", pages=forged)
+        page = product.codebases[0].pages["p1"]
+        assert "verified" not in page
+        assert "verified_by" not in page
 
 
 # --------------------------------------------------------------------------- #

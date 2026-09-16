@@ -41,12 +41,18 @@ export function VerifiedButton({
   ownerId,
   onVerified,
   size = "sm",
+  mapResponse,
+  onResponse,
 }: {
   verified?: boolean;
   verifyUrl: string;
   ownerId?: string | null;
   onVerified?: (next: { verified: boolean; verified_by?: string | null }) => void;
   size?: "sm" | "md";
+  /** Map a non-default response body (e.g. the per-page endpoint returns the whole Product). */
+  mapResponse?: (data: unknown) => { verified: boolean; verified_by?: string | null };
+  /** Raw response body hook (e.g. to swap in a returned Product). */
+  onResponse?: (data: unknown) => void;
 }) {
   const { user } = useAuth();
   const { notify } = useNotifications();
@@ -80,10 +86,15 @@ export function VerifiedButton({
         throw new Error(body?.detail || `Verify failed (${res.status})`);
       }
       const data = await res.json().catch(() => ({}));
-      onVerified?.({
-        verified: data.verified ?? !verified,
-        verified_by: data.verified_by ?? null,
-      });
+      onResponse?.(data);
+      const next = mapResponse
+        ? mapResponse(data)
+        : {
+            verified: (data as { verified?: boolean })?.verified ?? !verified,
+            verified_by:
+              (data as { verified_by?: string | null })?.verified_by ?? null,
+          };
+      onVerified?.(next);
     } catch (e) {
       notify({
         tone: "error",

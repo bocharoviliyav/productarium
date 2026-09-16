@@ -129,6 +129,9 @@ class ActiveTurn:
     query: str
     session_id: Optional[str] = None
     user_id: Optional[str] = None
+    #: Query the runner sees (the raw query + inlined attachment blocks);
+    #: None -> use ``query``. The transcript keeps the raw ``query``.
+    runner_query: Optional[str] = None
     #: Transcript persistence enabled (needs a session row; False for
     #: ephemeral turns or when the session was deleted mid-turn).
     persist: bool = True
@@ -293,8 +296,9 @@ def _final_transcript_rows(events: List[ExpertStreamEvent]) -> List[Dict[str, An
 
 def _append_message_rows(
     session: Session, session_id: str, rows: List[Dict[str, Any]]
-) -> None:
-    """Insert transcript rows and refresh the session's ``updated_at``.
+) -> List[str]:
+    """Insert transcript rows and refresh the session's ``updated_at``;
+    returns the created row ids in insertion order.
 
     Each row gets an explicit strictly-increasing ``created_at`` (SQLite may
     store the same microsecond for the whole batch, which would make the
@@ -306,7 +310,7 @@ def _append_message_rows(
     from api.models import ChatMessageORM, ChatSessionORM
 
     if not rows:
-        return
+        return []
     # Base timestamp: now, clamped strictly past the session's newest row so
     # a fast follow-up turn can never interleave with the previous turn's
     # +i-second offsets (SQLite often stores the same microsecond per batch).
@@ -318,10 +322,13 @@ def _append_message_rows(
     base = datetime.utcnow()
     if last is not None and last >= base:
         base = last + timedelta(seconds=1)
+    ids: List[str] = []
     for i, row in enumerate(rows):
+        row_id = _new_id("msg")
+        ids.append(row_id)
         session.add(
             ChatMessageORM(
-                id=_new_id("msg"),
+                id=row_id,
                 session_id=session_id,
                 role=row["role"],
                 content=row["content"],
@@ -333,22 +340,47 @@ def _append_message_rows(
     if sess is not None:
         sess.updated_at = base + timedelta(seconds=len(rows))
     session.commit()
+    return ids
 
 
-def _persist_rows(session_id: str, rows: List[Dict[str, Any]]) -> None:
-    """Best-effort transcript row insert (never raises)."""
+def _link_attachments(
+    session_id: str, message_id: str, attachment_ids: List[str]
+) -> None:
+    """Best-effort: point attachment rows at their transcript message."""
+    try:
+        with _local_session() as session:
+            if session is None:
+                return
+            from api.models import ChatAttachmentORM
+
+            (
+                session.query(ChatAttachmentORM)
+                .filter(ChatAttachmentORM.id.in_(attachment_ids))
+                .update(
+                    {"message_id": message_id, "session_id": session_id},
+                    synchronize_session=False,
+                )
+            )
+            session.commit()
+    except Exception as e:  # pragma: no cover - best-effort
+        logger.debug("attachment linking failed for %s: %s", message_id, e)
+
+
+def _persist_rows(session_id: str, rows: List[Dict[str, Any]]) -> List[str]:
+    """Best-effort transcript row insert (never raises); returns row ids."""
     if not rows:
-        return
+        return []
     try:
         with _local_session() as session:
             if session is not None:
-                _append_message_rows(session, session_id, rows)
+                return _append_message_rows(session, session_id, rows)
     except Exception as e:  # pragma: no cover - best-effort
         logger.warning(
             "expert chat transcript persistence failed (session %s): %s",
             session_id,
             e,
         )
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +393,9 @@ async def _consume(
     runner_kwargs: Dict[str, Any],
 ) -> None:
     """Drive the runner, buffering every event for the subscribers."""
-    async for event in runner(turn.product_id, turn.query, **runner_kwargs):
+    async for event in runner(
+        turn.product_id, turn.runner_query or turn.query, **runner_kwargs
+    ):
         if event is None:
             continue
         turn.append(event)
@@ -442,11 +476,14 @@ def start_turn(
     seed_history: bool = False,
     persist: bool = True,
     runner: Callable[..., Any],
+    runner_query: Optional[str] = None,
+    attachment_ids: Optional[List[str]] = None,
 ) -> ActiveTurn:
     """Start a detached ask turn; returns immediately with the handle.
 
     The user row is persisted right away (best-effort) so the question is in
-    the session history even if the process dies mid-turn. Raises
+    the session history even if the process dies mid-turn; when
+    ``attachment_ids`` are given, they are linked to that row. Raises
     :class:`TurnBusyError` when the session already has a running turn.
     """
     _prune()
@@ -462,11 +499,14 @@ def start_turn(
         session_id=session_id,
         user_id=user_id,
         persist=persist,
+        runner_query=runner_query,
     )
     if turn.persist and session_id:
-        _persist_rows(
+        created_ids = _persist_rows(
             session_id, [{"role": "user", "content": query[:MAX_QUERY_CHARS]}]
         )
+        if attachment_ids and created_ids:
+            _link_attachments(session_id, created_ids[0], attachment_ids)
 
     runner_kwargs: Dict[str, Any] = {
         "session_id": session_id,

@@ -342,6 +342,8 @@ async def run_agent_chat_stream(
 
     from langchain_core.messages import AIMessageChunk, HumanMessage
 
+    from api.config.timeout import resolve_expert_recursion_limit
+
     if checkpointer is None and session_id:
         from api.agents.runtime import get_checkpointer
 
@@ -351,7 +353,7 @@ async def run_agent_chat_stream(
     thread_id = session_id or f"ephemeral_{product_id}_{secrets.token_hex(4)}"
     config: Dict[str, Any] = {
         "configurable": {"thread_id": thread_id},
-        "recursion_limit": 25,
+        "recursion_limit": resolve_expert_recursion_limit(),
     }
 
     # One chat model (and one httpx client) per request; closed in the
@@ -490,88 +492,8 @@ def _history_messages(history: List[Dict[str, Any]]) -> List[Any]:
     return out
 
 
-async def run_agent_doc(
-    product_id: str,
-    query: str,
-    model: Optional[str] = None,
-    checkpointer: Optional[Any] = None,
-    session_factory: Optional[Any] = None,
-) -> str:
-    """One-shot expert document over the agent (returns full Markdown).
-
-    Runs the same product-scoped agent without a checkpointer thread (docs are
-    standalone) and with the ``expert_agent_doc.md`` prompt variant. Falls
-    back to the legacy non-agent generator on any agent failure so the
-    ``/ask/doc`` endpoint keeps working without a live LLM server.
-    """
-    from langchain_core.messages import HumanMessage
-
-    from api.expert import prompt as _expert_prompt
-    from api.expert.knowledge import _product_name_by_id as _legacy_name
-
-    try:
-        from langgraph.prebuilt import create_react_agent
-
-        chat = _build_expert_chat_model(model)
-        try:
-            tools = build_expert_tools(product_id, session_factory=session_factory)
-            tools = tools + await _gather_mcp_tools(product_id, session_factory)
-            tools = tools + _gather_http_integration_tools(product_id, session_factory)
-            system_prompt = _build_agent_system_prompt(
-                _expert_prompt.EXPERT_DOC_PROMPT, _legacy_name(product_id)
-            )
-            agent = create_react_agent(
-                model=chat, tools=tools, prompt=system_prompt, checkpointer=checkpointer
-            )
-            result = await agent.ainvoke(
-                {"messages": [HumanMessage(content=query)]},
-                config={"recursion_limit": 25},
-            )
-            text = _final_ai_text(result)
-            if text.strip():
-                from api.expert.prompt import _clean_llm_text
-
-                return _clean_llm_text(text)
-        finally:
-            # Close the per-request httpx client even when the agent fails
-            # (the except below then falls back to the legacy generator).
-            await _close_model_client(chat)
-    except Exception as e:  # pragma: no cover - depends on live LLM
-        logger.warning(
-            "expert agent doc generation failed (%s); using legacy path.", e
-        )
-    # Legacy fallback: the Wave-A non-agent generator.
-    from api.expert.chat import run_expert_doc
-
-    return await run_expert_doc(product_id, query, model)
-
-
-def _final_ai_text(result: Any) -> str:
-    """Extract the final AIMessage text from an agent invoke result."""
-    messages = getattr(result, "messages", None) or (
-        result.get("messages") if isinstance(result, dict) else None
-    ) or []
-    for message in reversed(list(messages)):
-        if getattr(message, "type", "") == "ai":
-            content = getattr(message, "content", "")
-            if isinstance(content, list):
-                parts = []
-                for block in content:
-                    if isinstance(block, str):
-                        parts.append(block)
-                    elif isinstance(block, dict) and isinstance(
-                        block.get("text"), str
-                    ):
-                        parts.append(block["text"])
-                content = "".join(parts)
-            if isinstance(content, str) and content.strip():
-                return content
-    return ""
-
-
 __all__ = [
     "MAX_HISTORY_MESSAGES",
     "build_expert_agent",
     "run_agent_chat_stream",
-    "run_agent_doc",
 ]

@@ -31,10 +31,7 @@ Design notes:
 from __future__ import annotations
 
 import logging
-import os
 import re
-import tempfile
-import importlib
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -44,6 +41,10 @@ from sqlalchemy.orm import Session, selectinload
 from api.auth.deps import get_current_user, require_product_access
 from api.db import get_db
 from api.docgen.summary import generate_product_summary
+from api.expert.attachments import (
+    convert_via_markitdown as _convert_via_markitdown,
+    upload_max_bytes as _upload_max_bytes,
+)
 from api.models import KnowledgeNodeORM, ProductORM
 from api.schemas import (
     KnowledgeNode,
@@ -143,26 +144,6 @@ def _load_product(db: Session, product_id: str) -> ProductORM:
     if p is None:
         raise HTTPException(status_code=404, detail="Product not found")
     return p
-
-
-# Upload size limit (P0-11): admin setting > env > 50 MiB default.
-_DEFAULT_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
-
-
-def _upload_max_bytes() -> int:
-    """Resolve the upload size limit for markitdown uploads."""
-    try:
-        from api.config.settings import get_setting
-
-        raw = get_setting("limits.upload_max_bytes")
-        if raw and str(raw).strip().isdigit():
-            return int(str(raw).strip())
-    except Exception:  # pragma: no cover - settings store down
-        pass
-    raw_env = os.environ.get("UPLOAD_MAX_BYTES", "")
-    if raw_env.strip().isdigit():
-        return int(raw_env.strip())
-    return _DEFAULT_UPLOAD_MAX_BYTES
 
 
 def _load_node(db: Session, product_id: str, node_id: str) -> KnowledgeNodeORM:
@@ -363,50 +344,6 @@ def delete_node(
 # --------------------------------------------------------------------------- #
 # markitdown upload
 # --------------------------------------------------------------------------- #
-def _convert_via_markitdown(data: bytes, filename: str) -> tuple:
-    """Try api.formats.markitdown.convert_to_markdown with common conventions.
-
-    Returns ``(ok, markdown_or_error)``. We import it lazily and tolerate
-    either a path-based or bytes-based ``convert_to_markdown`` signature.
-    """
-    try:
-        md = importlib.import_module("api.formats.markitdown")
-    except Exception as e:  # module absent -> degrade
-        return (False, f"markitdown unavailable: {e}")
-    convert = getattr(md, "convert_to_markdown", None)
-    if convert is None:
-        return (False, "formats.markitdown.convert_to_markdown not found")
-
-    suffix = os.path.splitext(filename or "")[1]
-    tmp_path: Optional[str] = None
-    try:
-        # Persist bytes to a temp file so path-based wrappers work too.
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
-            tf.write(data)
-            tmp_path = tf.name
-        for args, kwargs in (
-            ((tmp_path,), {"filename": filename}),
-            ((tmp_path,), {}),
-            ((data,), {"filename": filename}),
-            ((data,), {}),
-        ):
-            try:
-                result = convert(*args, **kwargs)
-            except TypeError:
-                continue
-            if result:
-                return (True, str(result))
-        return (False, "markitdown convert_to_markdown returned no output")
-    except Exception as e:
-        return (False, f"markitdown conversion failed: {e}")
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-
-
 @router.post(
     "/api/products/{product_id}/knowledge/nodes/{node_id}/upload",
     response_model=KnowledgeNode,

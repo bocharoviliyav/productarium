@@ -7,8 +7,9 @@
  * contract (see src/lib/expertChat.ts) from POST /api/products/{id}/ask:
  * status → phase loader, reasoning → collapsible "Reasoning" panel (mono,
  * muted), content → markdown answer, tool_call/tool_result → compact chips,
- * error → inline error row. "Download as document" hits POST
- * /api/products/{id}/ask/doc and saves the returned .md file.
+ * error → inline error row. Attachments (paperclip) upload via POST
+ * /ask/attachments and ride the next ask as attachment_ids; every assistant
+ * message carries hover Copy / Download-.md actions (client-side).
  *
  * Chat history: sessions are persisted server-side. On mount the component
  * lists GET /api/products/{id}/chat/sessions and resumes the latest one
@@ -38,6 +39,8 @@
  * - Streaming cursor: pulsing ▍ appended to content while streaming.
  * - Smart auto-scroll: smooth scroll to bottom on new content, but pauses
  *   when the user scrolls up.
+ * - Attachments: paperclip picker (≤5 per message) with removable chips;
+ *   Enter sends, Shift+Enter inserts a newline.
  *
  * The sessions feature degrades gracefully: if the history endpoints are not
  * deployed yet (404) the strip hides and the chat behaves like before.
@@ -50,13 +53,17 @@ import {
   Brain,
   CaretDown,
   ChatCircleText,
+  Check,
+  Copy,
   DownloadSimple,
   Eraser,
   MagnifyingGlass,
+  Paperclip,
   Sparkle,
   Spinner,
   StopCircle,
   WarningCircle,
+  X,
 } from "@phosphor-icons/react";
 import dynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
@@ -75,14 +82,28 @@ import {
 } from "@/lib/expertChat";
 import {
   ApiError,
+  attachmentDownloadUrl,
   cancelExpertTurn,
   deleteChatSession,
   fetchActiveTurn,
   fetchChatMessages,
   fetchChatSessions,
+  uploadChatAttachments,
+  type ChatAttachmentMeta,
   type ChatMessage as ChatHistoryMessage,
   type ChatSession,
+  type UploadedAttachment,
 } from "@/lib/chatSessions";
+
+/** Mirrors the backend MAX_ATTACHMENTS_PER_ASK. */
+const MAX_ATTACHMENTS = 5;
+
+function formatBytes(n: number): string {
+  if (!n) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 const Markdown = dynamic(() => import("@/components/Markdown"), {
   ssr: false,
@@ -107,6 +128,8 @@ interface Turn {
   tools: ToolEvent[];
   /** Inline stream error (assistant turns only). */
   error: string | null;
+  /** Attachment chips (user turns only). */
+  attachments: ChatAttachmentMeta[];
 }
 
 const EMPTY_TURN: Omit<Turn, "role"> = {
@@ -118,6 +141,7 @@ const EMPTY_TURN: Omit<Turn, "role"> = {
   reasoningTouched: false,
   tools: [],
   error: null,
+  attachments: [],
 };
 
 /**
@@ -152,6 +176,7 @@ function historyToTurns(history: ChatHistoryMessage[]): Turn[] {
       reasoningOpen: false,
       phase: "done",
       tools: message.role === "assistant" ? pendingTools : [],
+      attachments: message.attachments,
     });
     if (message.role === "assistant") pendingTools = [];
   }
@@ -166,7 +191,10 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
   const [input, setInput] = useState("");
   const [turns, setTurns] = useState<Turn[]>([]);
   const [streaming, setStreaming] = useState(false);
-  const [downloading, setDownloading] = useState(false);
+  // Attachments staged for the NEXT ask (uploaded eagerly, ids ride the ask).
+  const [pendingAttachments, setPendingAttachments] = useState<UploadedAttachment[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   // Deep Research mode (wave E): sends {deep_research: true} so the backend
   // routes the query through the planner → researcher → synthesizer graph.
   const [deepResearch, setDeepResearch] = useState(false);
@@ -524,6 +552,7 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
     activeSessionIdRef.current = null;
     setTurns([]);
     setInput("");
+    setPendingAttachments([]);
   }, []);
 
   // On mount, resume the latest session once (history + possible RUNNING
@@ -545,15 +574,27 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
     const q = input.trim();
     if (!q || streaming) return;
     lastQuestionRef.current = q;
+    const sentAttachments = pendingAttachments;
     // Reset scroll state for a new question.
     userScrolledUpRef.current = false;
     setTurns([
       ...turns,
-      { role: "user", ...EMPTY_TURN, content: q, streaming: false },
+      {
+        role: "user",
+        ...EMPTY_TURN,
+        content: q,
+        streaming: false,
+        attachments: sentAttachments.map(({ id, filename, sizeBytes }) => ({
+          id,
+          filename,
+          sizeBytes,
+        })),
+      },
       { role: "assistant", ...EMPTY_TURN },
     ]);
     setStreaming(true);
     setInput("");
+    setPendingAttachments([]);
 
     abortRef.current?.abort();
     const token = ++runTokenRef.current;
@@ -576,6 +617,11 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
       if (sessionId) body.session_id = sessionId;
       // Deep Research flag — additive; ignored by backends without the graph.
       if (deepResearch) body.deep_research = true;
+      // Staged attachments: the backend inlines their Markdown renditions
+      // into the runner query (conversation context only).
+      if (sentAttachments.length > 0) {
+        body.attachment_ids = sentAttachments.map((a) => a.id);
+      }
 
       const res = await fetch(`/api/products/${productId}/ask`, {
         method: "POST",
@@ -659,6 +705,7 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
   }, [
     input,
     streaming,
+    pendingAttachments,
     productId,
     turns,
     deepResearch,
@@ -673,6 +720,61 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
     t.expertTitle,
     t.stillGenerating,
   ]);
+
+  /** Paperclip picker: upload eagerly, stage chips for the next ask. */
+  const onPickFiles = useCallback(
+    async (fileList: FileList | null) => {
+      if (!fileList || fileList.length === 0) return;
+      const files = Array.from(fileList);
+      const room = MAX_ATTACHMENTS - pendingAttachments.length;
+      if (room <= 0) {
+        notify({
+          tone: "error",
+          title: t.expertTitle ?? "Expert",
+          message: t.attachmentTooMany ?? `At most ${MAX_ATTACHMENTS} files per message`,
+        });
+        return;
+      }
+      const accepted = files.slice(0, room);
+      setUploading(true);
+      try {
+        const uploaded = await uploadChatAttachments(productId, accepted);
+        setPendingAttachments((prev) => [...prev, ...uploaded]);
+        if (files.length > accepted.length) {
+          notify({
+            tone: "info",
+            title: t.expertTitle ?? "Expert",
+            message: t.attachmentTooMany ?? `At most ${MAX_ATTACHMENTS} files per message`,
+          });
+        }
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 401) {
+          router.replace(`/login?next=/products/${productId}`);
+          return;
+        }
+        notify({
+          tone: "error",
+          title: t.attachmentUploadFailed ?? "Attachment upload failed",
+          message: e instanceof Error ? e.message : "Attachment upload failed",
+        });
+      } finally {
+        setUploading(false);
+      }
+    },
+    [
+      pendingAttachments.length,
+      productId,
+      notify,
+      router,
+      t.expertTitle,
+      t.attachmentTooMany,
+      t.attachmentUploadFailed,
+    ],
+  );
+
+  const removeAttachment = useCallback((id: string) => {
+    setPendingAttachments((prev) => prev.filter((a) => a.id !== id));
+  }, []);
 
   /**
    * Stop = cancel the RUNNING turn SERVER-side (partial answer kept), then
@@ -697,11 +799,13 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
     if (!sessionId) {
       setTurns([]);
       setInput("");
+      setPendingAttachments([]);
       return;
     }
     abortRef.current?.abort();
     setTurns([]);
     setInput("");
+    setPendingAttachments([]);
     setActiveSessionId(null);
     activeSessionIdRef.current = null;
     deleteChatSession(productId, sessionId)
@@ -739,6 +843,7 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
         activeSessionIdRef.current = null;
         setTurns([]);
         setInput("");
+        setPendingAttachments([]);
       }
       deleteChatSession(productId, sessionId)
         .then(() => {
@@ -776,61 +881,6 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
     },
     [],
   );
-
-  const downloadDoc = useCallback(async () => {
-    const q = lastQuestionRef.current.trim() || input.trim();
-    if (!q || downloading) return;
-    setDownloading(true);
-    try {
-      const res = await fetch(`/api/products/${productId}/ask/doc`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ query: q }),
-      });
-      if (res.status === 401) {
-        router.replace(`/login?next=/products/${productId}`);
-        return;
-      }
-      if (res.status === 429) {
-        // Per-user rate limit (P1-17): human message + Retry-After.
-        const detail = await res.json().catch(() => ({}));
-        const ra = res.headers.get("Retry-After");
-        const wait = ra && /^\d+$/.test(ra) ? Number(ra) : null;
-        throw new Error(
-          `${
-            (detail as { detail?: string })?.detail ||
-            "Too many requests — please wait a moment and try again."
-          }${wait ? ` (retry in ~${wait}s)` : ""}`,
-        );
-      }
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(
-          (detail as { detail?: string })?.detail ||
-            `Document request failed (${res.status})`,
-        );
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-      a.download = `productarium-expert-${stamp}.md`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      notify({
-        tone: "error",
-        title: "Download failed",
-        message: e instanceof Error ? e.message : "Download failed",
-      });
-    } finally {
-      setDownloading(false);
-    }
-  }, [downloading, input, productId, notify, router]);
 
   const showSessions =
     sessionsAvailableRef.current || sessions.length > 0 || !sessionsLoading;
@@ -884,7 +934,7 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
                   "max-w-[88%] rounded-md px-3 py-2 text-sm",
                   turn.role === "user"
                     ? "bg-ink text-[var(--button-fg)]"
-                    : "bg-surface text-ink border border-divider",
+                    : "group bg-surface text-ink border border-divider",
                 )}
               >
                 {turn.role === "assistant" ? (
@@ -894,7 +944,27 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
                     onToggleReasoning={() => toggleReasoning(i)}
                   />
                 ) : (
-                  <p className="whitespace-pre-wrap">{turn.content}</p>
+                  <div className="space-y-1.5">
+                    {turn.attachments.length > 0 && (
+                      <div className="flex flex-wrap justify-end gap-1">
+                        {turn.attachments.map((a) => (
+                          <a
+                            key={a.id}
+                            href={attachmentDownloadUrl(productId, a.id)}
+                            download
+                            className="flex items-center gap-1 rounded border border-[var(--button-fg)]/25 px-1.5 py-0.5 text-[11px] opacity-80 transition-opacity hover:opacity-100"
+                          >
+                            <Paperclip size={10} />
+                            <span className="max-w-[160px] truncate">{a.filename}</span>
+                            {formatBytes(a.sizeBytes) && (
+                              <span className="opacity-60">{formatBytes(a.sizeBytes)}</span>
+                            )}
+                          </a>
+                        ))}
+                      </div>
+                    )}
+                    <p className="whitespace-pre-wrap">{turn.content}</p>
+                  </div>
                 )}
               </div>
             </div>
@@ -904,6 +974,28 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
 
       {/* Input + actions */}
       <div className="mt-3">
+        {pendingAttachments.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {pendingAttachments.map((a) => (
+              <span
+                key={a.id}
+                className="flex items-center gap-1.5 rounded border border-divider bg-surface-2 px-2 py-1 text-xs"
+              >
+                <Paperclip size={11} className="shrink-0 text-muted" />
+                <span className="max-w-[180px] truncate text-ink">{a.filename}</span>
+                <span className="text-muted">{formatBytes(a.sizeBytes)}</span>
+                <button
+                  type="button"
+                  onClick={() => removeAttachment(a.id)}
+                  title={t.removeAttachment ?? "Remove"}
+                  className="shrink-0 text-muted transition-colors hover:text-ink"
+                >
+                  <X size={11} weight="bold" />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
         <Textarea
           value={input}
           onChange={(e) => setInput(e.target.value)}
@@ -914,7 +1006,8 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
           rows={3}
           className="font-sans"
           onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+            // Enter sends; Shift+Enter inserts a newline (⌘/Ctrl+Enter works too).
+            if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               void send();
             }
@@ -939,15 +1032,25 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
                 </>
               )}
             </Button>
+            {/* Attachments: hidden multi-file picker behind a paperclip. */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                void onPickFiles(e.target.files);
+                e.target.value = "";
+              }}
+            />
             <Button
               type="button"
               variant="ghost"
-              onClick={downloadDoc}
-              disabled={downloading || (!lastQuestionRef.current && !input.trim())}
-              title={t.downloadAsDocument ?? "Download the answer as a markdown document"}
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading || streaming}
+              title={t.attach ?? "Attach files"}
             >
-              {downloading ? <Spinner /> : <DownloadSimple size={16} weight="regular" />}
-              {t.downloadAsDocument ?? "Download as document"}
+              {uploading ? <Spinner size={16} /> : <Paperclip size={16} weight="regular" />}
             </Button>
             {/* Deep Research toggle — same quiet button language, highlighted
                 (blue tag palette + filled icon) while active. */}
@@ -972,7 +1075,7 @@ export function ExpertChat({ productId, className }: ExpertChatProps) {
             )}
             <span className="hidden items-center gap-1 text-xs text-muted sm:flex">
               <ChatCircleText size={13} weight="regular" />
-              ⌘⏎
+              ↵ send · ⇧↵ newline
             </span>
           </div>
         </div>
@@ -1067,6 +1170,9 @@ function AssistantContent({ turn, t, onToggleReasoning }: AssistantContentProps)
         <span className="text-muted">…</span>
       ) : null}
 
+      {/* Hover actions: Copy + Download .md (finished answers only) */}
+      {content && !streaming && <AssistantActions content={content} t={t} />}
+
       {/* Inline stream error */}
       {turn.error && (
         <div
@@ -1077,6 +1183,51 @@ function AssistantContent({ turn, t, onToggleReasoning }: AssistantContentProps)
           <span className="min-w-0 break-words">{turn.error}</span>
         </div>
       )}
+    </div>
+  );
+}
+
+// --- Per-message hover actions (Copy / Download .md) -------------------------
+
+function AssistantActions({ content, t }: { content: string; t: Record<string, string> }) {
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard unavailable — silently ignore */
+    }
+  };
+
+  const download = () => {
+    const url = URL.createObjectURL(new Blob([content], { type: "text/markdown" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `answer-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const btn =
+    "rounded p-1 text-muted transition-colors hover:bg-surface-2 hover:text-ink";
+  return (
+    <div className="flex items-center gap-0.5 pt-1 opacity-0 transition-opacity group-hover:opacity-100">
+      <button type="button" onClick={copy} className={btn} title={t.copyAnswer ?? "Copy"}>
+        {copied ? <Check size={13} weight="bold" /> : <Copy size={13} />}
+      </button>
+      <button
+        type="button"
+        onClick={download}
+        className={btn}
+        title={t.downloadMarkdown ?? "Download .md"}
+      >
+        <DownloadSimple size={13} />
+      </button>
     </div>
   );
 }

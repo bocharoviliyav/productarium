@@ -258,10 +258,12 @@ async def _run_research_agent(
 
     from langgraph.prebuilt import create_react_agent
 
+    from api.config.timeout import resolve_expert_recursion_limit
+
     agent = create_react_agent(model=chat, tools=tools, prompt=system_prompt)
     result = await agent.ainvoke(
         {"messages": [HumanMessage(content=task)]},
-        config={"recursion_limit": 25},
+        config={"recursion_limit": resolve_expert_recursion_limit()},
     )
     messages = (
         getattr(result, "messages", None)

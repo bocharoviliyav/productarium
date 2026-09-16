@@ -190,19 +190,20 @@ graph TD
 | :--- | :--- | :--- | :--- |
 | **App Assembly & Lifespan** | App init, CORS, lifespan, DB & memory startup, router registration | `api/main.py`<br>`api/api.py`<br>`api/db.py` | All routers, background tasks |
 | **Data Models & Schemas** | SQLAlchemy 2.0 ORM models, Pydantic DTOs | `api/models.py`<br>`api/schemas.py` | `product_repo.py`, all routers |
-| **Entity Repository** | Single source for Product, Codebase, Spec, Links, Database DB queries | `api/repositories/product_repo.py` | `routers/products.py`, `routers/databases.py`, `docgen/` |
+| **Entity Repository** | Single source for Product, Codebase, Spec, Links, Database DB queries; entity + per-page verification flags (server-owned; page flags reset on content change) | `api/repositories/product_repo.py` | `routers/products.py`, `routers/databases.py`, `docgen/` |
 | **Auth & Security** | JWT tokens, bcrypt, Keycloak OIDC, RBAC & product grants, secret encryption | `api/auth/deps.py`<br>`api/auth/local.py`<br>`api/auth/tokens.py`<br>`api/config/settings.py` | All protected routers, MCP secrets |
 | **Doc Versioning (Vault-style)** | Immutable doc version snapshots (`productarium_doc_versions`), baseline bootstrap, append/restore, `current_version` pointers, version REST endpoints | `api/repositories/doc_version_repo.py`<br>`api/routers/doc_versions.py` | `docgen/jobs.py`, `routers/products.py`, `routers/databases.py`, `routers/docgen.py` |
 | **DocGen: Codebase** | DeepAgents repo exploration, prompt synthesis, verification pipeline | `api/docgen/codebase.py`<br>`api/docgen/verification.py`<br>`api/docgen/jobs.py` | `routers/docgen.py`, `models.py:Codebase` |
 | **DocGen: Database (RE)** | MCP introspection walk (Oracle cross-schema `ALL_*` bulk walk first, `ROWNUM`-paged 1 200-row catalog queries; maintenance-owner python filter (`_ora_user_owner`); effective-schema source guard (`_oracle_session_schema`) + server-error rejection (`_looks_like_server_error`); schema-qualified subpage titles; PG system-schema/extension filtering; pack-authoritative categories), role classifier, SQL catalog packs, LLM enrichment | `api/docgen/database.py`<br>`api/docgen/introspection_cache.py` | `routers/databases.py`, `models.py:Database` |
 | **DocGen: Spec** | OpenAPI/AsyncAPI parsing, Markdown skeleton, LangGraph enrichment | `api/docgen/spec.py` | `routers/docgen.py`, `models.py:Spec` |
 | **Expert Agent & Research** | SSE chat streaming, LangGraph checkpointer, multi-iteration Deep Research | `api/expert/chat.py`<br>`api/expert/deep_research.py`<br>`api/expert/generate.py` | `routers/expert.py`, `models.py:ChatSession` |
+| **Chat Attachments** | markitdown/UTF-8 conversion (50k cap), `<attachment>` prompt blocks; conversation-context only (never indexed into memory) | `api/expert/attachments.py`<br>`api/expert/turns.py` (runner_query + message linking) | `routers/expert.py`, `routers/knowledge.py` (shared converter), `models.py:ChatAttachment` |
 | **Semantic Memory** | pgvector HNSW cosine recall over `knowledge_chunks`, resolver fallback | `api/memory/resolver.py`<br>`api/memory/pgvector_backend.py` | `expert/knowledge.py`, `docgen/` |
 | **MCP Platform** | Bidirectional MCP: Outbound client cache (`langchain-mcp-adapters`) + Inbound FastMCP (`/api/mcp`) | `api/mcp/manager.py`<br>`api/mcp/inbound.py`<br>`api/mcp/policy.py`<br>`api/mcp/secrets.py` | `routers/mcp_admin.py`, `routers/product_mcp.py` |
 | **Prompts Registry** | Externalized Markdown prompts loader (`load_prompt_file`) | `api/prompts.py`<br>`refs/prompts/*.md` | `docgen/`, `expert/` |
 | **Authoritative Timeouts** | Central registry for all external, LLM, memory, and tool timeouts | `api/config/timeout.py` | `llm/client.py`, `mcp/manager.py`, `expert/` |
 | **Frontend: Views** | Dashboard, Product details, Artifact docs viewer, Admin panels | `src/app/page.tsx`<br>`src/app/products/[productId]/page.tsx`<br>`src/app/products/[productId]/artifacts/[artifactId]/page.tsx` | Next.js App Router |
-| **Frontend: Components** | Editorial UI components, Mermaid renderer, Expert chat, Markdown editor, verification provenance panel | `src/components/ExpertChat.tsx`<br>`src/components/Mermaid.tsx`<br>`src/components/Markdown.tsx`<br>`src/components/ProvenancePanel.tsx`<br>`src/components/ui.tsx` | Frontend pages |
+| **Frontend: Components** | Editorial UI components, Mermaid renderer, Expert chat (paperclip attachments with removable chips, per-assistant-message hover Copy / Download .md, Enter=send / Shift+Enter=newline), Markdown editor, verification panel (judge verdict + extracted provenance report) rendered BELOW the page text; legacy in-content «Провенанс и проверка» blocks hidden at render | `src/components/ExpertChat.tsx`<br>`src/lib/chatSessions.ts` (upload/normalize helpers)<br>`src/components/Mermaid.tsx`<br>`src/components/Markdown.tsx`<br>`src/components/ProvenancePanel.tsx`<br>`src/components/ui.tsx` | Frontend pages |
 | **Frontend: State & Lib** | SSE consumers, chat session state, API client types | `src/lib/expertChat.ts`<br>`src/lib/types.ts`<br>`src/contexts/LanguageContext.tsx` | Frontend UI components |
 
 ---
@@ -214,12 +215,13 @@ graph TD
 2. **Router Validation**: Handled by `api/routers/products.py` or `api/routers/databases.py` with RBAC guard `require_product_access`.
 3. **Repository Persistence**: Written via `api/repositories/product_repo.py` into PostgreSQL / SQLite (`api/models.py`).
 4. **Secret Sanitization**: Raw DSNs are immediately masked (`dsn_masked`); repo tokens are Fernet-encrypted.
+5. **Per-page Verification**: owner/admin verifies a single doc page via `POST /{product_id}/{codebases|databases}/{id}/pages/{page_id}/verify` (`product_repo.verify_page`); flags ride inside the page dicts, are stripped from client-supplied `pages` payloads, reset when page content changes, and survive regeneration only for byte-identical pages (`docgen/_common._carry_page_verify_flags`).
 
 ### B. Documentation Generation Flow (Codebase / Spec / Database RE)
 1. **Trigger**: `POST /api/products/{id}/[codebases|specs|databases]/{id}/generate` -> Returns `202 Accepted` + `job_id`.
 2. **Locking & Execution**: Handled asynchronously by `api/docgen/jobs.py` with per-entity lock (`lock_for_entity`).
 3. **Generation Pipeline**:
-   - **Codebase**: Managed shallow clone -> DeepAgents exploration with `open_read_nofollow` -> Section generation (`refs/prompts/*.md`) -> Verification (Citations + LLM Judge + Mermaid Verify/Repair) -> Persist `generated_docs` + JSON `pages`.
+   - **Codebase**: Managed shallow clone -> DeepAgents exploration with `open_read_nofollow` -> Section generation (`refs/prompts/*.md`) -> Verification (Citations + LLM Judge + Mermaid Verify/Repair; the trailing LLM block «Провенанс и проверка» is extracted into `provenance.report` via `_split_provenance_block`, never persisted in page text) -> Persist `generated_docs` + JSON `pages`.
    - **Database RE**: Outbound MCP walk (`api/docgen/database.py`): Oracle takes a cross-schema `ALL_*` bulk walk first (per-owner columns/comments, `BIN$` skipped; every catalog query `ROWNUM`-paged under the tool-result char cap, no per-schema table cap; maintenance owners like SYSMAN/APEX_* filtered in SQL AND python; per-object source fetches guarded by the server's effective schema and reject ORA-*/error texts), otherwise the per-schema adapter walk; system schemas/owners and extension-shipped objects (`pg_depend`) are excluded; SQL packs replace category listings authoritatively (a server error is NOT an authoritative empty) -> Catalog introspection -> Table/relation schemas -> Batched LLM enrichment (`DB_DOCGEN_ENRICH_BATCH`) -> ER diagrams; subpage titles are schema-qualified, frontend nav groups collapsible.
    - **Spec**: stdlib parse -> Skeleton -> LangGraph enrichment.
 4. **Memory Ingestion**: Background vector indexing into `knowledge_chunks` via `api/memory/pgvector_backend.py`.
@@ -228,10 +230,11 @@ graph TD
 7. **Per-page Regeneration**: `POST .../pages/{page_id}/regenerate` (codebases/databases only) submits a job with `force_pages=[page_id]`; codebase maps pages to `force_units` with judge-issue reviewer notes, database regenerates and merges only the forced page into old `pages`.
 
 ### C. Expert Agent Chat & Deep Research Flow
-1. **Client Stream**: `POST /api/products/{id}/ask` with SSE event-stream.
+1. **Client Stream**: `POST /api/products/{id}/ask` with SSE event-stream; optional `attachment_ids` (≤5) reference previously uploaded chat attachments.
 2. **Context Assembly**: `api/expert/chat.py` retrieves semantic memory chunks via pgvector cosine recall (`api/memory/pgvector_backend.py`) + bound MCP tools (`api/mcp/manager.py`).
 3. **LangGraph Execution**: Orchestrates expert response; optional Deep Research multi-iteration search loop (`api/expert/deep_research.py`).
 4. **Session Persistence**: Checkpointed into `chat_sessions` and `chat_messages` in PostgreSQL/SQLite.
+5. **Attachments**: `POST /{id}/ask/attachments` (multipart, markitdown → UTF-8 fallback → 501 for unconvertible binary, same per-user rate bucket as `/ask`) stores Markdown renditions in `chat_attachments`; `/ask` inlines them into the runner query via `build_attachment_blocks` (transcript user row keeps the RAW query, chips ride the messages endpoint); `GET /{id}/ask/attachments/{attachment_id}` downloads the rendition. Per-message Copy / Download-.md are client-side in `ExpertChat.tsx`.
 
 ---
 

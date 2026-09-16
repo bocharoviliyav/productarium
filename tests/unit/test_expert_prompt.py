@@ -2,7 +2,7 @@
 
 Covers:
 - Tunables: ``KNOWLEDGE_MAX_CHARS``, ``STREAM_CHUNK_SIZE``.
-- Loaded prompt bodies: ``EXPERT_SYSTEM_PROMPT`` / ``EXPERT_DOC_PROMPT`` non-empty.
+- Loaded prompt bodies: ``EXPERT_SYSTEM_PROMPT`` non-empty.
 - ``_clean_llm_text``: fence stripping, ``<r>`` block stripping, line-number
   stripping inside code blocks, empty/None passthrough.
 - ``_chunk_text``: empty, short lines, long line word-splitting, custom size.
@@ -21,7 +21,6 @@ import pytest
 
 from api.expert import prompt as expert_prompt
 from api.expert.prompt import (
-    EXPERT_DOC_PROMPT,
     EXPERT_SYSTEM_PROMPT,
     KNOWLEDGE_MAX_CHARS,
     STREAM_CHUNK_SIZE,
@@ -52,13 +51,9 @@ class TestLoadedPrompts:
         assert isinstance(EXPERT_SYSTEM_PROMPT, str)
         assert EXPERT_SYSTEM_PROMPT.strip()
 
-    def test_doc_prompt_loaded_nonempty(self):
-        assert isinstance(EXPERT_DOC_PROMPT, str)
-        assert EXPERT_DOC_PROMPT.strip()
-
-    def test_system_and_doc_prompts_differ(self):
-        assert EXPERT_SYSTEM_PROMPT != EXPERT_DOC_PROMPT
-
+    def test_system_prompt_has_placeholders(self):
+        assert "{product_name}" in EXPERT_SYSTEM_PROMPT
+        assert "{language_name}" in EXPERT_SYSTEM_PROMPT
 
 # --------------------------------------------------------------------------- #
 # _clean_llm_text

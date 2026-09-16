@@ -35,7 +35,6 @@
 | Файл | Назначение | Плейсхолдеры |
 |------|-----------|--------------|
 | `expert_agent_system.md` | System prompt эксперта (ответ инлайн) | `{product_name} {language_name}` |
-| `expert_agent_doc.md` | Эксперт в режиме генерации документа | `{product_name} {language_name}` |
 
 ### Deep Research (`api/expert/deep_research.py`)
 | Файл | Назначение | Плейсхолдеры |

@@ -10,8 +10,7 @@ Wave B (expert agent) modules:
   (Postgres → SQLite file → in-memory fallback chain).
 - :mod:`api.agents.expert` — the expert agent itself
   (``create_react_agent``) plus the typed stream mapper
-  (``run_agent_chat_stream``) and one-shot doc generation
-  (``run_agent_doc``).
+  (``run_agent_chat_stream``).
 
 Later waves add: MCP platform (C), docgen agents (D), Deep Research (E).
 

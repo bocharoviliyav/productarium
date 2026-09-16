@@ -14,6 +14,7 @@ import {
   LinkSimple,
   PencilSimple,
   Plus,
+  SealCheck,
   StopCircle,
   Trash,
 } from "@phosphor-icons/react";
@@ -690,15 +691,19 @@ export default function EntityDocsViewer() {
                       {tc.cancel ?? "Cancel"}
                     </Button>
                   )}
-                  <VerifiedButton
-                    verified={verified}
-                    verifyUrl={`/api/products/${productId}/${entityPath(kind)}/${artifactId}/verify`}
-                    ownerId={product?.owner_id ?? null}
-                    onVerified={(next) => {
-                      setVerified(next.verified);
-                      setVerifiedBy(next.verified_by ?? null);
-                    }}
-                  />
+                  {/* Page-bearing kinds verify per page instead (action row
+                      below); the artifact-level button stays for spec/links. */}
+                  {(isSpec || isLinks) && (
+                    <VerifiedButton
+                      verified={verified}
+                      verifyUrl={`/api/products/${productId}/${entityPath(kind)}/${artifactId}/verify`}
+                      ownerId={product?.owner_id ?? null}
+                      onVerified={(next) => {
+                        setVerified(next.verified);
+                        setVerifiedBy(next.verified_by ?? null);
+                      }}
+                    />
+                  )}
                   <IconButton
                     type="button"
                     aria-label={t.delete ?? "Delete"}
@@ -897,6 +902,13 @@ export default function EntityDocsViewer() {
                                 )}
                               >
                                 {p.title}
+                                {p.verified ? (
+                                  <SealCheck
+                                    size={11}
+                                    weight="fill"
+                                    className="ml-1 inline text-tag-green-fg"
+                                  />
+                                ) : null}
                                 {children.length > 0 && (
                                   <span className="ml-1.5 font-mono text-[11px] text-muted">
                                     {children.length}
@@ -926,6 +938,13 @@ export default function EntityDocsViewer() {
                                       )}
                                     >
                                       {c.title}
+                                      {c.verified ? (
+                                        <SealCheck
+                                          size={11}
+                                          weight="fill"
+                                          className="ml-1 inline text-tag-green-fg"
+                                        />
+                                      ) : null}
                                     </button>
                                   );
                                 })}
@@ -944,9 +963,6 @@ export default function EntityDocsViewer() {
 
                 <div className="flex min-w-0 flex-col gap-8">
                   <div className="flex flex-col gap-4">
-                    {!editing && !viewingArchive && activePage?.provenance ? (
-                      <ProvenancePanel provenance={activePage.provenance} />
-                    ) : null}
                     {(isCodebase || isDatabase) && !editing && (
                       <div className="flex items-center justify-end gap-2">
                         {regenStarting || regenJob ? (
@@ -970,15 +986,34 @@ export default function EntityDocsViewer() {
                         ) : (
                           activePage &&
                           !viewingArchive && (
-                            <Button
-                              type="button"
-                              variant="subtle"
-                              size="sm"
-                              onClick={() => setConfirmRegen(true)}
-                            >
-                              <Lightning size={14} weight="fill" />
-                              {t.regeneratePage ?? "Regenerate page"}
-                            </Button>
+                            <>
+                              <VerifiedButton
+                                verified={Boolean(activePage.verified)}
+                                verifyUrl={`/api/products/${productId}/${entityPath(kind)}/${artifactId}/pages/${encodeURIComponent(activePage.id)}/verify`}
+                                ownerId={product?.owner_id ?? null}
+                                mapResponse={(data) => {
+                                  const p = findPageInProduct(
+                                    data as Product,
+                                    artifactId,
+                                    activePage.id,
+                                  );
+                                  return {
+                                    verified: p?.verified ?? true,
+                                    verified_by: p?.verified_by ?? null,
+                                  };
+                                }}
+                                onResponse={(data) => setProduct(data as Product)}
+                              />
+                              <Button
+                                type="button"
+                                variant="subtle"
+                                size="sm"
+                                onClick={() => setConfirmRegen(true)}
+                              >
+                                <Lightning size={14} weight="fill" />
+                                {t.regeneratePage ?? "Regenerate page"}
+                              </Button>
+                            </>
                           )
                         )}
                       </div>
@@ -1006,10 +1041,18 @@ export default function EntityDocsViewer() {
                       </div>
                     ) : activePage ? (
                       <article className="prose-editor max-w-none">
-                        <h2 className="font-editorial text-2xl tracking-tight text-ink">
-                          {activePage.title}
-                        </h2>
-                        <Markdown content={activePage.content || ""} />
+                        <div className="flex flex-wrap items-center gap-3">
+                          <h2 className="font-editorial text-2xl tracking-tight text-ink">
+                            {activePage.title}
+                          </h2>
+                          {activePage.verified ? (
+                            <VerifiedBadge
+                              verified={activePage.verified}
+                              verifiedBy={activePage.verified_by ?? null}
+                            />
+                          ) : null}
+                        </div>
+                        <Markdown content={stripProvenanceBlock(activePage.content || "")} />
                       </article>
                     ) : (
                       <article className="prose-editor max-w-none">
@@ -1017,16 +1060,19 @@ export default function EntityDocsViewer() {
                           {t.generatedDocs ?? "Generated documentation"}
                         </h2>
                         <Markdown
-                          content={
+                          content={stripProvenanceBlock(
                             (viewingArchive ? versionDetail?.generated_docs : undefined) ||
-                            codebase?.generated_docs ||
-                            databaseEntity?.generated_docs ||
-                            ""
-                          }
+                              codebase?.generated_docs ||
+                              databaseEntity?.generated_docs ||
+                              "",
+                          )}
                         />
                       </article>
                     )}
                   </Card>
+                  {!editing && !viewingArchive && activePage?.provenance ? (
+                    <ProvenancePanel provenance={activePage.provenance} />
+                  ) : null}
                 </div>
               </div>
             )}
@@ -1084,6 +1130,58 @@ export default function EntityDocsViewer() {
       </main>
     </div>
   );
+}
+
+const PROV_BLOCK_HEADING_RE = /^(#{2,4})\s*(.+?)\s*$/;
+
+/**
+ * Hides the legacy in-content "Провенанс и проверка" block at render time —
+ * new pages carry it in provenance.report, rendered by the verification
+ * panel under the text. Pure display concern: stored content is untouched.
+ */
+function stripProvenanceBlock(content: string): string {
+  const lines = content.split("\n");
+  let start = -1;
+  let level = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = PROV_BLOCK_HEADING_RE.exec(lines[i]);
+    if (!m || !m[2]) continue;
+    const title = m[2].toLowerCase();
+    const isProvenance = title.includes("провенанс") || title.includes("provenance");
+    const isVerification = title.includes("проверка") || title.includes("verification");
+    if (isProvenance && isVerification) {
+      start = i;
+      level = m[1]?.length ?? 3;
+      break;
+    }
+  }
+  if (start === -1) return content;
+  let end = lines.length;
+  for (let j = start + 1; j < lines.length; j++) {
+    const m = /^(#{1,6})\s/.exec(lines[j]);
+    if (m && (m[1]?.length ?? 0) <= level) {
+      end = j;
+      break;
+    }
+  }
+  const head = lines.slice(0, start).join("\n").replace(/\s+$/, "");
+  const tail = lines.slice(end).join("\n").replace(/^\s+/, "");
+  const kept = [head, tail].filter(Boolean).join("\n\n");
+  return kept || content;
+}
+
+/** Find one doc page inside a product payload by entity + page id. */
+function findPageInProduct(
+  product: Product,
+  entityId: string,
+  pageId: string,
+): ArtifactPage | undefined {
+  const found = findEntity(product, entityId);
+  const pages =
+    found && (found.kind === "codebase" || found.kind === "database")
+      ? normalizePages((found.entity as Codebase | Database).pages)
+      : [];
+  return pages.find((p) => p.id === pageId);
 }
 
 /** Find a codebase/spec/links/database entity by id across the product's lists. */

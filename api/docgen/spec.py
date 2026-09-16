@@ -619,12 +619,13 @@ async def _run_spec_agent(agent: Any, task_prompt: str) -> str:
     """Run the react agent once; '' on any failure (never raises)."""
     from langchain_core.messages import HumanMessage
 
+    from api.config.timeout import resolve_spec_recursion_limit
     from api.docgen.codebase import _final_agent_text
 
     try:
         result = await agent.ainvoke(
             {"messages": [HumanMessage(content=task_prompt)]},
-            config={"recursion_limit": 40},
+            config={"recursion_limit": resolve_spec_recursion_limit()},
         )
     except Exception as e:  # pragma: no cover - depends on live model
         logger.warning("spec react agent run failed: %s", e)

@@ -101,7 +101,6 @@ LANGUAGE_NAMES = {
 #   {language_name}/{slot} substitution in api.docgen.codebase.
 _UNWRAPPED_PROMPTS = frozenset({
     "expert_agent_system.md",
-    "expert_agent_doc.md",
     "_verification_guard.md",
     "mermaid_repair.md",
     # Wave D docgen prompts: the agent system prompt carries a {language_name}
@@ -377,14 +376,12 @@ def load_prompt_file(
 # Inventory invariant: keys == the *.md files in refs/prompts/ minus
 # README.md (enforced by tests).
 #
-# Note: expert_agent_system.md and expert_agent_doc.md are consumed by
-# ``api.expert.prompt`` (which loads them via ``load_prompt_file`` into its
-# own ``EXPERT_SYSTEM_PROMPT`` / ``EXPERT_DOC_PROMPT`` constants). They are
-# included here so ``reload_prompt_file`` can also refresh them via
-# ``importlib.reload(api.expert.prompt)`` (best-effort, optional).
+# Note: expert_agent_system.md is consumed by ``api.expert.prompt`` (which
+# loads it via ``load_prompt_file`` into its own ``EXPERT_SYSTEM_PROMPT``
+# constant). It is included here so ``reload_prompt_file`` can also refresh
+# it via ``importlib.reload(api.expert.prompt)`` (best-effort, optional).
 PROMPT_FILES: Dict[str, str] = {
     "expert_agent_system.md": "EXPERT_SYSTEM_PROMPT",
-    "expert_agent_doc.md": "EXPERT_DOC_PROMPT",
     "product_summary.md": "PRODUCT_SUMMARY_PROMPT",
     "openapi_doc.md": "OPENAPI_DOC_PROMPT",
     "asyncapi_doc.md": "ASYNCAPI_DOC_PROMPT",
@@ -497,7 +494,7 @@ def reload_prompt_file(filename: str, language: Optional[str] = None) -> bool:
     if filename == "docgen_subpages.md":
         _load_subpages_registry()
 
-    if filename in ("expert_agent_system.md", "expert_agent_doc.md"):
+    if filename == "expert_agent_system.md":
         try:
             import importlib
 

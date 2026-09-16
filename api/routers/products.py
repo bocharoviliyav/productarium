@@ -10,6 +10,8 @@ Endpoints (prefix ``/api/products``, tags ``products``):
 - ``POST   /api/products/{product_id}/codebases``             — add codebase
 - ``DELETE /api/products/{product_id}/codebases/{codebase_id}`` — delete codebase
 - ``PUT    /api/products/{product_id}/codebases/{codebase_id}``  — update docs (WYSIWYG)
+- ``POST   /api/products/{product_id}/codebases/{codebase_id}/pages/{page_id}/verify``
+  — verify a single documentation page (owner/admin)
 - ``POST   /api/products/{product_id}/specs``                 — add spec
 - ``DELETE /api/products/{product_id}/specs/{spec_id}``       — delete spec
 - ``PUT    /api/products/{product_id}/specs/{spec_id}``       — update spec content
@@ -414,7 +416,12 @@ async def update_links(
 
 # --- Verification (item 5) — owner or admin -------------------------------
 def _verify_entity(
-    db: Session, product_id: str, entity_id: str, collection: str, user: UserORM
+    db: Session,
+    product_id: str,
+    entity_id: str,
+    collection: str,
+    user: UserORM,
+    page_id: Optional[str] = None,
 ) -> Product:
     product = product_repo.load_product_orm(db, product_id)
     if product is None:
@@ -426,9 +433,15 @@ def _verify_entity(
             detail="Only the product owner or an admin can verify",
         )
     try:
-        return product_repo.verify_child(db, product_id, entity_id, collection, user.id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Entity not found")
+        if page_id is None:
+            return product_repo.verify_child(
+                db, product_id, entity_id, collection, user.id
+            )
+        return product_repo.verify_page(
+            db, product_id, entity_id, collection, page_id, user.id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e) or "Entity not found")
 
 
 @router.post("/{product_id}/codebases/{codebase_id}/verify", response_model=Product)
@@ -437,6 +450,20 @@ async def verify_codebase(
     db: Session = Depends(get_db), user: UserORM = Depends(get_current_user),
 ):
     return _verify_entity(db, product_id, codebase_id, "codebases", user)
+
+
+@router.post(
+    "/{product_id}/codebases/{codebase_id}/pages/{page_id}/verify",
+    response_model=Product,
+)
+async def verify_codebase_page(
+    product_id: str, codebase_id: str, page_id: str,
+    db: Session = Depends(get_db), user: UserORM = Depends(get_current_user),
+):
+    """Verify a single documentation page (not the whole codebase artifact)."""
+    return _verify_entity(
+        db, product_id, codebase_id, "codebases", user, page_id=page_id
+    )
 
 
 @router.post("/{product_id}/specs/{spec_id}/verify", response_model=Product)

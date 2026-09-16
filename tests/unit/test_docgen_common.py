@@ -103,6 +103,121 @@ class TestCleanLlmText:
         )
         assert c._clean_llm_text(text) == "# Архитектура\n\nСостав системы."
 
+    def test_preamble_revealing_fence_stripped(self):
+        # The preamble hides a wrapping fence; a single-pass cleaner leaves the
+        # fence behind — the fixed-point loop must consume both.
+        text = (
+            "Now i'll produce the final markdown section:\n"
+            "```markdown\n# Architecture\n\nContent.\n```"
+        )
+        assert c._clean_llm_text(text) == "# Architecture\n\nContent."
+
+    def test_preamble_without_colon_before_fence_stripped(self):
+        text = "Now i'll produce the final markdown section\n```markdown\n# Arch\n```"
+        assert c._clean_llm_text(text) == "# Arch"
+
+    def test_bold_preamble_with_fence_stripped(self):
+        text = "**Now i'll produce the section:**\n```markdown\n# Arch\n```"
+        assert c._clean_llm_text(text) == "# Arch"
+
+    def test_fence_wrapping_preamble_stripped(self):
+        text = "```markdown\nOkay, here is the section:\n# Arch\n```"
+        assert c._clean_llm_text(text) == "# Arch"
+
+    def test_plain_prose_untouched(self):
+        text = "Plain prose answer without structure."
+        assert c._clean_llm_text(text) == text
+
+
+# ============================================================================
+# _carry_page_verify_flags
+# ============================================================================
+class TestCarryPageVerifyFlags:
+    def test_identical_content_carries_flags(self):
+        old = {"p1": {"content": "# A", "verified": True, "verified_by": "u", "verified_at": "t"}}
+        new = {"p1": {"content": "# A"}}
+        c._carry_page_verify_flags(new, old)
+        assert new["p1"]["verified"] is True
+        assert new["p1"]["verified_by"] == "u"
+
+    def test_changed_content_resets(self):
+        old = {"p1": {"content": "# A", "verified": True, "verified_by": "u"}}
+        new = {"p1": {"content": "# B"}}
+        c._carry_page_verify_flags(new, old)
+        assert "verified" not in new["p1"]
+
+    def test_new_page_ids_untouched(self):
+        old = {"p1": {"content": "# A", "verified": True}}
+        new = {"p2": {"content": "# A"}}
+        c._carry_page_verify_flags(new, old)
+        assert "verified" not in new["p2"]
+
+    def test_unverified_old_page_not_flagged(self):
+        old = {"p1": {"content": "# A"}}
+        new = {"p1": {"content": "# A"}}
+        c._carry_page_verify_flags(new, old)
+        assert "verified" not in new["p1"]
+
+
+# ============================================================================
+# _split_provenance_block
+# ============================================================================
+class TestSplitProvenanceBlock:
+    def test_empty_and_none(self):
+        assert c._split_provenance_block("") == ("", None)
+
+    def test_no_block_unchanged(self):
+        text = "# Раздел\n\nТекст с `src/api.py` и списками."
+        assert c._split_provenance_block(text) == (text, None)
+
+    def test_trailing_ru_block_split(self):
+        text = (
+            "# Раздел\n\nОсновной текст о `main.py`.\n\n"
+            "### Провенанс и проверка\n"
+            "Ключевые источники: `main.py`.\n\n"
+            "Допущения: нет.\n\nПробелы: нет."
+        )
+        content, report = c._split_provenance_block(text)
+        assert content == "# Раздел\n\nОсновной текст о `main.py`."
+        assert "Ключевые источники: `main.py`." in report
+        assert "Допущения" in report and "Пробелы" in report
+        assert "Провенанс" not in report  # heading itself stays out
+
+    def test_en_heading_variant(self):
+        text = "Body text.\n\n## Provenance and verification\nSources: `a.py`\nConfidence: high."
+        content, report = c._split_provenance_block(text)
+        assert content == "Body text."
+        assert report == "Sources: `a.py`\nConfidence: high."
+
+    def test_block_bounded_by_next_heading(self):
+        # A same-or-higher level heading AFTER the block ends it; deeper
+        # headings inside the block belong to the block.
+        text = (
+            "# Doc\n\n### Провенанс и проверка\nДопущения: нет.\n"
+            "#### Детали\nвнутри блока\n\n## Следующий раздел\nТекст."
+        )
+        content, report = c._split_provenance_block(text)
+        assert content == "# Doc\n\n## Следующий раздел\nТекст."
+        assert "Допущения: нет." in report and "#### Детали" in report
+
+    def test_last_block_wins(self):
+        text = (
+            "### Провенанс и проверка\nстарый\n\nТекст.\n\n"
+            "### Провенанс и проверка\nновый"
+        )
+        content, report = c._split_provenance_block(text)
+        assert content == "### Провенанс и проверка\nстарый\n\nТекст."
+        assert report == "новый"
+
+    def test_only_block_page_kept(self):
+        # A page that is ONLY the block must not be emptied.
+        text = "### Провенанс и проверка\nДопущения: нет."
+        assert c._split_provenance_block(text) == (text, None)
+
+    def test_unrelated_heading_not_matched(self):
+        text = "# Архитектура и проверка\nТекст."  # no provenance word
+        assert c._split_provenance_block(text) == (text, None)
+
 
 # ============================================================================
 # _repo_name_from_url

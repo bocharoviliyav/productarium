@@ -54,6 +54,15 @@ def _placeholder(filename: Optional[str], reason: str) -> str:
     return f"<!-- markitdown: conversion unavailable for {name!r}: {reason} -->\n"
 
 
+def is_placeholder(text: str) -> bool:
+    """True when ``text`` is the conversion-unavailable placeholder comment.
+
+    Callers that must distinguish real conversions from the graceful
+    degradation placeholder (upload endpoints choosing 501) use this.
+    """
+    return text.startswith("<!-- markitdown: conversion unavailable")
+
+
 def convert_to_markdown(
     file_path_or_bytes: Union[str, bytes, "os.PathLike", "io.IOBase"],
     filename: Optional[str] = None,

@@ -48,7 +48,6 @@ REPLACE_CONTRACT: dict[str, set[str]] = {
     "docgen_subpages.md": {"item_title", "item_focus", "item_kind", "siblings_list"},
     # Expert agent (api.expert.prompt) + deep research (api.expert.deep_research).
     "expert_agent_system.md": {"language_name", "product_name"},
-    "expert_agent_doc.md": {"language_name", "product_name"},
     "deep_research_planner.md": {
         "query", "product_name", "language_name", "history", "findings",
     },

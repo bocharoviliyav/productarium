@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for the per-user rate limits on expensive endpoints (P1-17).
 
-docgen generate / expert ask (+ ask/doc) / public ask share the token-bucket
+docgen generate / expert ask / public ask share the token-bucket
 infrastructure from P0-7 (``api.utils.rate_limit``). Each endpoint family has
 its own settings key + env fallback; beyond the limit the endpoint answers 429
 with a ``Retry-After`` header, and buckets are per user (per token owner for
@@ -143,7 +143,7 @@ class TestDocgenRateLimit:
         assert r.status_code == 429
 
 
-# --- expert ask / ask/doc ------------------------------------------------------
+# --- expert ask ----------------------------------------------------------------
 class TestExpertRateLimit:
     @pytest.fixture
     def client(self, monkeypatch):
@@ -162,11 +162,7 @@ class TestExpertRateLimit:
 
             return gen()
 
-        async def _fake_doc(*args, **kw):
-            return "# doc"
-
         monkeypatch.setattr(expert_mod, "run_agent_chat_stream", _fake_chat)
-        monkeypatch.setattr(expert_mod, "run_agent_doc", _fake_doc)
 
         app = FastAPI()
         app.include_router(expert_mod.router)
@@ -183,15 +179,17 @@ class TestExpertRateLimit:
         r = client.post("/api/products/prod_1/ask", json={"query": "q"})
         assert int(r.headers["Retry-After"]) >= 1
 
-    def test_ask_doc_shares_the_expert_budget(self, client):
-        assert client.post("/api/products/prod_1/ask", json={"query": "q"}).status_code == 200
-        assert client.post(
-            "/api/products/prod_1/ask/doc", json={"query": "q"}
-        ).status_code == 200
-        # Both endpoints draw from the same rate.expert.per_user_min bucket.
-        assert client.post(
-            "/api/products/prod_1/ask/doc", json={"query": "q"}
-        ).status_code == 429
+    def test_attachment_upload_shares_the_expert_budget(self, client):
+        """/ask/attachments draws from the SAME per-user bucket as /ask."""
+        for _ in range(2):
+            assert client.post(
+                "/api/products/prod_1/ask", json={"query": "q"}
+            ).status_code == 200
+        r = client.post(
+            "/api/products/prod_1/ask/attachments",
+            files={"files": ("a.txt", b"x", "text/plain")},
+        )
+        assert r.status_code == 429
 
 
 # --- public ask ----------------------------------------------------------------

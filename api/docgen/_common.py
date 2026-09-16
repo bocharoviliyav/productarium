@@ -83,18 +83,24 @@ def _with_verification_guard(prompt: str) -> str:
 # _safe_replace / _cap now live in api.utils.llm_helpers (dedup). _clean_llm_text
 # stays here (docgen variant) and calls the shared strip helper.
 def _clean_llm_text(text: Optional[str]) -> str:
-    """Strip surrounding whitespace, a single wrapping ```markdown fence, and
-    any inline line-number prefixes the LLM emitted inside code blocks."""
+    """Deterministic docgen cleaning: strip meta preamble and a wrapping
+    ```lang fence to a fixed point, then inline line-number prefixes inside
+    code blocks. The loop matters because each strip can reveal the other
+    shape ("preamble:\n```markdown\n…```" → fence survives a single pass)."""
     if not text:
         return ""
     t = text.strip()
-    if t.startswith("```"):
-        t = re.sub(r"^```[a-zA-Z0-9]*\n?", "", t)
-        if t.endswith("```"):
-            t = t[:-3]
-    t = _strip_inline_line_numbers(t)
-    t = _strip_llm_preamble(t)
-    return t.strip()
+    for _ in range(3):
+        prev = t
+        t = _strip_llm_preamble(t)
+        if t.startswith("```"):
+            t = re.sub(r"^```[a-zA-Z0-9]*\n?", "", t)
+            if t.endswith("```"):
+                t = t[:-3]
+        t = t.strip()
+        if t == prev:
+            break
+    return _strip_inline_line_numbers(t).strip()
 
 
 def _repo_name_from_url(repo_url: str) -> str:
@@ -317,6 +323,84 @@ def _persist_artifact(artifact: Any, markdown: str, pages: Dict[str, Any]) -> No
         artifact.pages = pages
     except Exception as e:  # pragma: no cover - defensive over attribute setting
         logger.warning("Could not write generated_docs/pages onto artifact: %s", e)
+
+
+def _carry_page_verify_flags(
+    new_pages: Dict[str, Any], old_pages: Dict[str, Any]
+) -> None:
+    """Carry per-page verification flags onto regenerated pages whose content
+    is byte-identical (verification binds to exact content; a regenerated page
+    resets naturally). Mutates ``new_pages`` in place (fresh dicts at persist)."""
+    if not isinstance(new_pages, dict) or not isinstance(old_pages, dict):
+        return
+    for page_id, new_page in new_pages.items():
+        old_page = old_pages.get(page_id)
+        if (
+            isinstance(new_page, dict)
+            and isinstance(old_page, dict)
+            and old_page.get("verified")
+            and new_page.get("content") == old_page.get("content")
+        ):
+            for key in ("verified", "verified_by", "verified_at"):
+                new_page[key] = old_page.get(key)
+
+
+# Matches a markdown heading line; used to bound the provenance block.
+_ANY_HEADING_RE = re.compile(r"^(#{1,6})\s")
+_PROV_HEADING_RE = re.compile(r"^(#{2,4})\s*(.+?)\s*$")
+
+
+def _is_provenance_heading(line: str) -> Optional[int]:
+    """Heading level when ``line`` is a provenance-block heading, else None.
+
+    Matches the block mandated by ``docgen_agent_section.md`` —
+    ``### Провенанс и проверка`` — plus natural EN variants
+    (``### Provenance and verification``), at heading levels 2-4.
+    """
+    m = _PROV_HEADING_RE.match(line)
+    if not m:
+        return None
+    title = m.group(2).strip().lower().rstrip("#").strip()
+    has_prov = "провенанс" in title or "provenance" in title
+    has_ver = "проверка" in title or "verification" in title
+    return len(m.group(1)) if has_prov and has_ver else None
+
+
+def _split_provenance_block(content: str) -> Tuple[str, Optional[str]]:
+    """Split the LLM-written provenance block out of a generated page.
+
+    Every unit ends with a compact ``### Провенанс и проверка`` block (key
+    sources, assumptions, gaps, confidence). The report is rendered inside
+    the verification panel instead, so it is extracted from the persisted
+    text into ``provenance["report"]``. The LAST matching heading wins (the
+    contract puts the block at the end); the block spans to the next heading
+    of the same or higher level. Pages without the block (or consisting of
+    only the block) return unchanged.
+    """
+    if not content:
+        return content, None
+    lines = content.split("\n")
+    start = start_level = None
+    for i in range(len(lines) - 1, -1, -1):
+        level = _is_provenance_heading(lines[i])
+        if level is not None:
+            start, start_level = i, level
+            break
+    if start is None:
+        return content, None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        m = _ANY_HEADING_RE.match(lines[j])
+        if m and len(m.group(1)) <= start_level:
+            end = j
+            break
+    head = "\n".join(lines[:start]).rstrip()
+    report = "\n".join(lines[start + 1:end]).strip()
+    tail = "\n".join(lines[end:]).strip()
+    if not head and not tail:
+        return content, None
+    kept = "\n\n".join(p for p in (head, tail) if p)
+    return kept, report or None
 
 
 def _checkpoint_partial_docs(

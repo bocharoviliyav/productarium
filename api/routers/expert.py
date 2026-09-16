@@ -19,9 +19,11 @@ Endpoints (prefix ``/api/products``, tags ``expert``):
 - ``POST /api/products/{product_id}/ask/{turn_id}/cancel``
     Explicitly stop a running turn (the UI Stop button); the partial answer
     is persisted to the transcript.
-- ``POST /api/products/{product_id}/ask/doc``
-    Generate a self-contained Markdown document and return it as a
-    downloadable file (``Content-Disposition: attachment``).
+- ``POST /api/products/{product_id}/ask/attachments``
+    Upload chat attachments (multipart; converted to Markdown renditions via
+    markitdown) — conversation context only, never indexed into memory.
+- ``GET /api/products/{product_id}/ask/attachments/{attachment_id}``
+    Download the stored Markdown rendition of an attachment.
 - ``GET /api/products/{product_id}/chat/sessions``
     List the product's chat sessions (newest first).
 - ``GET /api/products/{product_id}/chat/sessions/{session_id}/messages``
@@ -48,10 +50,10 @@ with idle timeouts (e.g. the Next.js rewrite proxy) do not reap the stream.
 
 All endpoints require an authenticated session (``get_current_user``). The
 agent machinery lives in ``api.agents.expert``; this router only does request
-parsing, turn wiring, session persistence, and file-response packaging.
-``run_agent_chat_stream`` / ``run_agent_doc`` are imported as module
-attributes so tests can monkeypatch them on this module (the runner is
-passed into ``start_turn`` BY VALUE at request time, so the seam holds).
+parsing, turn wiring, and session persistence.
+``run_agent_chat_stream`` is imported as a module attribute so tests can
+monkeypatch it on this module (the runner is passed into ``start_turn``
+BY VALUE at request time, so the seam holds).
 
 Threading note: the async ``/ask`` handlers never touch the request-scoped
 ``db`` session (FastAPI runs sync dependencies on a worker thread while the
@@ -69,15 +71,21 @@ import re
 import secrets
 import time
 from contextlib import contextmanager
-from typing import Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from api.agents.expert import run_agent_chat_stream, run_agent_doc
+from api.agents.expert import run_agent_chat_stream
+from api.expert.attachments import (
+    MAX_ATTACHMENTS_PER_ASK,
+    build_attachment_blocks,
+    convert_attachment,
+    upload_max_bytes,
+)
 from api.expert.deep_research import run_deep_research_stream
 from api.auth.deps import get_current_user
 from api.db import get_db
@@ -93,7 +101,13 @@ from api.expert.turns import (
     start_turn,
     subscribe,
 )
-from api.models import ChatMessageORM, ChatSessionORM, ProductORM, UserORM
+from api.models import (
+    ChatAttachmentORM,
+    ChatMessageORM,
+    ChatSessionORM,
+    ProductORM,
+    UserORM,
+)
 from api.utils.rate_limit import enforce_user_rate_limit
 
 logger = logging.getLogger(__name__)
@@ -127,17 +141,16 @@ class ExpertAskRequest(BaseModel):
     # planning / researching / synthesizing; the final answer arrives as
     # regular content frames.
     deep_research: bool = False
+    # Previously uploaded attachment ids (POST .../ask/attachments) whose
+    # Markdown renditions are inlined into this turn's runner query.
+    attachment_ids: List[str] = Field(
+        default_factory=list, max_length=MAX_ATTACHMENTS_PER_ASK
+    )
 
     # Backward-compat: older clients may still send ``use_rlm``. The field is
     # accepted (and ignored) so those clients keep working after the RLM
     # removal; the engine choice is server-side now.
     model_config = {"extra": "ignore"}
-
-
-def _safe_filename(product_id: str) -> str:
-    """Build a safe attachment filename for the doc download."""
-    base = re.sub(r"[^A-Za-z0-9._-]", "_", product_id or "product") or "product"
-    return f"productarium_{base}_expert.md"
 
 
 def _new_id(prefix: str) -> str:
@@ -281,6 +294,34 @@ def _create_session(
             return None
 
 
+def _attachment_owner_filter(user_id: Optional[str]):
+    """Attachments visible to a user: their own plus unowned (``user_id IS NULL``)."""
+    return or_(
+        ChatAttachmentORM.user_id == user_id,
+        ChatAttachmentORM.user_id.is_(None),
+    )
+
+
+def _load_attachments(
+    product_id: str, ids: List[str], user: UserORM
+) -> List[Any]:
+    """Fetch the requested attachment rows (product + owner scoped) or 400."""
+    unique = list(dict.fromkeys(ids))
+    with _local_session() as session:
+        if session is None:
+            raise HTTPException(status_code=400, detail="Attachments unavailable")
+        query = session.query(ChatAttachmentORM).filter(
+            ChatAttachmentORM.product_id == product_id,
+            ChatAttachmentORM.id.in_(unique),
+        )
+        if user.role != "admin":
+            query = query.filter(_attachment_owner_filter(user.id))
+        rows = query.all()
+    if len(rows) != len(unique):
+        raise HTTPException(status_code=400, detail="Unknown attachment id")
+    return rows
+
+
 def _turn_or_404(turn_id: str, product_id: str, user_id: Optional[str]) -> ActiveTurn:
     """Resolve a turn for the attach/cancel endpoints or raise 404.
 
@@ -342,6 +383,15 @@ async def expert_ask(
             session_created = True
             persist = True
 
+    attachment_rows = (
+        _load_attachments(product_id, body.attachment_ids, user)
+        if body.attachment_ids
+        else []
+    )
+    runner_query = body.query
+    if attachment_rows:
+        runner_query = body.query + "\n\n" + build_attachment_blocks(attachment_rows)
+
     history = [{"role": m.role, "content": m.content} for m in body.messages]
     # The runner is captured BY VALUE at request time so tests that
     # monkeypatch the module attribute keep steering the flow.
@@ -358,6 +408,8 @@ async def expert_ask(
             seed_history=session_created,
             persist=persist,
             runner=runner,
+            runner_query=runner_query,
+            attachment_ids=body.attachment_ids or None,
         )
     except TurnBusyError as busy:
         raise HTTPException(
@@ -432,51 +484,122 @@ async def expert_ask_cancel(
     return {"turn_id": turn_id, "status": status}
 
 
-@router.post("/{product_id}/ask/doc")
-async def expert_ask_doc(
+@router.post("/{product_id}/ask/attachments")
+async def upload_chat_attachments(
     product_id: str,
-    body: ExpertAskRequest,
+    request: Request,
+    files: List[UploadFile] = File(...),
     user: UserORM = Depends(get_current_user),
 ):
-    """Generate a self-contained Markdown document and return it as a file.
+    """Convert uploaded chat attachments to Markdown renditions.
 
-    Requires login. Returns ``text/markdown`` with a ``Content-Disposition:
-    attachment`` header. ``messages`` is accepted but ignored (doc generation
-    is one-shot, not conversational).
+    Same per-user bucket as ``/ask``. Size-capped (Content-Length pre-check
+    + bounded read → 413); binary files markitdown cannot convert → 501.
+    Renditions are conversation-context only — never product memory.
     """
-    # P1-17: same per-user bucket as /ask (doc generation is the same cost
-    # class as a chat turn with deep research).
     enforce_user_rate_limit(
         user.id,
         setting_key="rate.expert.per_user_min",
         env_name="RATE_EXPERT_PER_USER_MINUTE",
         default_per_minute=30,
     )
-
-    if not body.query.strip():
-        raise HTTPException(status_code=400, detail="query is required")
-
-    try:
-        md = await run_agent_doc(product_id, body.query, body.model)
-    except Exception as e:  # pragma: no cover - defensive over generation
-        logger.error("expert /ask/doc failed: %s", e, exc_info=True)
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+    if len(files) > MAX_ATTACHMENTS_PER_ASK:
         raise HTTPException(
-            status_code=500, detail="Expert document generation failed"
+            status_code=400,
+            detail=f"At most {MAX_ATTACHMENTS_PER_ASK} files per message",
         )
 
-    if not md:
-        md = (
-            f"# Expert document for {product_id}\n\n"
-            "_(No content was generated. Ensure the product has indexed knowledge "
-            "or generated artifact docs, and that a local LLM is available.)_\n"
+    limit = upload_max_bytes()
+    content_length = request.headers.get("content-length")
+    if (
+        content_length
+        and content_length.strip().isdigit()
+        and int(content_length.strip()) > limit
+    ):
+        raise HTTPException(
+            status_code=413,
+            detail=f"Upload exceeds the {limit // (1024 * 1024)} MiB limit",
         )
 
+    out: List[Dict[str, Any]] = []
+    with _local_session() as session:
+        if session is None:
+            raise HTTPException(
+                status_code=500, detail="Attachment storage unavailable"
+            )
+        # Only link a user that exists in the DB (mirrors _create_session).
+        user_id = user.id if session.get(UserORM, user.id) is not None else None
+        for file in files:
+            data = await file.read(limit + 1)
+            if len(data) > limit:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Upload exceeds the {limit // (1024 * 1024)} MiB limit"
+                    ),
+                )
+            if not data:
+                raise HTTPException(status_code=400, detail="Uploaded file is empty")
+            try:
+                md = convert_attachment(data, file.filename or "")
+            except ValueError as e:
+                raise HTTPException(status_code=501, detail=str(e))
+            row = ChatAttachmentORM(
+                id=_new_id("atch"),
+                product_id=product_id,
+                user_id=user_id,
+                filename=(file.filename or "attachment")[:256],
+                mime=(file.content_type or "")[:128] or None,
+                size_bytes=len(data),
+                content_md=md,
+            )
+            session.add(row)
+            session.flush()
+            out.append(
+                {
+                    "id": row.id,
+                    "filename": row.filename,
+                    "size_bytes": row.size_bytes,
+                    "content_chars": len(md),
+                }
+            )
+        session.commit()
+    return out
+
+
+@router.get("/{product_id}/ask/attachments/{attachment_id}")
+def download_chat_attachment(
+    product_id: str,
+    attachment_id: str,
+    user: UserORM = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Download the stored Markdown rendition of a chat attachment."""
+    if user.role != "admin":
+        query = db.query(ChatAttachmentORM).filter(
+            ChatAttachmentORM.id == attachment_id,
+            ChatAttachmentORM.product_id == product_id,
+            _attachment_owner_filter(user.id),
+        )
+        row = query.first()
+    else:
+        row = (
+            db.query(ChatAttachmentORM)
+            .filter(
+                ChatAttachmentORM.id == attachment_id,
+                ChatAttachmentORM.product_id == product_id,
+            )
+            .first()
+        )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", row.filename) or "attachment.md"
     return Response(
-        content=md,
+        content=row.content_md,
         media_type="text/markdown; charset=utf-8",
-        headers={
-            "Content-Disposition": f"attachment; filename={_safe_filename(product_id)}"
-        },
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
     )
 
 
@@ -533,6 +656,18 @@ def list_chat_messages(
         .order_by(ChatMessageORM.created_at, ChatMessageORM.id)
         .all()
     )
+    attachments_by_message: Dict[str, List[Dict[str, Any]]] = {}
+    for a in (
+        db.query(ChatAttachmentORM)
+        .filter(
+            ChatAttachmentORM.session_id == chat_session.id,
+            ChatAttachmentORM.message_id.isnot(None),
+        )
+        .all()
+    ):
+        attachments_by_message.setdefault(a.message_id, []).append(
+            {"id": a.id, "filename": a.filename, "size_bytes": a.size_bytes}
+        )
     return [
         {
             "id": m.id,
@@ -540,6 +675,9 @@ def list_chat_messages(
             "role": m.role,
             "content": m.content,
             "tool_name": m.tool_name,
+            "attachments": (
+                attachments_by_message.get(m.id, []) if m.role == "user" else []
+            ),
             "created_at": m.created_at.isoformat() if m.created_at else None,
         }
         for m in rows

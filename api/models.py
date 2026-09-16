@@ -682,6 +682,58 @@ class ChatMessageORM(Base):
         )
 
 
+class ChatAttachmentORM(Base):
+    """ORM model for the ``chat_attachments`` table — a file attached to an
+    expert chat turn, stored as its converted Markdown rendition.
+
+    Conversation-context only: the rendition is inlined into the ask-turn
+    runner query (never indexed into the product memory). ``session_id`` /
+    ``message_id`` are linked best-effort when the turn persists its user
+    row; both cascade so deleting a session cleans its attachments.
+    """
+
+    __tablename__ = "chat_attachments"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    product_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("products.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey("productarium_users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    session_id: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    message_id: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey("chat_messages.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    filename: Mapped[str] = mapped_column(String(256), nullable=False)
+    mime: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    content_md: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return (
+            f"<ChatAttachmentORM id={self.id!r} product_id={self.product_id!r} "
+            f"filename={self.filename!r}>"
+        )
+
+
 class McpServerORM(Base):
     """ORM model for the ``mcp_servers`` table — admin registry of external
     MCP (Model Context Protocol) servers whose tools can be attached to

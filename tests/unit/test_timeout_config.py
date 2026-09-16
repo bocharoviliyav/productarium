@@ -39,7 +39,9 @@ from api.config.timeout import (
     resolve_docgen_section_concurrency,
     resolve_docgen_spec_context_enabled,
     resolve_docgen_unit_recursion_limit,
+    resolve_expert_recursion_limit,
     resolve_expert_stream_timeout,
+    resolve_spec_recursion_limit,
     resolve_timeout,
     resolve_timeout_bool,
     resolve_timeout_int,
@@ -62,6 +64,8 @@ WRAPPER_TO_KEY = {
     "resolve_docgen_spec_context_enabled": "docgen_spec_context_enabled",
     "resolve_docgen_db_context_enabled": "docgen_db_context_enabled",
     "resolve_expert_stream_timeout": "expert_stream",
+    "resolve_expert_recursion_limit": "expert_recursion_limit",
+    "resolve_spec_recursion_limit": "spec_recursion_limit",
     "resolve_memory_query_timeout": "memory_query",
     "resolve_model_list_timeout": "model_list",
     "resolve_integration_http_timeout": "integration_http",
@@ -283,6 +287,28 @@ class TestTimeoutConfig(unittest.TestCase):
             self.assertEqual(resolve_docgen_unit_recursion_limit(), 16)
             os.environ["DOCGEN_ORCHESTRATOR_RECURSION_LIMIT"] = "5"
             self.assertEqual(resolve_docgen_orchestrator_recursion_limit(), 32)
+
+    def test_expert_recursion_limit_default_env_floor(self):
+        # Expert react agents (ask stream / doc / deep-research researcher)
+        # read their LangGraph budget from the registry, not the old
+        # hardcoded 25 (langgraph's default) that killed tool-heavy turns.
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            self.assertEqual(resolve_expert_recursion_limit(), 64)
+            os.environ["EXPERT_RECURSION_LIMIT"] = "128"
+            self.assertEqual(resolve_expert_recursion_limit(), 128)
+            os.environ["EXPERT_RECURSION_LIMIT"] = "1"
+            self.assertEqual(resolve_expert_recursion_limit(), 8)
+
+    def test_spec_recursion_limit_default_env_floor(self):
+        # Spec enrichment agent: former hardcoded 40, now admin/env-tunable.
+        env_vars = [k.env_var for k in TIMEOUT_KEYS]
+        with _EnvGuard(env_vars, []):
+            self.assertEqual(resolve_spec_recursion_limit(), 40)
+            os.environ["SPEC_RECURSION_LIMIT"] = "80"
+            self.assertEqual(resolve_spec_recursion_limit(), 80)
+            os.environ["SPEC_RECURSION_LIMIT"] = "1"
+            self.assertEqual(resolve_spec_recursion_limit(), 8)
 
     def test_docgen_concurrency_knob_defaults(self):
         env_vars = [k.env_var for k in TIMEOUT_KEYS]

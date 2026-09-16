@@ -494,8 +494,6 @@ class TestAuth:
         )
         assert client.post("/api/products/prod_1/ask",
                            json={"query": "hi"}).status_code == 401
-        assert client.post("/api/products/prod_1/ask/doc",
-                           json={"query": "hi"}).status_code == 401
         assert client.get("/api/products/prod_1/chat/sessions").status_code == 401
         assert client.get(
             "/api/products/prod_1/chat/sessions/x/messages"

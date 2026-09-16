@@ -480,6 +480,36 @@ async def verify_database(
         raise HTTPException(status_code=404, detail="Entity not found")
 
 
+@router.post(
+    "/{product_id}/databases/{database_id}/pages/{page_id}/verify",
+    response_model=Product,
+)
+async def verify_database_page(
+    product_id: str,
+    database_id: str,
+    page_id: str,
+    db: Session = Depends(get_db),
+    user: UserORM = Depends(get_current_user),
+):
+    """Verify a single page of a database artifact's docs (owner/admin)."""
+    product = product_repo.load_product_orm(db, product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if user.role != "admin" and (
+        not product.owner_id or product.owner_id != user.id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the product owner or an admin can verify",
+        )
+    try:
+        return product_repo.verify_page(
+            db, product_id, database_id, "databases", page_id, user.id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e) or "Entity not found")
+
+
 # --- Reverse-engineering (202 + poll) ----------------------------------------
 @router.post("/{product_id}/databases/{database_id}/generate")
 async def generate_database_docs(

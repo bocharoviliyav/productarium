@@ -22,6 +22,18 @@ export interface ChatSession {
   updatedAt: string | null;
 }
 
+/** Attachment chip metadata riding a user message. */
+export interface ChatAttachmentMeta {
+  id: string;
+  filename: string;
+  sizeBytes: number;
+}
+
+/** Upload result (POST …/ask/attachments). */
+export interface UploadedAttachment extends ChatAttachmentMeta {
+  contentChars: number;
+}
+
 /** A persisted chat message inside a session. */
 export interface ChatMessage {
   /** Backend also persists tool rows (``role='tool'``) with a short summary. */
@@ -32,6 +44,8 @@ export interface ChatMessage {
   toolName: string | null;
   /** Parsed tool args for role='tool' rows (null when absent/unparseable). */
   toolArgs: Record<string, unknown> | null;
+  /** Attachment chips on user rows (empty otherwise). */
+  attachments: ChatAttachmentMeta[];
 }
 
 /** Error carrying the HTTP status so callers can react to 401/404. */
@@ -95,6 +109,22 @@ function parseToolArgs(value: unknown): Record<string, unknown> | null {
   return null;
 }
 
+/** Normalize attachment chip records (tolerates field spellings). */
+function normalizeAttachments(value: unknown): ChatAttachmentMeta[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(isRecord)
+    .map((raw) => ({
+      id: str(raw.id) ?? "",
+      filename: str(raw.filename) ?? str(raw.name) ?? "",
+      sizeBytes:
+        typeof raw.size_bytes === "number" || typeof raw.sizeBytes === "number"
+          ? ((raw.size_bytes ?? raw.sizeBytes) as number)
+          : 0,
+    }))
+    .filter((a) => a.id);
+}
+
 /** Normalize one message record into the UI view model. */
 export function normalizeMessage(raw: Record<string, unknown>): ChatMessage | null {
   const content = str(raw.content);
@@ -112,6 +142,7 @@ export function normalizeMessage(raw: Record<string, unknown>): ChatMessage | nu
     createdAt: normalizeDate(raw.created_at ?? raw.createdAt),
     toolName: str(raw.tool_name) ?? str(raw.toolName),
     toolArgs: parseToolArgs(raw.tool_args ?? raw.toolArgs),
+    attachments: role === "user" ? normalizeAttachments(raw.attachments) : [],
   };
 }
 
@@ -252,6 +283,47 @@ export async function cancelExpertTurn(
   return isRecord(payload) && typeof payload.status === "string"
     ? payload.status
     : "cancelled";
+}
+
+/**
+ * Upload chat attachments (multipart) — returns metadata chips whose ids ride
+ * the next ask. Renditions are conversation-context only, never indexed.
+ */
+export async function uploadChatAttachments(
+  productId: string,
+  files: File[],
+): Promise<UploadedAttachment[]> {
+  const form = new FormData();
+  for (const file of files) form.append("files", file);
+  const res = await fetch(
+    `/api/products/${encodeURIComponent(productId)}/ask/attachments`,
+    { method: "POST", body: form, credentials: "include" },
+  );
+  if (res.status === 401) throw new ApiError(401, "Not authenticated");
+  if (!res.ok) {
+    const detail = (await res.json().catch(() => null)) as { detail?: string } | null;
+    throw new ApiError(
+      res.status,
+      detail?.detail ?? `Attachment upload failed (${res.status})`,
+    );
+  }
+  const payload: unknown = await res.json().catch(() => null);
+  return unwrapList(payload, ["attachments", "items", "data"])
+    .map((raw) => ({
+      id: str(raw.id) ?? "",
+      filename: str(raw.filename) ?? "",
+      sizeBytes: typeof raw.size_bytes === "number" ? raw.size_bytes : 0,
+      contentChars: typeof raw.content_chars === "number" ? raw.content_chars : 0,
+    }))
+    .filter((a) => a.id);
+}
+
+/** Direct download URL for a stored attachment rendition. */
+export function attachmentDownloadUrl(
+  productId: string,
+  attachmentId: string,
+): string {
+  return `/api/products/${encodeURIComponent(productId)}/ask/attachments/${encodeURIComponent(attachmentId)}`;
 }
 
 /**

@@ -1576,6 +1576,35 @@ class TestDocgenAgentFlow:
         assert "main.py" in prov["citations"]["resolved"]
         assert "judge" not in prov  # judge disabled -> key omitted
 
+    def test_provenance_block_moves_to_report(
+        self, fake_artifact, fake_product, fake_repo_dir, monkeypatch
+    ):
+        """The unit contract's trailing `### Провенанс и проверка` block is
+        extracted from the persisted text into provenance["report"] — the UI
+        renders it inside the verification panel, never in the page body."""
+        orchestrator = _FakeOrchestrator({
+            sid: (
+                f"Agent wrote this section about `main.py`.\n\n"
+                "### Провенанс и проверка\n"
+                "Ключевые источники: `main.py`.\n\n"
+                "Допущения: нет.\n\nПробелы: нет.\n\n"
+                "Уверенность: высокая, текст основан на прочитанном файле."
+            )
+            for sid in cb.SECTION_ORDER
+        })
+        self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator)
+
+        result = asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
+
+        page = fake_artifact.pages["page_overview"]
+        assert "Провенанс и проверка" not in page["content"]
+        assert "Agent wrote this section" in page["content"]
+        report = page["provenance"]["report"]
+        assert "Ключевые источники: `main.py`." in report
+        assert "Уверенность: высокая" in report
+        # The assembled markdown is block-free too (one place only).
+        assert "Провенанс и проверка" not in result
+
     def test_opener_duplicate_reported_in_provenance(
         self, fake_artifact, fake_product, fake_repo_dir, monkeypatch
     ):

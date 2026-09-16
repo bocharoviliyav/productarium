@@ -1,15 +1,21 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { SealCheck, SealQuestion, SealWarning } from "@phosphor-icons/react";
 import { Tag } from "@/components/ui";
 import { useLanguage } from "@/contexts/LanguageContext";
 import type { PageProvenance } from "@/lib/types";
 
+const Markdown = dynamic(() => import("@/components/Markdown"), {
+  ssr: false,
+});
+
 /**
  * Compact "Verification" panel for the active page's provenance block
  * (api/docgen/verification.py): judge verdict + issues, citation/secret/
- * mermaid/corroborate counters and generation meta. Renders nothing for
- * legacy pages without provenance or partial (zero) fields.
+ * mermaid/corroborate counters, generation meta, and the extracted
+ * provenance report (assumptions/gaps/confidence). Renders below the page
+ * text; nothing for legacy pages without provenance.
  */
 export function ProvenancePanel({ provenance }: { provenance?: PageProvenance }) {
   const { messages, fmt } = useLanguage();
@@ -62,6 +68,8 @@ export function ProvenancePanel({ provenance }: { provenance?: PageProvenance })
     .join(" · ");
 
   const issues = provenance.judge?.issues ?? [];
+  const report =
+    typeof provenance.report === "string" ? provenance.report.trim() : "";
 
   return (
     <div className="rounded-xl border border-divider bg-surface px-4 py-3 text-xs">
@@ -92,6 +100,11 @@ export function ProvenancePanel({ provenance }: { provenance?: PageProvenance })
               <li key={`${i}-${issue}`}>{issue}</li>
             ))}
           </ul>
+        </div>
+      )}
+      {report && (
+        <div className="mt-2 border-t border-divider pt-2">
+          <Markdown content={report} />
         </div>
       )}
     </div>

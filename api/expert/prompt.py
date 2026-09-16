@@ -3,8 +3,8 @@
 Split out of the former ``api/expert_agent.py`` (Step 6). Owns:
 - Tunables: ``KNOWLEDGE_MAX_CHARS``, ``STREAM_CHUNK_SIZE``,
   ``_DEFAULT_LANGUAGE_NAME``.
-- Loaded prompt bodies: ``EXPERT_SYSTEM_PROMPT`` / ``EXPERT_DOC_PROMPT``
-  (from ``refs/prompts/expert_agent_*.md`` via ``api.prompts.load_prompt_file``).
+- Loaded prompt bodies: ``EXPERT_SYSTEM_PROMPT``
+  (from ``refs/prompts/expert_agent_system.md`` via ``api.prompts.load_prompt_file``).
 - ``_clean_llm_text`` (expert variant — also strips ``<r>...</r>`` blocks that
   some local models emit; differs from the docgen variant in
   ``api.docgen._common``, so each module keeps its own).
@@ -45,9 +45,8 @@ KNOWLEDGE_MAX_CHARS = 60_000
 # chunked fallback) so the client still receives incremental SSE chunks.
 STREAM_CHUNK_SIZE = 80
 
-# Loaded once at import; the .md files are the source of truth.
+# Loaded once at import; the .md file is the source of truth.
 EXPERT_SYSTEM_PROMPT: str = load_prompt_file("expert_agent_system.md", "")
-EXPERT_DOC_PROMPT: str = load_prompt_file("expert_agent_doc.md", "")
 
 # Default language instruction substituted into {language_name}. The expert
 # agent follows the user's language rather than a fixed one.

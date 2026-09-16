@@ -79,6 +79,7 @@ from api.utils.llm_helpers import cap as _cap
 from api.formats.mermaid import run_repair_loop
 from api.prompts import LANGUAGE_NAMES, load_prompt_file
 from api.docgen._common import (
+    _carry_page_verify_flags,
     _check_cancel,
     _close_owned_llm,
     _product_dataset,
@@ -3897,6 +3898,7 @@ async def generate_database_docs(
         merged.update({p: pages[p] for p in force_pages if p in pages})
         order = list(order) + [p for p in merged if p not in order]
         pages = merged
+    _carry_page_verify_flags(pages, old_pages)
     emit_progress(progress, phase="indexing")
     docs = _assemble_docs(pages, order)
     _persist_artifact(entity, docs, pages)

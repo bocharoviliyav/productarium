@@ -132,6 +132,16 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         unit="graph steps",
         group="LLM",
     ),
+    # Spec enrichment react agent (api/docgen/spec.py); former hardcoded 40.
+    TimeoutKey(
+        key="spec_recursion_limit",
+        env_var="SPEC_RECURSION_LIMIT",
+        default=40.0,
+        floor=8.0,
+        label="Docgen: spec enrichment agent recursion limit",
+        unit="graph steps",
+        group="LLM",
+    ),
     # Promoted from the env-only DOCGEN_SECTION_CONCURRENCY knob (bounds the
     # section agents of the python-parallel fallback). Env semantics are
     # unchanged; the registry only adds the admin-store layer above it.
@@ -193,6 +203,18 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         default=1800.0,
         floor=60.0,
         label="Expert ask turn budget (wall-clock)",
+        group="Expert",
+    ),
+    # LangGraph recursion budget for the expert react agents (ask stream,
+    # /ask/doc, deep-research researcher). Raised from langgraph's default of
+    # 25 that killed tool-heavy expert turns (memory + MCP tool loops).
+    TimeoutKey(
+        key="expert_recursion_limit",
+        env_var="EXPERT_RECURSION_LIMIT",
+        default=64.0,
+        floor=8.0,
+        label="Expert: agent recursion limit",
+        unit="graph steps",
         group="Expert",
     ),
     # --- Memory backend (pgvector recall) -------------------------------
@@ -534,6 +556,11 @@ def resolve_docgen_orchestrator_recursion_limit() -> int:
     return resolve_timeout_int("docgen_orchestrator_recursion_limit")
 
 
+def resolve_spec_recursion_limit() -> int:
+    """LangGraph ``recursion_limit`` for the spec enrichment react agent."""
+    return resolve_timeout_int("spec_recursion_limit")
+
+
 def resolve_docgen_section_concurrency() -> int:
     """Max parallel section agents in the python-parallel fallback path.
 
@@ -581,6 +608,17 @@ def resolve_expert_stream_timeout() -> float:
     persisted, and subscribers receive an error frame.
     """
     return resolve_timeout("expert_stream")
+
+
+def resolve_expert_recursion_limit() -> int:
+    """LangGraph ``recursion_limit`` for the expert react agents.
+
+    One budget for the ask stream, the one-shot doc turn, and the
+    deep-research researcher — all the same react-agent shape. Replaces the
+    old hardcoded 25 (langgraph's default); read per request so an admin
+    change applies to the next turn without a restart.
+    """
+    return resolve_timeout_int("expert_recursion_limit")
 
 
 def resolve_memory_query_timeout() -> float:
@@ -752,10 +790,12 @@ __all__ = [
     "resolve_llm_request_timeout",
     "resolve_llm_retry_max_time",
     "resolve_expert_stream_timeout",
+    "resolve_expert_recursion_limit",
     "resolve_docgen_indexing_drain_seconds",
     "resolve_docgen_map_concurrency",
     "resolve_docgen_unit_recursion_limit",
     "resolve_docgen_orchestrator_recursion_limit",
+    "resolve_spec_recursion_limit",
     "resolve_docgen_section_concurrency",
     "resolve_docgen_llm_concurrency",
     "resolve_docgen_spec_context_enabled",

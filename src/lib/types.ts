@@ -35,6 +35,11 @@ export interface PageProvenance {
   judge?: { verdict?: string; issues?: string[] };
   mermaid?: Record<string, number>;
   corroborate?: { removed?: string[] };
+  /**
+   * Extracted trailing "Провенанс и проверка" block (key sources,
+   * assumptions, gaps, confidence) — rendered inside the verification panel.
+   */
+  report?: string;
   [key: string]: unknown;
 }
 
@@ -58,6 +63,13 @@ export interface ArtifactPage {
    * tolerate its presence without breaking.
    */
   provenance?: PageProvenance;
+  /**
+   * Server-owned per-page verification flags (set via the pages/{id}/verify
+   * endpoint; reset when the page content changes — see product_repo).
+   */
+  verified?: boolean;
+  verified_by?: string | null;
+  verified_at?: string | null;
 }
 
 /**

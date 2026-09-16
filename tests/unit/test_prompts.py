@@ -582,7 +582,6 @@ class TestPromptContentValidation:
             "{repo_brief}", "{sections_list}", "{section_hints}",
         ],
         "expert_agent_system.md": ["{product_name}", "{language_name}"],
-        "expert_agent_doc.md": ["{product_name}", "{language_name}"],
         "deep_research_planner.md": [
             "{query}", "{product_name}", "{language_name}",
         ],
@@ -713,7 +712,7 @@ class TestPromptFiles:
 
     def test_contains_expert_prompts(self):
         assert "expert_agent_system.md" in PROMPT_FILES
-        assert "expert_agent_doc.md" in PROMPT_FILES
+        assert "expert_agent_doc.md" not in PROMPT_FILES
 
     def test_contains_deep_research_prompts(self):
         assert "deep_research_planner.md" in PROMPT_FILES

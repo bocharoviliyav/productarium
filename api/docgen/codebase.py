@@ -82,6 +82,7 @@ from api.docgen.verification import (
     verify_section,
 )
 from api.docgen._common import (
+    _carry_page_verify_flags,
     _check_cancel,
     _checkpoint_partial_docs,
     _clean_llm_text,
@@ -94,6 +95,7 @@ from api.docgen._common import (
     _make_repair_llm,
     _persist_artifact,
     _product_dataset,
+    _split_provenance_block,
     _index_in_background,
     _repo_name_from_url,
     emit_progress,
@@ -3217,6 +3219,12 @@ async def generate_codebase_docs(
                 # covers the structure-check tail and reuse-only runs).
                 emit_progress(progress, phase="verifying")
 
+            # The provenance block the unit contract mandates (assumptions,
+            # gaps, confidence) moves OUT of the persisted text into
+            # provenance["report"] — the UI shows it inside the verification
+            # panel under the page instead of an in-content duplicate.
+            content, prov_report = _split_provenance_block(content)
+
             # --- verification pipeline (guard + citations + fingerprint +
             # judge). Every stage degrades with warnings; the masked content
             # is what gets persisted. The judge never runs on reused sections
@@ -3300,6 +3308,12 @@ async def generate_codebase_docs(
                     verification.corroborate_removed if verification else None
                 ),
             )
+            if prov_report:
+                # Extraction runs pre-verify (clean citations/judge): mask the
+                # report here so the persisted provenance payload is as
+                # secret-free as the page text verify_section produced.
+                prov_report, _m = mask_secrets(prov_report)
+                unit_provenance["report"] = prov_report
             if unit.is_child:
                 # Child identity for the NEXT run's diff-regen (prompt hash +
                 # family reconstruction from stored pages).
@@ -3454,6 +3468,7 @@ async def generate_codebase_docs(
 
     emit_progress(progress, phase="indexing")
     pages = _units_pages(unit_contents, units, language)
+    _carry_page_verify_flags(pages, old_pages)
     for uid, prov in provenance_by_unit.items():
         attach_provenance(pages, uid, prov)
     _persist_artifact(artifact, markdown, pages)

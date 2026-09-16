@@ -98,7 +98,6 @@ class TestImportsAndPrompts:
         # Every endpoint exists on the router (paths include the router prefix).
         paths = {r.path for r in mod.router.routes}
         assert "/api/products/{product_id}/ask" in paths
-        assert "/api/products/{product_id}/ask/doc" in paths
         # Detached-turn endpoints (issue #9).
         assert "/api/products/{product_id}/ask/stream/{turn_id}" in paths
         assert "/api/products/{product_id}/ask/{turn_id}/cancel" in paths
@@ -107,18 +106,15 @@ class TestImportsAndPrompts:
 
     def test_prompts_loaded_from_refs(self):
         import api.expert as ea
-        # The .md files exist and are loaded (non-empty).
+        # The .md file exists and is loaded (non-empty).
         assert ea.EXPERT_SYSTEM_PROMPT, "expert_agent_system.md not loaded"
-        assert ea.EXPERT_DOC_PROMPT, "expert_agent_doc.md not loaded"
-        # Placeholders are present in the bodies (substituted at runtime).
+        # Placeholders are present in the body (substituted at runtime).
         assert "{product_name}" in ea.EXPERT_SYSTEM_PROMPT
         assert "{language_name}" in ea.EXPERT_SYSTEM_PROMPT
-        assert "{product_name}" in ea.EXPERT_DOC_PROMPT
-        assert "{language_name}" in ea.EXPERT_DOC_PROMPT
 
     def test_public_api_surface(self):
         import api.expert as ea
-        for name in ("run_expert_chat", "run_expert_doc"):
+        for name in ("run_expert_chat",):
             assert hasattr(ea, name)
 
 
@@ -181,12 +177,8 @@ class TestHelpers:
 
     def test_build_prompt_uses_note_when_no_knowledge(self):
         import api.expert as ea
-        prompt = ea._build_prompt(ea.EXPERT_DOC_PROMPT, "Acme", "", "", "Q")
+        prompt = ea._build_prompt("T", "Acme", "", "", "Q")
         assert "<note>" in prompt
-        # No knowledge BLOCK was added. The template body mentions
-        # <product_knowledge> in prose, so check for the closing block tag
-        # (only present when an actual block is emitted) and for the absence of
-        # a populated block.
         assert "</product_knowledge>" not in prompt
         assert "<product_knowledge>\n" not in prompt
 
@@ -252,26 +244,6 @@ class TestKnowledgeRetrieval:
         # patching the attr on the module is enough.
         assert ea._fallback_artifact_docs("prod_x") == ""
 
-
-# ============================================================================
-# run_expert_doc
-# ============================================================================
-class TestRunExpertDoc:
-    def test_returns_markdown_from_llm(self, monkeypatch):
-        import api.expert as ea
-        _patch_memory_recall(monkeypatch, "CTX")
-        _patch_llm(monkeypatch, text="# Generated Doc\n\nbody text")
-        out = asyncio.run(ea.run_expert_doc("prod_1", "summarize the service"))
-        assert out.startswith("# Generated Doc")
-        assert "body text" in out
-
-    def test_returns_placeholder_when_llm_empty(self, monkeypatch):
-        import api.expert as ea
-        _patch_memory_recall(monkeypatch, "CTX")
-        _patch_llm(monkeypatch, text="")
-        out = asyncio.run(ea.run_expert_doc("prod_1", "q"))
-        assert "No content was generated" in out
-        assert "prod_1" in out
 
 # ============================================================================
 # run_expert_chat
@@ -542,30 +514,6 @@ class TestExpertRouter:
         assert 'data: {"content": " world"}' in body
         assert "data: [DONE]" in body
 
-    def test_ask_doc_returns_markdown_file(self, app_and_client, monkeypatch):
-        _, client = app_and_client
-        import api.routers.expert as expert_router
-
-        async def _fake_doc(product_id, query, model=None, use_rlm=None, **kwargs):
-            return "# Title\n\ndoc body"
-
-        monkeypatch.setattr(expert_router, "run_agent_doc", _fake_doc)
-        resp = client.post(
-            "/api/products/prod_1/ask/doc", json={"query": "write the doc"}
-        )
-        assert resp.status_code == 200
-        assert resp.headers["content-type"].startswith("text/markdown")
-        cd = resp.headers.get("content-disposition", "")
-        assert "attachment" in cd
-        assert "productarium_prod_1_expert.md" in cd
-        assert "# Title" in resp.text
-        assert "doc body" in resp.text
-
-    def test_ask_doc_empty_query_400(self, app_and_client):
-        _, client = app_and_client
-        resp = client.post("/api/products/prod_1/ask/doc", json={"query": "   "})
-        assert resp.status_code == 400
-
     def test_ask_empty_query_400(self, app_and_client):
         _, client = app_and_client
         resp = client.post("/api/products/prod_1/ask", json={"query": ""})
@@ -579,15 +527,3 @@ class TestExpertRouter:
         resp = client.post("/api/products/prod_1/ask", json={"query": "hi"})
         assert resp.status_code == 401
 
-    def test_ask_doc_requires_auth_when_not_none(self, app_and_client, monkeypatch):
-        _, client = app_and_client
-        import api.auth.deps as deps
-        monkeypatch.setattr(deps, "AUTH_PROVIDER", "local")
-        resp = client.post("/api/products/prod_1/ask/doc", json={"query": "hi"})
-        assert resp.status_code == 401
-
-    def test_safe_filename_sanitizes(self):
-        import api.routers.expert as expert_router
-        assert expert_router._safe_filename("prod_1") == "productarium_prod_1_expert.md"
-        # Unsafe characters are replaced with underscores.
-        assert expert_router._safe_filename("prod a/b") == "productarium_prod_a_b_expert.md"

@@ -861,7 +861,12 @@
   },
   "expert": {
     "askExpert": "Ask expert",
-    "downloadAsDocument": "Download as document",
+    "attach": "Attach files",
+    "removeAttachment": "Remove",
+    "attachmentTooMany": "At most 5 files per message",
+    "attachmentUploadFailed": "Attachment upload failed",
+    "copyAnswer": "Copy",
+    "downloadMarkdown": "Download as Markdown",
     "emptyHint": "Ask the expert anything about this product. Answers are grounded in its indexed artifacts (codebases, specs, links) with sources.",
     "placeholder": "Ask the expert: map the data flow across services, summarize the API contract, draft an on-call runbook…",
     "stop": "Stop",

@@ -9,8 +9,9 @@ Covers:
   no-op, empty block).
 - ``strip_inline_line_numbers`` (fenced code blocks, mermaid blocks skipped,
   prose untouched, no fence passthrough, empty/None input).
-- ``strip_llm_preamble`` (ru/en meta lead-ins stripped, content lead-ins and
-  meta lines without a colon kept, structural-first untouched).
+- ``strip_llm_preamble`` (two-phase rule: a fully-meta leading run before a
+  structural element is stripped regardless of punctuation; prose answers,
+  JSON payloads and content lead-ins without a meta opener stay untouched).
 """
 
 from __future__ import annotations
@@ -282,10 +283,23 @@ class TestStripLlmPreamble:
         text = "Основные компоненты системы:\n\n- ядро\n- API"
         assert strip_llm_preamble(text) == text
 
-    def test_meta_without_colon_kept(self):
-        # Not a lead-in into following content — conservative keep.
+    def test_meta_without_colon_before_structure_stripped(self):
+        # A fully-meta run directly before a structural element is a preamble
+        # even without trailing punctuation.
         text = "Now let me think about the structure.\n\n# Заголовок"
-        assert strip_llm_preamble(text) == text
+        assert strip_llm_preamble(text) == "# Заголовок"
+
+    def test_multiline_meta_run_stripped(self):
+        text = (
+            "Okay, I analyzed the provided files.\n"
+            "Now i'll produce the final markdown section:\n\n"
+            "# Section"
+        )
+        assert strip_llm_preamble(text) == "# Section"
+
+    def test_bold_meta_line_stripped(self):
+        text = "**Now i'll produce the final markdown section:**\n\n# Заголовок"
+        assert strip_llm_preamble(text) == "# Заголовок"
 
     def test_structural_first_untouched(self):
         text = "```mermaid\nflowchart TD\n  A --> B\n```"
@@ -294,6 +308,20 @@ class TestStripLlmPreamble:
     def test_meta_before_prose_stripped(self):
         text = "Хорошо, вот краткое резюме:\nПрозаический ответ модели."
         assert strip_llm_preamble(text) == "Прозаический ответ модели."
+
+    def test_meta_prose_without_colon_kept(self):
+        # No structural element ahead — conservative rule keeps the sentence.
+        text = "Now the system supports clustering."
+        assert strip_llm_preamble(text) == text
+
+    def test_json_payload_untouched(self):
+        text = "[\n  {\"title\": \"T\", \"summary\": \"S\"}\n]"
+        assert strip_llm_preamble(text) == text
+
+    def test_word_boundary_openers(self):
+        # "now\b" must not eat words that merely start with "now"/"well".
+        text = "Nowadays most services are stateless.\n\n# Заголовок"
+        assert strip_llm_preamble(text) == text
 
 
 # ---------------------------------------------------------------------------

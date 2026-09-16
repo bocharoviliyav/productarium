@@ -229,7 +229,7 @@ Fernet-шифрование key/value поверх `SettingORM`. `bootstrap_secr
 Без диспетчера — каждый generate-эндпоинт вызывает свой генератор напрямую. `codebase.py:generate_codebase_docs` (RLM для длинного контекста ≥20k символов, иначе стандартный LLM, 7 секций), `spec.py:generate_openapi_docs`/`generate_asyncapi_docs` (stdlib parse + skeleton + LLM enrichment). `jobs.py` (async 202+poll worker, принимает `entity_type`). `_common.py` (общий `_StandardLLM`, `_index_in_background`). Настраиваемые параметры: `RLM_MIN_CHARS=20000`, `CODEBASE_BLOB_MAX_CHARS=200000`, `PER_FILE_MAX_CHARS=8000`. Ремонт Mermaid через `run_repair_loop`. `_persist_artifact` — запись `generated_docs` + `pages`.
 
 ### `expert/` — пакет экспертного агента
-Продукто-скоупный агент. `chat.py:run_expert_chat` (stream/collect), `generate.py:run_expert_doc`. `_ExpertLLM` (реплика `_StandardLLM` + async `stream()`). `_retrieve_product_knowledge` (cognee recall top_k=20 → fallback конкатенация доков сущностей). `_build_prompt` добавляет `conversation_history` + блоки `product_knowledge`. Маршрутизация RLM (`_resolve_use_rlm`, `RLM_MIN_CHARS=20000`). Загружает `EXPERT_SYSTEM_PROMPT/EXPERT_DOC_PROMPT` из `refs/prompts`.
+Продукто-скоупный агент. `chat.py:run_expert_chat` (stream/collect). `_ExpertLLM` (реплика `_StandardLLM` + async `stream()`). `_retrieve_product_knowledge` (cognee recall top_k=20 → fallback конкатенация доков сущностей). `_build_prompt` добавляет `conversation_history` + блоки `product_knowledge`. Маршрутизация RLM (`_resolve_use_rlm`, `RLM_MIN_CHARS=20000`). Загружает `EXPERT_SYSTEM_PROMPT` из `refs/prompts`.
 
 ### `prompts.py` — реестр + загрузчик промптов
 `WIKI_SECTIONS`, `get_section_title`, `load_prompt_file`, `PROMPT_FILES` (dict filename→attr), `reload_prompt_file` (hot-reload). `load_prompt_file()` применяет `_wrap_prompt(content, language)` после загрузки. `SECTION_PROMPTS`-реестр. `RAG_TEMPLATE` — inline.
@@ -251,7 +251,6 @@ Fernet-шифрование key/value поверх `SettingORM`. `bootstrap_secr
 
 ### `routers/expert.py` (префикс `/api/products`)
 - `POST /{id}/ask` — SSE-стрим чата эксперта.
-- `POST /{id}/ask/doc` — скачивание Markdown-файла.
 Требует `get_current_user`.
 
 ### `routers/knowledge.py`
@@ -437,7 +436,6 @@ flowchart TD
 Продукто-скоупный агент поверх всех артефактов и узлов знаний.
 
 - `POST /api/products/{id}/ask` — SSE-стрим чата. Тело: `{ query, messages, stream, use_rlm }`.
-- `POST /api/products/{id}/ask/doc` — генерация самодостаточного Markdown-документа (скачивание .md).
 
 Внутренний поток:
 1. `_retrieve_product_knowledge` — cognee recall (top_k=20) → fallback конкатенация доков артефактов.
@@ -445,7 +443,7 @@ flowchart TD
 3. Маршрутизация RLM (`_resolve_use_rlm`): `RLM_MIN_CHARS=20000`, `RLM_EXPERT_TIMEOUT=1200`. Пользователь может форсировать: Auto / LLM / RLM (с откатом к LLM).
 4. `_ExpertLLM` стримит ответ; `_chunk_text` для fallback-стриминга.
 
-Промпты: `EXPERT_SYSTEM_PROMPT`, `EXPERT_DOC_PROMPT` в `refs/prompts/expert_agent_*.md`.
+Промпты: `EXPERT_SYSTEM_PROMPT` в `refs/prompts/expert_agent_system.md`.
 
 ---
 
@@ -494,7 +492,7 @@ flowchart TD
 ### Ключевые компоненты `components/`
 - `ui.tsx` — shared-примитивы minimalist-ui: `Card`, `Button` (primary/ghost/danger/subtle), `IconButton`, `Tag` (blue/green/yellow/red/neutral), `Input/Textarea/Select`, `Label`, `SectionHeader`, `Reveal` (IntersectionObserver, translateY+opacity, 600ms), `EmptyState`, `Spinner`, `TopBar`, `Banner` (info/success/error/warning), `Modal` (portal, ESC), `Switch`, `Avatar`, `Divider`, `Skeleton`.
 - `Ask.tsx` — интерфейс чата с RAG. Deep Research toggle (мульти-турн, до 5 итераций).
-- `ExpertChat.tsx` — экспертный агент: SSE-стрим из `POST /api/products/{id}/ask`, рендер streamed Markdown (Mermaid через `<Markdown/>`), «Download as document» (`POST .../ask/doc`), переключатель движка Auto/LLM/RLM. Толерантность к SSE: парсит `data:`-строки, принимает JSON с `{content|delta|text}`, fallback на raw-text.
+- `ExpertChat.tsx` — экспертный агент: SSE-стрим из `POST /api/products/{id}/ask`, рендер streamed Markdown (Mermaid через `<Markdown/>`), per-message copy/download, вложения в чат. Толерантность к SSE: парсит `data:`-строки, принимает JSON с `{content|delta|text}`, fallback на raw-text.
 - `Mermaid.tsx` — рендер Mermaid с SVG pan/zoom и авто-фиксом.
 - `Markdown.tsx` — рендер Markdown (react-markdown + rehype-raw + remark-gfm + подсветка синтаксиса).
 - `knowledge/KnowledgeTree.tsx` — дерево знаний (CRUD, drag, verify).

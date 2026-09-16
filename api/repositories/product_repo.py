@@ -658,6 +658,20 @@ def delete_database(db: Session, product_id: str, database_id: str) -> Product:
 
 
 # --- Content updates (WYSIWYG saves) ----------------------------------------
+# Per-page verification flags (server-owned; ride inside the pages JSON dict).
+_PAGE_VERIFY_KEYS = ("verified", "verified_by", "verified_at")
+
+
+def _strip_page_flags(pages: dict) -> dict:
+    """Drop client-supplied per-page verification flags (server-owned)."""
+    out = {}
+    for pid, page in pages.items():
+        if isinstance(page, dict) and any(k in page for k in _PAGE_VERIFY_KEYS):
+            page = {k: v for k, v in page.items() if k not in _PAGE_VERIFY_KEYS}
+        out[pid] = page
+    return out
+
+
 def update_database_content(
     db: Session,
     product_id: str,
@@ -687,6 +701,7 @@ def update_database_content(
     indexed_text: Optional[str] = None
 
     if pages is not None:
+        pages = _strip_page_flags(pages)
         database.pages = pages
         indexed_text = json.dumps(pages, ensure_ascii=False)
     elif page_id is not None and content is not None:
@@ -697,6 +712,10 @@ def update_database_content(
         current = dict(database.pages) if isinstance(database.pages, dict) else {}
         page = dict(current.get(page_id) or {})
         if page:
+            # Verification binds to exact content: a changed page resets it.
+            if page.get("content") != content:
+                for key in _PAGE_VERIFY_KEYS:
+                    page.pop(key, None)
             page["content"] = content
         else:
             page = {
@@ -752,6 +771,7 @@ def update_codebase_content(
         indexed_text: Optional[str] = None
 
         if pages is not None:
+            pages = _strip_page_flags(pages)
             codebase.pages = pages
             indexed_text = json.dumps(pages, ensure_ascii=False)
         elif page_id is not None and content is not None:
@@ -760,6 +780,10 @@ def update_codebase_content(
             current = dict(codebase.pages) if isinstance(codebase.pages, dict) else {}
             page = dict(current.get(page_id) or {})
             if page:
+                # Verification binds to exact content: a changed page resets it.
+                if page.get("content") != content:
+                    for key in _PAGE_VERIFY_KEYS:
+                        page.pop(key, None)
                 page["content"] = content
             else:
                 page = {
@@ -873,6 +897,43 @@ def verify_child(
     entity.verified = True
     entity.verified_by = user_id
     entity.verified_at = datetime.utcnow()
+    db.commit()
+    db.refresh(p_orm)
+    return orm_to_product(p_orm)
+
+
+def verify_page(
+    db: Session,
+    product_id: str,
+    entity_id: str,
+    collection: str,
+    page_id: str,
+    user_id: str,
+) -> Product:
+    """Mark one documentation page (codebases/databases pages JSON) verified.
+
+    Copy-on-write on the pages dict — in-place JSON mutation is not tracked.
+    Verification binds to content: edits and regenerations that change the
+    page drop the flags (see ``update_*_content`` and docgen persist).
+    """
+    p_orm = load_product_orm(db, product_id)
+    if p_orm is None:
+        raise ValueError("Product not found")
+    entity = next((x for x in getattr(p_orm, collection) if x.id == entity_id), None)
+    if entity is None:
+        raise ValueError("Entity not found")
+    pages = entity.pages if isinstance(entity.pages, dict) else {}
+    if page_id not in pages:
+        raise ValueError("Page not found")
+    current = dict(pages)
+    page = dict(current[page_id])
+    page.update(
+        verified=True,
+        verified_by=user_id,
+        verified_at=datetime.utcnow().isoformat(),
+    )
+    current[page_id] = page
+    entity.pages = current
     db.commit()
     db.refresh(p_orm)
     return orm_to_product(p_orm)

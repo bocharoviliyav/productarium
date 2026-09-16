@@ -147,30 +147,80 @@ def strip_number_prefixes_from_block(block: List[str]) -> List[str]:
 # --- LLM meta-preamble stripping ----------------------------------------------
 # The writer contract says the final message is the section markdown ONLY,
 # yet models still prepend assistant meta-commentary ("Now let me generate the
-# final architecture section:", "Хорошо, вот раздел:"). A line counts as meta
-# only when it starts with a known meta opener AND ends with ':' (a lead-in
-# into the content that follows) — ordinary prose and lead-ins like "Основные
-# компоненты системы:" never match and are kept.
+# final architecture section:", "**Okay, below is the section**",
+# "Хорошо, вот раздел:"). Two-phase rule:
+#   1. Structured answers — when EVERY line of the leading run (bounded, short)
+#      is meta AND a structural markdown element follows, the whole run is a
+#      preamble regardless of trailing punctuation.
+#   2. Prose answers (no structural element ahead) — keep the conservative
+#      per-line rule (meta opener AND ends with ':') so ordinary prose and
+#      content lead-ins like "Основные компоненты системы:" are never touched.
+# Word-boundary English openers avoid substring hits ("nowadays", "wellspring");
+# Russian stems (продолж|начн|…) stay prefix-matched by design.
 _PREAMBLE_META_RE = re.compile(
-    r"(?i)^(?:now|okay|ok|well|let(?:'s| us)? me|i(?:'ll| will|'ve| have)|"
-    r"here(?:'s| is)?|below|based on|finally|next|вот|ниже|хорошо|отлично|"
-    r"понятно|принято|сейчас|итак|давайте|продолж|начн|сгенерир|готово|финальн)"
+    r"(?i)^(?:now\b|okay\b|ok\b|well\b|sure\b|certainly\b|of course\b|"
+    r"alright\b|moving on\b|proceeding\b|let(?:'s|\s+us)?(?:\s+me)?\b|"
+    r"i(?:'ll|\s+will|\s+'ve|\s+have|'m)\b|here(?:'s|\s+is|\s+are)?\b|"
+    r"below\b|based\s+on\b|finally\b|next\b|"
+    r"вот\b|ниже\b|хорошо\b|отлично\b|понятно\b|принято\b|сейчас\b|"
+    r"итак\b|давайте\b|конечно\b|готово\b|продолж|начн|сгенерир|финальн)"
 )
 # First structural markdown element: heading, fence, list item or table row.
 _STRUCTURAL_MD_RE = re.compile(r"^\s*(?:#{1,6}\s|```|\||[-*+]\s|\d+[.)]\s)")
+_META_LINE_MAX = 200
+_META_RUN_MAX = 4
+_EMPHASIS_PAIRS = (("**", "**"), ("__", "__"), ("*", "*"), ("_", "_"))
+
+
+def _unwrap_emphasis(line: str) -> str:
+    """Strip whole-line markdown emphasis (``**…**`` etc.) for meta matching."""
+    t = line.strip()
+    for _ in range(3):  # bounded nesting
+        for left, right in _EMPHASIS_PAIRS:
+            if len(t) > 2 * len(left) and t.startswith(left) and t.endswith(right):
+                t = t[len(left):len(t) - len(right)].strip()
+                break
+        else:
+            break
+    return t
+
+
+def _is_meta_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or len(stripped) > _META_LINE_MAX:
+        return False
+    return bool(
+        _PREAMBLE_META_RE.match(stripped)
+        or _PREAMBLE_META_RE.match(_unwrap_emphasis(stripped))
+    )
 
 
 def strip_llm_preamble(text: Optional[str]) -> str:
     """Drop leading assistant meta-commentary lines from an LLM answer.
 
-    Walks the leading run of non-blank lines before the first structural
-    markdown element; strips the meta-matching prefix (bounded to 4 lines)
-    wherever one exists. Anything that is not a clear meta lead-in — prose,
-    lead-ins without a meta opener — leaves the text untouched.
+    See the two-phase contract above the regex. Returns the text unchanged for
+    prose answers, JSON payloads and content lead-ins that lack a meta opener.
     """
     if not text:
         return ""
     lines = text.split("\n")
+    # Phase 1: leading run of short non-structural lines, all meta, directly
+    # followed by a structural element → drop the whole run.
+    run: List[int] = []
+    structural = False
+    for idx, ln in enumerate(lines):
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        if _STRUCTURAL_MD_RE.match(ln):
+            structural = True
+            break
+        if len(run) == _META_RUN_MAX:
+            break
+        run.append(idx)
+    if run and structural and all(_is_meta_line(lines[i]) for i in run):
+        return "\n".join(lines[run[-1] + 1:]).lstrip("\n")
+    # Phase 2 (conservative): colon-terminated meta lead-in only.
     meta_end = 0
     seen_meta = 0
     for idx, ln in enumerate(lines):
@@ -179,16 +229,17 @@ def strip_llm_preamble(text: Optional[str]) -> str:
             continue
         if _STRUCTURAL_MD_RE.match(ln):
             break
+        unwrapped = _unwrap_emphasis(stripped)
         if (
-            len(stripped) <= 200
-            and stripped.endswith(":")
-            and _PREAMBLE_META_RE.match(stripped)
+            len(stripped) <= _META_LINE_MAX
+            and (stripped.endswith(":") or unwrapped.endswith(":"))
+            and _is_meta_line(stripped)
         ):
             seen_meta += 1
             meta_end = idx + 1
             continue
         break
-    if 0 < seen_meta <= 4:
+    if 0 < seen_meta <= _META_RUN_MAX:
         return "\n".join(lines[meta_end:]).lstrip("\n")
     return text
 
