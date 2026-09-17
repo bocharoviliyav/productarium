@@ -163,10 +163,10 @@ class TestCacheKey:
         ) != introspection_cache_key(budgets={"max_tool_calls": 10})
 
     def test_format_version_pinned(self):
-        # v5: full-catalog Oracle walk (packages/jobs/programs, constraints,
-        # dependencies, column comments, source_full overhangs). A stale
-        # version number would silently replay v4 payloads lacking the fields.
-        assert CACHE_FORMAT_VERSION == 5
+        # v6: quote-fixed Oracle pack (single-quoted NVL defaults, LONG
+        # columns dropped). A stale version number would silently replay the
+        # v5 payload whose categories emptied on real Oracle.
+        assert CACHE_FORMAT_VERSION == 6
 
     def test_ttl_env_default_and_parse(self, monkeypatch):
         monkeypatch.delenv("DB_INTROSPECTION_CACHE_TTL_SECONDS", raising=False)

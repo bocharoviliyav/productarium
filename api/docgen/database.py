@@ -91,6 +91,7 @@ from api.docgen._common import (
     _persist_artifact,
     _resolve_docgen_model,
     emit_progress,
+    plain_agent_tools,
 )
 from api.docgen.corroborate import (
     filter_ungrounded_prose,
@@ -874,7 +875,8 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
         'SELECT a.owner AS "table_schema", a.table_name AS "table_name", '
         'a.constraint_name AS "constraint_name", '
         'a.constraint_type AS "constraint_type", '
-        'ac.column_name AS "column_name", ac.position AS "position" '
+        'ac.column_name AS "column_name", '
+        "NVL(TO_CHAR(ac.position), '0') AS \"position\" "
         "FROM all_constraints a "
         "JOIN all_cons_columns ac ON ac.owner = a.owner "
         "AND ac.constraint_name = a.constraint_name "
@@ -884,10 +886,11 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
     ),
     # Object dependency graph (view → table, package → table, …).
     "dependencies": (
-        'SELECT owner AS "owner", name AS "name", NVL(type, "?") AS "type", '
-        'NVL(referenced_owner, "?") AS "ref_owner", '
+        'SELECT owner AS "owner", name AS "name", "'
+        "NVL(type, '?') AS \"type\", "
+        "NVL(referenced_owner, '?') AS \"ref_owner\", "
         'referenced_name AS "ref_name", '
-        'NVL(referenced_type, "?") AS "ref_type" '
+        "NVL(referenced_type, '?') AS \"ref_type\" "
         "FROM all_dependencies "
         "WHERE " + _ora_not_system("owner") + " "
         "AND referenced_name IS NOT NULL "
@@ -898,23 +901,25 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
         'SELECT owner AS "schema_name", trigger_name AS "trigger_name", '
         'table_name AS "table_name", '
         'triggering_event AS "triggering_event", trigger_type AS "trigger_type", '
-        'NVL(status, "?") AS "enabled", '
-        + _ora_flat("description", 400) + ' AS "description" '
+        # description is a LONG (ORA-00997 under SUBSTR): the trigger's
+        # header arrives with the trigger_sources lines instead.
+        "NVL(status, '?') AS \"enabled\" "
         "FROM all_triggers WHERE " + _ora_not_system("owner")
     ),
     # Trigger bodies: line-based, merged into the triggers metadata above.
     "trigger_sources": (
         'SELECT owner AS "schema_name", name AS "trigger_name", '
         # Blank ALL_SOURCE lines can be NULL — NVL or the whole pack dies.
-        'NVL(text, " ") AS "line_text" '
+        "NVL(text, ' ') AS \"line_text\" "
         "FROM all_source WHERE type = 'TRIGGER' AND "
         + _ora_not_system("owner") + " ORDER BY owner, name, line"
     ),
     "sequences": (
         'SELECT sequence_owner AS "schema_name", sequence_name AS "sequence_name", '
-        'NVL(TO_CHAR(min_value), "-") AS "min_value", '
-        'NVL(TO_CHAR(max_value), "-") AS "max_value", '
-        'increment_by AS "increment_by", cycle_flag AS "cycle_flag" '
+        "NVL(TO_CHAR(min_value), '-') AS \"min_value\", "
+        "NVL(TO_CHAR(max_value), '-') AS \"max_value\", "
+        "NVL(TO_CHAR(increment_by), '-') AS \"increment_by\", "
+        "NVL(cycle_flag, '?') AS \"cycle_flag\" "
         "FROM all_sequences WHERE " + _ora_not_system("sequence_owner")
     ),
     # all_mviews.query is a LONG: selecting it crashes the pinned formatter
@@ -922,12 +927,12 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
     # definition (when the source tool resolves it) arrives via source fetch.
     "matviews": (
         'SELECT owner AS "schema_name", mview_name AS "view_name", '
-        'NVL(refresh_mode, "?") AS "refresh_mode", '
-        'NVL(refresh_method, "?") AS "refresh_method", '
-        'NVL(build_mode, "?") AS "build_mode", '
+        "NVL(refresh_mode, '?') AS \"refresh_mode\", "
+        "NVL(refresh_method, '?') AS \"refresh_method\", "
+        "NVL(build_mode, '?') AS \"build_mode\", "
         "NVL(TO_CHAR(last_refresh_date, 'YYYY-MM-DD HH24:MI'), '-') "
         'AS "last_refresh", '
-        'NVL(updatable, "?") AS "updatable" '
+        "NVL(updatable, '?') AS \"updatable\" "
         "FROM all_mviews WHERE " + _ora_not_system("owner")
     ),
     # Names only: all_views.TEXT is a LONG column (no SUBSTR/aggregation) —
@@ -938,14 +943,14 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
     ),
     "types": (
         'SELECT owner AS "schema_name", type_name AS "type_name", '
-        'NVL(typecode, "?") AS "typecode" '
+        "NVL(typecode, '?') AS \"typecode\" "
         "FROM all_types WHERE " + _ora_not_system("owner")
     ),
     # TYPE / TYPE BODY sources: line-based, merged into the types metadata.
     "type_bodies": (
         'SELECT owner AS "schema_name", name AS "type_name", '
         'type AS "object_type", '
-        'NVL(text, " ") AS "line_text" '
+        "NVL(text, ' ') AS \"line_text\" "
         "FROM all_source WHERE type IN ('TYPE', 'TYPE BODY') AND "
         + _ora_not_system("owner") + " ORDER BY owner, name, type, line"
     ),
@@ -955,7 +960,7 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
     "routines": (
         'SELECT owner AS "schema_name", name AS "object_name", '
         'type AS "object_type", line AS "line", '
-        'NVL(text, " ") AS "line_text" '
+        "NVL(text, ' ') AS \"line_text\" "
         "FROM all_source "
         "WHERE type IN ('FUNCTION', 'PROCEDURE') "
         "AND " + _ora_not_system("owner") + " "
@@ -965,7 +970,7 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
     "packages": (
         'SELECT owner AS "schema_name", name AS "object_name", '
         'type AS "object_type", line AS "line", '
-        'NVL(text, " ") AS "line_text" '
+        "NVL(text, ' ') AS \"line_text\" "
         "FROM all_source "
         "WHERE type IN ('PACKAGE', 'PACKAGE BODY') "
         "AND " + _ora_not_system("owner") + " "
@@ -973,21 +978,21 @@ _ORACLE_SQL_PACK: Dict[str, str] = {
     ),
     "jobs": (
         'SELECT owner AS "schema_name", job_name AS "job_name", '
-        'NVL(job_type, "?") AS "job_type", '
+        "NVL(job_type, '?') AS \"job_type\", "
         + _ora_flat("job_action", 400) + ' AS "job_action", '
-        'NVL(state, "?") AS "state", NVL(enabled, "?") AS "enabled", '
+        "NVL(state, '?') AS \"state\", NVL(enabled, '?') AS \"enabled\", "
         + _ora_flat("repeat_interval", 200) + ' AS "repeat_interval", '
-        'NVL(schedule_type, "?") AS "schedule_type", '
+        "NVL(schedule_type, '?') AS \"schedule_type\", "
         "NVL(TO_CHAR(last_start_date, 'YYYY-MM-DD HH24:MI'), '-') "
         'AS "last_start" '
         "FROM all_scheduler_jobs WHERE " + _ora_not_system("owner")
     ),
     "programs": (
         'SELECT owner AS "schema_name", program_name AS "program_name", '
-        'NVL(program_type, "?") AS "program_type", '
+        "NVL(program_type, '?') AS \"program_type\", "
         + _ora_flat("program_action", 400) + ' AS "program_action", '
-        'NVL(enabled, "?") AS "enabled", '
-        'NVL(TO_CHAR(number_of_arguments), "0") AS "arguments" '
+        "NVL(enabled, '?') AS \"enabled\", "
+        "NVL(TO_CHAR(number_of_arguments), '0') AS \"arguments\" "
         "FROM all_scheduler_programs WHERE " + _ora_not_system("owner")
     ),
 }
@@ -3386,9 +3391,72 @@ def _render_page_tree(
         if frm in table_page_ids and to in table_page_ids:
             neighbors[frm].add(table_page_ids[to])
             neighbors[to].add(table_page_ids[frm])
-    for cat, full, pid in units:
-        if cat != "tables":
-            continue
+
+    # Schema-level aggregation: when one root's children span >=2 schemas,
+    # per-schema pages (deterministic listings) interpose between the root
+    # and its entity subpages — enterprise cross-schema layouts stay
+    # navigable. Single-schema / schema-less sets render exactly as before.
+
+    def _schema_buckets(
+        children: List[Tuple[str, str, str]],
+    ) -> List[Tuple[str, List[Tuple[str, str]]]]:
+        """Bucket children by entity schema, first-encounter order."""
+        seen: List[str] = []
+        buckets: Dict[str, List[Tuple[str, str]]] = {}
+        for cat, full, pid in children:
+            meta = (
+                (tables if cat == "tables" else (info.get(cat) or {})).get(full) or {}
+            )
+            schema = str(meta.get("schema") or "")
+            if schema not in buckets:
+                buckets[schema] = []
+                seen.append(schema)
+            buckets[schema].append((full, pid))
+        return [(schema, buckets[schema]) for schema in seen]
+
+    def _schema_pages(
+        root_id: str, title: str,
+        groups: List[Tuple[str, List[Tuple[str, str]]]],
+        purposes: Callable[[str], str], importance: str,
+    ) -> Dict[str, str]:
+        """Insert per-schema pages; returns entity pid → schema page id."""
+        grouped = sum(1 for schema, _items in groups if schema) >= 2
+        parents: Dict[str, str] = {}
+        # Fresh per root: ids are namespaced by the root prefix, so "app" on
+        # tables must not push the views page to "app_2".
+        slugger = _Slugger()
+        for schema, items in groups:
+            if not (grouped and schema):
+                continue
+            gpid = f"page_grp_{root_id[len('page_'):]}_{slugger(schema)}"
+            lines = [
+                f"## {title} — schema `{schema}`", "",
+                f"{len(items)} object(s)", "",
+            ]
+            for full, _pid in items:
+                purpose = purposes(full)
+                lines.append(f"- `{full}`" + (f" — {purpose}" if purpose else ""))
+            pages[gpid] = {
+                "id": gpid,
+                "title": schema,
+                "content": "\n".join(lines).strip(),
+                "parent": root_id,
+                "filePaths": [],
+                "importance": importance,
+                "relatedPages": sorted(pid for _full, pid in items),
+            }
+            order.append(gpid)
+            for _full, pid in items:
+                parents[pid] = gpid
+        return parents
+
+    tbl_units = [(cat, full, pid) for cat, full, pid in units if cat == "tables"]
+    tbl_parents = _schema_pages(
+        "page_tables", "Tables", _schema_buckets(tbl_units),
+        lambda full: (descriptions.get(full) or {}).get("purpose") or "",
+        "medium",
+    )
+    for cat, full, pid in tbl_units:
         meta = tables.get(full) or {}
         pages[pid] = {
             "id": pid,
@@ -3399,7 +3467,7 @@ def _render_page_tree(
                 full, meta, descriptions.get(full) or {}, edges, triggers,
                 deps_index,
             ),
-            "parent": "page_tables",
+            "parent": tbl_parents.get(pid, "page_tables"),
             "filePaths": [],
             "importance": "medium",
             "relatedPages": sorted(neighbors.get(full) or ()),
@@ -3408,10 +3476,6 @@ def _render_page_tree(
 
     # Category roots + children (only with evidence); children ride the same
     # shared cap through _subpage_units (0 = unlimited).
-    units_by_cat: Dict[str, List[Tuple[str, str]]] = {}
-    for cat, full, pid in units:
-        if cat != "tables":
-            units_by_cat.setdefault(cat, []).append((full, pid))
     for cat in _CATEGORIES:
         entries = info.get(cat) or {}
         if not entries:
@@ -3426,7 +3490,13 @@ def _render_page_tree(
             "relatedPages": ["page_tables"],
         }
         order.append(root_id)
-        for full, pid in units_by_cat.get(cat, []):
+        cat_units = [(c, f, p) for c, f, p in units if c == cat]
+        cat_parents = _schema_pages(
+            root_id, _CATEGORY_TITLES[cat], _schema_buckets(cat_units),
+            lambda full, _cat=cat: (cat_descs.get(_cat) or {}).get(full, ""),
+            "low",
+        )
+        for _c, full, pid in cat_units:
             pages[pid] = {
                 "id": pid,
                 "title": full,  # schema-qualified, same as table subpages
@@ -3435,14 +3505,15 @@ def _render_page_tree(
                     (cat_descs.get(cat) or {}).get(full, ""),
                     deps_index,
                 ),
-                "parent": root_id,
+                "parent": cat_parents.get(pid, root_id),
                 "filePaths": [],
                 "importance": "low",
                 "relatedPages": [],
             }
             order.append(pid)
         pages[root_id]["relatedPages"] = sorted(
-            pid for _full, pid in units_by_cat.get(cat, [])
+            set(cat_parents.values())
+            | {pid for _c, _f, pid in cat_units if pid not in cat_parents}
         )
     return pages, order
 
@@ -4407,6 +4478,9 @@ async def _run_deep_units(
             mcp_tools = await gather_mcp_agent_tools(str(product_id))
         except Exception as e:  # pragma: no cover - gather is never-fatal
             logger.warning("deep units: MCP tools unavailable (%s).", e)
+        # Adapter tools' content_and_artifact error path raises inside
+        # langchain and kills the unit agent; plain text tools degrade.
+        mcp_tools = plain_agent_tools(mcp_tools)
     entity_tools = build_entity_tools(info)
 
     template = load_prompt_file(

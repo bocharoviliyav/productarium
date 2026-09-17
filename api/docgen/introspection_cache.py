@@ -45,6 +45,10 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 #: Payload format version — a bump invalidates every stored entry.
+#: v6: quote-fixed Oracle pack (single-quoted NVL defaults — the double-
+#: quoted forms are ORA-00904 on a real server, LONG description dropped
+#: from all_triggers, NULL-safe position/increment/cycle). v5 payloads
+#: carry empty categories from those failures and must not be replayed.
 #: v5: full-catalog Oracle walk — new pack categories (packages, jobs,
 #: programs), per-type source split (routines = FUNCTION/PROCEDURE only),
 #: trigger sources, type bodies, matview metadata (LONG-free), PK/UNIQUE/CHECK
@@ -67,7 +71,7 @@ logger = logging.getLogger(__name__)
 #: ``_parse_names``/``_render_search_full`` drill into inner result
 #: collections — v1 payloads may hold envelope-shredded garbage and must not
 #: be replayed.
-CACHE_FORMAT_VERSION = 5
+CACHE_FORMAT_VERSION = 6
 
 _CACHE_DIR_NAME = "introspection_cache"
 #: Default TTL: long enough to cover reruns/repairs of a multi-hour job,

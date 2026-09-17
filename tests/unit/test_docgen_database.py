@@ -16,7 +16,7 @@ Covers (post-restructure contract: root pages + per-entity subpages):
 - ``_edges_from_fk_rows`` / ``_er_mermaid`` (FK graph → relationships/ER).
 - ``_render_skeleton`` (overview facts + tables root).
 - ``_render_table_subpage`` / category roots+subpages / ``_render_page_tree``
-  (parent, relatedPages, caps, fold).
+  (parent, relatedPages, caps, fold, per-schema grouping pages).
 - Batched enrichment (``_enrich_table_descriptions`` / ``_enrich_categories``
   / ``_infer_relations``) — strict JSON, name validation, budgets.
 - Cross-context (``_db_context_payload`` / ``product_database_context``).
@@ -1181,6 +1181,26 @@ class TestSqlGuard:
             for name, query in pack.items():
                 assert db_doc_mod._assert_readonly_sql(query), name
 
+    def test_pack_nvl_defaults_never_double_quoted(self):
+        # Oracle parses "…" as a quoted identifier: NVL(x, "?") raised
+        # ORA-00904 on every pack query and emptied the categories.
+        for pack in (db_doc_mod._PG_SQL_PACK, db_doc_mod._ORACLE_SQL_PACK):
+            for name, query in pack.items():
+                assert not re.search(r"NVL\([^)]*\"", query), name
+
+    def test_oracle_nullable_columns_are_pinned(self):
+        # all_triggers.description is a LONG (ORA-00997 under SUBSTR);
+        # nullable position/increment/cycle cells crash the pinned server's
+        # None-cell formatter — coerced with single-quoted NVL defaults.
+        assert "description" not in db_doc_mod._ORACLE_SQL_PACK["triggers"].lower()
+        assert (
+            "NVL(TO_CHAR(ac.position), '0')"
+            in db_doc_mod._ORACLE_SQL_PACK["constraints"]
+        )
+        seq = db_doc_mod._ORACLE_SQL_PACK["sequences"]
+        assert "NVL(TO_CHAR(increment_by), '-')" in seq
+        assert "NVL(cycle_flag, '?')" in seq
+
 
 # ============================================================================
 # _detect_engine
@@ -2039,14 +2059,14 @@ class TestOracleFullCatalogPack:
                     "| APP | PKG_ORDERS | PACKAGE BODY | APP | ORDERS | TABLE |",
                 ])
             if "all_triggers" in q:
+                # description (LONG) is not selected by the pack anymore.
                 return self._page(q, (
                     "| schema_name | trigger_name | table_name"
-                    " | triggering_event | trigger_type | enabled | description |"
-                    "\n| --- | --- | --- | --- | --- | --- | --- |\n"
+                    " | triggering_event | trigger_type | enabled |"
+                    "\n| --- | --- | --- | --- | --- | --- |\n"
                 ), [
-                    "| APP | ORD_TRG | ORDERS | INSERT | BEFORE EACH ROW"
-                    " | ENABLED | act on ORD_TRG |",
-                    "| APP | SKIP_TRG | ORDERS | UPDATE | - | ENABLED | - |",
+                    "| APP | ORD_TRG | ORDERS | INSERT | BEFORE EACH ROW | ENABLED |",
+                    "| APP | SKIP_TRG | ORDERS | UPDATE | - | ENABLED |",
                 ])
             if "type = 'TRIGGER'" in q:
                 return self._page(
@@ -2149,8 +2169,10 @@ class TestOracleFullCatalogPack:
             "APP.ORD_TRG", "APP.SKIP_TRG", "APP.ORPHAN_TRG",
         }
         assert info["triggers"]["APP.ORD_TRG"]["source"].strip() == "BEGIN\nEND;"
-        assert info["triggers"]["APP.ORD_TRG"]["meta"]["description"] == "act on ORD_TRG"
-        assert "description" not in info["triggers"]["APP.SKIP_TRG"]["meta"]
+        assert info["triggers"]["APP.ORD_TRG"]["meta"]["status"] == "ENABLED"
+        assert info["triggers"]["APP.SKIP_TRG"]["meta"] == {
+            "table": "ORDERS", "event": "UPDATE", "status": "ENABLED",
+        }
         assert info["triggers"]["APP.ORPHAN_TRG"]["source"]
         # Views stay names-only; matviews join as kind MATERIALIZED VIEW + meta.
         assert info["views"]["APP.V_ORDERS"].get("kind") == "VIEW"
@@ -2516,6 +2538,117 @@ class TestPageTree:
         assert pages["page_views"]["relatedPages"] == [child]
         assert order[-2:] == ["page_views", child]
         assert "Статистика." in pages[child]["content"]
+
+    @staticmethod
+    def _two_schemas(**overrides):
+        """Two-schema layout: the case where grouping pages interpose."""
+        base = dict(
+            schemas=["app", "billing"],
+            tables={
+                "app.users": {
+                    "schema": "app", "table": "users",
+                    "definition": "CREATE TABLE users (id int);",
+                    "columns": [
+                        {"name": "id", "type": "int", "nullable": False, "default": None},
+                    ],
+                },
+                "billing.orders": {
+                    "schema": "billing", "table": "orders",
+                    "definition": "CREATE TABLE orders (id int, user_id int);",
+                    "columns": [
+                        {"name": "id", "type": "int", "nullable": False, "default": None},
+                        {"name": "user_id", "type": "int", "nullable": True, "default": None},
+                    ],
+                },
+            },
+            fk_edges=[],
+        )
+        base.update(overrides)
+        return _sample_info(**base)
+
+    def test_schema_pages_between_root_and_tables(self):
+        pages, order = db_doc_mod._render_page_tree(
+            _fake_entity(), self._two_schemas(),
+            {"overview": None, "tables": {}, "categories": {}},
+        )
+        grp_app, grp_bill = "page_grp_tables_app", "page_grp_tables_billing"
+        assert grp_app in pages and grp_bill in pages
+        for gpid in (grp_app, grp_bill):
+            assert pages[gpid]["parent"] == "page_tables"
+            assert pages[gpid]["importance"] == "medium"
+        assert pages[grp_app]["title"] == "app"
+        assert "## Tables — schema `app`" in pages[grp_app]["content"]
+        assert "1 object(s)" in pages[grp_app]["content"]
+        assert "- `app.users`" in pages[grp_app]["content"]
+        # Entity subpages reparent onto their schema page.
+        assert pages["page_tbl_app_users"]["parent"] == grp_app
+        assert pages["page_tbl_billing_orders"]["parent"] == grp_bill
+        assert pages[grp_app]["relatedPages"] == ["page_tbl_app_users"]
+        # Grouping pages sit between the root and its entity subpages.
+        assert (
+            order.index("page_tables") < order.index(grp_app)
+            < order.index("page_tbl_app_users")
+        )
+        # The tables root keeps its own relatedPages contract.
+        assert pages["page_tables"]["relatedPages"] == ["page_overview"]
+
+    def test_schema_pages_for_category_children(self):
+        info = self._two_schemas(views={
+            "app.v_stats": {"schema": "app", "name": "v_stats", "kind": "VIEW"},
+            "billing.v_orders": {
+                "schema": "billing", "name": "v_orders", "kind": "VIEW",
+            },
+        })
+        pages, order = db_doc_mod._render_page_tree(
+            _fake_entity(), info, {"overview": None, "tables": {}, "categories": {}},
+        )
+        grp_app, grp_bill = "page_grp_views_app", "page_grp_views_billing"
+        assert grp_app in pages and grp_bill in pages
+        assert pages[grp_app]["parent"] == "page_views"
+        assert pages[grp_app]["importance"] == "low"
+        assert pages["page_view_app_v_stats"]["parent"] == grp_app
+        assert pages["page_view_billing_v_orders"]["parent"] == grp_bill
+        # The category root links the schema pages, not the entity subpages.
+        assert pages["page_views"]["relatedPages"] == sorted([grp_app, grp_bill])
+        assert "## Views — schema `billing`" in pages[grp_bill]["content"]
+        assert order.index("page_views") < order.index(grp_app)
+
+    def test_single_schema_set_renders_without_group_pages(self):
+        pages, order = db_doc_mod._render_page_tree(
+            _fake_entity(), _sample_info(),
+            {"overview": None, "tables": {}, "categories": {}},
+        )
+        assert not [p for p in pages if p.startswith("page_grp_")]
+        assert pages["page_tbl_public_users"]["parent"] == "page_tables"
+
+    def test_schema_less_entities_stay_on_their_root(self):
+        tables = dict(self._two_schemas()["tables"])
+        tables["legacy.thing"] = {
+            "schema": None, "table": "thing", "definition": "",
+            "columns": [
+                {"name": "id", "type": "int", "nullable": False, "default": None},
+            ],
+        }
+        pages, _ = db_doc_mod._render_page_tree(
+            _fake_entity(), self._two_schemas(tables=tables),
+            {"overview": None, "tables": {}, "categories": {}},
+        )
+        assert pages["page_tbl_app_users"]["parent"] == "page_grp_tables_app"
+        # No schema evidence → stays directly under the category root.
+        assert pages["page_tbl_legacy_thing"]["parent"] == "page_tables"
+
+    def test_subpage_units_ids_stable_under_grouping(self):
+        info = self._two_schemas()
+        units = db_doc_mod._subpage_units(info)
+        pages, _ = db_doc_mod._render_page_tree(
+            _fake_entity(), info, {"overview": None, "tables": {}, "categories": {}},
+        )
+        # Grouping pages ride alongside; the single-id space of deep units
+        # and force_pages is untouched.
+        assert "page_grp_tables_app" in pages
+        assert {u[2] for u in units} == {
+            p for p in pages if p.startswith("page_tbl_")
+        }
 
     def test_assemble_docs_order_and_separator(self):
         pages, order = db_doc_mod._render_page_tree(
@@ -3107,6 +3240,34 @@ class TestRunDeepUnits:
         out = self._run(_sample_info())
         assert out["fallback"] is False
         assert any(len(tools) == 3 for tools in created["tools"])
+
+    def test_mcp_tools_rewrapped_for_deep_agents(self, monkeypatch):
+        # content_and_artifact MCP tools are rewrapped before the agent sees
+        # them — one poisoned tool error must not kill the unit agent.
+        import api.mcp.manager as mcp_manager
+
+        created = self._patch_stack(monkeypatch, lambda name: "x" * 60)
+        monkeypatch.setattr(db_doc_mod, "_entity_mcp_enabled", lambda: True)
+
+        class PoisonedTool:
+            name = "mcp_probe"
+            description = "probe"
+            response_format = "content_and_artifact"
+
+            async def ainvoke(self, args):
+                return ["Query executed with errors"]
+
+        async def fake_gather(product_id):
+            return [PoisonedTool()]
+
+        monkeypatch.setattr(mcp_manager, "gather_mcp_agent_tools", fake_gather)
+        out = self._run(_sample_info())
+        assert out["fallback"] is False
+        for tools in created["tools"]:
+            assert all(
+                getattr(t, "response_format", None) != "content_and_artifact"
+                for t in tools
+            )
 
 
 # ============================================================================

@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from api.utils import setup_logging
 from api.utils.llm_helpers import (  # noqa: E402
@@ -375,6 +375,55 @@ def _carry_page_verify_flags(
         ):
             for key in ("verified", "verified_by", "verified_at"):
                 new_page[key] = old_page.get(key)
+
+
+def plain_agent_tools(tools: List[Any]) -> List[Any]:
+    """Rewrap MCP adapter tools (``response_format=content_and_artifact``)
+    as plain string tools for deepagents subagents.
+
+    langchain-mcp-adapters' error handler returns a bare list on
+    ``isError=True`` results, which langchain_core rejects with a ValueError
+    — killing the whole agent instead of degrading one call. The wrapper
+    invokes the original tool and flattens ANY result or exception to text.
+    Non-adapter tools pass through untouched.
+    """
+    from langchain_core.tools import StructuredTool
+
+    def _text(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts = []
+            for block in value:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+                else:
+                    parts.append(str(block))
+            return "".join(parts)
+        content = getattr(value, "content", None)
+        return _text(content) if isinstance(content, (str, list)) else str(value)
+
+    out: List[Any] = []
+    for original in tools:
+        if getattr(original, "response_format", None) != "content_and_artifact":
+            out.append(original)
+            continue
+
+        async def _run(tool: Any = original, **kwargs: Any) -> str:
+            try:
+                return _cap(_text(await tool.ainvoke(dict(kwargs))), 100_000)
+            except Exception as e:
+                return _cap(f"ERROR: {type(e).__name__}: {e}".split("\n")[0], 4000)
+
+        out.append(StructuredTool(
+            name=original.name,
+            description=original.description,
+            args_schema=getattr(original, "args_schema", None),
+            coroutine=_run,
+        ))
+    return out
 
 
 # Matches a markdown heading line; used to bound the provenance block.

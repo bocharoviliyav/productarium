@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import {
@@ -267,15 +267,100 @@ export default function EntityDocsViewer() {
   }, [displayPages]);
 
   // Collapsible nav groups: with hundreds of per-table subpages the nav is
-  // unreadable, so children stay hidden until the group opens; the group
-  // holding the active page auto-opens so deep links remain navigable.
+  // unreadable, so children stay hidden until the group opens; every group
+  // on the active page's ANCESTOR chain auto-opens so deep links (three
+  // levels: root → schema → entity) remain navigable.
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
-  const activeParent = activePage?.parent?.trim();
-  useEffect(() => {
-    if (activeParent) {
-      setOpenGroups((g) => (g[activeParent] ? g : { ...g, [activeParent]: true }));
+  const pagesById = useMemo(
+    () => new Map(displayPages.map((p) => [p.id, p])),
+    [displayPages],
+  );
+  const activeAncestors = useMemo(() => {
+    const chain: string[] = [];
+    let cur = activePage?.parent?.trim();
+    while (cur && pagesById.has(cur) && !chain.includes(cur)) {
+      chain.push(cur);
+      cur = pagesById.get(cur)!.parent?.trim() || undefined;
     }
-  }, [activeParent]);
+    return chain;
+  }, [activePage, pagesById]);
+  useEffect(() => {
+    if (activeAncestors.length) {
+      setOpenGroups((g) =>
+        activeAncestors.every((id) => g[id])
+          ? g
+          : { ...g, ...Object.fromEntries(activeAncestors.map((id) => [id, true])) },
+      );
+    }
+  }, [activeAncestors]);
+
+  // Recursive nav node (any depth): caret toggles subtrees, count badges
+  // show direct children, verified seals ride every level.
+  const renderNavNode = (p: ArtifactPage, depth: number): ReactNode => {
+    const isActive = p.id === activePageId;
+    const children = pageTree.childrenByParent.get(p.id) ?? [];
+    const open = Boolean(openGroups[p.id]);
+    return (
+      <div key={p.id} className="flex flex-col gap-0.5">
+        <div className="flex items-center gap-1">
+          {children.length > 0 ? (
+            <button
+              type="button"
+              aria-expanded={open}
+              aria-label={p.title}
+              onClick={() => setOpenGroups((g) => ({ ...g, [p.id]: !open }))}
+              className="shrink-0 rounded p-1 text-muted transition-colors hover:bg-surface-2 hover:text-ink"
+            >
+              <CaretDown
+                size={12}
+                weight="bold"
+                className={cn("transition-transform", !open && "-rotate-90")}
+              />
+            </button>
+          ) : (
+            <span className="w-5 shrink-0" aria-hidden />
+          )}
+          <button
+            onClick={() => setActivePageId(p.id)}
+            disabled={editing}
+            className={cn(
+              "flex-1 rounded-md text-left transition-colors",
+              depth === 0
+                ? "px-2 py-2 text-sm"
+                : "px-3 py-1.5 text-[13px] leading-snug",
+              "disabled:cursor-not-allowed disabled:opacity-50",
+              isActive
+                ? "bg-surface-2 font-medium text-ink"
+                : "text-muted hover:bg-surface-2 hover:text-ink",
+            )}
+          >
+            {p.title}
+            {p.verified ? (
+              <SealCheck
+                size={11}
+                weight="fill"
+                className="ml-1 inline text-tag-green-fg"
+              />
+            ) : null}
+            {children.length > 0 && (
+              <span className="ml-1.5 font-mono text-[11px] text-muted">
+                {children.length}
+              </span>
+            )}
+          </button>
+        </div>
+        {children.length > 0 && open && (
+          <div
+            className="ml-3 flex flex-col gap-0.5 border-l border-divider pl-2"
+            role="group"
+            aria-label={p.title}
+          >
+            {children.map((c) => renderNavNode(c, depth + 1))}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   const isCodebase = kind === "codebase";
   const isDatabase = kind === "database";
@@ -861,98 +946,7 @@ export default function EntityDocsViewer() {
                   <SectionHeader title={t.pages ?? "Pages"} className="mb-3" />
                   {pages.length > 0 ? (
                     <nav className="flex flex-col gap-0.5">
-                      {pageTree.roots.map((p) => {
-                        const isActive = p.id === activePageId;
-                        const children = pageTree.childrenByParent.get(p.id) ?? [];
-                        const open = Boolean(openGroups[p.id]);
-                        return (
-                          <div key={p.id} className="flex flex-col gap-0.5">
-                            <div className="flex items-center gap-1">
-                              {children.length > 0 ? (
-                                <button
-                                  type="button"
-                                  aria-expanded={open}
-                                  aria-label={p.title}
-                                  onClick={() =>
-                                    setOpenGroups((g) => ({ ...g, [p.id]: !open }))
-                                  }
-                                  className="shrink-0 rounded p-1 text-muted transition-colors hover:bg-surface-2 hover:text-ink"
-                                >
-                                  <CaretDown
-                                    size={12}
-                                    weight="bold"
-                                    className={cn(
-                                      "transition-transform",
-                                      !open && "-rotate-90",
-                                    )}
-                                  />
-                                </button>
-                              ) : (
-                                <span className="w-5 shrink-0" aria-hidden />
-                              )}
-                              <button
-                                onClick={() => setActivePageId(p.id)}
-                                disabled={editing}
-                                className={cn(
-                                  "flex-1 rounded-md px-2 py-2 text-left text-sm transition-colors",
-                                  "disabled:cursor-not-allowed disabled:opacity-50",
-                                  isActive
-                                    ? "bg-surface-2 font-medium text-ink"
-                                    : "text-muted hover:bg-surface-2 hover:text-ink",
-                                )}
-                              >
-                                {p.title}
-                                {p.verified ? (
-                                  <SealCheck
-                                    size={11}
-                                    weight="fill"
-                                    className="ml-1 inline text-tag-green-fg"
-                                  />
-                                ) : null}
-                                {children.length > 0 && (
-                                  <span className="ml-1.5 font-mono text-[11px] text-muted">
-                                    {children.length}
-                                  </span>
-                                )}
-                              </button>
-                            </div>
-                            {children.length > 0 && open && (
-                              <div
-                                className="ml-3 flex flex-col gap-0.5 border-l border-divider pl-2"
-                                role="group"
-                                aria-label={p.title}
-                              >
-                                {children.map((c) => {
-                                  const childActive = c.id === activePageId;
-                                  return (
-                                    <button
-                                      key={c.id}
-                                      onClick={() => setActivePageId(c.id)}
-                                      disabled={editing}
-                                      className={cn(
-                                        "rounded-md px-3 py-1.5 text-left text-[13px] leading-snug transition-colors",
-                                        "disabled:cursor-not-allowed disabled:opacity-50",
-                                        childActive
-                                          ? "bg-surface-2 font-medium text-ink"
-                                          : "text-muted hover:bg-surface-2 hover:text-ink",
-                                      )}
-                                    >
-                                      {c.title}
-                                      {c.verified ? (
-                                        <SealCheck
-                                          size={11}
-                                          weight="fill"
-                                          className="ml-1 inline text-tag-green-fg"
-                                        />
-                                      ) : null}
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
+                      {pageTree.roots.map((p) => renderNavNode(p, 0))}
                     </nav>
                   ) : (
                     <p className="text-xs text-muted">

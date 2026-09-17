@@ -4,7 +4,7 @@ Covers: set_main_event_loop / get_main_event_loop, _clean_llm_text,
 _repo_name_from_url, _product_name, _StandardLLM (mocked generator),
 _safe_build_llm, _llm_or_none, _make_repair_llm, _persist_artifact,
 _product_dataset, _index_in_background, _with_verification_guard,
-_resolve_docgen_model.
+_resolve_docgen_model, plain_agent_tools.
 """
 
 from __future__ import annotations
@@ -624,3 +624,59 @@ class TestIndexInBackground:
             await asyncio.sleep(0.05)
 
         asyncio.run(_run())
+
+
+# ============================================================================
+# plain_agent_tools (deepagents-safe MCP tool rewrap)
+# ============================================================================
+class TestPlainAgentTools:
+    @staticmethod
+    def _adapter_tool(coroutine):
+        """A stand-in for a langchain-mcp-adapters tool: args_schema + the
+        poison ``response_format=content_and_artifact``."""
+        from langchain_core.tools import StructuredTool
+        from pydantic import BaseModel
+
+        class Args(BaseModel):
+            sql: str = ""
+
+        tool = StructuredTool(
+            name="run_sql_query", description="SQL",
+            args_schema=Args, coroutine=coroutine,
+        )
+        tool.response_format = "content_and_artifact"
+        return tool
+
+    def test_plain_tools_pass_through(self):
+        class LocalTool:
+            pass
+
+        local = LocalTool()
+        assert c.plain_agent_tools([local]) == [local]
+
+    def test_error_result_becomes_error_string(self):
+        # The production defect: the adapter's error handler returns a bare
+        # list → BaseTool (content_and_artifact) raises ValueError and the
+        # whole deep-unit agent died instead of degrading one call.
+        async def bad(**kw):
+            return ["Query executed with errors"]
+
+        wrapped = c.plain_agent_tools([self._adapter_tool(bad)])[0]
+        out = asyncio.run(wrapped.ainvoke({"sql": "SELECT 1"}))
+        assert out.startswith("ERROR: ValueError")
+        assert wrapped.name == "run_sql_query"
+        assert "sql" in wrapped.args
+
+    def test_content_blocks_flattened_to_text(self):
+        async def ok(**kw):
+            return (["alpha", {"text": "beta"}], {"raw": 1})
+
+        wrapped = c.plain_agent_tools([self._adapter_tool(ok)])[0]
+        assert asyncio.run(wrapped.ainvoke({"sql": "SELECT 1"})) == "alphabeta"
+
+    def test_string_content_untouched(self):
+        async def ok(**kw):
+            return ("plain", {"raw": 1})
+
+        wrapped = c.plain_agent_tools([self._adapter_tool(ok)])[0]
+        assert asyncio.run(wrapped.ainvoke({"sql": "SELECT 1"})) == "plain"
