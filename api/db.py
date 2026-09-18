@@ -253,13 +253,16 @@ _SCHEMA_COLUMN_SHIMS: tuple = (
 
 def _ensure_schema_columns() -> None:
     """Best-effort ``ALTER TABLE … ADD COLUMN`` for ``_SCHEMA_COLUMN_SHIMS``."""
+    # Postgres supports IF NOT EXISTS (avoids ERROR-noise in the server log
+    # at every start); SQLite lacks the clause and relies on the catch below.
+    if_not_exists = "IF NOT EXISTS" if _is_postgres() else ""
     for table, column, ddl_type in _SCHEMA_COLUMN_SHIMS:
         try:
             with engine.begin() as conn:
                 conn.exec_driver_sql(
-                    f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"
+                    f"ALTER TABLE {table} ADD COLUMN {if_not_exists} {column} {ddl_type}"
                 )
-            logger.info("Schema shim: added column %s.%s", table, column)
+            logger.debug("Schema shim ensured column %s.%s", table, column)
         except Exception as e:
             text = str(e).lower()
             if "already exists" in text or "duplicate column" in text:
