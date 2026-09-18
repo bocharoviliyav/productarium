@@ -152,11 +152,17 @@ def _guard_no_raw_dsn(result: Product, request: Product) -> None:
             raise HTTPException(status_code=500, detail="Internal masking error")
 
 
+def _maybe_light(product: Product, light: bool) -> Product:
+    """``?light=1`` responses: page bodies stripped (viewer loads them per page)."""
+    return product_repo.strip_page_content(product) if light else product
+
+
 @router.post("", response_model=Product)
 async def create_product(
     product: Product,
     db: Session = Depends(get_db),
     user: UserORM = Depends(get_current_user),
+    light: bool = Query(False),
 ):
     """Create a product (admin|manager only, P0-2).
 
@@ -172,7 +178,7 @@ async def create_product(
     p_orm = product_repo.upsert_product(db, product)
     result = product_repo.orm_to_product(p_orm)
     _guard_no_raw_dsn(result, product)
-    return result
+    return _maybe_light(result, light)
 
 
 @router.get("/{product_id}", response_model=Product)
@@ -180,11 +186,12 @@ async def get_product(
     product_id: str,
     db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("ro")),
+    light: bool = Query(False, description="Strip page bodies + generated_docs from page-bearing entities"),
 ):
     p_orm = product_repo.load_product_orm(db, product_id)
     if p_orm is None:
         raise HTTPException(status_code=404, detail="Product not found")
-    return product_repo.orm_to_product(p_orm)
+    return _maybe_light(product_repo.orm_to_product(p_orm), light)
 
 
 @router.put("/{product_id}", response_model=Product)
@@ -193,21 +200,22 @@ async def update_product(
     product: Product,
     db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("rw")),
+    light: bool = Query(False),
 ):
     # Preserve previous overwrite semantics: the body Product is saved as-is.
     # (Server-owned verified flags and stored tokens survive the replace —
-    # see product_repo.upsert_product.)
-    # P1-18: the path product_id wins over any body id, so a stale/mismatched
-    # body can never spawn a second product.
+    # see product_repo.upsert_product.) Pages whose body was stripped by a
+    # ?light=1 GET get their stored content back first (round-trip guard).
     if product.id != product_id:
         product = product.model_copy(update={"id": product_id})
+    product = product_repo.merge_stored_page_bodies(db, product_id, product)
     try:
         p_orm = product_repo.upsert_product(db, product)
     except EntityBusyError as e:
         raise HTTPException(status_code=409, detail=str(e))
     result = product_repo.orm_to_product(p_orm)
     _guard_no_raw_dsn(result, product)
-    return result
+    return _maybe_light(result, light)
 
 
 @router.delete("/{product_id}")
@@ -250,6 +258,7 @@ async def add_codebase(
     codebase: Codebase,
     db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("rw")),
+    light: bool = Query(False),
 ):
     # P0-1: reject dangerous clone sources at the CRUD boundary, before any
     # git invocation (ext::, file://, ssh://, arbitrary local paths, ...).
@@ -257,9 +266,9 @@ async def add_codebase(
         try:
             validate_repo_url(codebase.repo_url)
         except ValueError as e:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=e)
     try:
-        return product_repo.add_codebase(db, product_id, codebase)
+        return _maybe_light(product_repo.add_codebase(db, product_id, codebase), light)
     except EntityBusyError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
@@ -272,9 +281,10 @@ async def delete_codebase(
     codebase_id: str,
     db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("rw")),
+    light: bool = Query(False),
 ):
     try:
-        return product_repo.delete_codebase(db, product_id, codebase_id)
+        return _maybe_light(product_repo.delete_codebase(db, product_id, codebase_id), light)
     except EntityBusyError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
@@ -288,6 +298,7 @@ async def update_codebase_docs(
     body: CodebaseDocUpdate,
     db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("rw")),
+    light: bool = Query(False),
 ):
     """Edit a codebase's generated documentation (WYSIWYG editor saves)."""
     try:
@@ -307,7 +318,7 @@ async def update_codebase_docs(
         status = 400 if "Provide one of" in msg else 404
         raise HTTPException(status_code=status, detail=msg)
     _reindex(product_id, indexed_text, codebase_id, source_type="codebase")
-    return product
+    return _maybe_light(product, light)
 
 
 # --- Specs ------------------------------------------------------------------
@@ -317,9 +328,10 @@ async def add_spec(
     spec: Spec,
     db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("rw")),
+    light: bool = Query(False),
 ):
     try:
-        return product_repo.add_spec(db, product_id, spec)
+        return _maybe_light(product_repo.add_spec(db, product_id, spec), light)
     except EntityBusyError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
@@ -332,9 +344,10 @@ async def delete_spec(
     spec_id: str,
     db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("rw")),
+    light: bool = Query(False),
 ):
     try:
-        return product_repo.delete_spec(db, product_id, spec_id)
+        return _maybe_light(product_repo.delete_spec(db, product_id, spec_id), light)
     except EntityBusyError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
@@ -348,6 +361,7 @@ async def update_spec(
     body: ContentUpdate,
     db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("rw")),
+    light: bool = Query(False),
 ):
     """Replace a spec's raw content (authored directly, no generation)."""
     try:
@@ -359,7 +373,7 @@ async def update_spec(
     except ValueError as e:
         raise HTTPException(status_code=404, detail="Product not found")
     _reindex(product_id, indexed_text, spec_id, source_type="spec")
-    return product
+    return _maybe_light(product, light)
 
 
 # --- Links ------------------------------------------------------------------
@@ -369,9 +383,10 @@ async def add_links(
     links: Links,
     db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("rw")),
+    light: bool = Query(False),
 ):
     try:
-        return product_repo.add_links(db, product_id, links)
+        return _maybe_light(product_repo.add_links(db, product_id, links), light)
     except EntityBusyError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
@@ -384,9 +399,10 @@ async def delete_links(
     links_id: str,
     db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("rw")),
+    light: bool = Query(False),
 ):
     try:
-        return product_repo.delete_links(db, product_id, links_id)
+        return _maybe_light(product_repo.delete_links(db, product_id, links_id), light)
     except EntityBusyError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
@@ -400,6 +416,7 @@ async def update_links(
     body: ContentUpdate,
     db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("rw")),
+    light: bool = Query(False),
 ):
     """Replace a links collection's raw content."""
     try:
@@ -411,7 +428,7 @@ async def update_links(
     except ValueError as e:
         raise HTTPException(status_code=404, detail="Product not found")
     _reindex(product_id, indexed_text, links_id)
-    return product
+    return _maybe_light(product, light)
 
 
 # --- Verification (item 5) — owner or admin -------------------------------
@@ -422,6 +439,7 @@ def _verify_entity(
     collection: str,
     user: UserORM,
     page_id: Optional[str] = None,
+    light: bool = False,
 ) -> Product:
     product = product_repo.load_product_orm(db, product_id)
     if product is None:
@@ -434,12 +452,14 @@ def _verify_entity(
         )
     try:
         if page_id is None:
-            return product_repo.verify_child(
+            result = product_repo.verify_child(
                 db, product_id, entity_id, collection, user.id
             )
-        return product_repo.verify_page(
-            db, product_id, entity_id, collection, page_id, user.id
-        )
+        else:
+            result = product_repo.verify_page(
+                db, product_id, entity_id, collection, page_id, user.id
+            )
+        return _maybe_light(result, light)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e) or "Entity not found")
 
@@ -448,8 +468,9 @@ def _verify_entity(
 async def verify_codebase(
     product_id: str, codebase_id: str,
     db: Session = Depends(get_db), user: UserORM = Depends(get_current_user),
+    light: bool = Query(False),
 ):
-    return _verify_entity(db, product_id, codebase_id, "codebases", user)
+    return _verify_entity(db, product_id, codebase_id, "codebases", user, light=light)
 
 
 @router.post(
@@ -459,10 +480,11 @@ async def verify_codebase(
 async def verify_codebase_page(
     product_id: str, codebase_id: str, page_id: str,
     db: Session = Depends(get_db), user: UserORM = Depends(get_current_user),
+    light: bool = Query(False),
 ):
     """Verify a single documentation page (not the whole codebase artifact)."""
     return _verify_entity(
-        db, product_id, codebase_id, "codebases", user, page_id=page_id
+        db, product_id, codebase_id, "codebases", user, page_id=page_id, light=light
     )
 
 
@@ -470,16 +492,18 @@ async def verify_codebase_page(
 async def verify_spec(
     product_id: str, spec_id: str,
     db: Session = Depends(get_db), user: UserORM = Depends(get_current_user),
+    light: bool = Query(False),
 ):
-    return _verify_entity(db, product_id, spec_id, "specs", user)
+    return _verify_entity(db, product_id, spec_id, "specs", user, light=light)
 
 
 @router.post("/{product_id}/links/{links_id}/verify", response_model=Product)
 async def verify_links(
     product_id: str, links_id: str,
     db: Session = Depends(get_db), user: UserORM = Depends(get_current_user),
+    light: bool = Query(False),
 ):
-    return _verify_entity(db, product_id, links_id, "links", user)
+    return _verify_entity(db, product_id, links_id, "links", user, light=light)
 
 
 __all__ = ["router"]

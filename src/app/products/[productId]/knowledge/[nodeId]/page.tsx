@@ -60,7 +60,7 @@ export default function KnowledgeNodePage() {
           credentials: "include",
           cache: "no-store",
         }),
-        fetch(`/api/products/${productId}`, {
+        fetch(`/api/products/${productId}?light=1`, {
           credentials: "include",
           cache: "no-store",
         }),

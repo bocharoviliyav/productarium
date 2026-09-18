@@ -809,3 +809,63 @@ class TestInitDb:
         assert db_mod.init_db() is True
         assert db_mod._db_ready is True
         assert called["n"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# ?light=1 payloads: meta-only pages + the PUT round-trip data-loss guard
+# --------------------------------------------------------------------------- #
+class TestLightPayloadEndpoints:
+    _PAGES = {
+        "p1": {
+            "id": "p1", "title": "P1", "content": "the body",
+            "provenance": {"judge": {"verdict": "ok"}},
+            "verified": True, "verified_by": "u", "verified_at": "t",
+        }
+    }
+
+    def _seed_with_pages(self, db_mod):
+        _seed_product(db_mod)
+        s = db_mod.SessionLocal()
+        try:
+            s.add(CodebaseORM(
+                id="cb_1", product_id="prod_1", name="Repo A", source="manual",
+                generated_docs="# stored", pages=self._PAGES,
+            ))
+            s.commit()
+        finally:
+            s.close()
+
+    @staticmethod
+    def _codebase(body):
+        return next(c for c in body["codebases"] if c["id"] == "cb_1")
+
+    def test_get_light_strips_bodies(self, isolated_db):
+        self._seed_with_pages(isolated_db)
+        _app, client = _make_client(isolated_db)
+        r = client.get("/api/products/prod_1?light=1")
+        assert r.status_code == 200
+        cb = self._codebase(r.json())
+        assert "content" not in cb["pages"]["p1"]
+        assert "provenance" not in cb["pages"]["p1"]
+        assert cb["pages"]["p1"]["verified"] is True  # flags are metadata
+        assert cb["generated_docs"] is None
+
+    def test_get_default_contract_unchanged(self, isolated_db):
+        self._seed_with_pages(isolated_db)
+        _app, client = _make_client(isolated_db)
+        cb = self._codebase(client.get("/api/products/prod_1").json())
+        assert cb["pages"]["p1"]["content"] == "the body"
+        assert cb["generated_docs"] == "# stored"
+
+    def test_put_light_roundtrip_preserves_content(self, isolated_db):
+        self._seed_with_pages(isolated_db)
+        _app, client = _make_client(isolated_db)
+        light = client.get("/api/products/prod_1?light=1").json()
+
+        # Naive client: PUTs the light payload straight back.
+        r = client.put("/api/products/prod_1?light=1", json=light)
+        assert r.status_code == 200
+
+        cb = self._codebase(client.get("/api/products/prod_1").json())
+        assert cb["pages"]["p1"]["content"] == "the body"
+        assert cb["generated_docs"] == "# stored"

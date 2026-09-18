@@ -95,6 +95,16 @@ class TestDocVersionsRouter:
             rows = dvr.list_versions(s, "codebase", "art_1")
             assert [v.source for v in rows] == ["rollback", "generate", "edit"]
 
+    def test_detail_light_strips_page_bodies(self, isolated_db):
+        _seed(isolated_db)
+        _app, client = _client(isolated_db)
+        r = client.get("/api/products/prod_1/codebases/art_1/versions/1?light=1")
+        assert r.status_code == 200
+        body = r.json()
+        # Page body dropped; the blob (redundant with the bodies) dropped too.
+        assert body["pages"] == {"page_overview": {}}
+        assert body["generated_docs"] is None
+
     def test_restore_unknown_version_404(self, isolated_db):
         _seed(isolated_db)
         _app, client = _client(isolated_db)

@@ -77,6 +77,7 @@ from api.models import (
 )
 from api.docgen.verification import mask_dsn
 from api.repositories import product_repo
+from api.routers.products import _maybe_light
 from api.schemas import Database, Product
 
 logger = logging.getLogger(__name__)
@@ -165,12 +166,13 @@ def _validate_mcp_server_pin(db: Session, product_id: str, mcp_server_id: str) -
 # --- CRUD --------------------------------------------------------------------
 @router.post("/{product_id}/databases", response_model=Product)
 async def add_database(
-    product_id: str, database: Database, db: Session = Depends(get_db)
+    product_id: str, database: Database, db: Session = Depends(get_db),
+    light: bool = Query(False),
 ):
     if database.db_type:
         product = await _add_preset_database(product_id, database, db)
         _assert_no_raw_dsn(product, database.dsn)
-        return product
+        return _maybe_light(product, light)
     if database.mcp_server_id:
         _validate_mcp_server_pin(db, product_id, database.mcp_server_id)
     # Verified state is server-owned: a client cannot grant verification at
@@ -186,7 +188,7 @@ async def add_database(
         raise HTTPException(status_code=404, detail="Product not found")
     # Defensive: the raw DSN must never appear in the serialized response.
     _assert_no_raw_dsn(product, database.dsn)
-    return product
+    return _maybe_light(product, light)
 
 
 async def _add_preset_database(
@@ -298,7 +300,8 @@ def _drop_preset_server(db: Session, database_row: DatabaseORM) -> None:
 
 @router.delete("/{product_id}/databases/{database_id}", response_model=Product)
 async def delete_database(
-    product_id: str, database_id: str, db: Session = Depends(get_db)
+    product_id: str, database_id: str, db: Session = Depends(get_db),
+    light: bool = Query(False),
 ):
     p_orm = product_repo.load_product_orm(db, product_id)
     if p_orm is not None:
@@ -308,7 +311,9 @@ async def delete_database(
         if existing is not None:
             _drop_preset_server(db, existing)
     try:
-        return product_repo.delete_database(db, product_id, database_id)
+        return _maybe_light(
+            product_repo.delete_database(db, product_id, database_id), light
+        )
     except EntityBusyError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError:
@@ -321,6 +326,7 @@ async def update_database(
     database_id: str,
     body: DatabaseUpdate,
     db: Session = Depends(get_db),
+    light: bool = Query(False),
 ):
     """Edit a database artifact: generated docs (WYSIWYG) OR metadata.
 
@@ -354,7 +360,7 @@ async def update_database(
             status = 400 if "Provide one of" in msg else 404
             raise HTTPException(status_code=status, detail=msg)
         _reindex(product_id, indexed_text, database_id, source_type="database")
-        return product
+        return _maybe_light(product, light)
 
     if body.mcp_server_id:
         _validate_mcp_server_pin(db, product_id, body.mcp_server_id)
@@ -372,7 +378,7 @@ async def update_database(
     except ValueError:
         raise HTTPException(status_code=404, detail="Database not found")
     _assert_no_raw_dsn(product, body.dsn)
-    return product
+    return _maybe_light(product, light)
 
 
 def _reject_preset_connection_changes(
@@ -461,6 +467,7 @@ async def verify_database(
     database_id: str,
     db: Session = Depends(get_db),
     user: UserORM = Depends(get_current_user),
+    light: bool = Query(False),
 ):
     product = product_repo.load_product_orm(db, product_id)
     if product is None:
@@ -473,8 +480,9 @@ async def verify_database(
             detail="Only the product owner or an admin can verify",
         )
     try:
-        return product_repo.verify_child(
-            db, product_id, database_id, "databases", user.id
+        return _maybe_light(
+            product_repo.verify_child(db, product_id, database_id, "databases", user.id),
+            light,
         )
     except ValueError:
         raise HTTPException(status_code=404, detail="Entity not found")
@@ -490,6 +498,7 @@ async def verify_database_page(
     page_id: str,
     db: Session = Depends(get_db),
     user: UserORM = Depends(get_current_user),
+    light: bool = Query(False),
 ):
     """Verify a single page of a database artifact's docs (owner/admin)."""
     product = product_repo.load_product_orm(db, product_id)
@@ -503,8 +512,11 @@ async def verify_database_page(
             detail="Only the product owner or an admin can verify",
         )
     try:
-        return product_repo.verify_page(
-            db, product_id, database_id, "databases", page_id, user.id
+        return _maybe_light(
+            product_repo.verify_page(
+                db, product_id, database_id, "databases", page_id, user.id
+            ),
+            light,
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e) or "Entity not found")

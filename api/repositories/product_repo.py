@@ -269,6 +269,106 @@ def orm_to_product(p_orm: ProductORM) -> Product:
     )
 
 
+# --- Light payloads (?light=1) ----------------------------------------------
+# Per-page verification flags (server-owned; ride inside the pages JSON dict).
+_PAGE_VERIFY_KEYS = ("verified", "verified_by", "verified_at")
+# Page keys kept when page bodies are stripped from a response: the viewer
+# needs the tree + verification flags, never the content (loaded per page).
+_PAGE_META_KEYS = (
+    "id", "title", "parent", "importance", "relatedPages", "filePaths",
+) + _PAGE_VERIFY_KEYS
+
+
+def light_pages(pages: Optional[dict]) -> Optional[dict]:
+    """Pages dicts reduced to ``_PAGE_META_KEYS`` (non-dict shapes pass through)."""
+    if not isinstance(pages, dict):
+        return pages
+    return {
+        pid: {k: v for k, v in page.items() if k in _PAGE_META_KEYS}
+        if isinstance(page, dict)
+        else page
+        for pid, page in pages.items()
+    }
+
+
+def strip_page_content(product: Product) -> Product:
+    """Copy of ``product`` with page bodies and redundant blobs removed.
+
+    Serves ``?light=1`` product payloads: for entities WITH pages the legacy
+    ``generated_docs`` blob duplicates the page content, so bodies (content +
+    provenance) and the blob are both dropped — the viewer loads one page at
+    a time via the page-content endpoint. Page-less legacy entities keep
+    ``generated_docs`` (it IS their doc).
+    """
+
+    def _light(entities: list) -> list:
+        out = []
+        for e in entities:
+            if isinstance(e.pages, dict) and e.pages:
+                e = e.model_copy(update={
+                    "pages": light_pages(e.pages),
+                    "generated_docs": None,
+                })
+            out.append(e)
+        return out
+
+    return product.model_copy(update={
+        "codebases": _light(product.codebases),
+        "databases": _light(product.databases),
+    })
+
+
+def merge_stored_page_bodies(db: Session, product_id: str, product: Product) -> Product:
+    """Fill page bodies omitted by a light GET back in from storage (PUT guard).
+
+    A ``?light=1`` GET strips ``content``/``provenance``; a naive round-trip
+    PUT of that payload would wipe every page body. Pages missing the
+    ``content`` KEY (an explicit clear sends ``content: ""``) inherit the
+    stored body; ``generated_docs`` is restored the same way.
+    """
+
+    def _merge(entities: list, model) -> tuple:
+        stored = {
+            row.id: row
+            for row in db.query(model).filter(model.product_id == product_id)
+        }
+        out, changed = [], False
+        for e in entities:
+            row = stored.get(e.id)
+            if row is None or not isinstance(e.pages, dict) or not e.pages:
+                out.append(e)
+                continue
+            merged, dirty = {}, False
+            for pid, page in e.pages.items():
+                stored_page = (row.pages or {}).get(pid)
+                if (
+                    isinstance(page, dict)
+                    and "content" not in page
+                    and isinstance(stored_page, dict)
+                    and "content" in stored_page
+                ):
+                    page = {**stored_page, **page}  # stored body + fresh meta
+                    dirty = True
+                merged[pid] = page
+            if dirty:
+                e = e.model_copy(update={
+                    "pages": merged,
+                    "generated_docs": e.generated_docs or row.generated_docs,
+                })
+                changed = True
+            out.append(e)
+        return out, changed
+
+    codebases, c1 = _merge(product.codebases, CodebaseORM)
+    databases, c2 = _merge(product.databases, DatabaseORM)
+    if not (c1 or c2):
+        return product
+    return product.model_copy(update={
+        "codebases": codebases,
+        "databases": databases,
+    })
+
+
 # --- Product queries --------------------------------------------------------
 def _load_options():
     return (
@@ -658,9 +758,6 @@ def delete_database(db: Session, product_id: str, database_id: str) -> Product:
 
 
 # --- Content updates (WYSIWYG saves) ----------------------------------------
-# Per-page verification flags (server-owned; ride inside the pages JSON dict).
-_PAGE_VERIFY_KEYS = ("verified", "verified_by", "verified_at")
-
 
 def _strip_page_flags(pages: dict) -> dict:
     """Drop client-supplied per-page verification flags (server-owned)."""

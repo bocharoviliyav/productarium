@@ -49,6 +49,7 @@ import {
   type Spec,
   entityPath,
   generateId,
+  normalizePages,
   parseLinksContent,
   serializeLinksContent,
 } from "@/lib/types";
@@ -155,7 +156,7 @@ export default function ProductDetailPage() {
     setIsLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/products/${productId}`, {
+      const res = await fetch(`/api/products/${productId}?light=1`, {
         credentials: "include",
         cache: "no-store",
       });
@@ -377,7 +378,7 @@ export default function ProductDetailPage() {
         dsn: dbDsn.trim(),
         source: "manual" as const,
       };
-      const res = await fetch(`/api/products/${product.id}/databases`, {
+      const res = await fetch(`/api/products/${product.id}/databases?light=1`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
@@ -415,7 +416,7 @@ export default function ProductDetailPage() {
         ...(cbToken.trim() ? { token: cbToken.trim() } : {}),
         source: "manual" as const,
       };
-      const res = await fetch(`/api/products/${product.id}/codebases`, {
+      const res = await fetch(`/api/products/${product.id}/codebases?light=1`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
@@ -450,7 +451,7 @@ export default function ProductDetailPage() {
         content: serializeLinksContent([item]) || null,
         source: "manual" as const,
       };
-      const res = await fetch(`/api/products/${product.id}/links`, {
+      const res = await fetch(`/api/products/${product.id}/links?light=1`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
@@ -480,7 +481,7 @@ export default function ProductDetailPage() {
       // the PLURAL segments (codebases/specs/links/databases) while `type` is
       // the singular form-state value — raw interpolation produces a 404.
       const res = await fetch(
-        `/api/products/${product.id}/${entityPath(type)}/${entityId}`,
+        `/api/products/${product.id}/${entityPath(type)}/${entityId}?light=1`,
         { method: "DELETE", credentials: "include" },
       );
       if (!res.ok) throw new Error(`Failed to delete (${res.status})`);
@@ -1080,7 +1081,10 @@ export default function ProductDetailPage() {
                           const gen = generating[c.id] ?? null;
                           const isGenerating = Boolean(gen);
                           const isDeleting = deletingId === c.id;
-                          const hasDocs = Boolean(c.generated_docs);
+                          // Light payloads strip generated_docs when pages
+                          // exist — metadata presence is the fallback signal.
+                          const hasDocs =
+                            Boolean(c.generated_docs) || normalizePages(c.pages).length > 0;
                           return (
                             <Reveal key={c.id} delayMs={Math.min(i, 6) * 80}>
                               <Card
@@ -1137,10 +1141,10 @@ export default function ProductDetailPage() {
                                   </p>
                                 )}
 
-                                {hasDocs && (
+                                {c.generated_docs && (
                                   <div className="mt-4 max-h-28 overflow-hidden rounded-md border border-divider bg-surface-2 p-3 font-mono text-xs leading-relaxed text-muted">
-                                    {c.generated_docs?.slice(0, 280)}
-                                    {(c.generated_docs?.length ?? 0) > 280 && "…"}
+                                    {c.generated_docs.slice(0, 280)}
+                                    {c.generated_docs.length > 280 && "…"}
                                   </div>
                                 )}
 
@@ -1227,7 +1231,8 @@ export default function ProductDetailPage() {
                           const gen = generating[d.id] ?? null;
                           const isGenerating = Boolean(gen);
                           const isDeleting = deletingId === d.id;
-                          const hasDocs = Boolean(d.generated_docs);
+                          const hasDocs =
+                            Boolean(d.generated_docs) || normalizePages(d.pages).length > 0;
                           return (
                             <Reveal key={d.id} delayMs={Math.min(i, 6) * 80}>
                               <Card
@@ -1283,10 +1288,10 @@ export default function ProductDetailPage() {
                                   </p>
                                 )}
 
-                                {hasDocs && (
+                                {d.generated_docs && (
                                   <div className="mt-4 max-h-28 overflow-hidden rounded-md border border-divider bg-surface-2 p-3 font-mono text-xs leading-relaxed text-muted">
-                                    {d.generated_docs?.slice(0, 280)}
-                                    {(d.generated_docs?.length ?? 0) > 280 && "…"}
+                                    {d.generated_docs.slice(0, 280)}
+                                    {d.generated_docs.length > 280 && "…"}
                                   </div>
                                 )}
 

@@ -783,8 +783,84 @@ class TestVerifyPage:
 
 
 # --------------------------------------------------------------------------- #
-# upsert_product — database verified state is server-owned (review #4)
+# ?light=1 shaping: meta-only pages + the PUT round-trip merge guard
 # --------------------------------------------------------------------------- #
+class TestLightPayloadHelpers:
+    _FULL_PAGES = {
+        "p1": {
+            "id": "p1", "title": "P1", "parent": "root", "content": "body",
+            "importance": "high", "filePaths": ["a.py"], "relatedPages": ["p2"],
+            "provenance": {"judge": {"verdict": "ok"}},
+            "verified": True, "verified_by": "u1", "verified_at": "2026-01-01",
+        }
+    }
+
+    def test_strip_keeps_meta_drops_bodies(self):
+        prod = _make_product(
+            codebases=[_make_codebase(pages=self._FULL_PAGES, generated_docs="# blob")]
+        )
+        light = pr.strip_page_content(prod)
+        page = light.codebases[0].pages["p1"]
+        assert set(page) == {
+            "id", "title", "parent", "importance", "filePaths", "relatedPages",
+            "verified", "verified_by", "verified_at",
+        }
+        assert light.codebases[0].generated_docs is None
+        # Copy semantics: the source product is untouched.
+        assert prod.codebases[0].pages["p1"]["content"] == "body"
+        assert prod.codebases[0].generated_docs == "# blob"
+
+    def test_strip_keeps_pageless_blob_and_specs(self):
+        prod = _make_product(
+            codebases=[_make_codebase(generated_docs="# docs")],
+            specs=[_make_spec()],
+        )
+        light = pr.strip_page_content(prod)
+        assert light.codebases[0].generated_docs == "# docs"
+        assert light.codebases[0].pages is None
+        assert light.specs[0].content == "openapi: 3.0.0"
+
+    def test_merge_fills_missing_content_from_storage(self, session):
+        _seed_product(session)
+        session.add(CodebaseORM(
+            id="cb_1", product_id="prod_1", name="A", source="manual",
+            generated_docs="# stored", pages=self._FULL_PAGES,
+        ))
+        session.commit()
+        light = pr.strip_page_content(
+            pr.orm_to_product(pr.load_product_orm(session, "prod_1"))
+        )
+        merged = pr.merge_stored_page_bodies(session, "prod_1", light)
+        page = merged.codebases[0].pages["p1"]
+        assert page["content"] == "body"  # restored from storage
+        assert page["verified"] is True  # fresh meta wins
+        assert merged.codebases[0].generated_docs == "# stored"
+
+    def test_merge_respects_explicit_empty_content(self, session):
+        _seed_product(session)
+        session.add(CodebaseORM(
+            id="cb_1", product_id="prod_1", name="A", source="manual",
+            pages=self._FULL_PAGES,
+        ))
+        session.commit()
+        prod = pr.orm_to_product(pr.load_product_orm(session, "prod_1"))
+        prod.codebases[0] = prod.codebases[0].model_copy(update={
+            "pages": {"p1": {"id": "p1", "title": "P1", "content": ""}},
+        })
+        merged = pr.merge_stored_page_bodies(session, "prod_1", prod)
+        assert merged.codebases[0].pages["p1"]["content"] == ""
+
+    def test_merge_noop_when_bodies_present(self, session):
+        _seed_product(session)
+        session.add(CodebaseORM(
+            id="cb_1", product_id="prod_1", name="A", source="manual",
+            pages=self._FULL_PAGES,
+        ))
+        session.commit()
+        full = pr.orm_to_product(pr.load_product_orm(session, "prod_1"))
+        assert pr.merge_stored_page_bodies(session, "prod_1", full) is full
+
+
 class TestUpsertDatabaseVerifiedOwnership:
     def test_upsert_preserves_stored_verified_forces_false_for_new(self, session):
         _seed_product(session)

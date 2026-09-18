@@ -31,7 +31,7 @@ from api.docgen.jobs import (
     submit_job,
 )
 from api.models import ProductORM, UserORM
-from api.repositories import product_repo
+from api.repositories import doc_version_repo, product_repo
 from api.utils.rate_limit import enforce_user_rate_limit
 
 logger = logging.getLogger(__name__)
@@ -235,6 +235,46 @@ async def regenerate_docgen_page(
         db, product_id, entity_type, entity_id, request_data, user.id,
         force_pages=force_pages,
     )
+
+
+@router.get("/{product_id}/{segment}/{entity_id}/pages/{page_id}")
+async def get_docgen_page(
+    product_id: str, segment: str, entity_id: str, page_id: str,
+    db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_access("ro")),
+    version: Optional[int] = Query(None, ge=1, description="Read from this archived doc version"),
+):
+    """Full page body (content + provenance + verify flags).
+
+    Companion to the ``light`` product payloads: product endpoints return
+    page metadata only, so the viewer lazy-loads the open page here —
+    optionally from an archived doc version (``?version=N``).
+    """
+    entity_type = _SEGMENT_TO_TYPE.get(segment)
+    if entity_type not in ("codebase", "database"):
+        raise HTTPException(
+            status_code=400,
+            detail="Page content is only available for codebases and databases",
+        )
+    if version is None:
+        p_orm = product_repo.load_product_orm(db, product_id)
+        if p_orm is None:
+            raise HTTPException(status_code=404, detail="Product not found")
+        collection = (
+            p_orm.codebases if entity_type == "codebase" else p_orm.databases
+        )
+        entity = next((e for e in collection if e.id == entity_id), None)
+        if not entity:
+            raise HTTPException(status_code=404, detail=f"{entity_type.capitalize()} not found")
+        page, source = (entity.pages or {}).get(page_id), "current"
+    else:
+        row = doc_version_repo.get_version(db, entity_type, entity_id, version)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Version not found")
+        page, source = (row.pages or {}).get(page_id), "archive"
+    if not isinstance(page, dict):
+        raise HTTPException(status_code=404, detail="Page not found")
+    return {"page": page, "source": source}
 
 
 @router.get("/{product_id}/docgen/active")

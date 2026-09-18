@@ -51,6 +51,7 @@ import {
   type EntityKind,
   type LinkItem,
   type Links,
+  type PageProvenance,
   type Product,
   type Spec,
   entityPath,
@@ -100,6 +101,16 @@ export default function EntityDocsViewer() {
   const [confirmRestore, setConfirmRestore] = useState<number | null>(null);
   const [restoring, setRestoring] = useState(false);
 
+  // Lazy page body: product payloads are light (?light=1 strips page
+  // content), so the OPEN page's content/provenance is fetched on demand —
+  // from the current entity or an archived version (?version=N).
+  const [pageDetail, setPageDetail] = useState<{
+    content: string | null;
+    provenance: PageProvenance | null;
+  } | null>(null);
+  const [detailTick, setDetailTick] = useState(0);
+  const refetchPageDetail = useCallback(() => setDetailTick((t) => t + 1), []);
+
   // Silences poller toasts once the viewer unmounts.
   const viewerAbortRef = useRef(false);
   useEffect(() => {
@@ -113,7 +124,7 @@ export default function EntityDocsViewer() {
     setIsLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/products/${productId}`, {
+      const res = await fetch(`/api/products/${productId}?light=1`, {
         credentials: "include",
         cache: "no-store",
       });
@@ -203,7 +214,7 @@ export default function EntityDocsViewer() {
     void (async () => {
       try {
         const res = await fetch(
-          `/api/products/${productId}/${entityPath(kind)}/${artifactId}/versions/${viewVersion}`,
+          `/api/products/${productId}/${entityPath(kind)}/${artifactId}/versions/${viewVersion}?light=1`,
           { credentials: "include", cache: "no-store" },
         );
         if (!res.ok) throw new Error(String(res.status));
@@ -224,6 +235,44 @@ export default function EntityDocsViewer() {
       cancelled = true;
     };
   }, [viewVersion, productId, artifactId, kind, notify]);
+
+  // Page body of the active page (current or archived version). A failure
+  // degrades to empty text — the viewer stays usable.
+  useEffect(() => {
+    if ((kind !== "codebase" && kind !== "database") || !activePageId) {
+      setPageDetail(null);
+      return;
+    }
+    let cancelled = false;
+    setPageDetail(null);
+    void (async () => {
+      try {
+        const base = `/api/products/${productId}/${entityPath(kind)}/${artifactId}`;
+        const q = viewVersion !== null ? `?version=${viewVersion}` : "";
+        const res = await fetch(
+          `${base}/pages/${encodeURIComponent(activePageId)}${q}`,
+          { credentials: "include", cache: "no-store" },
+        );
+        if (!res.ok) throw new Error(String(res.status));
+        const d = (await res.json()) as {
+          page?: { content?: string; provenance?: PageProvenance };
+        };
+        if (!cancelled) {
+          setPageDetail({
+            content: d.page?.content ?? "",
+            provenance: d.page?.provenance ?? null,
+          });
+        }
+      } catch {
+        // null content marks a FAILED load: the editor stays locked so a
+        // retry-save cannot wipe the stored body with an empty draft.
+        if (!cancelled) setPageDetail({ content: null, provenance: null });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [kind, productId, artifactId, activePageId, viewVersion, detailTick]);
 
   const archivePages = useMemo(
     () => (versionDetail ? normalizePages(versionDetail.pages) : []),
@@ -380,9 +429,14 @@ export default function EntityDocsViewer() {
     codebase?.generated_docs || databaseEntity?.generated_docs || pages.length > 0,
   );
   const hasRawContent = Boolean(spec?.content || linksEntity?.content);
+  // Page body still loading (or failed) — the editor must not open on an
+  // empty draft (saving it would wipe the stored content).
+  const pageContentPending =
+    Boolean(activePage) && (pageDetail === null || pageDetail.content === null);
   // Archived versions are read-only — editing targets the current version.
   const canEdit =
     !viewingArchive &&
+    !pageContentPending &&
     ((isCodebase && hasDocs) ||
       (isDatabase && hasDocs) ||
       ((isSpec || isLinks) && hasRawContent));
@@ -398,12 +452,12 @@ export default function EntityDocsViewer() {
     } else {
       setDraftContent(
         activePage
-          ? activePage.content || ""
+          ? pageDetail?.content ?? ""
           : spec?.content || codebase?.generated_docs || databaseEntity?.generated_docs || "",
       );
     }
     setDirty(false);
-  }, [activePage, codebase, databaseEntity, spec, linksEntity, editing, isLinks]);
+  }, [activePage, pageDetail, codebase, databaseEntity, spec, linksEntity, editing, isLinks]);
 
   const startEditing = () => {
     if (isLinks) {
@@ -415,7 +469,7 @@ export default function EntityDocsViewer() {
     } else {
       setDraftContent(
         activePage
-          ? activePage.content || ""
+          ? pageDetail?.content ?? ""
           : spec?.content || codebase?.generated_docs || databaseEntity?.generated_docs || "",
       );
     }
@@ -438,7 +492,7 @@ export default function EntityDocsViewer() {
         payload = { generated_docs: draftContent };
       }
       const res = await fetch(
-        `/api/products/${productId}/${entityPath(kind)}/${artifactId}`,
+        `/api/products/${productId}/${entityPath(kind)}/${artifactId}?light=1`,
         {
           method: "PUT",
           credentials: "include",
@@ -458,6 +512,7 @@ export default function EntityDocsViewer() {
       }
       const updated = (await res.json()) as Product;
       setProduct(updated);
+      refetchPageDetail();
       setEditing(false);
       setDirty(false);
       notify({ tone: "success", title: t.savedTitle ?? "Saved", message: t.savedMessage ?? "Documentation updated and re-indexed." });
@@ -568,6 +623,7 @@ export default function EntityDocsViewer() {
           });
           await fetchProduct();
           await fetchVersions();
+          refetchPageDetail();
           return;
         }
         if (st.status === "failed") {
@@ -632,7 +688,7 @@ export default function EntityDocsViewer() {
     setRestoring(true);
     try {
       const res = await fetch(
-        `/api/products/${productId}/${entityPath(kind)}/${artifactId}/versions/${version}/restore`,
+        `/api/products/${productId}/${entityPath(kind)}/${artifactId}/versions/${version}/restore?light=1`,
         {
           method: "POST",
           credentials: "include",
@@ -988,7 +1044,7 @@ export default function EntityDocsViewer() {
                             <>
                               <VerifiedButton
                                 verified={Boolean(activePage.verified)}
-                                verifyUrl={`/api/products/${productId}/${entityPath(kind)}/${artifactId}/pages/${encodeURIComponent(activePage.id)}/verify`}
+                                verifyUrl={`/api/products/${productId}/${entityPath(kind)}/${artifactId}/pages/${encodeURIComponent(activePage.id)}/verify?light=1`}
                                 ownerId={product?.owner_id ?? null}
                                 mapResponse={(data) => {
                                   const p = findPageInProduct(
@@ -1051,7 +1107,17 @@ export default function EntityDocsViewer() {
                             />
                           ) : null}
                         </div>
-                        <Markdown content={stripProvenanceBlock(activePage.content || "")} />
+                        {pageDetail && pageDetail.content !== null ? (
+                          <Markdown content={stripProvenanceBlock(pageDetail.content || "")} />
+                        ) : pageDetail ? (
+                          <p className="mt-6 text-sm text-muted">
+                            {t.versionsLoadFailed ?? "Failed to load version."}
+                          </p>
+                        ) : (
+                          <div className="mt-6 flex items-center gap-2 text-sm text-muted">
+                            <Spinner /> {t.loading ?? "Loading…"}
+                          </div>
+                        )}
                       </article>
                     ) : (
                       <article className="prose-editor max-w-none">
@@ -1069,8 +1135,8 @@ export default function EntityDocsViewer() {
                       </article>
                     )}
                   </Card>
-                  {!editing && !viewingArchive && activePage?.provenance ? (
-                    <ProvenancePanel provenance={activePage.provenance} />
+                  {!editing && !viewingArchive && activePage && pageDetail?.provenance ? (
+                    <ProvenancePanel provenance={pageDetail.provenance} />
                   ) : null}
                 </div>
               </div>

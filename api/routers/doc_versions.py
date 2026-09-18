@@ -17,7 +17,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -26,7 +26,7 @@ from api.db import get_db
 from api.docgen.jobs import EntityBusyError, lock_for_entity
 from api.models import ProductORM
 from api.repositories import doc_version_repo, product_repo
-from api.routers.products import _reindex
+from api.routers.products import _maybe_light, _reindex
 from api.schemas import Product
 
 logger = logging.getLogger(__name__)
@@ -117,11 +117,16 @@ async def get_doc_version(
     product_id: str, segment: str, entity_id: str, version: int,
     db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("ro")),
+    light: bool = Query(False, description="Strip page bodies; load them via the page-content endpoint"),
 ):
     _, entity_type, entity = _load_entity(db, product_id, segment, entity_id)
     row = doc_version_repo.get_version(db, entity_type, entity_id, version)
     if row is None:
         raise HTTPException(status_code=404, detail="Version not found")
+    pages, generated_docs = row.pages, row.generated_docs
+    if light and isinstance(pages, dict) and pages:
+        pages = product_repo.light_pages(pages)
+        generated_docs = None  # redundant with the page bodies
     return DocVersionDetail(
         version=row.version,
         source=row.source,
@@ -129,8 +134,8 @@ async def get_doc_version(
         job_id=row.job_id,
         created_at=row.created_at,
         is_current=(row.version == entity.current_version),
-        generated_docs=row.generated_docs,
-        pages=row.pages,
+        generated_docs=generated_docs,
+        pages=pages,
         content=row.content,
     )
 
@@ -143,6 +148,7 @@ async def restore_doc_version(
     product_id: str, segment: str, entity_id: str, version: int,
     db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("rw")),
+    light: bool = Query(False),
 ):
     """Roll the artifact back to ``version`` (appends a new rollback version)."""
     p_orm, entity_type, entity = _load_entity(db, product_id, segment, entity_id)
@@ -159,7 +165,7 @@ async def restore_doc_version(
     except EntityBusyError as e:
         raise HTTPException(status_code=409, detail=str(e))
     _reindex(product_id, indexed_text, entity_id, source_type=entity_type)
-    return product_repo.orm_to_product(p_orm)
+    return _maybe_light(product_repo.orm_to_product(p_orm), light)
 
 
 __all__ = ["router"]

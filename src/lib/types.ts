@@ -46,7 +46,11 @@ export interface PageProvenance {
 export interface ArtifactPage {
   id: string;
   title: string;
-  content: string;
+  /**
+   * Absent in `?light=1` product payloads (page bodies are stripped to
+   * metadata); the viewer lazy-loads it from the page-content endpoint.
+   */
+  content?: string;
   /**
    * Parent page id for generated subpages (docgen units model: children of
    * the functional/technical/datamodel sections carry the parent's page id).
