@@ -3934,8 +3934,9 @@ class TestGenerateDeepUnits:
         kept = "page_tbl_public_orders"
         old_pages = {
             kept: {
-                "id": kept, "title": "public.orders", "content": "OLD PAGE",
-                "filePaths": [], "importance": "medium", "relatedPages": [],
+                "id": kept, "title": "STALE TITLE", "content": "OLD PAGE",
+                "parent": "page_grp_tables_public",
+                "filePaths": [], "importance": "low", "relatedPages": ["page_ghost"],
                 "provenance": {
                     "entity_fingerprint": "fp1", "custom": "keep-me",
                 },
@@ -3966,6 +3967,11 @@ class TestGenerateDeepUnits:
         assert entity.pages[kept]["provenance"] == {
             "entity_fingerprint": "fp1", "custom": "keep-me",
         }
+        # Tree fields follow the FRESH render — stale parent/title/importance
+        # from a previous tree shape are refreshed (schema regrouping fix).
+        assert entity.pages[kept]["parent"] == "page_tables"
+        assert entity.pages[kept]["title"] == "public.orders"
+        assert entity.pages[kept]["importance"] == "medium"
         assert "OLD PAGE" in result
         # Fresh pages carry the deep generator + reuse-aware caps.
         fresh = entity.pages["page_tbl_public_users"]["provenance"]

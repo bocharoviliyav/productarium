@@ -3528,6 +3528,12 @@ def _assemble_docs(pages: Dict[str, Any], order: List[str]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+# Tree fields owned by the page render: wholesale reuse keeps stored
+# content/provenance but takes these from the FRESH render so schema
+# regrouping reaches reused pages too.
+_PAGE_TREE_FIELDS = ("parent", "title", "importance", "relatedPages", "filePaths")
+
+
 # --------------------------------------------------------------------------- #
 # Enrichment prompts (externalized in refs/prompts/<lang>/database_*.md)
 # --------------------------------------------------------------------------- #
@@ -4892,13 +4898,21 @@ async def generate_database_docs(
         {"overview": llm_overview, "tables": descriptions, "categories": cat_descs},
     )
     if deep_result:
-        # Fingerprint-matching units keep their stored page wholesale — same
-        # evidence + same prompt ⇒ the same page; no LLM tokens spent. Their
-        # stored provenance (and verify flags) stay intact.
+        # Fingerprint-matching units keep their stored content and provenance
+        # (verify flags included) — same evidence + same prompt ⇒ the same
+        # text; no LLM tokens spent. Tree fields follow the fresh render so
+        # regrouping (e.g. new per-schema pages) applies to reused pages.
         for pid in deep_result.get("reused") or []:
             old = old_pages.get(pid)
-            if old:
-                pages[pid] = old
+            if not old:
+                continue
+            fresh = pages.get(pid)
+            if fresh:
+                old = {
+                    **old,
+                    **{k: fresh[k] for k in _PAGE_TREE_FIELDS if k in fresh},
+                }
+            pages[pid] = old
 
     # 6) Guard: mermaid repair → secret masking → corroborate → judge.
     emit_progress(progress, phase="verifying")

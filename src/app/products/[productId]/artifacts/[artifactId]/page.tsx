@@ -266,6 +266,11 @@ export default function EntityDocsViewer() {
     return { roots, childrenByParent };
   }, [displayPages]);
 
+  // Branch regeneration is offered only for pages with children.
+  const activeChildCount = activePage
+    ? (pageTree.childrenByParent.get(activePage.id)?.length ?? 0)
+    : 0;
+
   // Collapsible nav groups: with hundreds of per-table subpages the nav is
   // unreadable, so children stay hidden until the group opens; every group
   // on the active page's ANCESTOR chain auto-opens so deep links (three
@@ -514,7 +519,7 @@ export default function EntityDocsViewer() {
 
   // Per-page regeneration: the forced page rides through the normal docgen
   // job (diff-reuse for the rest) and lands as a NEW doc version.
-  const handleRegeneratePage = async () => {
+  const handleRegeneratePage = async (branch: boolean) => {
     if (!kind || !activePage || regenJob || regenStarting) return;
     setConfirmRegen(false);
     setRegenStarting(true);
@@ -526,7 +531,7 @@ export default function EntityDocsViewer() {
           method: "POST",
           credentials: "include",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
+          body: JSON.stringify({ branch }),
         },
       );
       const data = await res.json().catch(() => ({}));
@@ -1073,25 +1078,38 @@ export default function EntityDocsViewer() {
           </>
         )}
 
-        {/* Per-page regeneration confirmation */}
+        {/* Per-page regeneration confirmation (3-way for pages with children) */}
         <Modal
           open={confirmRegen}
           onClose={() => setConfirmRegen(false)}
-          title={t.confirmPageRegenTitle ?? "Regenerate page?"}
+          title={
+            activeChildCount > 0
+              ? (t.confirmBranchRegenTitle ?? "Regenerate page or branch?")
+              : (t.confirmPageRegenTitle ?? "Regenerate page?")
+          }
           footer={null}
         >
           <p className="text-sm text-muted">
-            {t.confirmPageRegenText ??
-              "A new documentation version will be generated for this page."}
+            {activeChildCount > 0
+              ? (t.confirmBranchRegenText ??
+                "Regenerate only this page, or the whole branch — the page together with all its subpages.")
+              : (t.confirmPageRegenText ??
+                "A new documentation version will be generated for this page.")}
           </p>
           <div className="mt-6 flex items-center justify-end gap-2">
             <Button variant="ghost" onClick={() => setConfirmRegen(false)}>
               {tc.cancel ?? "Cancel"}
             </Button>
-            <Button onClick={() => void handleRegeneratePage()}>
+            <Button onClick={() => void handleRegeneratePage(false)}>
               <Lightning size={16} weight="fill" />
               {t.regeneratePage ?? "Regenerate page"}
             </Button>
+            {activeChildCount > 0 && (
+              <Button onClick={() => void handleRegeneratePage(true)}>
+                <Lightning size={16} weight="fill" />
+                {t.regenerateBranch ?? "Regenerate branch"}
+              </Button>
+            )}
           </div>
         </Modal>
 

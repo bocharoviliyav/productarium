@@ -13,7 +13,7 @@ thread (see ``api.docgen.jobs``). The status endpoint polls the job registry.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -53,6 +53,29 @@ class GenerateDocRequest(BaseModel):
     # and resolved when the job starts. The field is kept so older clients
     # sending it are not rejected.
     language: Optional[str] = None
+    # Regenerate endpoint only: also force every descendant of the target
+    # page (branch regeneration). Plain /generate ignores it.
+    branch: bool = False
+
+
+def _branch_page_ids(pages: Dict[str, Any], root: str) -> List[str]:
+    """The page plus all descendants, via BFS over parent links."""
+    children: Dict[str, List[str]] = {}
+    for pid, page in pages.items():
+        parent = (page or {}).get("parent")
+        if parent and parent != pid:
+            children.setdefault(parent, []).append(pid)
+    out: List[str] = []
+    seen = {root}
+    queue = [root]
+    while queue:
+        pid = queue.pop(0)
+        out.append(pid)
+        for child in children.get(pid, ()):
+            if child not in seen:
+                seen.add(child)
+                queue.append(child)
+    return out
 
 
 def _start_generate(
@@ -181,9 +204,10 @@ async def regenerate_docgen_page(
 ):
     """Per-page regeneration (codebase / database artifacts).
 
-    Re-runs generation for ONE page: unchanged codebase units still come back
-    via diff-reuse, the database flow merges only the forced page at persist.
-    The judge issues stored on the page feed the prompt as reviewer notes.
+    Re-runs generation for ONE page — or, with ``branch: true``, for the page
+    and all its descendants: unchanged codebase units still come back via
+    diff-reuse, the database flow merges only the forced pages at persist.
+    The judge issues stored on each page feed the prompt as reviewer notes.
     The result lands as a NEW doc version (like any generation).
     """
     entity_type = _SEGMENT_TO_TYPE.get(segment)
@@ -203,9 +227,13 @@ async def regenerate_docgen_page(
         raise HTTPException(status_code=404, detail=f"{entity_type.capitalize()} not found")
     if page_id not in (entity.pages or {}):
         raise HTTPException(status_code=404, detail="Page not found")
+    force_pages = (
+        _branch_page_ids(entity.pages or {}, page_id)
+        if request_data.branch else [page_id]
+    )
     return _start_generate(
         db, product_id, entity_type, entity_id, request_data, user.id,
-        force_pages=[page_id],
+        force_pages=force_pages,
     )
 
 

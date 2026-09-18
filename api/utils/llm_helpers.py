@@ -148,10 +148,11 @@ def strip_number_prefixes_from_block(block: List[str]) -> List[str]:
 # The writer contract says the final message is the section markdown ONLY,
 # yet models still prepend assistant meta-commentary ("Now let me generate the
 # final architecture section:", "**Okay, below is the section**",
-# "Хорошо, вот раздел:"). Two-phase rule:
-#   1. Structured answers — when EVERY line of the leading run (bounded, short)
-#      is meta AND a structural markdown element follows, the whole run is a
-#      preamble regardless of trailing punctuation.
+# "Хорошо, вот раздел:", "I've fixed the issues…"). Two-phase rule:
+#   1. Structured answers — when the leading run (bounded, short) starts with
+#      a meta opener AND (every line is meta OR the last line signs off with
+#      a ':' introducing the output) and a structural markdown element
+#      follows, the whole run is a preamble regardless of later lines.
 #   2. Prose answers (no structural element ahead) — keep the conservative
 #      per-line rule (meta opener AND ends with ':') so ordinary prose and
 #      content lead-ins like "Основные компоненты системы:" are never touched.
@@ -160,12 +161,14 @@ def strip_number_prefixes_from_block(block: List[str]) -> List[str]:
 _PREAMBLE_META_RE = re.compile(
     r"(?i)^(?:now\b|okay\b|ok\b|well\b|sure\b|certainly\b|of course\b|"
     r"alright\b|moving on\b|proceeding\b|let(?:'s|\s+us)?(?:\s+me)?\b|"
-    r"i(?:'ll|\s+will|\s+'ve|\s+have|'m)\b|here(?:'s|\s+is|\s+are)?\b|"
+    r"i(?:'ll|'ve|'d|'m|\s+will|\s+'ve|\s+have)\b|"
+    r"here(?:'s|\s+is|\s+are)?\b|"
     r"below\b|based\s+on\b|finally\b|next\b|"
+    r"fixed\b|revised\b|updated\b|done\b|"
     r"вот\b|ниже\b|хорошо\b|отлично\b|понятно\b|принято\b|сейчас\b|"
-    r"итак\b|давайте\b|конечно\b|готово\b|продолж|начн|сгенерир|финальн)"
+    r"итак\b|давайте\b|конечно\b|готов|продолж|начн|сгенерир|финальн|"
+    r"исправ|обнов|учёл|учел)"
 )
-# First structural markdown element: heading, fence, list item or table row.
 _STRUCTURAL_MD_RE = re.compile(r"^\s*(?:#{1,6}\s|```|\||[-*+]\s|\d+[.)]\s)")
 _META_LINE_MAX = 200
 _META_RUN_MAX = 4
@@ -204,8 +207,10 @@ def strip_llm_preamble(text: Optional[str]) -> str:
     if not text:
         return ""
     lines = text.split("\n")
-    # Phase 1: leading run of short non-structural lines, all meta, directly
-    # followed by a structural element → drop the whole run.
+    # Phase 1: leading run of short non-structural lines directly followed
+    # by a structural element → drop the whole run when it starts with a meta
+    # opener and either every line is meta or the run signs off with a ':'
+    # (multi-line intros whose later lines carry no opener).
     run: List[int] = []
     structural = False
     for idx, ln in enumerate(lines):
@@ -218,8 +223,15 @@ def strip_llm_preamble(text: Optional[str]) -> str:
         if len(run) == _META_RUN_MAX:
             break
         run.append(idx)
-    if run and structural and all(_is_meta_line(lines[i]) for i in run):
-        return "\n".join(lines[run[-1] + 1:]).lstrip("\n")
+    if run and structural:
+        metas = [_is_meta_line(lines[i]) for i in run]
+        last = lines[run[-1]].strip()
+        if metas[0] and (
+            all(metas)
+            or last.endswith(":")
+            or _unwrap_emphasis(last).endswith(":")
+        ):
+            return "\n".join(lines[run[-1] + 1:]).lstrip("\n")
     # Phase 2 (conservative): colon-terminated meta lead-in only.
     meta_end = 0
     seen_meta = 0

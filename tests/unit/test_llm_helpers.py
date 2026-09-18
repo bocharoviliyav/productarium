@@ -323,6 +323,36 @@ class TestStripLlmPreamble:
         text = "Nowadays most services are stateless.\n\n# Заголовок"
         assert strip_llm_preamble(text) == text
 
+    def test_multiline_intro_colon_signoff_stripped(self):
+        # Line 2 carries no meta opener, but the run starts meta and signs
+        # off with a colon introducing the section → preamble.
+        text = (
+            "Хорошо, я внёс правки.\n"
+            "Конечный вариант раздела:\n\n"
+            "## Раздел"
+        )
+        assert strip_llm_preamble(text) == "## Раздел"
+
+    def test_regeneration_openers_stripped(self):
+        # Reviewer-note answers open with fix/update vocabulary.
+        assert (
+            strip_llm_preamble("I've fixed the issues you raised.\n\n## Section")
+            == "## Section"
+        )
+        assert (
+            strip_llm_preamble("Исправленный раздел с учётом замечаний:\n\n## Раздел")
+            == "## Раздел"
+        )
+        assert (
+            strip_llm_preamble("Обновлённый раздел ниже:\nПрозаический ответ.")
+            == "Прозаический ответ."
+        )
+
+    def test_prose_first_line_with_colon_second_kept(self):
+        # No meta opener on line 1 → never stripped, colon signoff or not.
+        text = "Система обновлена.\nРаздел ниже:\n\n## Раздел"
+        assert strip_llm_preamble(text) == text
+
 
 # ---------------------------------------------------------------------------
 # Regex patterns (smoke tests)

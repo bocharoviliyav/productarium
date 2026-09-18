@@ -708,6 +708,61 @@ class TestDocgenVersioning:
             (1, "baseline"), (2, "generate"),
         ]
 
+    def test_page_regenerate_branch_forces_descendants(self, monkeypatch):
+        db_mod = _setup_db()
+        from api.models import CodebaseORM, ProductORM
+
+        with db_mod.SessionLocal() as db:
+            db.add(ProductORM(id="prod_1", name="Acme"))
+            db.flush()
+            db.add(CodebaseORM(
+                id="art_1", product_id="prod_1", name="svc",
+                repo_url="https://github.com/x/y", repo_type="github",
+                source="manual", generated_docs="# legacy",
+                pages={
+                    "page_arch": {
+                        "id": "page_arch", "title": "Arch", "content": "a",
+                    },
+                    "page_arch_db": {
+                        "id": "page_arch_db", "title": "DB", "content": "b",
+                        "parent": "page_arch",
+                    },
+                    "page_arch_db_kafka": {
+                        "id": "page_arch_db_kafka", "title": "K", "content": "c",
+                        "parent": "page_arch_db",
+                    },
+                    "page_overview": {
+                        "id": "page_overview", "title": "Overview",
+                        "content": "o",
+                    },
+                },
+            ))
+            db.commit()
+        _app, client = _build_app(db_mod, monkeypatch)
+        kwargs_sink: dict = {}
+        self._fake_pipeline(monkeypatch, "# regenerated", kwargs_sink=kwargs_sink)
+
+        resp = client.post(
+            "/api/products/prod_1/codebases/art_1/pages/page_arch/regenerate",
+            json={"branch": True},
+        )
+        assert resp.status_code == 202
+        last = _poll_terminal(client, resp.json()["job_id"])
+        assert last["status"] == "succeeded", last
+        # The whole subtree rides through; siblings outside it do not.
+        assert sorted(kwargs_sink.get("force_units") or []) == [
+            "page_arch", "page_arch_db", "page_arch_db_kafka",
+        ]
+
+    def test_branch_page_ids_cycle_safe(self):
+        from api.routers.docgen import _branch_page_ids
+
+        pages = {
+            "a": {"parent": "b"}, "b": {"parent": "a"}, "c": {"parent": "a"},
+        }
+        assert sorted(_branch_page_ids(pages, "a")) == ["a", "b", "c"]
+        assert _branch_page_ids({"x": None}, "x") == ["x"]
+
     def test_page_regenerate_unknown_page_404(self, monkeypatch):
         db_mod = _setup_db()
         _seed_legacy(db_mod)
