@@ -1,8 +1,9 @@
 """AI product summary generator (item 4).
 
-Generates a concise summary of a Product by concatenating its artifacts'
-``generated_docs`` and its knowledge nodes' ``content_md`` and asking the
-standard local LLM for a summary. The result is stored onto
+Generates a concise summary of a Product over ALL its nested entities
+(codebases, databases, specs, knowledge nodes, links) via the shared
+fair-budget collector ``api.docgen._common.collect_entity_parts`` and asks
+the standard local LLM for a summary. The result is stored onto
 ``ProductORM.summary`` by the caller (the knowledge router).
 
 Decoupling notes (per the Wave 2 plan):
@@ -25,20 +26,25 @@ from typing import Any, Iterable, Optional
 
 from api.prompts import load_prompt_file
 from api.utils.llm_helpers import (  # noqa: E402
-    cap as _cap,
     strip_inline_line_numbers as _strip_inline_line_numbers,
+    wrap_untrusted,
 )
-from api.docgen._common import _safe_aclose, _with_verification_guard
+from api.docgen._common import (
+    _safe_aclose,
+    _with_verification_guard,
+    collect_entity_parts,
+)
 from api.docgen.verification import mask_secrets
 
 logger = logging.getLogger(__name__)
 
-# Cap the concatenated context handed to the LLM so very large products stay
-# within a single prompt. The summary is intentionally concise, so a truncated
-# context is acceptable. ~20k chars tokenizes to ~6k tokens, leaving headroom
-# for the model response inside an 8192-token context window (the previous
-# 60_000 cap overflowed to ~18.5k tokens and raised "n_keep >= n_ctx" on the
-# default served model).
+# Floor (NOT a global cut) for the fair per-entity context budget computed in
+# ``generate_product_summary``: the budget scales with the model's context
+# window (max_summary_tokens * 3, capped at 120k chars) but never drops below
+# this floor — ~20k chars tokenizes to ~6k tokens, leaving headroom for the
+# model response inside an 8192-token window (the previous 60_000 GLOBAL cap
+# overflowed to ~18.5k tokens and raised "n_keep >= n_ctx" on the default
+# served model).
 SUMMARY_CONTEXT_MAX_CHARS = 20_000
 
 # Inline fallback prompt used only if refs/prompts/product_summary.md is missing.
@@ -108,44 +114,15 @@ def _clean_text(text: Optional[str]) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Context collection + prompt building
+# Prompt building
 # --------------------------------------------------------------------------- #
-def _collect_summary_content(
-    codebases: Iterable[Any],
-    specs: Iterable[Any],
-    nodes: Iterable[Any],
-    max_tokens: int = 6000,
-) -> str:
-    """Concatenate codebase generated_docs + spec content + knowledge node content_md."""
-    parts = []
-    for c in codebases or []:
-        docs = getattr(c, "generated_docs", None) or ""
-        if docs and docs.strip():
-            name = getattr(c, "name", None) or getattr(c, "id", "codebase")
-            parts.append(f"## Codebase: {name}\n\n{docs.strip()}")
-    for s in specs or []:
-        content = getattr(s, "content", None) or ""
-        if content and content.strip():
-            name = getattr(s, "name", None) or getattr(s, "id", "spec")
-            kind = getattr(s, "kind", None) or "spec"
-            parts.append(f"## Спецификация ({kind}): {name}\n\n{content.strip()}")
-    for n in nodes or []:
-        md = getattr(n, "content_md", None) or ""
-        if md and md.strip():
-            title = getattr(n, "title", None) or getattr(n, "id", "node")
-            parts.append(f"## Страница базы знаний: {title}\n\n{md.strip()}")
-    if not parts:
-        return ""
-
-    full_text = "\n\n".join(parts)
-    return _cap(full_text, SUMMARY_CONTEXT_MAX_CHARS)
-
-
 def _build_summary_prompt(product_name: str, content: str) -> str:
     template = load_prompt_file("product_summary.md", _SUMMARY_PROMPT_FALLBACK)
     out = template
     out = out.replace("{product_name}", product_name)
-    out = out.replace("{content}", content)
+    # Entity content is member-editable data — frame it (P0-8) so embedded
+    # prompt injections stay inert.
+    out = out.replace("{content}", wrap_untrusted(content))
     # Same deterministic verification guard as the docgen flows (Wave D):
     # no secrets, no invented facts, source-bound claims.
     return _with_verification_guard(out)
@@ -161,8 +138,13 @@ async def generate_product_summary(
     nodes: Iterable[Any],
     *,
     model: Optional[str] = None,
+    databases: Iterable[Any] = (),
+    links: Iterable[Any] = (),
 ) -> str:
-    """Generate an AI summary over the product's codebases + specs + knowledge nodes.
+    """Generate an AI summary over ALL the product's nested entities.
+
+    Codebases + specs + nodes (legacy positional contract) plus databases and
+    links (keyword-only; empty defaults keep old callers/tests working).
 
     Returns the cleaned summary text (possibly empty on LLM failure or when the
     product has no content to summarize). NEVER raises: callers store/return the
@@ -194,7 +176,14 @@ async def generate_product_summary(
         ctx_win = 8192
 
     max_summary_tokens = max(1024, ctx_win - 2048)
-    content = _collect_summary_content(codebases, specs, nodes, max_tokens=max_summary_tokens)
+    # Fair per-entity budget: scales with the model's context window, floored
+    # at SUMMARY_CONTEXT_MAX_CHARS so small-context models never overflow.
+    budget_chars = max(SUMMARY_CONTEXT_MAX_CHARS, min(120_000, max_summary_tokens * 3))
+    content = "\n\n".join(
+        collect_entity_parts(
+            codebases, databases, specs, nodes, links, budget_chars=budget_chars
+        )
+    )
     if not content.strip():
         logger.info("Product %r has no content to summarize.", product_name)
         return ""

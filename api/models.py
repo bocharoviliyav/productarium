@@ -9,6 +9,7 @@ Defines the product-centric data model:
 - ``SpecORM``          — OpenAPI/AsyncAPI spec artifact (single yaml/json)
 - ``LinksORM``         — curated external links (kv pairs)
 - ``DatabaseORM``      — reverse-engineered database artifact (masked DSN, MCP)
+- ``HldORM``           — high-level design (HLD) artifact, one per product
 - ``KnowledgeNodeORM`` — Confluence-like tree of knowledge pages per product
 - ``SettingORM``       — admin config key/value store (optionally encrypted)
 - ``ApiTokenORM``      — public API tokens for external integrations
@@ -184,6 +185,11 @@ class ProductORM(Base):
     )
     databases: Mapped[list["DatabaseORM"]] = relationship(
         back_populates="product",
+        cascade="all, delete-orphan",
+    )
+    hld: Mapped[Optional["HldORM"]] = relationship(
+        back_populates="product",
+        uselist=False,
         cascade="all, delete-orphan",
     )
     knowledge_nodes: Mapped[list["KnowledgeNodeORM"]] = relationship(
@@ -407,6 +413,54 @@ class DatabaseORM(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
         return f"<DatabaseORM id={self.id!r} name={self.name!r}>"
+
+
+class HldORM(Base):
+    """ORM model for the ``hlds`` table — the product's high-level design.
+
+    Pseudo-entity: exactly one row per product (``id = hld_{product_id}``,
+    auto-created by the generate endpoint). Mirrors the documentation columns
+    of :class:`CodebaseORM` (``generated_docs`` blob + ``pages`` JSON tree,
+    verified triple, version pointer) without any repo/connection fields.
+    """
+
+    __tablename__ = "hlds"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    product_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("products.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(256), nullable=False, default="HLD")
+    generated_docs: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # JSON tree of generated HLD pages, keyed by page id (hld_{section}).
+    pages: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    verified_by: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey("productarium_users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="generated")
+    # Active documentation version (productarium_doc_versions.version).
+    current_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    product: Mapped["ProductORM"] = relationship(back_populates="hld")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return f"<HldORM id={self.id!r} product_id={self.product_id!r}>"
 
 
 class DocVersionORM(Base):

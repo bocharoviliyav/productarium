@@ -14,9 +14,10 @@ the docgen variant lives here and expert keeps its own.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from api.utils import setup_logging
 from api.utils.llm_helpers import (  # noqa: E402
@@ -175,6 +176,98 @@ def _product_name(product: Any, artifact: Any) -> str:
     if getattr(artifact, "repo_url", None):
         return _repo_name_from_url(artifact.repo_url)
     return getattr(artifact, "name", "") or "product"
+
+
+def collect_entity_parts(
+    codebases: Iterable[Any] = (),
+    databases: Iterable[Any] = (),
+    specs: Iterable[Any] = (),
+    nodes: Iterable[Any] = (),
+    links: Iterable[Any] = (),
+    *,
+    budget_chars: int = 20_000,
+    min_part_chars: int = 1_500,
+) -> List[str]:
+    """Fair-budget Markdown context parts across ALL product entities.
+
+    One ``## <Kind>: <name>`` part per entity; every part is capped at
+    ``budget_chars // len(parts)`` (floor ``min_part_chars`` while it fits —
+    the joined total never exceeds ``budget_chars``) so every entity
+    kind stays represented — the old global tail-cut starved everything after
+    the first codebase. Shared by the product summary and the HLD pipeline.
+    Databases/codebases fall back to concatenated page bodies when
+    ``generated_docs`` is empty; links render their JSON url/description items.
+    """
+
+    def _docs_text(entity: Any) -> str:
+        docs = getattr(entity, "generated_docs", None) or ""
+        if docs.strip():
+            return docs.strip()
+        pages = getattr(entity, "pages", None)
+        if isinstance(pages, dict):
+            bodies = [
+                (p or {}).get("content") or ""
+                for p in pages.values()
+                if isinstance(p, dict)
+            ]
+            joined = "\n\n".join(b for b in bodies if b.strip())
+            if joined:
+                return joined
+        return ""
+
+    def _name(entity: Any, fallback: str) -> str:
+        return getattr(entity, "name", None) or getattr(entity, "id", None) or fallback
+
+    parts: List[str] = []
+    for c in codebases or ():
+        text = _docs_text(c)
+        if text:
+            parts.append(f"## Codebase: {_name(c, 'codebase')}\n\n{text}")
+    for d in databases or ():
+        text = _docs_text(d)
+        if text:
+            parts.append(f"## Database: {_name(d, 'database')}\n\n{text}")
+    for s in specs or ():
+        content = (getattr(s, "content", None) or "").strip()
+        if content:
+            kind = getattr(s, "kind", None) or "spec"
+            parts.append(f"## Спецификация ({kind}): {_name(s, 'spec')}\n\n{content}")
+    for n in nodes or ():
+        md = (getattr(n, "content_md", None) or "").strip()
+        if md:
+            title = getattr(n, "title", None) or getattr(n, "id", None) or "node"
+            parts.append(f"## Страница базы знаний: {title}\n\n{md}")
+    for lk in links or ():
+        raw = (getattr(lk, "content", None) or "").strip()
+        lines: List[str] = []
+        if raw.startswith("["):
+            try:
+                for item in json.loads(raw):
+                    if isinstance(item, dict):
+                        url = str(item.get("url", "")).strip()
+                        desc = str(item.get("description", "")).strip()
+                        if url or desc:
+                            lines.append(f"- {url}: {desc}".rstrip(": "))
+            except (ValueError, TypeError):
+                lines = []
+        elif raw:
+            lines = [raw]
+        if lines:
+            parts.append(
+                f"## Ссылки: {_name(lk, 'links')}\n\n" + "\n".join(lines)
+            )
+    if not parts:
+        return []
+    fair = max(1, budget_chars // len(parts))
+    # The floor keeps small entity sets richly quoted, but yields once N
+    # parts would push the JOINED context past budget_chars — the sum bound
+    # is what prevents context-window overflow on entity-heavy products.
+    per_part = (
+        max(min_part_chars, fair)
+        if len(parts) * min_part_chars <= budget_chars
+        else fair
+    )
+    return [_cap(p, per_part) for p in parts]
 
 
 # ---------------------------------------------------------------------------

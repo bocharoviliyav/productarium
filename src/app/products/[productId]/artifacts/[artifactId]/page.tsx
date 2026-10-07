@@ -6,6 +6,7 @@ import { useParams, useRouter } from "next/navigation";
 import {
   ArrowCounterClockwise,
   ArrowLeft,
+  Blueprint,
   CaretDown,
   Database as DatabaseIcon,
   FileText,
@@ -49,6 +50,7 @@ import {
   type DocVersionDetail,
   type DocVersionList,
   type EntityKind,
+  type Hld,
   type LinkItem,
   type Links,
   type PageProvenance,
@@ -64,6 +66,10 @@ const Markdown = dynamic(() => import("@/components/Markdown"), {
   ssr: false,
   loading: () => <div className="text-sm text-muted">{"Loading…"}</div>,
 });
+
+// Page-tree kinds share the codebase viewer contract (pages dict + nav).
+const isPageTreeKind = (kind?: EntityKind) =>
+  kind === "codebase" || kind === "database" || kind === "hld";
 
 export default function EntityDocsViewer() {
   const params = useParams<{ productId: string; artifactId: string }>();
@@ -170,20 +176,21 @@ export default function EntityDocsViewer() {
     }
   }, [kind, artifactId, productId, router]);
 
-  // Databases share the codebase page-tree contract (pages dict keyed by id,
-  // plus the additive provenance block the verification pipeline persists).
+  // Databases and HLD share the codebase page-tree contract (pages dict
+  // keyed by id, plus the additive provenance block the verification
+  // pipeline persists).
   const pages: ArtifactPage[] = useMemo(
     () =>
-      entity && (kind === "codebase" || kind === "database")
-        ? normalizePages((entity as Codebase | Database).pages)
+      entity && isPageTreeKind(kind)
+        ? normalizePages((entity as Codebase | Database | Hld).pages)
         : [],
     [entity, kind],
   );
 
-  // Version history (codebase/database): best-effort list — a failure just
-  // leaves the selector hidden.
+  // Version history (codebase/database/hld): best-effort list — a failure
+  // just leaves the selector hidden.
   const fetchVersions = useCallback(async () => {
-    if (kind !== "codebase" && kind !== "database") return;
+    if (!isPageTreeKind(kind)) return;
     try {
       const res = await fetch(
         `/api/products/${productId}/${entityPath(kind)}/${artifactId}/versions`,
@@ -239,7 +246,7 @@ export default function EntityDocsViewer() {
   // Page body of the active page (current or archived version). A failure
   // degrades to empty text — the viewer stays usable.
   useEffect(() => {
-    if ((kind !== "codebase" && kind !== "database") || !activePageId) {
+    if (!isPageTreeKind(kind) || !activePageId) {
       setPageDetail(null);
       return;
     }
@@ -420,13 +427,21 @@ export default function EntityDocsViewer() {
   const isDatabase = kind === "database";
   const isSpec = kind === "spec";
   const isLinks = kind === "links";
+  // HLD is read-only in the viewer: no edit/save, per-page regen or delete
+  // (no endpoints) — only browsing, versions and verify.
+  const isHld = kind === "hld";
+  const isPageTree = isCodebase || isDatabase || isHld;
   const codebase = entity as Codebase | undefined;
   const databaseEntity = entity as Database | undefined;
+  const hldEntity = entity as Hld | undefined;
   const spec = entity as Spec | undefined;
   const linksEntity = entity as Links | undefined;
 
   const hasDocs = Boolean(
-    codebase?.generated_docs || databaseEntity?.generated_docs || pages.length > 0,
+    codebase?.generated_docs ||
+      databaseEntity?.generated_docs ||
+      hldEntity?.generated_docs ||
+      pages.length > 0,
   );
   const hasRawContent = Boolean(spec?.content || linksEntity?.content);
   // Page body still loading (or failed) — the editor must not open on an
@@ -453,11 +468,15 @@ export default function EntityDocsViewer() {
       setDraftContent(
         activePage
           ? pageDetail?.content ?? ""
-          : spec?.content || codebase?.generated_docs || databaseEntity?.generated_docs || "",
+          : spec?.content ||
+              codebase?.generated_docs ||
+              databaseEntity?.generated_docs ||
+              hldEntity?.generated_docs ||
+              "",
       );
     }
     setDirty(false);
-  }, [activePage, pageDetail, codebase, databaseEntity, spec, linksEntity, editing, isLinks]);
+  }, [activePage, pageDetail, codebase, databaseEntity, hldEntity, spec, linksEntity, editing, isLinks]);
 
   const startEditing = () => {
     if (isLinks) {
@@ -470,7 +489,11 @@ export default function EntityDocsViewer() {
       setDraftContent(
         activePage
           ? pageDetail?.content ?? ""
-          : spec?.content || codebase?.generated_docs || databaseEntity?.generated_docs || "",
+          : spec?.content ||
+              codebase?.generated_docs ||
+              databaseEntity?.generated_docs ||
+              hldEntity?.generated_docs ||
+              "",
       );
     }
     setDirty(false);
@@ -531,14 +554,16 @@ export default function EntityDocsViewer() {
     ? (tArt?.codebase?.label ?? "Codebase")
     : isDatabase
       ? (tArt?.database?.label ?? "Database")
-      : isSpec
-        ? (tArt?.spec?.label ?? "Spec")
-        : (tArt?.links?.label ?? "Links");
-  const entityTone =
-    isCodebase || isDatabase ? "blue" : isSpec ? "green" : "yellow";
+      : isHld
+        ? (tArt?.hld?.label ?? "HLD")
+        : isSpec
+          ? (tArt?.spec?.label ?? "Spec")
+          : (tArt?.links?.label ?? "Links");
+  const entityTone = isPageTree ? "blue" : isSpec ? "green" : "yellow";
   const entityIcon =
     isCodebase ? <GitBranch size={18} weight="regular" /> :
     isDatabase ? <DatabaseIcon size={18} weight="regular" /> :
+    isHld ? <Blueprint size={18} weight="regular" /> :
     isSpec ? <FileText size={18} weight="regular" /> :
     <LinkSimple size={18} weight="regular" />;
 
@@ -570,7 +595,7 @@ export default function EntityDocsViewer() {
     }
   };
 
-  const empty = (isCodebase || isDatabase) ? !hasDocs : !hasRawContent;
+  const empty = isPageTree ? !hasDocs : !hasRawContent;
 
   // Per-page regeneration: the forced page rides through the normal docgen
   // job (diff-reuse for the rest) and lands as a NEW doc version.
@@ -779,7 +804,7 @@ export default function EntityDocsViewer() {
                   </div>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
-                  {(isCodebase || isDatabase) && versions && versions.versions.length > 0 && (
+                  {isPageTree && versions && versions.versions.length > 0 && (
                     <Select
                       value={viewVersion === null ? "" : String(viewVersion)}
                       onChange={(e) =>
@@ -850,15 +875,17 @@ export default function EntityDocsViewer() {
                       }}
                     />
                   )}
-                  <IconButton
-                    type="button"
-                    aria-label={t.delete ?? "Delete"}
-                    title={t.delete ?? "Delete"}
-                    onClick={remove}
-                    disabled={deleting}
-                  >
-                    {deleting ? <Spinner /> : <Trash size={14} weight="regular" />}
-                  </IconButton>
+                  {!isHld && (
+                    <IconButton
+                      type="button"
+                      aria-label={t.delete ?? "Delete"}
+                      title={t.delete ?? "Delete"}
+                      onClick={remove}
+                      disabled={deleting}
+                    >
+                      {deleting ? <Spinner /> : <Trash size={14} weight="regular" />}
+                    </IconButton>
+                  )}
                 </div>
               </div>
             </Reveal>
@@ -874,10 +901,12 @@ export default function EntityDocsViewer() {
                       ? (t.noDocsDesc ?? "")
                       : isDatabase
                         ? (t.noDbDocsDesc ?? "")
-                        : (t.noRawContentDesc ?? "Add content from the edit button above.")
+                        : isHld
+                          ? (t.noHldDocsDesc ?? "")
+                          : (t.noRawContentDesc ?? "Add content from the edit button above.")
                   }
                   action={
-                    isCodebase || isDatabase ? (
+                    isPageTree ? (
                       <Link href={`/products/${productId}`}>
                         <Button>{t.generateOnProductPage ?? "Generate on product page"}</Button>
                       </Link>
@@ -999,9 +1028,10 @@ export default function EntityDocsViewer() {
               </div>
             )}
 
-            {/* Databases render exactly like codebases: page nav + markdown
-                (Mermaid inside) with the generated summary as fallback. */}
-            {!empty && (isCodebase || isDatabase) && (
+            {/* Databases and HLD render exactly like codebases: page nav +
+                markdown (Mermaid inside) with the generated summary as
+                fallback. HLD hides edit/regen — see the action row below. */}
+            {!empty && isPageTree && (
               <div className="mt-8 grid grid-cols-1 gap-8 lg:grid-cols-[240px_1fr]">
                 <aside className="lg:sticky lg:top-20 lg:self-start">
                   <SectionHeader title={t.pages ?? "Pages"} className="mb-3" />
@@ -1018,7 +1048,7 @@ export default function EntityDocsViewer() {
 
                 <div className="flex min-w-0 flex-col gap-8">
                   <div className="flex flex-col gap-4">
-                    {(isCodebase || isDatabase) && !editing && (
+                    {isPageTree && !editing && (
                       <div className="flex items-center justify-end gap-2">
                         {regenStarting || regenJob ? (
                           <>
@@ -1059,15 +1089,17 @@ export default function EntityDocsViewer() {
                                 }}
                                 onResponse={(data) => setProduct(data as Product)}
                               />
-                              <Button
-                                type="button"
-                                variant="subtle"
-                                size="sm"
-                                onClick={() => setConfirmRegen(true)}
-                              >
-                                <Lightning size={14} weight="fill" />
-                                {t.regeneratePage ?? "Regenerate page"}
-                              </Button>
+                              {!isHld && (
+                                <Button
+                                  type="button"
+                                  variant="subtle"
+                                  size="sm"
+                                  onClick={() => setConfirmRegen(true)}
+                                >
+                                  <Lightning size={14} weight="fill" />
+                                  {t.regeneratePage ?? "Regenerate page"}
+                                </Button>
+                              )}
                             </>
                           )
                         )}
@@ -1129,6 +1161,7 @@ export default function EntityDocsViewer() {
                             (viewingArchive ? versionDetail?.generated_docs : undefined) ||
                               codebase?.generated_docs ||
                               databaseEntity?.generated_docs ||
+                              hldEntity?.generated_docs ||
                               "",
                           )}
                         />
@@ -1256,18 +1289,18 @@ function findPageInProduct(
 ): ArtifactPage | undefined {
   const found = findEntity(product, entityId);
   const pages =
-    found && (found.kind === "codebase" || found.kind === "database")
-      ? normalizePages((found.entity as Codebase | Database).pages)
+    found && (found.kind === "codebase" || found.kind === "database" || found.kind === "hld")
+      ? normalizePages((found.entity as Codebase | Database | Hld).pages)
       : [];
   return pages.find((p) => p.id === pageId);
 }
 
-/** Find a codebase/spec/links/database entity by id across the product's lists. */
+/** Find a codebase/spec/links/database/hld entity by id across the product. */
 function findEntity(
   product: Product,
   entityId: string,
 ): {
-  entity: Codebase | Spec | Links | Database | undefined;
+  entity: Codebase | Spec | Links | Database | Hld | undefined;
   kind: EntityKind | undefined;
 } {
   const c = product.codebases.find((x) => x.id === entityId);
@@ -1278,5 +1311,8 @@ function findEntity(
   if (l) return { entity: l, kind: "links" };
   const d = (product.databases ?? []).find((x) => x.id === entityId);
   if (d) return { entity: d, kind: "database" };
+  if (product.hld && product.hld.id === entityId) {
+    return { entity: product.hld, kind: "hld" };
+  }
   return { entity: undefined, kind: undefined };
 }

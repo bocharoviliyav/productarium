@@ -442,9 +442,9 @@ async def generate_summary(
     db: Session = Depends(get_db),
     _product: ProductORM = Depends(require_product_access("rw")),
 ) -> Dict[str, Any]:
-    """Generate an AI summary over the product's artifacts + knowledge nodes.
+    """Generate an AI summary over ALL the product's nested entities.
 
-    Concatenates artifact ``generated_docs`` + node ``content_md``, asks the
+    Collects codebases/databases/specs/links + knowledge node content, asks the
     standard local LLM for a concise summary, stores it onto ``ProductORM.summary``
     and returns it.
     """
@@ -453,6 +453,8 @@ async def generate_summary(
         .options(
             selectinload(ProductORM.codebases),
             selectinload(ProductORM.specs),
+            selectinload(ProductORM.databases),
+            selectinload(ProductORM.links),
         )
         .filter(ProductORM.id == product_id)
         .first()
@@ -464,7 +466,10 @@ async def generate_summary(
         .filter(KnowledgeNodeORM.product_id == product_id)
         .all()
     )
-    summary = await generate_product_summary(product, product.codebases, product.specs, nodes)
+    summary = await generate_product_summary(
+        product, product.codebases, product.specs, nodes,
+        databases=product.databases, links=product.links,
+    )
     if not summary:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

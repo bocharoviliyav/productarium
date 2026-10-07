@@ -29,6 +29,7 @@ from api.models import (
     CodebaseORM,
     DatabaseORM,
     DocVersionORM,
+    HldORM,
     LinksORM,
     ProductORM,
     SpecORM,
@@ -37,7 +38,7 @@ from api.repositories.doc_version_repo import (
     append_version,
     ensure_baseline_version,
 )
-from api.schemas import Codebase, Database, Links, Product, ProductListItem, Spec
+from api.schemas import Codebase, Database, Hld, Links, Product, ProductListItem, Spec
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +267,21 @@ def orm_to_product(p_orm: ProductORM) -> Product:
             )
             for d in p_orm.databases
         ],
+        hld=(
+            Hld(
+                id=h.id,
+                name=h.name,
+                generated_docs=h.generated_docs,
+                pages=h.pages,
+                current_version=h.current_version,
+                verified=h.verified,
+                verified_by=h.verified_by,
+                verified_at=h.verified_at,
+                source=h.source,
+            )
+            if (h := p_orm.hld) is not None
+            else None
+        ),
     )
 
 
@@ -312,9 +328,17 @@ def strip_page_content(product: Product) -> Product:
             out.append(e)
         return out
 
+    hld = product.hld
+    if hld is not None and isinstance(hld.pages, dict) and hld.pages:
+        hld = hld.model_copy(update={
+            "pages": light_pages(hld.pages),
+            "generated_docs": None,
+        })
+
     return product.model_copy(update={
         "codebases": _light(product.codebases),
         "databases": _light(product.databases),
+        "hld": hld,
     })
 
 
@@ -376,6 +400,7 @@ def _load_options():
         selectinload(ProductORM.specs),
         selectinload(ProductORM.links),
         selectinload(ProductORM.databases),
+        selectinload(ProductORM.hld),
     )
 
 
@@ -981,14 +1006,21 @@ def update_database_meta(
 
 
 # --- Verification (item 5) --------------------------------------------------
+def _find_child(p_orm: ProductORM, collection: str, entity_id: str):
+    """Child row by id — ``hld`` is a scalar (one row per product), not a list."""
+    if collection == "hld":
+        return p_orm.hld if p_orm.hld is not None and p_orm.hld.id == entity_id else None
+    return next((x for x in getattr(p_orm, collection) if x.id == entity_id), None)
+
+
 def verify_child(
     db: Session, product_id: str, entity_id: str, collection: str, user_id: str
 ) -> Product:
-    """Mark a codebase/spec/links entity as verified by ``user_id``."""
+    """Mark a codebase/spec/links/hld entity as verified by ``user_id``."""
     p_orm = load_product_orm(db, product_id)
     if p_orm is None:
         raise ValueError("Product not found")
-    entity = next((x for x in getattr(p_orm, collection) if x.id == entity_id), None)
+    entity = _find_child(p_orm, collection, entity_id)
     if entity is None:
         raise ValueError("Entity not found")
     entity.verified = True
@@ -1016,7 +1048,7 @@ def verify_page(
     p_orm = load_product_orm(db, product_id)
     if p_orm is None:
         raise ValueError("Product not found")
-    entity = next((x for x in getattr(p_orm, collection) if x.id == entity_id), None)
+    entity = _find_child(p_orm, collection, entity_id)
     if entity is None:
         raise ValueError("Entity not found")
     pages = entity.pages if isinstance(entity.pages, dict) else {}

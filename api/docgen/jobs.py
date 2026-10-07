@@ -498,6 +498,7 @@ async def _run_docgen_job_async(
                 selectinload(ProductORM.codebases),
                 selectinload(ProductORM.specs),
                 selectinload(ProductORM.databases),
+                selectinload(ProductORM.hld),
             )
             .filter(ProductORM.id == product_id)
             .first()
@@ -515,6 +516,7 @@ async def _run_docgen_job_async(
             "codebase": p_orm.codebases,
             "spec": p_orm.specs,
             "database": p_orm.databases,
+            "hld": [p_orm.hld] if p_orm.hld else [],
         }
         if entity_type not in collections:
             raise ValueError(f"Unsupported docgen entity_type: {entity_type}")
@@ -559,7 +561,7 @@ async def _run_docgen_job_async(
                     progress=progress_cb,
                     should_cancel=should_cancel,
                 )
-        else:
+        elif entity_type == "database":
             from api.docgen.database import generate_database_docs
             docs = await generate_database_docs(
                 entity, p_orm, model=model,
@@ -567,6 +569,14 @@ async def _run_docgen_job_async(
                 progress=progress_cb,
                 should_cancel=should_cancel,
                 force_pages=force_pages,
+            )
+        elif entity_type == "hld":
+            from api.docgen.hld import generate_hld_docs
+            docs = await generate_hld_docs(
+                entity, p_orm, model=model,
+                language=language or "ru",
+                progress=progress_cb,
+                should_cancel=should_cancel,
             )
 
         doc_version_repo.append_version(
@@ -597,6 +607,7 @@ async def _run_docgen_job_async(
                     selectinload(ProductORM.codebases),
                     selectinload(ProductORM.specs),
                     selectinload(ProductORM.databases),
+                    selectinload(ProductORM.hld),
                 )
                 .filter(ProductORM.id == product_id)
                 .first()
@@ -605,6 +616,7 @@ async def _run_docgen_job_async(
                 "codebase": p2.codebases,
                 "spec": p2.specs,
                 "database": p2.databases,
+                "hld": [p2.hld] if p2.hld else [],
             }.get(entity_type) or []) if p2 is not None else []
             ent = next((e for e in coll if e.id == entity_id), None)
             if ent is not None:

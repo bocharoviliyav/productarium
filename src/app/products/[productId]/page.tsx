@@ -7,6 +7,7 @@ import {
   ArrowLeft,
   ArrowRight,
   Article,
+  Blueprint,
   CaretDown,
   CaretUp,
   Database as DatabaseIcon,
@@ -57,7 +58,7 @@ import { safeExternalHref } from "@/lib/links";
 import { useNotifications } from "@/contexts/NotificationContext";
 
 type DeleteType = "codebase" | "spec" | "links" | "database";
-type GenerateType = "codebase" | "spec" | "database";
+type GenerateType = "codebase" | "spec" | "database" | "hld";
 
 // Progress block reported by the docgen job status/active endpoints
 // (api/docgen/jobs.py `_progress_snapshot`).
@@ -293,7 +294,7 @@ export default function ProductDetailPage() {
         for (const job of jobs) {
           const { job_id: jobId, entity_type: type, entity_id: entityId, progress } = job ?? {};
           if (cancelled || !jobId || !entityId) continue;
-          if (type !== "codebase" && type !== "spec" && type !== "database") continue;
+          if (type !== "codebase" && type !== "spec" && type !== "database" && type !== "hld") continue;
           // One poller per job even if the effect re-runs (StrictMode/dev).
           if (resumedJobsRef.current.has(jobId)) continue;
           resumedJobsRef.current.add(jobId);
@@ -504,9 +505,13 @@ export default function ProductDetailPage() {
       // The FastAPI generate routes are registered under the PLURAL segment
       // (codebases / specs / databases), but `type` is the singular
       // form-state value. Interpolating it raw produces a 404; route the
-      // segment through entityPath() (see src/lib/types.ts).
+      // segment through entityPath() (see src/lib/types.ts). HLD is the one
+      // exception: its generate route has no {id} segment — the run creates
+      // and updates the single hld_{productId} row itself.
       const res = await fetch(
-        `/api/products/${product.id}/${entityPath(type)}/${entityId}/generate`,
+        type === "hld"
+          ? `/api/products/${product.id}/hld/generate`
+          : `/api/products/${product.id}/${entityPath(type)}/${entityId}/generate`,
         {
           method: "POST",
           credentials: "include",
@@ -601,6 +606,13 @@ export default function ProductDetailPage() {
   // Optional on the Product contract (wave E backend lands in parallel) —
   // always read through `?? []` so the page keeps rendering on old payloads.
   const databases = product?.databases ?? [];
+  const hld = product?.hld ?? null;
+  // Deterministic backend row id (hld_{productId}) — keeps the generating-map
+  // key stable across the first run (row not created yet) and regenerations.
+  const hldId = hld?.id ?? `hld_${productId}`;
+  const hldGen = generating[hldId] ?? null;
+  const hasHldDocs =
+    Boolean(hld?.generated_docs) || normalizePages(hld?.pages).length > 0;
 
   return (
     <div className="min-h-screen bg-canvas text-ink">
@@ -989,6 +1001,82 @@ export default function ProductDetailPage() {
             {/* Two-column: (specs + knowledge tree) | main content */}
             <div className="mt-12 grid grid-cols-1 gap-8 lg:grid-cols-[320px_1fr]">
               <aside className="lg:sticky lg:top-20 lg:self-start">
+                {/* HLD — above Specs, styled like the Specs card */}
+                <div className="mb-3">
+                  <Card className="p-3">
+                    <div className="flex items-center justify-between px-1 pb-2">
+                      <h3 className="text-xs font-medium uppercase tracking-wide text-muted">
+                        {t.hldCardTitle ?? "HLD · High Level Design"}
+                      </h3>
+                      {hld && !hldGen && (
+                        <IconButton
+                          aria-label={t.hldRegenerate ?? "Regenerate HLD"}
+                          title={t.hldRegenerate ?? "Regenerate HLD"}
+                          className="h-7 w-7"
+                          onClick={() => setConfirmGen({ type: "hld", entityId: hldId })}
+                        >
+                          <Lightning size={14} weight="fill" />
+                        </IconButton>
+                      )}
+                    </div>
+                    {hld ? (
+                      <button
+                        onClick={() =>
+                          router.push(`/products/${product.id}/artifacts/${hld.id}`)
+                        }
+                        className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-sm text-muted transition-colors hover:bg-surface-2 hover:text-ink"
+                      >
+                        <span className="shrink-0 text-muted">
+                          <Blueprint size={14} weight="regular" />
+                        </span>
+                        <span className="min-w-0 flex-1 truncate">{hld.name || "HLD"}</span>
+                        <span className="flex shrink-0 items-center gap-1.5">
+                          {hasHldDocs && (
+                            <Tag tone="green">{t.docsReady ?? "Docs ready"}</Tag>
+                          )}
+                          {hld.verified && (
+                            <Tag tone="green">{t.verified ?? "Verified"}</Tag>
+                          )}
+                          {hld.current_version != null && (
+                            <Tag tone="neutral">{`v${hld.current_version}`}</Tag>
+                          )}
+                        </span>
+                      </button>
+                    ) : !hldGen ? (
+                      <div className="rounded-md border border-dashed border-divider bg-surface-2 px-3 py-4 text-center">
+                        <p className="mb-3 text-xs text-muted">
+                          {t.hldEmptyDesc ?? ""}
+                        </p>
+                        <Button
+                          size="sm"
+                          variant="subtle"
+                          onClick={() => setConfirmGen({ type: "hld", entityId: hldId })}
+                        >
+                          <Lightning size={14} weight="fill" />
+                          {t.hldGenerate ?? "Generate HLD"}
+                        </Button>
+                      </div>
+                    ) : null}
+                    {hldGen && (
+                      <div className="flex items-center justify-between gap-2 px-2 py-1.5">
+                        <span className="flex min-w-0 items-center gap-2 font-mono text-xs text-muted">
+                          <Spinner className="h-3.5 w-3.5" />
+                          <span className="truncate">{genProgressText(hldGen)}</span>
+                        </span>
+                        <Button
+                          size="sm"
+                          variant="subtle"
+                          onClick={() => handleCancelGenerate("hld", hldId)}
+                          disabled={!hldGen.jobId}
+                        >
+                          <StopCircle size={14} weight="fill" />
+                          {t.stopGeneration ?? "Stop"}
+                        </Button>
+                      </div>
+                    )}
+                  </Card>
+                </div>
+
                 {/* Specs — above the knowledge tree, styled like the knowledge tree */}
                 <div className="mb-3">
                   <Card className="p-3">

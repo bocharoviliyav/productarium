@@ -37,7 +37,14 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 
-_SEGMENT_TO_TYPE = {"codebases": "codebase", "specs": "spec", "databases": "database"}
+_SEGMENT_TO_TYPE = {
+    "codebases": "codebase",
+    "specs": "spec",
+    "databases": "database",
+    "hlds": "hld",
+    # Singular alias: the UI's entityPath("hld") builds version URLs with it.
+    "hld": "hld",
+}
 
 
 class DocVersionItem(BaseModel):
@@ -73,6 +80,7 @@ def _load_entity(db: Session, product_id: str, segment: str, entity_id: str):
         "codebase": p_orm.codebases,
         "spec": p_orm.specs,
         "database": p_orm.databases,
+        "hld": [p_orm.hld] if p_orm.hld else [],
     }[entity_type]
     entity = next((e for e in collection if e.id == entity_id), None)
     if entity is None:

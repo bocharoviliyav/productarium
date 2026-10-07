@@ -9,6 +9,7 @@ Shapes:
 - ``Codebase``  — git repo artifact (repo_url, pages, generated_docs)
 - ``Spec``      — OpenAPI/AsyncAPI spec (kind + content)
 - ``Links``     — curated external links (content = JSON array)
+- ``Hld``       — high-level design pseudo-entity (one per product)
 - ``User``      — id/username/email/role/provider
 - ``KnowledgeNode`` — Confluence-like tree node
 - ``ApiToken`` / ``Setting`` — admin/public API helpers
@@ -94,6 +95,24 @@ class Database(BaseModel):
     source: str = "manual"
 
 
+class Hld(BaseModel):
+    """High-level design pseudo-entity — one per product (no input fields).
+
+    Auto-created by ``POST /api/products/{id}/hld/generate``; content is
+    produced exclusively by the docgen pipeline.
+    """
+
+    id: str
+    name: str = "HLD"
+    generated_docs: Optional[str] = None
+    pages: Optional[Dict[str, Any]] = None
+    current_version: Optional[int] = None
+    verified: bool = False
+    verified_by: Optional[str] = None
+    verified_at: Optional[datetime] = None
+    source: str = "generated"
+
+
 class Product(BaseModel):
     id: str
     name: str
@@ -104,6 +123,7 @@ class Product(BaseModel):
     specs: List[Spec] = []
     links: List[Links] = []
     databases: List[Database] = []
+    hld: Optional[Hld] = None
 
 
 class ProductListItem(BaseModel):

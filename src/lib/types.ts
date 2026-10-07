@@ -173,6 +173,25 @@ export interface Database {
   source?: ArtifactSource;
 }
 
+/**
+ * High Level Design of a product: synthesized from the documentation of
+ * every product entity (codebases, databases, specs, links). Single row
+ * per product (id `hld_{productId}`) — repo-less, page-bearing like a
+ * codebase. Created by the generate run itself, never authored manually.
+ */
+export interface Hld {
+  id: string;
+  name: string;
+  generated_docs?: string | null;
+  pages?: ArtifactPages;
+  /** Active doc version; null = legacy, no versions yet. */
+  current_version?: number | null;
+  verified?: boolean;
+  verified_by?: string | null;
+  verified_at?: string | null;
+  source?: ArtifactSource;
+}
+
 /* ------------------------------------------------------------------ */
 /* Doc versions (immutable history, /versions endpoints)                */
 /* ------------------------------------------------------------------ */
@@ -247,6 +266,12 @@ export interface Product {
    * `product.databases ?? []`.
    */
   databases?: Database[];
+  /**
+   * High Level Design (single per-product row; null until the first
+   * generate run creates it). Optional so the UI keeps working against
+   * backends that do not serve the field yet.
+   */
+  hld?: Hld | null;
 }
 
 /**
@@ -445,17 +470,18 @@ export interface McpServerBinding {
 /* Entity kinds (codebase / spec / links)                               */
 /* ------------------------------------------------------------------ */
 
-export type EntityKind = "codebase" | "spec" | "links" | "database";
+export type EntityKind = "codebase" | "spec" | "links" | "database" | "hld";
 
 /**
  * Backend URL segment for an entity kind.
  *
  * The FastAPI routers (``api/routers/products.py``, ``docgen.py``) register
  * these sub-resources under the PLURAL segments (``codebases`` / ``specs`` /
- * ``links`` / ``databases``). The UI stores the SINGULAR kind
- * (``codebase`` / ``spec`` / ``links`` / ``database``) in form state, so every
- * API URL must go through this helper — interpolating the raw kind directly
- * produces 404s.
+ * ``links`` / ``databases``); ``hld`` is its own segment, identical in
+ * singular and plural. The UI stores the SINGULAR kind
+ * (``codebase`` / ``spec`` / ``links`` / ``database`` / ``hld``) in form state,
+ * so every API URL must go through this helper — interpolating the raw kind
+ * directly produces 404s.
  */
 export function entityPath(kind: EntityKind): string {
   switch (kind) {
@@ -467,6 +493,8 @@ export function entityPath(kind: EntityKind): string {
       return "links";
     case "database":
       return "databases";
+    case "hld":
+      return "hld";
   }
 }
 

@@ -71,7 +71,6 @@ type Section =
   | "prompts"
   | "memory"
   | "databases"
-  | "timeouts"
   | "users"
   | "tokens"
   | "publicapi";
@@ -85,7 +84,6 @@ const SECTIONS: { key: Section; icon: typeof Gear }[] = [
   { key: "prompts", icon: FileText },
   { key: "memory", icon: Brain },
   { key: "databases", icon: Database },
-  { key: "timeouts", icon: Wrench },
   { key: "users", icon: UserCircleGear },
   { key: "tokens", icon: Key },
   { key: "publicapi", icon: Code },
@@ -491,9 +489,11 @@ function ModelsSection() {
         );
       })}
 
-      {/* LLM request budgets + docgen agent knobs (LLM group of the timeout
-          registry; saves only these keys). */}
-      <TimeoutFieldsCard fields={LLM_TIMEOUT_FIELDS} />
+      {/* Timeout registry knobs of the Models tab — LLM, Expert and Mermaid
+          groups in ONE card: one fetch + one save, still one Card per group. */}
+      <TimeoutFieldsCard
+        fields={[...LLM_TIMEOUT_FIELDS, ...EXPERT_TIMEOUT_FIELDS, ...MERMAID_TIMEOUT_FIELDS]}
+      />
     </div>
   );
 }
@@ -1366,6 +1366,10 @@ function IntegrationsSection() {
           </table>
         </Card>
       )}
+
+      {/* Integrations-group knobs of the timeout registry (HTTP connector,
+          Git file fetch, MCP stdio wait; saves only these keys). */}
+      <TimeoutFieldsCard fields={INTEGRATIONS_TIMEOUT_FIELDS} />
 
       {/* Create / edit form */}
       <Modal
@@ -2427,7 +2431,7 @@ function MemorySection() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Timeouts section (central timeout_config resolvers)                */
+/* Timeout registry catalogs + shared card (timeout_config resolvers) */
 /* ------------------------------------------------------------------ */
 
 // Static catalog of every timeout key rendered in the UI, split by the tab
@@ -2470,16 +2474,24 @@ const DATABASES_TIMEOUT_FIELDS: TimeoutFieldSpec[] = [
   { key: "db_source_objects", group: "Databases" },
 ];
 
-// Timeouts tab: everything that did not move to a topical tab.
-const TIMEOUT_FIELDS: TimeoutFieldSpec[] = [
+// Models tab: the Expert group (expert ask turn budget).
+const EXPERT_TIMEOUT_FIELDS: TimeoutFieldSpec[] = [
   { key: "expert_stream", group: "Expert" },
-  { key: "integration_http", group: "Integrations" },
-  { key: "git_file_content", group: "Integrations" },
-  { key: "mcp_stdio_wait", group: "Integrations" },
+];
+
+// Models tab: the Mermaid verify/repair group.
+const MERMAID_TIMEOUT_FIELDS: TimeoutFieldSpec[] = [
   { key: "mermaid_verify", group: "Mermaid" },
   { key: "mermaid_repair", group: "Mermaid" },
   { key: "mermaid_max_repair_attempts", group: "Mermaid" },
   { key: "mermaid_repair_deadline", group: "Mermaid" },
+];
+
+// Integrations tab: connector / Git API / MCP stdio wait budgets.
+const INTEGRATIONS_TIMEOUT_FIELDS: TimeoutFieldSpec[] = [
+  { key: "integration_http", group: "Integrations" },
+  { key: "git_file_content", group: "Integrations" },
+  { key: "mcp_stdio_wait", group: "Integrations" },
 ];
 
 interface TimeoutResolvedEntry {
@@ -2504,8 +2516,8 @@ interface TimeoutsGroupResponse {
  * Reusable timeout-registry card: loads GET /api/admin/timeouts, renders the
  * given fields grouped by their group label (one Card per group) and saves
  * ONLY its own keys (PUT /api/admin/timeouts; empty string = clear override).
- * Sections embed it with their field subset — Models (LLM), Agent Memory
- * (Memory), Databases, and the general Timeouts tab.
+ * Sections embed it with their field subset — Models (LLM, Expert, Mermaid),
+ * Integrations, Agent Memory (Memory), and Databases.
  */
 function TimeoutFieldsCard({ fields }: { fields: TimeoutFieldSpec[] }) {
   const { getJson, putJson, notify } = useAdminApi();
@@ -2646,21 +2658,6 @@ function TimeoutFieldsCard({ fields }: { fields: TimeoutFieldSpec[] }) {
         </Button>
       </div>
     </>
-  );
-}
-
-function TimeoutsSection() {
-  const { messages } = useLanguage();
-  const t = messages?.admin ?? {};
-  const tt = t?.timeouts ?? {};
-  return (
-    <div className="space-y-6">
-      <p className="text-[15px] text-muted">
-        {tt.intro ??
-          "Centralized timeout management. Each value is resolved with precedence: admin store > env var > default. Leave a field empty to fall back to the env var or the built-in default. LLM and docgen agent knobs live on the Models tab, memory knobs on the Agent Memory tab, database knobs on the Databases tab."}
-      </p>
-      <TimeoutFieldsCard fields={TIMEOUT_FIELDS} />
-    </div>
   );
 }
 
@@ -3587,7 +3584,6 @@ function AdminShell() {
             {section === "prompts" && <PromptsSection />}
             {section === "memory" && <MemorySection />}
             {section === "databases" && <DatabasesSection />}
-            {section === "timeouts" && <TimeoutsSection />}
             {section === "users" && <UsersSection />}
             {section === "tokens" && <TokensSection />}
             {section === "publicapi" && <PublicApiSection />}

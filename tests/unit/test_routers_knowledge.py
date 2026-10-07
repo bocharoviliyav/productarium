@@ -697,7 +697,7 @@ class TestGenerateSummary:
     def test_summary_success(self, isolated_db, monkeypatch):
         from api.routers import knowledge as knowledge_mod
 
-        async def _fake_summary(product, codebases, specs, nodes):
+        async def _fake_summary(product, codebases, specs, nodes, **kw):
             return "A concise summary."
 
         monkeypatch.setattr(knowledge_mod, "generate_product_summary", _fake_summary)
@@ -714,7 +714,7 @@ class TestGenerateSummary:
     def test_summary_empty_returns_503(self, isolated_db, monkeypatch):
         from api.routers import knowledge as knowledge_mod
 
-        async def _fake_summary(product, codebases, specs, nodes):
+        async def _fake_summary(product, codebases, specs, nodes, **kw):
             return ""
 
         monkeypatch.setattr(knowledge_mod, "generate_product_summary", _fake_summary)
@@ -729,7 +729,7 @@ class TestGenerateSummary:
     def test_summary_product_not_found_404(self, isolated_db, monkeypatch):
         from api.routers import knowledge as knowledge_mod
 
-        async def _fake_summary(product, codebases, specs, nodes):
+        async def _fake_summary(product, codebases, specs, nodes, **kw):
             return "x"
 
         monkeypatch.setattr(knowledge_mod, "generate_product_summary", _fake_summary)

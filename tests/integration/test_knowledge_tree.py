@@ -158,21 +158,30 @@ class TestProductSummary:
         out = asyncio.run(ks.generate_product_summary(product, codebases, [], []))
         assert out == ""
 
-    def test_collect_summary_content_caps_large_input(self):
+    def test_summary_context_caps_large_input(self, monkeypatch):
         import api.docgen.summary as ks
 
-        # _collect_summary_content concatenates codebase/specs/node docs and
-        # char-caps the result to SUMMARY_CONTEXT_MAX_CHARS via the char-based
-        # _cap helper (token-based clamping was removed in the cleanup).
+        # Context collection (via _common.collect_entity_parts) char-caps each
+        # entity part by the fair budget whose floor is
+        # SUMMARY_CONTEXT_MAX_CHARS (char-based _cap with a truncation suffix).
         unit = "Артефакт: файл структуры кодовой базы. "
-        big = unit * 1300  # ~50k chars -> well over the 20k char cap
+        big = unit * 1300  # ~50k chars -> well over the 20k floor
         assert len(big) > ks.SUMMARY_CONTEXT_MAX_CHARS
+
+        captured = {}
+
+        class _FakeLLM:
+            async def generate(self, prompt: str) -> str:
+                captured["prompt"] = prompt
+                return "s"
+
+        monkeypatch.setattr(ks, "_safe_build_summary_llm", lambda m, **kw: _FakeLLM())
+        product = SimpleNamespace(id="prod_1", name="Acme")
         codebases = [SimpleNamespace(id="a", name="a", generated_docs=big)]
-        out = ks._collect_summary_content(codebases, [], [])
-        # Char-clamping fired: output is capped and carries the truncation suffix.
-        assert len(out) < len(big)
-        assert len(out) <= ks.SUMMARY_CONTEXT_MAX_CHARS + 100
-        assert "обрезано для контекста" in out
+        out = asyncio.run(ks.generate_product_summary(product, codebases, [], []))
+        assert out == "s"
+        # Char-clamping fired: the prompt carries the truncation suffix.
+        assert "обрезано для контекста" in captured["prompt"]
 
 
 # --- Router endpoint integration (SQLite + TestClient) -----------------------

@@ -79,6 +79,10 @@
     "saveArtifact": "Save",
     "addSpec": "Add spec",
     "specEmptyDesc": "Add an OpenAPI or AsyncAPI spec to document an API or event contract.",
+    "hldCardTitle": "HLD · High Level Design",
+    "hldGenerate": "Generate HLD",
+    "hldRegenerate": "Regenerate HLD",
+    "hldEmptyDesc": "Built from the documentation of every product entity — codebases, databases, specs, and links.",
     "addLink": "Add link",
     "linkName": "Link name",
     "linksEmptyInline": "No links yet.",
@@ -134,6 +138,10 @@
     "genSectionDatamodel": "Data Model",
     "genSectionEnrichment": "Enrichment",
     "genSectionIntrospection": "Introspection",
+    "genSectionCapabilities": "Capability Map",
+    "genSectionIntegrations": "Integrations",
+    "genSectionData": "Data",
+    "genSectionApi": "API",
     "mcp": {
       "title": "MCP Servers",
       "subtitle": "Bound MCP servers extend the expert agent with their tools. Only enabled bindings expose tools; the allowlist filters which ones.",
@@ -257,6 +265,7 @@
     "noDocsTitle": "No content yet",
     "noDocsDesc": "Generate documentation for this codebase from the product page. Once generated, the page tree and content will appear here.",
     "noDbDocsDesc": "Reverse-engineer this database from the product page. Once generated, the schema pages and content will appear here.",
+    "noHldDocsDesc": "Generate the HLD from the product page. Once generated, the page tree and content will appear here.",
     "noRawContentDesc": "Add content using the edit button above.",
     "generateOnProductPage": "Generate on product page",
     "pages": "Pages",
@@ -476,7 +485,6 @@
       "prompts": "System prompts",
       "memory": "Agent memory",
       "databases": "Databases",
-      "timeouts": "Timeouts",
       "users": "Users",
       "tokens": "API tokens",
       "publicapi": "Public API"
@@ -699,7 +707,6 @@
       "reindexOkMsg": "Memory index rebuilt."
     },
     "timeouts": {
-      "intro": "Centralized timeout management. Each value is resolved with precedence: admin store > env var > default. Leave a field empty to fall back to the env var or the built-in default. LLM and docgen agent knobs live on the Models tab, memory knobs on the Agent Memory tab, database knobs on the Databases tab.",
       "loading": "Loading timeout settings…",
       "save": "Save",
       "savedToast": "Saved timeout settings.",
@@ -851,6 +858,10 @@
     "links": {
       "label": "Links",
       "description": "Curated external links with descriptions."
+    },
+    "hld": {
+      "label": "HLD",
+      "description": "High Level Design — assembled from the documentation of every product entity."
     }
   },
   "notifications": {

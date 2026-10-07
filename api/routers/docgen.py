@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from api.auth.deps import get_current_user, require_product_access
@@ -30,7 +31,7 @@ from api.docgen.jobs import (
     request_cancel_for_entity,
     submit_job,
 )
-from api.models import ProductORM, UserORM
+from api.models import HldORM, ProductORM, UserORM
 from api.repositories import doc_version_repo, product_repo
 from api.utils.rate_limit import enforce_user_rate_limit
 
@@ -98,8 +99,24 @@ def _start_generate(
     if p_orm is None:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    collection = p_orm.codebases if entity_type == "codebase" else p_orm.specs
-    entity = next((e for e in collection if e.id == entity_id), None)
+    if entity_type == "hld":
+        # Pseudo-entity: auto-create the single row on first generate (the
+        # worker loads it in a fresh session — commit BEFORE the job starts).
+        if p_orm.hld is None:
+            try:
+                p_orm.hld = HldORM(id=f"hld_{product_id}", product_id=product_id)
+                db.commit()
+            except IntegrityError:
+                # Lost a concurrent first-generate race: adopt the winner's
+                # row and let create_or_get_job dedup the in-flight job.
+                db.rollback()
+                p_orm.hld = db.query(HldORM).filter(
+                    HldORM.id == f"hld_{product_id}"
+                ).one_or_none()
+        entity = p_orm.hld
+    else:
+        collection = p_orm.codebases if entity_type == "codebase" else p_orm.specs
+        entity = next((e for e in collection if e.id == entity_id), None)
     if not entity:
         raise HTTPException(status_code=404, detail=f"{entity_type.capitalize()} not found")
 
@@ -169,6 +186,10 @@ _SEGMENT_TO_TYPE = {
     "codebases": "codebase",
     "specs": "spec",
     "databases": "database",
+    "hlds": "hld",
+    # Singular alias: the UI's entityPath("hld") builds sub-resource URLs
+    # with the singular segment (cancel, page-content, versions).
+    "hld": "hld",
 }
 _CANCEL_SEGMENTS = _SEGMENT_TO_TYPE
 
@@ -251,17 +272,19 @@ async def get_docgen_page(
     optionally from an archived doc version (``?version=N``).
     """
     entity_type = _SEGMENT_TO_TYPE.get(segment)
-    if entity_type not in ("codebase", "database"):
+    if entity_type not in ("codebase", "database", "hld"):
         raise HTTPException(
             status_code=400,
-            detail="Page content is only available for codebases and databases",
+            detail="Page content is only available for codebases, databases and HLD",
         )
     if version is None:
         p_orm = product_repo.load_product_orm(db, product_id)
         if p_orm is None:
             raise HTTPException(status_code=404, detail="Product not found")
         collection = (
-            p_orm.codebases if entity_type == "codebase" else p_orm.databases
+            ([p_orm.hld] if p_orm.hld else [])
+            if entity_type == "hld" else
+            (p_orm.codebases if entity_type == "codebase" else p_orm.databases)
         )
         entity = next((e for e in collection if e.id == entity_id), None)
         if not entity:
@@ -269,7 +292,9 @@ async def get_docgen_page(
         page, source = (entity.pages or {}).get(page_id), "current"
     else:
         row = doc_version_repo.get_version(db, entity_type, entity_id, version)
-        if row is None:
+        # Version rows key on (entity_type, entity_id) alone — reject another
+        # product's row (hld_{product_id} ids are deterministic/guessable).
+        if row is None or row.product_id != product_id:
             raise HTTPException(status_code=404, detail="Version not found")
         page, source = (row.pages or {}).get(page_id), "archive"
     if not isinstance(page, dict):

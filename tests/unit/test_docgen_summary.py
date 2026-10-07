@@ -1,8 +1,10 @@
 """Unit tests for api.docgen.summary (AI product summary generator).
 
-Covers: _collect_summary_content (capping), _build_summary_prompt,
-_clean_text, _SummaryLLM (mocked), _safe_build_summary_llm,
-generate_product_summary (mocked LLM + empty content + LLM-unavailable).
+Covers: context collection via _common.collect_entity_parts (all entity
+kinds, per-entity fair cap, DB pages fallback, links JSON),
+_build_summary_prompt, _clean_text, _SummaryLLM (mocked),
+_safe_build_summary_llm, generate_product_summary (mocked LLM + empty
+content + LLM-unavailable).
 """
 
 from __future__ import annotations
@@ -43,6 +45,21 @@ class FakeNode:
         self.id = f"node_{title}"
 
 
+class FakeDatabase:
+    def __init__(self, name, docs="", pages=None):
+        self.name = name
+        self.generated_docs = docs
+        self.pages = pages or {}
+        self.id = f"db_{name}"
+
+
+class FakeLink:
+    def __init__(self, name, content):
+        self.name = name
+        self.content = content
+        self.id = f"link_{name}"
+
+
 class FakeProduct:
     def __init__(self, name="MyProduct", pid="prod_123"):
         self.name = name
@@ -50,82 +67,110 @@ class FakeProduct:
 
 
 # ============================================================================
-# _collect_summary_content
+# Context collection via _common.collect_entity_parts (through the prompt)
 # ============================================================================
-class TestCollectSummaryContent:
-    def test_empty_all(self):
-        assert summary_mod._collect_summary_content([], [], []) == ""
+class _PromptCaptureLLM:
+    def __init__(self):
+        self.prompt = ""
 
-    def test_codebases_only(self):
-        cbs = [FakeCodebase("app", "# App\nDocs here.")]
-        result = summary_mod._collect_summary_content(cbs, [], [])
-        assert "## Codebase: app" in result
-        assert "Docs here." in result
+    async def generate(self, prompt):
+        self.prompt = prompt
+        return "summary text"
 
-    def test_specs_only(self):
-        specs = [FakeSpec("api", "openapi: 3.0.0", kind="openapi")]
-        result = summary_mod._collect_summary_content([], specs, [])
-        assert "## Спецификация (openapi): api" in result
-        assert "openapi: 3.0.0" in result
 
-    def test_nodes_only(self):
-        nodes = [FakeNode("Architecture", "# Architecture\nC4 model.")]
-        result = summary_mod._collect_summary_content([], [], nodes)
-        assert "## Страница базы знаний: Architecture" in result
-        assert "C4 model." in result
+def _capture_prompt(monkeypatch, product, cbs=(), specs=(), nodes=(), **kw):
+    """Run generate_product_summary with a mocked LLM; return (prompt, result)."""
+    llm = _PromptCaptureLLM()
+    monkeypatch.setattr(summary_mod, "_safe_build_summary_llm", lambda *a, **k: llm)
+    result = asyncio.run(
+        summary_mod.generate_product_summary(product, cbs, specs, nodes, **kw)
+    )
+    return llm.prompt, result
 
-    def test_all_combined(self):
-        cbs = [FakeCodebase("app", "App docs")]
-        specs = [FakeSpec("api", "spec content")]
-        nodes = [FakeNode("Arch", "arch content")]
-        result = summary_mod._collect_summary_content(cbs, specs, nodes)
-        assert "## Codebase: app" in result
-        assert "## Спецификация" in result
-        assert "## Страница базы знаний: Arch" in result
 
-    def test_skips_empty_content(self):
-        cbs = [FakeCodebase("empty", ""), FakeCodebase("real", "content")]
-        result = summary_mod._collect_summary_content(cbs, [], [])
-        assert "## Codebase: real" in result
-        assert "## Codebase: empty" not in result
+class TestSummaryContextCollector:
+    def test_all_entity_kinds_reach_prompt(self, monkeypatch):
+        links = [FakeLink("docs", '[{"url": "https://x.dev", "description": "Docs portal"}]')]
+        prompt, result = _capture_prompt(
+            monkeypatch,
+            FakeProduct(),
+            cbs=[FakeCodebase("app", "app docs")],
+            specs=[FakeSpec("api", "spec content")],
+            nodes=[FakeNode("arch", "arch content")],
+            databases=[FakeDatabase("main", docs="db docs")],
+            links=links,
+        )
+        assert result == "summary text"
+        assert "## Codebase: app" in prompt
+        assert "## Database: main" in prompt
+        assert "## Спецификация (openapi): api" in prompt
+        assert "## Страница базы знаний: arch" in prompt
+        assert "## Ссылки: docs" in prompt
+        assert "- https://x.dev: Docs portal" in prompt
 
-    def test_skips_whitespace_content(self):
-        cbs = [FakeCodebase("ws", "   \n  ")]
-        result = summary_mod._collect_summary_content(cbs, [], [])
+    def test_later_entity_not_displaced_by_huge_codebase(self, monkeypatch):
+        # Fair per-part cap: the huge FIRST codebase is truncated instead of
+        # starving the entity that comes later in the collector's order.
+        async def fake_ctx(**kw):
+            return 8192  # hermetic window -> budget floor 20k, 10k per part
+
+        monkeypatch.setattr("api.utils.get_model_context_window_async", fake_ctx)
+        prompt, _ = _capture_prompt(
+            monkeypatch,
+            FakeProduct(),
+            cbs=[FakeCodebase("big", "x" * 60_000)],
+            nodes=[FakeNode("small", "tiny but present")],
+        )
+        assert "обрезано" in prompt  # codebase part capped, not global tail-cut
+        assert "## Страница базы знаний: small" in prompt
+        assert "tiny but present" in prompt
+
+    def test_database_pages_fallback(self, monkeypatch):
+        db = FakeDatabase("legacy", docs="", pages={
+            "p1": {"content": "page one body"},
+            "p2": {"content": "page two body"},
+        })
+        prompt, _ = _capture_prompt(monkeypatch, FakeProduct(), databases=[db])
+        assert "## Database: legacy" in prompt
+        assert "page one body" in prompt
+        assert "page two body" in prompt
+
+    def test_links_json_rendered(self, monkeypatch):
+        raw = '[{"url": "https://a.dev", "description": "A"}, {"url": "https://b.dev", "description": "B"}]'
+        prompt, _ = _capture_prompt(
+            monkeypatch, FakeProduct(), links=[FakeLink("res", raw)]
+        )
+        assert "## Ссылки: res" in prompt
+        assert "- https://a.dev: A" in prompt
+        assert "- https://b.dev: B" in prompt
+
+    def test_old_positional_signature_still_works(self, monkeypatch):
+        # Legacy callers pass only (product, codebases, specs, nodes).
+        prompt, result = _capture_prompt(
+            monkeypatch, FakeProduct(), cbs=[FakeCodebase("app", "docs")]
+        )
+        assert result == "summary text"
+        assert "## Codebase: app" in prompt
+
+    def test_empty_databases_links_only_returns_empty(self):
+        result = asyncio.run(
+            summary_mod.generate_product_summary(
+                FakeProduct(), [], [], [],
+                databases=[FakeDatabase("empty", docs="", pages={})],
+                links=[FakeLink("none", "")],
+            )
+        )
         assert result == ""
 
-    def test_caps_large_content(self):
-        cbs = [FakeCodebase("big", "x" * 50000)]
-        result = summary_mod._collect_summary_content(cbs, [], [])
-        assert len(result) <= summary_mod.SUMMARY_CONTEXT_MAX_CHARS + 100  # allow for cap suffix
-        assert "обрезано" in result
+    def test_budget_scales_with_context_window(self, monkeypatch):
+        async def fake_ctx(**kw):
+            return 131_072  # 128k window -> budget capped at 120k chars
 
-    def test_uses_id_when_no_name(self):
-        cb = FakeCodebase("named", "docs")
-        cb.name = None
-        result = summary_mod._collect_summary_content([cb], [], [])
-        assert "cb_named" in result
-
-    def test_spec_uses_id_when_no_name(self):
-        spec = FakeSpec("named", "content")
-        spec.name = None
-        result = summary_mod._collect_summary_content([], [spec], [])
-        assert "spec_named" in result
-
-    def test_node_uses_id_when_no_title(self):
-        node = FakeNode("titled", "content")
-        node.title = None
-        result = summary_mod._collect_summary_content([], [], [node])
-        assert "node_titled" in result
-
-    def test_spec_kind_defaults(self):
-        spec = FakeSpec("s", "content")
-        spec.kind = None
-        result = summary_mod._collect_summary_content([], [spec], [])
-        assert "## Спецификация (spec):" in result
-
-    def test_none_inputs(self):
-        assert summary_mod._collect_summary_content(None, None, None) == ""
+        monkeypatch.setattr("api.utils.get_model_context_window_async", fake_ctx)
+        prompt, _ = _capture_prompt(
+            monkeypatch, FakeProduct(), cbs=[FakeCodebase("big", "x" * 60_000)]
+        )
+        assert "обрезано" not in prompt  # fits well inside the scaled budget
 
 
 # ============================================================================
