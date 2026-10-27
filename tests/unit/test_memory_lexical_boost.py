@@ -199,7 +199,8 @@ class _DispatchEngine:
                         raise engine._lexical_error
                     rows = [(r,) for r in engine._lexical_rows]
                 else:
-                    rows = [(r,) for r in engine._cosine_rows]
+                    # Cosine query is source-aware: (content, source_id, distance).
+                    rows = [(r, None, None) for r in engine._cosine_rows]
 
                 class _Result:
                     def fetchall(self):

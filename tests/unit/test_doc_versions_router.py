@@ -87,10 +87,12 @@ class TestDocVersionsRouter:
         assert cb["generated_docs"] == "# V1"
         assert cb["current_version"] == 3
 
-        # The restored text was re-indexed with the artifact as its source.
-        assert reindexed == [(
-            ("prod_1", "# V1", "art_1"), {"source_type": "codebase"},
-        )]
+        # The restored docs re-index page-granular (SPEC-010).
+        assert reindexed == [
+            (("prod_1", "# V1", "art_1"),
+             {"source_type": "codebase",
+              "pages": {"page_overview": {"content": "v1"}}}),
+        ]
         with isolated_db.SessionLocal() as s:
             rows = dvr.list_versions(s, "codebase", "art_1")
             assert [v.source for v in rows] == ["rollback", "generate", "edit"]
@@ -137,3 +139,85 @@ class TestDocVersionsRouter:
         assert client.get("/api/products/ghost/codebases/art_1/versions").status_code == 404
         assert client.get("/api/products/prod_1/links/art_1/versions").status_code == 404
         assert client.get("/api/products/prod_1/codebases/ghost/versions").status_code == 404
+
+
+def _seed_delta(db_mod):
+    """v1 full (edit) → v2 full (generate) → v3 page-delta (edit)."""
+    with db_mod.SessionLocal() as s:
+        s.add(ProductORM(id="prod_1", name="Acme"))
+        s.flush()
+        s.add(CodebaseORM(
+            id="art_1", product_id="prod_1", name="svc", source="manual",
+            generated_docs="# V1",
+            pages={"page_overview": {"content": "v1"}, "page_arch": {"content": "arch"}},
+        ))
+        s.flush()
+        cb = s.get(CodebaseORM, "art_1")
+        dvr.append_version(s, "codebase", cb, source="edit")        # v1 full
+        cb.generated_docs = "# V2"
+        dvr.append_version(s, "codebase", cb, source="generate")    # v2 full
+        cb.pages = {**cb.pages, "page_overview": {"content": "v3"}}
+        dvr.append_version(s, "codebase", cb, source="edit")        # v3 delta on v2
+        s.commit()
+
+
+class TestDeltaScope:
+    def test_list_marks_scope_and_detail_materializes(self, isolated_db):
+        _seed_delta(isolated_db)
+        _app, client = _client(isolated_db)
+        body = client.get("/api/products/prod_1/codebases/art_1/versions").json()
+        assert [(v["version"], v["scope"]) for v in body["versions"]] == [
+            (3, "page"), (2, "full"), (1, "full"),
+        ]
+        detail = client.get("/api/products/prod_1/codebases/art_1/versions/3").json()
+        assert detail["scope"] == "page"
+        # Materialized: v2's full page set + the v3 override on top.
+        assert detail["pages"]["page_overview"] == {"content": "v3"}
+        assert detail["pages"]["page_arch"] == {"content": "arch"}
+        assert detail["generated_docs"] == "# V2"  # resolves through the base
+
+
+class TestDeleteVersionEndpoint:
+    """SPEC-013: deleting an old snapshot removes ONLY the version row."""
+
+    def test_delete_old_version_204_artifact_untouched(self, isolated_db):
+        _seed_delta(isolated_db)
+        _app, client = _client(isolated_db)
+        r = client.delete("/api/products/prod_1/codebases/art_1/versions/1")
+        assert r.status_code == 204
+        with isolated_db.SessionLocal() as s:
+            assert [v.version for v in dvr.list_versions(s, "codebase", "art_1")] == [3, 2]
+            cb = s.get(CodebaseORM, "art_1")
+            assert cb.current_version == 3
+            assert cb.generated_docs == "# V2"
+            assert cb.pages == {
+                "page_overview": {"content": "v3"}, "page_arch": {"content": "arch"},
+            }
+
+    def test_refusals_current_base_unknown(self, isolated_db):
+        _seed_delta(isolated_db)
+        _app, client = _client(isolated_db)
+        url = "/api/products/prod_1/codebases/art_1/versions/{}"
+        assert client.delete(url.format(3)).status_code == 409  # current
+        assert client.delete(url.format(2)).status_code == 409  # base of v3
+        assert client.delete(url.format(99)).status_code == 404
+        with isolated_db.SessionLocal() as s:
+            assert len(dvr.list_versions(s, "codebase", "art_1")) == 3
+
+    def test_rbac_docs_forbidden_manage_ok(self, isolated_db):
+        from datetime import datetime
+
+        from api.models import UserORM
+
+        _seed_delta(isolated_db)
+        app, client = _client(isolated_db)
+        url = "/api/products/prod_1/codebases/art_1/versions/1"
+        # Manager without a grant: docs-level access, but not manage.
+        manager = UserORM(id="u_mgr", username="mgr", role="manager",
+                          provider="local", created_at=datetime.utcnow())
+        app.dependency_overrides[doc_versions_router.get_current_user] = lambda: manager
+        assert client.delete(url).status_code == 403
+        admin = UserORM(id="u_adm", username="adm", role="admin",
+                        provider="local", created_at=datetime.utcnow())
+        app.dependency_overrides[doc_versions_router.get_current_user] = lambda: admin
+        assert client.delete(url).status_code == 204

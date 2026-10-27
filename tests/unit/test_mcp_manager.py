@@ -10,7 +10,11 @@ Everything runs against fake clients (no subprocesses, no network):
 - client cache + discovery cache keyed by config fingerprint, ``invalidate``.
 - ``health_check`` success / failure / timeout with sanitized short errors.
 - ``get_tools_for_product``: allowlist, disabled binding/server filters, dead
-  server skipped, duplicate tool names deduped, DB failure -> ``[]``.
+  server skipped, duplicate tool names deduped, DB failure -> ``[]``, scope
+  filter (SPEC-028).
+- ``_wrap_bounded_tool``: SPEC-025 — the wrapped copy is response_format
+  "content" and an adapter tool's bare-list error path degrades to a short
+  ERROR string instead of a langchain ValueError.
 - ``gather_mcp_agent_tools`` never raises.
 """
 
@@ -294,17 +298,22 @@ class TestNegativeDiscoveryCache:
             asyncio.run(m.discover_tools(_server(url="http://other:1/mcp")))
         assert client.calls == 2
 
-
-# --- stdio policy (shared with the router) ------------------------------------------
+# --- stdio policy (shared with the router) ------------------------------------------ #
 class TestStdioPolicy:
     def test_command_policy(self):
         from api.mcp.policy import stdio_command_error
 
+        # ``node`` by ABSOLUTE path moved to the good list: the SPEC-014
+        # carve-out for JS-entrypoint stdio servers (REA). Everything else
+        # interpreter-shaped stays banned — absolute or not.
         for bad in ("/bin/sh", "bash", "/usr/bin/zsh", "/usr/bin/env", "npx",
-                    "uvx", "/usr/local/bin/python3.12", "/usr/bin/node",
-                    "/usr/bin/osascript", "sh -c run.sh", ""):
+                    "/usr/local/bin/npx", "node", "./node", "uvx",
+                    "/usr/local/bin/python3.12", "/usr/bin/nodejs",
+                    "/usr/bin/osascript", "sh -c run.sh", "",
+                    "/usr/bin/docker", "kubectl", "/usr/local/bin/ssh", "podman"):
             assert stdio_command_error(bad) is not None, bad
-        for good in ("/usr/local/bin/mcp-server", "/bin/srv", "mcp-server-foo"):
+        for good in ("/usr/local/bin/mcp-server", "/bin/srv", "mcp-server-foo",
+                     "/usr/local/bin/node"):
             assert stdio_command_error(good) is None, good
 
     def test_env_policy(self):
@@ -334,6 +343,53 @@ class TestStdioPolicy:
                     url=None,
                     command="/usr/local/bin/mcp-server",
                     env=encrypt_secret_dict({"LD_PRELOAD": "/tmp/x.so"}),
+                )
+            )
+
+
+class TestReaStdioLaunch:
+    """SPEC-014: REA connects as a REGULAR stdio server — the node binary by
+    absolute path is the single interpreter carve-out; the upstream
+    ``npx rea-agents`` launcher stays blocked at write AND connect time."""
+
+    def test_upstream_npx_launcher_blocked(self):
+        from api.mcp.policy import stdio_command_error
+
+        assert stdio_command_error("npx") is not None
+        assert stdio_command_error("/usr/local/bin/npx") is not None
+
+    def test_node_allowed_only_by_absolute_path(self):
+        from api.mcp.policy import stdio_command_error
+
+        assert stdio_command_error("/usr/local/bin/node") is None
+        # PATH / relative forms of the same binary stay blocked.
+        assert stdio_command_error("node") is not None
+        assert stdio_command_error("./node") is not None
+
+    def test_rea_row_builds_connection(self):
+        from api.mcp.presets import STDIO_TOOL_PRESETS
+
+        rea = STDIO_TOOL_PRESETS[0]
+        conn = manager_mod.build_connection(
+            _server(
+                transport="stdio",
+                url=None,
+                command=rea.command,
+                args=list(rea.args),
+            )
+        )
+        assert conn["command"] == rea.command
+        assert conn["args"] == list(rea.args)
+        assert conn["args"][-1] == "mcp"
+
+    def test_bare_node_row_still_refused_at_connect_time(self):
+        with pytest.raises(ValueError, match="shell/interpreter/runner"):
+            manager_mod.build_connection(
+                _server(
+                    transport="stdio",
+                    url=None,
+                    command="node",
+                    args=["/opt/rea/rea.mjs", "mcp"],
                 )
             )
 
@@ -416,7 +472,7 @@ class TestPresetStdioPolicy:
 
 # --- bounded tool wrapper (timeout + result cap) --------------------------------------
 class TestBoundedToolWrapper:
-    def _structured(self, name, coro):
+    def _structured(self, name, coro, response_format="content"):
         from langchain_core.tools import StructuredTool
         from pydantic import BaseModel
 
@@ -431,6 +487,7 @@ class TestBoundedToolWrapper:
             args_schema=_NoArgs,
             func=lambda **kwargs: "sync-fallback",
             coroutine=coro,
+            response_format=response_format,
         )
 
     def test_fake_tools_pass_through_unwrapped(self):
@@ -473,6 +530,47 @@ class TestBoundedToolWrapper:
         wrapped = manager_mod._wrap_bounded_tool(self._structured("small", _small))
         out = asyncio.run(wrapped.ainvoke({}))
         assert out == {"items": [1, 2, 3]}
+
+    def test_wrapped_copy_is_content_format(self):
+        async def _ok(**kwargs):
+            return "x"
+
+        wrapped = manager_mod._wrap_bounded_tool(self._structured("fmt", _ok))
+        assert wrapped.response_format == "content"
+
+    def test_adapter_artifact_error_path_degrades_to_string(self, monkeypatch):
+        """SPEC-025: adapter tools (content_and_artifact) whose error handler
+        returns a BARE LIST of content blocks make langchain_core raise
+        ValueError inside ainvoke — the wrapped copy must degrade to a short
+        ERROR string instead of killing the agent graph."""
+        monkeypatch.delenv("MCP_TOOL_CALL_TIMEOUT_SECONDS", raising=False)
+
+        async def _bare_blocks(**kwargs):
+            return [{"type": "text", "text": "server exploded"}]
+
+        tool = self._structured(
+            "adapter", _bare_blocks, response_format="content_and_artifact"
+        )
+        wrapped = manager_mod._wrap_bounded_tool(tool)
+        out = asyncio.run(wrapped.ainvoke({}))
+        assert isinstance(out, str)
+        assert out.startswith("ERROR:")
+        assert "ValueError" in out
+
+    def test_adapter_tuple_path_content_passes_through(self, monkeypatch):
+        """SPEC-025 happy path: a (content, artifact) tuple resolves to its
+        content half and reaches the caller as plain content."""
+        monkeypatch.delenv("MCP_TOOL_RESULT_MAX_CHARS", raising=False)
+
+        async def _tuple(**kwargs):
+            return ("payload text", {"artifact": 1})
+
+        tool = self._structured(
+            "adapter", _tuple, response_format="content_and_artifact"
+        )
+        wrapped = manager_mod._wrap_bounded_tool(tool)
+        out = asyncio.run(wrapped.ainvoke({}))
+        assert out == "payload text"
 
 
 # --- health check ----------------------------------------------------------------
@@ -705,10 +803,40 @@ class TestGetToolsForProduct:
         # equal created_at -> id tiebreak gives a deterministic order
         assert [b.id for b, _server in rows] == ["pmb_a", "pmb_b"]
 
+    def test_scope_filters_bindings(self, isolated_db):
+        from api.models import McpServerORM, ProductMcpServerORM
+
+        _seed_registry(isolated_db)
+        with isolated_db.SessionLocal() as db:
+            db.get(McpServerORM, "mcp_b").scopes = ["expert", "database"]
+            db.get(ProductMcpServerORM, "pmb_b").allowed_tools = None
+            db.commit()  # mcp_a keeps scopes=None
+
+        m = manager_mod.McpToolManager()
+
+        async def _fake_discover(server, use_cache=True):
+            return [_FakeTool(f"t_{server.id}")]
+
+        m.discover_tools = _fake_discover
+        scoped = asyncio.run(
+            m.get_tools_for_product(
+                "prod_1", session_factory=isolated_db.SessionLocal, scope="expert"
+            )
+        )
+        # NULL scopes stay invisible under a filter (pre-backfill rows need
+        # the db backfill before they appear in any scope).
+        assert [t.name for t in scoped] == ["t_mcp_b"]
+        unscoped = asyncio.run(
+            m.get_tools_for_product(
+                "prod_1", session_factory=isolated_db.SessionLocal
+            )
+        )
+        assert [t.name for t in unscoped] == ["t_mcp_a", "t_mcp_b"]
+
     def test_db_error_returns_empty(self, isolated_db, monkeypatch):
         m = manager_mod.McpToolManager()
 
-        def _boom(product_id, session_factory=None):
+        def _boom(product_id, session_factory=None, scope=None):
             raise RuntimeError("db down")
 
         monkeypatch.setattr(m, "_load_bindings", _boom)
@@ -738,13 +866,16 @@ class TestGatherNeverRaises:
         monkeypatch.setattr(manager_mod, "get_mcp_manager", _boom)
         assert asyncio.run(manager_mod.gather_mcp_agent_tools("prod_1")) == []
 
-    def test_delegates_to_manager(self, monkeypatch):
+    def test_delegates_to_manager_with_expert_scope(self, monkeypatch):
         m = manager_mod.McpToolManager()
+        seen: dict = {}
 
-        async def _fake(pid, session_factory=None):
+        async def _fake(pid, session_factory=None, scope=None):
+            seen["scope"] = scope
             return [_FakeTool("ok")]
 
         monkeypatch.setattr(m, "get_tools_for_product", _fake)
         monkeypatch.setattr(manager_mod, "get_mcp_manager", lambda: m)
         out = asyncio.run(manager_mod.gather_mcp_agent_tools("prod_1"))
         assert [t.name for t in out] == ["ok"]
+        assert seen["scope"] == "expert"  # SPEC-028 default consumer scope

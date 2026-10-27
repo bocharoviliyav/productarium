@@ -20,6 +20,8 @@ Covers:
 - ``preset_row_mismatch`` — the stdio-policy exact-match guard (valid baked
   and docker rows pass; tampered command/args/env are rejected).
 - ``presets_public_view`` — the static catalog payload (no secrets).
+- ``STDIO_TOOL_PRESETS`` — the admin one-step stdio recipes (REA): node by
+  absolute path, never a runner; the upstream ``npx`` launcher stays banned.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from api.mcp.presets import (
     DBHUB_BIN,
     ORACLE_PY,
     PRESETS,
+    STDIO_TOOL_PRESETS,
     Launcher,
     PresetError,
     choose_launcher,
@@ -426,3 +429,35 @@ class TestRegistry:
         text = repr(presets_public_view())
         assert "hunter2" not in text
         assert "sup3rs3cret" not in text
+
+
+# --- stdio tool-server presets (REA, SPEC-014) -------------------------------- #
+class TestStdioToolPresets:
+    def test_rea_listed_with_policy_clean_command(self):
+        from api.mcp.policy import stdio_command_error
+
+        assert [p.key for p in STDIO_TOOL_PRESETS] == ["rea"]
+        rea = STDIO_TOOL_PRESETS[0]
+        # The allowlist shape: the node BINARY by absolute path, the package
+        # entrypoint as an arg, the stdio `mcp` subcommand last.
+        assert os.path.isabs(rea.command)
+        assert os.path.basename(rea.command) == "node"
+        assert stdio_command_error(rea.command) is None
+        assert os.path.isabs(rea.args[0])
+        assert rea.args[-1] == "mcp"
+        assert rea.node_major >= 22
+        assert rea.package == "rea-agents"
+
+    def test_rea_launch_uses_no_runner(self):
+        from api.mcp.policy import stdio_command_error
+
+        rea = STDIO_TOOL_PRESETS[0]
+        assert "npx" not in rea.command
+        assert not any("npx" in a for a in rea.args)
+        # Upstream's documented `npx rea-agents` launcher stays rejected.
+        assert stdio_command_error("npx") is not None
+
+    def test_database_registry_untouched_by_tool_presets(self):
+        """REA is NOT a database engine — it must not leak into /api/db-presets."""
+        assert "rea" not in PRESETS
+        assert "rea" not in [p["key"] for p in presets_public_view()]

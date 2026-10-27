@@ -1,7 +1,7 @@
 """Admin panel router (contract J, plan section D).
 
 Admin-guarded CRUD + connectivity-test endpoints for configurable groups:
-``models``, ``git``, ``confluence``, ``integrations``, ``users``,
+``models``, ``git``, ``integrations``, ``users``,
 ``apitokens``. Every endpoint requires an admin session (``require_admin``).
 Secrets are encrypted on save via
 ``api.config.settings.set_setting(..., encrypt=True)`` and redacted on read
@@ -11,7 +11,7 @@ API tokens are created here (``POST /api/admin/apitokens``) and verified by
 ``api.auth.deps.require_api_token`` (sha256 hash). The plaintext token is
 returned exactly once at creation time.
 
-Integration/git/confluence connectivity tests import ``api.integrations``
+Integration/git connectivity tests import ``api.integrations``
 lazily: the integrations package is built in parallel and may not be present
 yet, so a missing connector degrades to a clear failure result instead of
 crashing the import.
@@ -32,6 +32,7 @@ from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
+from api.auth import keycloak as kc_admin
 from api.auth.deps import require_admin
 from api.auth.local import (
     RESET_TOKEN_TTL_SECONDS,
@@ -51,7 +52,6 @@ from api.schemas import (
 from api.config.settings import (
     _sanitize_api_key,
     delete_setting,
-    get_confluence_creds,
     get_git_accounts,
     get_git_creds,
     get_integration_config,
@@ -75,8 +75,7 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 # Setting-key suffixes that mark a value as a secret (encrypted on save,
 # redacted on read). Keep in sync with the secret fields used by the grouped
-# getters in api.config.settings (e.g. models.<task>.api_key, git.<host>.token,
-# confluence.token).
+# getters in api.config.settings (e.g. models.<task>.api_key, git.<host>.token).
 _SECRET_SUFFIXES = (".api_key", ".token", ".password", ".secret")
 
 # Groups backed by the SettingORM key/value store (contract J).
@@ -88,9 +87,11 @@ _SECRET_SUFFIXES = (".api_key", ".token", ".password", ".secret")
 # api.config.timeout (admin store > env var > default); NOT secret.
 # ``memory`` stores the active memory backend (memory.backend = pgvector);
 # NOT secret.
+# ``auth`` stores the Keycloak groups->roles mapping
+# (auth.keycloak.role_mapping, a JSON object string); NOT secret (SPEC-001).
 _SETTING_GROUPS = (
-    "models", "git", "confluence", "integrations", "ssl",
-    "embedder", "timeouts", "memory", "generation",
+    "models", "git", "integrations", "ssl",
+    "embedder", "timeouts", "memory", "generation", "auth",
 )
 
 # Valid memory backend names (stored under ``memory.backend``).
@@ -146,8 +147,26 @@ def _token_out(
     )
 
 
-def _redact_model_task(cfg: Dict[str, Optional[Any]]) -> Dict[str, Any]:
+def _redact_model_task(task: str, cfg: Dict[str, Optional[Any]]) -> Dict[str, Any]:
+    """Redacted resolved view of one model task + its resolved context window.
+
+    The window is resolved WITHOUT live probes (env > admin max_prompt_tokens
+    > known-model catalog > 200000 fallback) so the admin panel load stays
+    instant; runtime calls may still refine it via server probes.
+    """
+    from api.utils import get_model_context_window
+
     has_key = bool(cfg.get("api_key"))
+    try:
+        context_window = get_model_context_window(
+            base_url=cfg.get("base_url"),
+            model_name=cfg.get("model"),
+            api_key=cfg.get("api_key"),
+            task=task,
+            allow_probes=False,
+        )
+    except Exception:  # pragma: no cover - resolver is exception-safe
+        context_window = None
     return {
         "model": cfg.get("model"),
         "base_url": cfg.get("base_url"),
@@ -155,6 +174,7 @@ def _redact_model_task(cfg: Dict[str, Optional[Any]]) -> Dict[str, Any]:
         "hasApiKey": has_key,
         "max_prompt_tokens": cfg.get("max_prompt_tokens"),
         "dimensions": cfg.get("dimensions"),
+        "context_window": context_window,
     }
 
 
@@ -204,15 +224,6 @@ def _save_git_accounts(accounts: Dict[str, Any], saved: List[str]) -> List[str]:
 
 
 
-def _redact_confluence_creds(creds: Dict[str, Optional[str]]) -> Dict[str, Any]:
-    return {
-        "base_url": creds.get("base_url"),
-        "space": creds.get("space"),
-        "token": None,
-        "hasToken": bool(creds.get("token")),
-    }
-
-
 # --- System prompts (refs/prompts/*.md) -------------------------------------
 # These are separate from the _SETTING_GROUPS key/value store: prompt bodies
 # live as .md files on disk and are hot-reloadable via reload_prompt_file.
@@ -243,6 +254,9 @@ def _memory_status_view() -> Dict[str, Any]:
     except Exception as e:  # pragma: no cover - non-fatal
         logger.warning("memory status() failed: %s", e)
         out["available"] = False
+    from api.memory.knowledge_graph import graph_stats
+
+    out["graphs"] = graph_stats()  # SPEC-008: per-product node/edge counts
     return out
 
 
@@ -289,6 +303,36 @@ async def trigger_memory_reindex(
     except Exception as e:
         logger.error("Admin memory reindex failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail="Reindex failed")
+
+
+@router.post("/memory/graph/reindex")
+async def trigger_knowledge_graph_reindex(
+    body: Optional[MemoryReindexRequest] = None,
+    _admin: UserORM = Depends(require_admin),
+):
+    """Force a full knowledge-graph rebuild (SPEC-008) for one/all products."""
+    from api.db import SessionLocal
+    from api.memory.knowledge_graph import rebuild_product_graph
+
+    pid = (body.product_id if body else None) or None
+    try:
+        if pid is None:
+            with SessionLocal() as db:
+                pids = [row[0] for row in db.query(ProductORM.id).order_by(ProductORM.id)]
+            # Sequential (Q-6): the LLM semaphore lives INSIDE each rebuild,
+            # so gather would run every product's extraction at once and
+            # multiply the real concurrency far past DOCGEN_LLM_CONCURRENCY.
+            results = [await rebuild_product_graph(p) for p in pids]
+            return {"product_id": None, "rebuilt": len(results), "results": results}
+        with SessionLocal() as db:
+            if db.get(ProductORM, pid) is None:
+                raise HTTPException(status_code=404, detail="Product not found")
+        return await rebuild_product_graph(pid)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Admin knowledge graph reindex failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Graph reindex failed")
 
 
 def _safe_prompt_filename(filename: str) -> Optional[str]:
@@ -442,6 +486,126 @@ def get_openapi_schema(
         raise HTTPException(status_code=500, detail="Could not build OpenAPI schema")
 
 
+# --- Keycloak groups reference (SPEC-001) -------------------------------------
+@router.get("/keycloak/groups")
+def keycloak_groups(_admin: UserORM = Depends(require_admin)) -> Dict[str, Any]:
+    """Realm groups for the roles↔groups mapping reference.
+
+    501 when the service-account client is not configured; 502 when
+    Keycloak rejects the call (logged server-side, no internals leaked).
+    """
+    if not kc_admin.admin_configured():
+        raise HTTPException(
+            status_code=501,
+            detail="Keycloak Admin API not configured "
+            "(set KEYCLOAK_ADMIN_CLIENT_ID + KEYCLOAK_ADMIN_CLIENT_SECRET).",
+        )
+    groups = kc_admin.list_groups()
+    if groups is None:
+        raise HTTPException(
+            status_code=502, detail="Keycloak Admin API request failed"
+        )
+    return {"groups": groups}
+
+
+# --- Per-product access grants (P0-2) -----------------------------------------
+# Static routes must be declared BEFORE the dynamic /{group} handlers below:
+# FastAPI matches routes in declaration order, so a later GET/PUT /grants
+# would be swallowed by /{group} with group="grants" (404).
+_GRANT_LEVELS = ("ro", "rw")
+
+
+class GrantUpdate(BaseModel):
+    product_id: str
+    user_id: str
+    level: str  # ro | rw
+
+@router.get("/grants")
+def list_grants(
+    admin: UserORM = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> List[Dict[str, Any]]:
+    """List all per-product access grants (admin UI).
+
+    Each row carries the product/user display names so the admin panel can
+    render the matrix without extra lookups.
+    """
+    grants = db.query(ProductGrantORM).all()
+    products = {p.id: p.name for p in db.query(ProductORM.id, ProductORM.name).all()}
+    users = {u.id: u.username for u in db.query(UserORM.id, UserORM.username).all()}
+    return [
+        {
+            "product_id": g.product_id,
+            "user_id": g.user_id,
+            "level": g.level,
+            "granted_by": g.granted_by,
+            "created_at": g.created_at,
+            "product_name": products.get(g.product_id),
+            "username": users.get(g.user_id),
+        }
+        for g in grants
+    ]
+
+
+@router.put("/grants")
+def upsert_grant(
+    body: GrantUpdate,
+    admin: UserORM = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Create or update a per-product grant (level ro|rw)."""
+    if body.level not in _GRANT_LEVELS:
+        raise HTTPException(status_code=400, detail="level must be 'ro' or 'rw'.")
+    if db.get(ProductORM, body.product_id) is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    user = db.get(UserORM, body.user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.role == "admin":
+        raise HTTPException(
+            status_code=400,
+            detail="Admins already have full access; grants are redundant.",
+        )
+    grant = db.get(ProductGrantORM, {"product_id": body.product_id, "user_id": body.user_id})
+    if grant is None:
+        grant = ProductGrantORM(
+            product_id=body.product_id,
+            user_id=body.user_id,
+            level=body.level,
+            granted_by=admin.id,
+        )
+        db.add(grant)
+    else:
+        grant.level = body.level
+        grant.granted_by = admin.id
+    db.commit()
+    logger.info(
+        "Admin %r set grant %s -> %s (%s).",
+        admin.username, body.product_id, user.username, body.level,
+    )
+    return {
+        "product_id": grant.product_id,
+        "user_id": grant.user_id,
+        "level": grant.level,
+        "granted_by": grant.granted_by,
+    }
+
+
+@router.delete("/grants")
+def delete_grant(
+    product_id: str,
+    user_id: str,
+    admin: UserORM = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> Dict[str, str]:
+    """Remove a per-product grant."""
+    grant = db.get(ProductGrantORM, {"product_id": product_id, "user_id": user_id})
+    if grant is not None:
+        db.delete(grant)
+        db.commit()
+    return {"message": "Grant removed"}
+
+
 # --- GET /api/admin/{group} -------------------------------------------------
 @router.get("/{group}")
 def get_group(
@@ -451,7 +615,7 @@ def get_group(
 ):
     """Return the current settings/users/tokens for a group (secrets redacted).
 
-    For ``models``/``git``/``confluence``/``integrations``: raw settings under
+    For ``models``/``git``/``integrations``: raw settings under
     the group prefix plus a ``resolved`` view (effective config with secrets
     redacted as ``hasKey``/``hasToken`` booleans).
     For ``users``: list of users (``UserOut``).
@@ -465,14 +629,13 @@ def get_group(
         resp: Dict[str, Any] = {"group": group, "settings": settings}
         if group == "models":
             resp["resolved"] = {
-                task: _redact_model_task(get_model_for_task(task)) for task in _MODEL_TASKS
+                task: _redact_model_task(task, get_model_for_task(task))
+                for task in _MODEL_TASKS
             }
         elif group == "git":
             resp["resolved"] = {
                 host: _redact_git_accounts(get_git_accounts(host)) for host in _GIT_HOSTS
             }
-        elif group == "confluence":
-            resp["resolved"] = _redact_confluence_creds(get_confluence_creds())
         elif group == "integrations":
             parsed: Dict[str, Any] = {}
             for r in rows:
@@ -532,7 +695,8 @@ def put_group(
     outside the requested group are ignored to avoid accidental cross-write.
     Secret keys (suffix ``.api_key``/``.token``/``.password``/``.secret``) are
     encrypted via ``set_setting(..., encrypt=True)``.
-    Body for ``users``: ``{user_id, role}`` with ``role`` in (user, admin).
+    Body for ``users``: ``{user_id, role}`` with ``role`` any of USER_ROLES
+    (admin/manager/user/viewer_global).
     """
     if group in _SETTING_GROUPS:
         if not isinstance(body, dict):
@@ -706,102 +870,6 @@ def create_user(
     )
 
 
-# --- Per-product access grants (P0-2) -----------------------------------------
-_GRANT_LEVELS = ("ro", "rw")
-
-
-class GrantUpdate(BaseModel):
-    product_id: str
-    user_id: str
-    level: str  # ro | rw
-
-
-@router.get("/grants")
-def list_grants(
-    admin: UserORM = Depends(require_admin),
-    db: Session = Depends(get_db),
-) -> List[Dict[str, Any]]:
-    """List all per-product access grants (admin UI).
-
-    Each row carries the product/user display names so the admin panel can
-    render the matrix without extra lookups.
-    """
-    grants = db.query(ProductGrantORM).all()
-    products = {p.id: p.name for p in db.query(ProductORM.id, ProductORM.name).all()}
-    users = {u.id: u.username for u in db.query(UserORM.id, UserORM.username).all()}
-    return [
-        {
-            "product_id": g.product_id,
-            "user_id": g.user_id,
-            "level": g.level,
-            "granted_by": g.granted_by,
-            "created_at": g.created_at,
-            "product_name": products.get(g.product_id),
-            "username": users.get(g.user_id),
-        }
-        for g in grants
-    ]
-
-
-@router.put("/grants")
-def upsert_grant(
-    body: GrantUpdate,
-    admin: UserORM = Depends(require_admin),
-    db: Session = Depends(get_db),
-) -> Dict[str, Any]:
-    """Create or update a per-product grant (level ro|rw)."""
-    if body.level not in _GRANT_LEVELS:
-        raise HTTPException(status_code=400, detail="level must be 'ro' or 'rw'.")
-    if db.get(ProductORM, body.product_id) is None:
-        raise HTTPException(status_code=404, detail="Product not found")
-    user = db.get(UserORM, body.user_id)
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    if user.role == "admin":
-        raise HTTPException(
-            status_code=400,
-            detail="Admins already have full access; grants are redundant.",
-        )
-    grant = db.get(ProductGrantORM, {"product_id": body.product_id, "user_id": body.user_id})
-    if grant is None:
-        grant = ProductGrantORM(
-            product_id=body.product_id,
-            user_id=body.user_id,
-            level=body.level,
-            granted_by=admin.id,
-        )
-        db.add(grant)
-    else:
-        grant.level = body.level
-        grant.granted_by = admin.id
-    db.commit()
-    logger.info(
-        "Admin %r set grant %s -> %s (%s).",
-        admin.username, body.product_id, user.username, body.level,
-    )
-    return {
-        "product_id": grant.product_id,
-        "user_id": grant.user_id,
-        "level": grant.level,
-        "granted_by": grant.granted_by,
-    }
-
-
-@router.delete("/grants")
-def delete_grant(
-    product_id: str,
-    user_id: str,
-    admin: UserORM = Depends(require_admin),
-    db: Session = Depends(get_db),
-) -> Dict[str, str]:
-    """Remove a per-product grant."""
-    grant = db.get(ProductGrantORM, {"product_id": product_id, "user_id": user_id})
-    if grant is not None:
-        db.delete(grant)
-        db.commit()
-    return {"message": "Grant removed"}
-
-
 @router.post("/users/{user_id}/reset-token")
 def issue_reset_token(
     user_id: str,
@@ -841,9 +909,9 @@ def test_group(
     body: Optional[Dict[str, Any]] = None,
     admin: UserORM = Depends(require_admin),
 ):
-    """Connectivity test for a group (models/git/confluence/integrations).
+    """Connectivity test for a group (models/git/integrations).
 
-    Returns ``{success, message, models?}``. Integration/git/confluence tests
+    Returns ``{success, message, models?}``. Integration/git tests
     import ``api.integrations`` lazily and degrade to a failure result if the
     connector is not registered (integrations are built in parallel).
     """
@@ -852,8 +920,6 @@ def test_group(
         return _test_models(body)
     if group == "git":
         return _test_git(body)
-    if group == "confluence":
-        return _test_confluence(body)
     if group == "integrations":
         return _test_integration(body)
     raise HTTPException(status_code=404, detail=f"No test available for group: {group}")
@@ -873,6 +939,22 @@ def _test_models(body: Dict[str, Any]) -> Dict[str, Any]:
     if not base_url:
         return {"success": False, "message": "No base_url configured for models test."}
     return _ping_model_endpoint(base_url, api_key, model, task=task)
+
+
+def _server_error_detail(resp: Any) -> str:
+    """Sanitized server error for client messages: first ~200 chars of the
+    JSON ``error.message``/``message``; non-JSON bodies degrade to the status.
+    """
+    try:
+        body = resp.json()
+    except Exception:
+        return f"status {resp.status_code}"
+    if isinstance(body, dict):
+        err = body.get("error")
+        msg = err.get("message") if isinstance(err, dict) else body.get("message")
+        if isinstance(msg, str) and msg.strip():
+            return " ".join(msg.split())[:200]
+    return f"status {resp.status_code}"
 
 
 def _ping_model_endpoint(
@@ -905,6 +987,8 @@ def _ping_model_endpoint(
         names = [m.get("id", "") for m in resp.json().get("data", [])]
         probe_model = model or (names[0] if names else "")
         chat_note = ""
+        if probe_model and names and probe_model not in names:
+            chat_note = " (model not listed by /v1/models)"
         if probe_model:
             try:
                 if task == "embedder":
@@ -928,7 +1012,7 @@ def _ping_model_endpoint(
                             ),
                         }
                     if probe_resp.status_code >= 400:
-                        chat_note = f" (embeddings probe returned status {probe_resp.status_code})"
+                        chat_note += f" (embeddings probe returned status {probe_resp.status_code})"
                 else:
                     chat_resp = requests.post(
                         f"{url}/chat/completions",
@@ -941,6 +1025,22 @@ def _ping_model_endpoint(
                         timeout=15,
                         verify=requests_verify(),
                     )
+                    if chat_resp.status_code == 400:
+                        # New-generation OpenAI gateways reject ``max_tokens``:
+                        # one fallback retry with ``max_completion_tokens``.
+                        chat_resp = requests.post(
+                            f"{url}/chat/completions",
+                            headers=headers,
+                            json={
+                                "model": probe_model,
+                                "messages": [{"role": "user", "content": "ping"}],
+                                "max_completion_tokens": 1,
+                            },
+                            timeout=15,
+                            verify=requests_verify(),
+                        )
+                        if chat_resp.status_code < 400:
+                            chat_note += " (chat probe succeeded with max_completion_tokens)"
                     if chat_resp.status_code in (401, 403):
                         return {
                             "success": False,
@@ -953,17 +1053,33 @@ def _ping_model_endpoint(
                             ),
                         }
                     if chat_resp.status_code >= 400:
-                        chat_note = f" (chat probe returned status {chat_resp.status_code})"
+                        # Honest probe (SPEC-026): a 4xx/5xx chat probe means
+                        # real generation would fail too — report failure with
+                        # the model name + sanitized server detail.
+                        return {
+                            "success": False,
+                            "message": (
+                                f"Chat probe failed for model {probe_model!r}: "
+                                f"{_server_error_detail(chat_resp)}"
+                            ),
+                        }
             except Exception as ce:
-                chat_note = f" (probe failed: {ce})"
+                # Class name only: request exceptions may embed internal
+                # endpoints; full context stays in the server log.
+                return {
+                    "success": False,
+                    "message": f"Probe request failed ({type(ce).__name__}).",
+                }
         return {
             "success": True,
             "message": f"OpenAI-compatible API reachable; {len(names)} model(s).{chat_note}",
             "models": names,
         }
     except Exception as e:
-        # Covers ConnectionError / Timeout / JSON errors uniformly.
-        return {"success": False, "message": f"Error testing connection: {e}"}
+        # Covers ConnectionError / Timeout / JSON errors uniformly. The raw
+        # error may embed internal endpoints/paths — keep it in the log only.
+        logger.warning("models connectivity test failed: %s", e, exc_info=True)
+        return {"success": False, "message": "Connection test failed"}
 
 
 def _lazy_connector(name: str):
@@ -979,7 +1095,8 @@ def _lazy_connector(name: str):
     try:
         return getter(name), None
     except Exception as e:
-        return None, f"No connector registered for '{name}': {e}"
+        logger.warning("connector '%s' lookup failed: %s", name, e)
+        return None, f"No connector registered for '{name}'."
 
 
 def _connector_test_result(name: str, connector, cfg: Any) -> Dict[str, Any]:
@@ -992,7 +1109,8 @@ def _connector_test_result(name: str, connector, cfg: Any) -> Dict[str, Any]:
         # so test() takes no arguments here.
         result = test_fn()
     except Exception as e:
-        return {"success": False, "message": f"'{name}' test failed: {e}"}
+        logger.warning("connector '%s' test failed: %s", name, e, exc_info=True)
+        return {"success": False, "message": f"'{name}' test failed."}
     if isinstance(result, dict):
         return result
     if result is True:
@@ -1009,14 +1127,6 @@ def _test_git(body: Dict[str, Any]) -> Dict[str, Any]:
     if connector is None:
         return {"success": False, "message": err or f"No git connector for '{host}'."}
     return _connector_test_result(host, connector, creds)
-
-
-def _test_confluence(body: Dict[str, Any]) -> Dict[str, Any]:
-    creds = get_confluence_creds()
-    connector, err = _lazy_connector("confluence")
-    if connector is None:
-        return {"success": False, "message": err or "No Confluence connector registered."}
-    return _connector_test_result("confluence", connector, creds)
 
 
 def _test_integration(body: Dict[str, Any]) -> Dict[str, Any]:

@@ -60,7 +60,8 @@ def _seed(db_mod):
     from api.models import McpServerORM, ProductORM
 
     with db_mod.SessionLocal() as db:
-        db.add(ProductORM(id="prod_1", name="Acme"))
+        # owner: the plain user behind get_current_user (P-2 guards need access)
+        db.add(ProductORM(id="prod_1", name="Acme", owner_id="user_1"))
         db.add(
             McpServerORM(
                 id="mcp_a",
@@ -69,6 +70,7 @@ def _seed(db_mod):
                 url="http://a/mcp",
                 enabled=True,
                 status="ok",
+                scopes=["expert", "database"],
             )
         )
         db.add(
@@ -113,6 +115,8 @@ class TestProductMcpBindings:
         assert body["enabled"] is True
         assert body["allowed_tools"] is None
         assert body["status"] == "ok"
+        # SPEC-028: the binding embeds the server's scopes (UI tags).
+        assert body["scopes"] == ["expert", "database"]
 
     def test_create_binding_with_allowlist(self, isolated_db):
         _seed(isolated_db)
@@ -127,6 +131,7 @@ class TestProductMcpBindings:
         assert body["enabled"] is False
         assert body["allowed_tools"] == ["echo", "fetch"]
         assert body["status"] == "unknown"
+        assert body["scopes"] == []  # mcp_b has no scopes
 
     def test_create_unknown_server_404(self, isolated_db):
         _seed(isolated_db)

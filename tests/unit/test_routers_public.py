@@ -4,7 +4,7 @@ tests/integration/test_admin_public.py.
 Focuses on:
 - ``list_public_products`` (list products)
 - ``export_knowledge`` with invalid format (400)
-- ``_default_push_target`` (confluence configured, git configured, neither)
+- ``_default_push_target`` (git configured, neither)
 - ``ask`` success path (SSE stream with mocked run_expert_chat)
 - ``ask`` product-not-found 404
 - ``push`` success with a connector that supports push/export
@@ -253,23 +253,8 @@ class TestHelpers:
 
 # --- _default_push_target ---------------------------------------------------
 class TestDefaultPushTarget:
-    def test_confluence_configured(self, monkeypatch):
-        from api.routers import public as public_mod
-
-        monkeypatch.setattr(
-            public_mod, "get_confluence_creds",
-            lambda: {"base_url": "http://conf", "token": "tok"},
-        )
-        monkeypatch.setattr(public_mod, "get_git_creds", lambda host: {})
-        assert public_mod._default_push_target() == "confluence"
-
     def test_git_configured(self, monkeypatch):
         from api.routers import public as public_mod
-
-        monkeypatch.setattr(
-            public_mod, "get_confluence_creds",
-            lambda: {},
-        )
 
         def _git_creds(host):
             if host == "github":
@@ -279,12 +264,20 @@ class TestDefaultPushTarget:
         monkeypatch.setattr(public_mod, "get_git_creds", _git_creds)
         assert public_mod._default_push_target() == "github"
 
-    def test_neither_configured_defaults_confluence(self, monkeypatch):
+    def test_gitlab_fallback_when_github_unconfigured(self, monkeypatch):
         from api.routers import public as public_mod
 
-        monkeypatch.setattr(public_mod, "get_confluence_creds", lambda: {})
+        monkeypatch.setattr(
+            public_mod, "get_git_creds",
+            lambda host: {"url": "http://gitlab", "token": "tok"} if host == "gitlab" else {},
+        )
+        assert public_mod._default_push_target() == "gitlab"
+
+    def test_neither_configured_defaults_github(self, monkeypatch):
+        from api.routers import public as public_mod
+
         monkeypatch.setattr(public_mod, "get_git_creds", lambda host: {})
-        assert public_mod._default_push_target() == "confluence"
+        assert public_mod._default_push_target() == "github"
 
 
 # --- GET /api/public/products -----------------------------------------------
@@ -429,7 +422,7 @@ class TestPush:
         app, client = _build_client(isolated_db, public_mod)
         resp = client.post(
             "/api/public/products/ghost/push",
-            json={"target": "confluence"},
+            json={"target": "github"},
         )
         assert resp.status_code == 404
 
@@ -465,7 +458,7 @@ class TestPush:
         app, client = _build_client(isolated_db, public_mod)
         resp = client.post(
             "/api/public/products/prod_1/push",
-            json={"target": "confluence"},
+            json={"target": "github"},
         )
         assert resp.status_code == 501
         assert "does not support push" in resp.json()["detail"]
@@ -480,7 +473,7 @@ class TestPush:
                 pass
 
             def push(self, payload):
-                return {"url": "http://conf/page/123", "id": "page-123"}
+                return {"url": "http://git/page/123", "id": "page-123"}
 
         import api.integrations.registry as reg_mod
         monkeypatch.setattr(reg_mod, "get_connector", lambda name: _PushConnector())
@@ -488,11 +481,11 @@ class TestPush:
         app, client = _build_client(isolated_db, public_mod)
         resp = client.post(
             "/api/public/products/prod_1/push",
-            json={"target": "confluence", "space": "SPACE"},
+            json={"target": "github", "space": "SPACE"},
         )
         assert resp.status_code == 200
         body = resp.json()
-        assert body["url"] == "http://conf/page/123"
+        assert body["url"] == "http://git/page/123"
 
     def test_push_success_non_dict_result(self, isolated_db, monkeypatch):
         from api.routers import public as public_mod
@@ -529,7 +522,7 @@ class TestPush:
                 pass
 
             async def push(self, payload):
-                return {"async_url": "http://conf/async"}
+                return {"async_url": "http://git/async"}
 
         import api.integrations.registry as reg_mod
         monkeypatch.setattr(reg_mod, "get_connector", lambda name: _AsyncPushConnector())
@@ -537,10 +530,10 @@ class TestPush:
         app, client = _build_client(isolated_db, public_mod)
         resp = client.post(
             "/api/public/products/prod_1/push",
-            json={"target": "confluence"},
+            json={"target": "github"},
         )
         assert resp.status_code == 200
-        assert resp.json()["async_url"] == "http://conf/async"
+        assert resp.json()["async_url"] == "http://git/async"
 
     def test_push_exception_502(self, isolated_db, monkeypatch):
         from api.routers import public as public_mod
@@ -560,10 +553,10 @@ class TestPush:
         app, client = _build_client(isolated_db, public_mod)
         resp = client.post(
             "/api/public/products/prod_1/push",
-            json={"target": "confluence"},
+            json={"target": "github"},
         )
         assert resp.status_code == 502
-        assert "Push to 'confluence' failed" in resp.json()["detail"]
+        assert "Push to 'github' failed" in resp.json()["detail"]
 
     def test_push_uses_default_target(self, isolated_db, monkeypatch):
         """When body.target is None, _default_push_target is used."""
@@ -587,10 +580,9 @@ class TestPush:
         import api.integrations.registry as reg_mod
         monkeypatch.setattr(reg_mod, "get_connector", _get_connector)
         monkeypatch.setattr(
-            public_mod, "get_confluence_creds",
-            lambda: {"base_url": "http://conf", "token": "tok"},
+            public_mod, "get_git_creds",
+            lambda host: {"url": "http://github", "token": "tok"} if host == "github" else {},
         )
-        monkeypatch.setattr(public_mod, "get_git_creds", lambda host: {})
 
         app, client = _build_client(isolated_db, public_mod)
         resp = client.post(
@@ -598,4 +590,4 @@ class TestPush:
             json={},
         )
         assert resp.status_code == 200
-        assert called_target[0] == "confluence"
+        assert called_target[0] == "github"

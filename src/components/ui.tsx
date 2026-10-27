@@ -285,6 +285,107 @@ export const Select = React.forwardRef<
 });
 
 /* ------------------------------------------------------------------ */
+/* Combobox — controlled input with a filtered options list            */
+/* ------------------------------------------------------------------ */
+
+export function Combobox({
+  value,
+  onChange,
+  options,
+  placeholder,
+  emptyOption,
+  className,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+  options: string[];
+  placeholder?: string;
+  /** Leading "clear" option; picking it calls onChange(""). */
+  emptyOption?: string;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocMouseDown = (e: MouseEvent) => {
+      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDocMouseDown);
+    return () => document.removeEventListener("mousedown", onDocMouseDown);
+  }, [open]);
+
+  const close = () => {
+    setOpen(false);
+    setQuery("");
+  };
+  const pick = (next: string) => {
+    onChange(next);
+    close();
+  };
+  const filtered = options.filter((o) =>
+    o.toLowerCase().includes(query.trim().toLowerCase()),
+  );
+
+  return (
+    <div ref={wrapRef} className={cn("relative", className)}>
+      <Input
+        value={open ? query : value}
+        placeholder={placeholder}
+        onFocus={() => setOpen(true)}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          setOpen(true);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            if (query.trim() && filtered.length) pick(filtered[0]);
+            else close();
+          } else if (e.key === "Escape") {
+            close();
+          }
+        }}
+        onBlur={close}
+      />
+      {open && (emptyOption || filtered.length > 0) && (
+        <ul className="absolute z-20 mt-1 max-h-60 w-full overflow-y-auto rounded-md border border-divider bg-surface py-1 text-sm shadow-[0_8px_24px_rgba(0,0,0,0.12)]">
+          {emptyOption && (
+            <li>
+              <button
+                type="button"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => pick("")}
+                className="block w-full px-3 py-1.5 text-left text-muted hover:bg-surface-2"
+              >
+                {emptyOption}
+              </button>
+            </li>
+          )}
+          {filtered.map((o) => (
+            <li key={o}>
+              <button
+                type="button"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => pick(o)}
+                className={cn(
+                  "block w-full px-3 py-1.5 text-left hover:bg-surface-2",
+                  o === value && "font-medium",
+                )}
+              >
+                {o}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Empty state + spinner                                               */
 /* ------------------------------------------------------------------ */
 

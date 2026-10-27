@@ -57,7 +57,7 @@ from api.mcp.secrets import (
     encrypt_secret_dict,
     mask_secret_dict,
 )
-from api.models import McpServerORM
+from api.models import MCP_SCOPES, McpServerORM
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,8 @@ class McpServerCreate(BaseModel):
     headers: Optional[Dict[str, str]] = None
     env: Optional[Dict[str, str]] = None
     enabled: bool = True
+    # Required non-empty subset of MCP_SCOPES (SPEC-028).
+    scopes: List[str] = Field(min_length=1)
 
 
 class McpServerUpdate(BaseModel):
@@ -113,6 +115,8 @@ class McpServerUpdate(BaseModel):
     headers: Optional[Dict[str, str]] = None
     env: Optional[Dict[str, str]] = None
     enabled: Optional[bool] = None
+    # Optional on update: absent keeps the stored scopes (SPEC-028).
+    scopes: Optional[List[str]] = None
 
 
 class McpServerOut(BaseModel):
@@ -128,6 +132,7 @@ class McpServerOut(BaseModel):
     headers_masked: Optional[Dict[str, str]] = None
     env_masked: Optional[Dict[str, str]] = None
     enabled: bool
+    scopes: List[str] = []
     status: str
     status_checked_at: Optional[datetime] = None
     status_error: Optional[str] = None
@@ -260,6 +265,22 @@ def _strip_masked_entries(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, 
     return real
 
 
+def _validate_scopes(scopes: List[str]) -> List[str]:
+    """Require a non-empty deduplicated subset of ``MCP_SCOPES`` (SPEC-028)."""
+    out: List[str] = []
+    for s in scopes or []:
+        if s not in MCP_SCOPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"scopes entries must be one of {list(MCP_SCOPES)}",
+            )
+        if s not in out:
+            out.append(s)
+    if not out:
+        raise HTTPException(status_code=400, detail="scopes must hold at least one value")
+    return out
+
+
 def _validate_transport_config(
     transport: str,
     *,
@@ -302,6 +323,7 @@ def _server_out(s: McpServerORM) -> McpServerOut:
         headers_masked=headers_masked,
         env_masked=env_masked,
         enabled=bool(s.enabled),
+        scopes=list(s.scopes) if isinstance(s.scopes, list) else [],
         status=s.status or "unknown",
         status_checked_at=s.status_checked_at,
         status_error=s.status_error,
@@ -394,6 +416,7 @@ async def create_mcp_server(
         headers=encrypt_secret_dict(headers) if headers is not None else None,
         env=encrypt_secret_dict(env) if env is not None else None,
         enabled=body.enabled,
+        scopes=_validate_scopes(body.scopes),
         status="unknown",
     )
     db.add(server)
@@ -464,6 +487,8 @@ async def update_mcp_server(
             policy_error = stdio_env_error(merged_env)
             if policy_error:
                 raise HTTPException(status_code=400, detail=policy_error)
+    if "scopes" in fields and body.scopes is not None:
+        server.scopes = _validate_scopes(body.scopes)
     if "enabled" in fields and body.enabled is not None:
         server.enabled = body.enabled
     if config_changed:

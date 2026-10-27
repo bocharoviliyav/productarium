@@ -11,7 +11,7 @@ Shapes:
 - ``Links``     — curated external links (content = JSON array)
 - ``Hld``       — high-level design pseudo-entity (one per product)
 - ``User``      — id/username/email/role/provider
-- ``KnowledgeNode`` — Confluence-like tree node
+- ``KnowledgeNode`` — knowledge-tree node
 - ``ApiToken`` / ``Setting`` — admin/public API helpers
 """
 
@@ -113,6 +113,17 @@ class Hld(BaseModel):
     source: str = "generated"
 
 
+class ProductGrantOut(BaseModel):
+    """One per-product access grant row (SPEC-001; server-owned in Product).
+
+    Populated from the grant table on serialization; client-supplied values
+    on PUT are ignored — the product grants endpoints are the only writers.
+    """
+    user_id: str
+    level: str  # ro | rw
+    granted_by: Optional[str] = None
+
+
 class Product(BaseModel):
     id: str
     name: str
@@ -124,6 +135,15 @@ class Product(BaseModel):
     links: List[Links] = []
     databases: List[Database] = []
     hld: Optional[Hld] = None
+    grants: List[ProductGrantOut] = []
+
+
+class ProductPatch(BaseModel):
+    """Partial product update (SPEC-002): absent fields stay unchanged."""
+    name: Optional[str] = None
+    description: Optional[str] = None
+    # Must reference an existing user (validated by the router -> 400).
+    owner_id: Optional[str] = None
 
 
 class ProductListItem(BaseModel):

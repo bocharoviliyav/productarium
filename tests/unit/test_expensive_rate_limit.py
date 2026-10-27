@@ -143,18 +143,62 @@ class TestDocgenRateLimit:
         assert r.status_code == 429
 
 
-# --- expert ask ----------------------------------------------------------------
-class TestExpertRateLimit:
+# --- product summary (shares the docgen budget) -------------------------------
+class TestSummaryRateLimit:
     @pytest.fixture
-    def client(self, monkeypatch):
+    def client(self, isolated_db, monkeypatch):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
         from api.auth import deps as auth_deps
+        from api.models import ProductORM
+        from api.routers import knowledge as knowledge_mod
+
+        monkeypatch.setenv("RATE_DOCGEN_PER_USER_HOUR", "2")
+
+        with isolated_db.SessionLocal() as db:
+            db.add(ProductORM(id="prod_1", name="Acme"))
+            db.commit()
+
+        async def _fake_summary(*args, **kwargs):
+            return "S"
+
+        monkeypatch.setattr(knowledge_mod, "generate_product_summary", _fake_summary)
+
+        app = FastAPI()
+        app.include_router(knowledge_mod.router)
+        ov = _db_override(isolated_db)
+        app.dependency_overrides[knowledge_mod.get_db] = ov
+        app.dependency_overrides[auth_deps.get_db] = ov
+        app.dependency_overrides[auth_deps.get_current_user] = _user
+        return TestClient(app)
+
+    def test_summary_429_after_limit(self, client):
+        codes = [
+            client.post("/api/products/prod_1/summary").status_code
+            for _ in range(3)
+        ]
+        assert codes[:2] == [200, 200]
+        assert codes[2] == 429
+
+
+# --- expert ask ----------------------------------------------------------------
+class TestExpertRateLimit:
+    @pytest.fixture
+    def client(self, isolated_db, monkeypatch):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from api.auth import deps as auth_deps
+        from api.models import ProductORM
         from api.routers import expert as expert_mod
         from api.expert.types import EVENT_CONTENT, ExpertStreamEvent
 
         monkeypatch.setenv("RATE_EXPERT_PER_USER_MINUTE", "2")
+
+        with isolated_db.SessionLocal() as db:
+            db.add(ProductORM(id="prod_1", name="Acme"))
+            db.commit()
 
         def _fake_chat(*args, **kw):
             async def gen():
@@ -166,6 +210,9 @@ class TestExpertRateLimit:
 
         app = FastAPI()
         app.include_router(expert_mod.router)
+        ov = _db_override(isolated_db)
+        app.dependency_overrides[auth_deps.get_db] = ov
+        app.dependency_overrides[expert_mod.get_db] = ov
         app.dependency_overrides[auth_deps.get_current_user] = _user
         return TestClient(app)
 

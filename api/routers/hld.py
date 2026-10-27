@@ -1,9 +1,9 @@
 """HLD router — high-level design generation, status and verification.
 
 Endpoints (prefix ``/api/products``, tags ``hld``):
-- ``POST /{product_id}/hld/generate``          (rw; auto-creates the row, 202)
+- ``POST /{product_id}/hld/generate``          (docs; auto-creates the row, 202)
 - ``GET  /{product_id}/hld/{hld_id}/generate/status``
-- ``POST /{product_id}/hld/{hld_id}/verify``   (owner/admin)
+- ``POST /{product_id}/hld/{hld_id}/verify``   (docs — SPEC-001)
 - ``POST /{product_id}/hld/{hld_id}/pages/{page_id}/verify``
 
 Cancellation and page/versions reuse the generic segment routes
@@ -15,7 +15,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
-from api.auth.deps import get_current_user, require_product_access
+from api.auth.deps import get_current_user, require_product_access, require_product_permission
 from api.db import get_db
 from api.models import ProductORM, UserORM
 from api.routers.docgen import GenerateDocRequest, _get_status, _start_generate
@@ -34,7 +34,7 @@ async def generate_hld(
     product_id: str,
     request_data: GenerateDocRequest,
     db: Session = Depends(get_db),
-    _product: ProductORM = Depends(require_product_access("rw")),
+    _product: ProductORM = Depends(require_product_permission("docs")),
     user: UserORM = Depends(get_current_user),
 ):
     """Start the HLD generation job (202 + job_id; dedups an in-flight job)."""
@@ -76,7 +76,7 @@ async def verify_hld_page(
     user: UserORM = Depends(get_current_user),
     light: bool = Query(False),
 ):
-    """Verify a single HLD page (owner/admin); flags reset on content change."""
+    """Verify a single HLD page (docs access); flags reset on content change."""
     return _verify_entity(
         db, product_id, hld_id, "hld", user, page_id=page_id, light=light
     )

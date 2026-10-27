@@ -8,8 +8,12 @@
 - ``require_admin``      — 403 unless the current user is an admin.
 - ``resolve_product_access`` — effective access of a user to a product
   ('rw' | 'ro' | None) under the P0-2 role/grant model.
+- ``product_access``         — same level plus the derived flags
+  ``can_docs`` / ``can_manage`` / ``can_edit`` / ``can_configure``.
 - ``require_product_access`` — dependency factory enforcing that level on the
   ``product_id`` path param (404 invisible, 403 insufficient).
+- ``require_product_permission`` — dependency factory for the
+  ``docs`` | ``manage`` | ``edit`` | ``configure`` permission levels.
 - ``require_api_token``  — validates a ``Bearer`` API token (public API),
   updates ``last_used_at``.
 """
@@ -18,8 +22,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
@@ -125,6 +130,62 @@ def get_product_grant(db: Session, product_id: str, user_id: str) -> Optional[Pr
     return db.get(ProductGrantORM, {"product_id": product_id, "user_id": user_id})
 
 
+@dataclass(frozen=True)
+class ProductAccess:
+    """Effective access level plus the derived permission flags.
+
+    Model on top of the P0-2 level:
+
+    - ``can_docs``      — edit doc pages, verify, generate/regenerate: any
+      product access (ro+) EXCEPT the pure read-only ``viewer_global``.
+    - ``can_manage``    — artifact CRUD: exactly the 'rw' level.
+    - ``can_edit``      — rename/describe/transfer the product (SPEC-023):
+      owner or admin only, NEVER via grants.
+    - ``can_configure`` — schedules and product user management (SPEC-023,
+      manager is global like in Grafana): owner, manager or admin — NOT via
+      grants.
+    """
+
+    level: Optional[str]
+    can_docs: bool = False
+    can_manage: bool = False
+    can_edit: bool = False
+    can_configure: bool = False
+
+
+_NO_ACCESS = ProductAccess(level=None)
+
+
+def product_access(
+    user: UserORM,
+    product: Optional[ProductORM],
+    grant: Optional[ProductGrantORM] = None,
+) -> ProductAccess:
+    """Permission view of the P0-2 access level (see ProductAccess)."""
+    if product is None:
+        return _NO_ACCESS
+    level = resolve_product_access(user, product, grant)
+    is_owner = product.owner_id == user.id
+    return ProductAccess(
+        level=level,
+        # viewer_global is pure read-only: access without docs rights.
+        can_docs=level is not None and user.role != "viewer_global",
+        can_manage=level == "rw",
+        # SPEC-023: settings rights ride on ownership/global roles, not grants.
+        can_edit=is_owner or user.role == "admin",
+        can_configure=is_owner or user.role in ("manager", "admin"),
+    )
+
+
+def _load_access(
+    db: Session, product_id: str, user: UserORM
+) -> Tuple[Optional[ProductORM], ProductAccess]:
+    """Shared loader for the product dependency factories (404-safe)."""
+    product = db.get(ProductORM, product_id)
+    grant = get_product_grant(db, product_id, user.id)
+    return product, product_access(user, product, grant)
+
+
 def require_product_access(level: str = "ro"):
     """Dependency factory enforcing product visibility/access on endpoints.
 
@@ -142,18 +203,68 @@ def require_product_access(level: str = "ro"):
         user: UserORM = Depends(get_current_user),
         db: Session = Depends(get_db),
     ) -> ProductORM:
-        product = db.get(ProductORM, product_id)
-        grant = get_product_grant(db, product_id, user.id)
-        effective = resolve_product_access(user, product, grant) if product else None
-        if product is None or effective is None:
+        product, access = _load_access(db, product_id, user)
+        if product is None or access.level is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Product not found",
             )
-        if level == "rw" and effective != "rw":
+        if level == "rw" and not access.can_manage:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Write access required for this product",
+            )
+        return product
+
+    return _dependency
+
+
+_PERMISSION_DETAILS = {
+    "docs": "Documentation rights required for this product",
+    "manage": "Manage access required for this product",
+    "edit": "Owner or admin rights required for this product",
+    "configure": "Owner, manager or admin rights required for this product",
+}
+
+
+def require_product_permission(permission: str = "docs"):
+    """Dependency factory for the product permission model.
+
+    Usage: ``product: ProductORM = Depends(require_product_permission("docs"))``.
+
+    - ``docs``      — edit doc pages / verify / generate: any product access
+      except ``viewer_global``.
+    - ``manage``    — artifact CRUD ('rw').
+    - ``edit``      — rename/describe/transfer the product: owner or admin
+      (SPEC-023).
+    - ``configure`` — schedules and product user management: owner, manager
+      or admin (SPEC-023).
+
+    Same posture as :func:`require_product_access`: 404 when the product is
+    nonexistent or invisible, 403 when visible but the permission is missing.
+    """
+
+    def _dependency(
+        product_id: str,
+        user: UserORM = Depends(get_current_user),
+        db: Session = Depends(get_db),
+    ) -> ProductORM:
+        product, access = _load_access(db, product_id, user)
+        if product is None or access.level is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Product not found",
+            )
+        allowed = {
+            "docs": access.can_docs,
+            "manage": access.can_manage,
+            "edit": access.can_edit,
+            "configure": access.can_configure,
+        }.get(permission, access.can_docs)
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=_PERMISSION_DETAILS.get(permission, "Access denied"),
             )
         return product
 

@@ -49,8 +49,16 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from api.auth.deps import get_current_user
+from api.auth.deps import (
+    get_current_user,
+    get_product_grant,
+    product_access,
+    require_product_access,
+    require_product_permission,
+)
 from api.db import get_db
+# Q-9: shared with the products router (tests monkeypatch this module alias).
+from api.docgen._common import reindex_entity as _reindex
 from api.docgen.jobs import (
     EntityBusyError,
     _progress_snapshot,
@@ -82,9 +90,10 @@ from api.schemas import Database, Product
 
 logger = logging.getLogger(__name__)
 
-# Same auth posture as the products router: all CRUD + generate endpoints
-# require an authenticated user (no-op when AUTH_PROVIDER=none); the verify
-# endpoint adds its owner/admin check on top.
+# Same auth posture as the products router: all endpoints require an
+# authenticated user (no-op when AUTH_PROVIDER=none). SPEC-001 permission
+# levels ride on top: add/delete + metadata PUT = manage, doc edits + verify +
+# generate = docs, status = read.
 router = APIRouter(
     prefix="/api/products",
     tags=["databases"],
@@ -138,12 +147,19 @@ def _validate_mcp_server_pin(db: Session, product_id: str, mcp_server_id: str) -
     """Ensure the pinned MCP server exists and is bound+enabled to the product.
 
     404 when the server id is unknown; 400 when the server exists but is not
-    (or not yet) usable for this product — the reverse-engineering flow may
-    only see the same MCP surface the expert agent sees.
+    (or not yet) usable for this product, or lacks the ``database`` scope
+    (SPEC-028) — the reverse-engineering flow may only see a database-scoped
+    MCP surface.
     """
     server = db.query(McpServerORM).filter(McpServerORM.id == mcp_server_id).first()
     if server is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
+    if "database" not in (server.scopes or []):
+        raise HTTPException(
+            status_code=400,
+            detail="MCP server does not have the 'database' scope; only "
+            "database-scoped servers can back a database artifact",
+        )
     binding = (
         db.query(ProductMcpServerORM)
         .filter(
@@ -167,6 +183,7 @@ def _validate_mcp_server_pin(db: Session, product_id: str, mcp_server_id: str) -
 @router.post("/{product_id}/databases", response_model=Product)
 async def add_database(
     product_id: str, database: Database, db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_permission("manage")),
     light: bool = Query(False),
 ):
     if database.db_type:
@@ -240,6 +257,7 @@ async def _add_preset_database(
                 id=server_id,
                 name=f"preset-{spec.key}-{database.id}",
                 preset_key=spec.key,
+                scopes=["database"],
                 transport="stdio",
                 command=launcher.command,
                 args=list(launcher.args),
@@ -301,6 +319,7 @@ def _drop_preset_server(db: Session, database_row: DatabaseORM) -> None:
 @router.delete("/{product_id}/databases/{database_id}", response_model=Product)
 async def delete_database(
     product_id: str, database_id: str, db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_permission("manage")),
     light: bool = Query(False),
 ):
     p_orm = product_repo.load_product_orm(db, product_id)
@@ -326,6 +345,8 @@ async def update_database(
     database_id: str,
     body: DatabaseUpdate,
     db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_permission("docs")),
+    user: UserORM = Depends(get_current_user),
     light: bool = Query(False),
 ):
     """Edit a database artifact: generated docs (WYSIWYG) OR metadata.
@@ -342,6 +363,16 @@ async def update_database(
     + re-add is the only way to change it. Name and doc edits stay allowed.
     """
     _reject_preset_connection_changes(db, product_id, database_id, body)
+    if not body.wants_doc_update():
+        # Metadata shape (name/DSN/MCP pin) is manage-level (SPEC-001).
+        access = product_access(
+            user, _product, get_product_grant(db, product_id, user.id)
+        )
+        if not access.can_manage:
+            raise HTTPException(
+                status_code=403,
+                detail="Manage access required for this product",
+            )
     if body.wants_doc_update():
         try:
             product, indexed_text = product_repo.update_database_content(
@@ -359,7 +390,10 @@ async def update_database(
             msg = str(e)
             status = 400 if "Provide one of" in msg else 404
             raise HTTPException(status_code=status, detail=msg)
-        _reindex(product_id, indexed_text, database_id, source_type="database")
+        _reindex(
+            product_id, indexed_text, database_id, source_type="database",
+            page_id=body.page_id, pages=body.pages,
+        )
         return _maybe_light(product, light)
 
     if body.mcp_server_id:
@@ -409,28 +443,8 @@ def _reject_preset_connection_changes(
         )
 
 
-def _reindex(
-    product_id: str,
-    indexed_text: Optional[str],
-    entity_id: str,
-    *,
-    source_type: str = "database",
-) -> None:
-    """Re-index edited docs into the product memory backend (fire-and-forget).
-
-    Same handoff as ``api.routers.products._reindex`` (kept local so the two
-    routers stay independently testable).
-    """
-    if indexed_text and indexed_text.strip():
-        try:
-            from api.docgen import _index_in_background
-
-            _index_in_background(
-                indexed_text, f"prod_{product_id}",
-                source_type=source_type, source_id=entity_id,
-            )
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("Memory re-index failed for entity %s: %s", entity_id, e)
+# ``_reindex`` is the shared ``reindex_entity`` imported above (Q-9);
+# the default ``source_type="codebase"`` is overridden at the call site.
 
 
 def _assert_no_raw_dsn(product: Product, raw_dsn: Optional[str]) -> None:
@@ -460,25 +474,16 @@ def _assert_no_raw_dsn(product: Product, raw_dsn: Optional[str]) -> None:
         pass
 
 
-# --- Verification (owner or admin) -------------------------------------------
+# --- Verification (docs permission, SPEC-001) --------------------------------
 @router.post("/{product_id}/databases/{database_id}/verify", response_model=Product)
 async def verify_database(
     product_id: str,
     database_id: str,
     db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_permission("docs")),
     user: UserORM = Depends(get_current_user),
     light: bool = Query(False),
 ):
-    product = product_repo.load_product_orm(db, product_id)
-    if product is None:
-        raise HTTPException(status_code=404, detail="Product not found")
-    if user.role != "admin" and (
-        not product.owner_id or product.owner_id != user.id
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Only the product owner or an admin can verify",
-        )
     try:
         return _maybe_light(
             product_repo.verify_child(db, product_id, database_id, "databases", user.id),
@@ -497,20 +502,11 @@ async def verify_database_page(
     database_id: str,
     page_id: str,
     db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_permission("docs")),
     user: UserORM = Depends(get_current_user),
     light: bool = Query(False),
 ):
-    """Verify a single page of a database artifact's docs (owner/admin)."""
-    product = product_repo.load_product_orm(db, product_id)
-    if product is None:
-        raise HTTPException(status_code=404, detail="Product not found")
-    if user.role != "admin" and (
-        not product.owner_id or product.owner_id != user.id
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Only the product owner or an admin can verify",
-        )
+    """Verify a single page of a database artifact's docs (docs access)."""
     try:
         return _maybe_light(
             product_repo.verify_page(
@@ -529,6 +525,7 @@ async def generate_database_docs(
     database_id: str,
     request_data: GenerateDatabaseDocsRequest,
     db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_permission("docs")),
 ):
     """Start the MCP reverse-engineering job (202 + job_id)."""
     p_orm = product_repo.load_product_orm(db, product_id)
@@ -571,6 +568,7 @@ async def get_database_docgen_status(
     product_id: str,
     database_id: str,
     job_id: str = Query(..., description="Docgen job id returned by the generate endpoint"),
+    _product: ProductORM = Depends(require_product_access("ro")),
 ):
     job = get_job(job_id)
     if (

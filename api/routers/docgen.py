@@ -21,7 +21,11 @@ from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from api.auth.deps import get_current_user, require_product_access
+from api.auth.deps import (
+    get_current_user,
+    require_product_access,
+    require_product_permission,
+)
 from api.db import get_db
 from api.docgen.jobs import (
     _progress_snapshot,
@@ -29,6 +33,8 @@ from api.docgen.jobs import (
     create_or_get_job,
     get_job,
     request_cancel_for_entity,
+    submit_detect_job,
+    submit_incremental_job,
     submit_job,
 )
 from api.models import HldORM, ProductORM, UserORM
@@ -39,7 +45,8 @@ logger = logging.getLogger(__name__)
 
 # Generation is an authenticated action: starting a (potentially expensive)
 # docgen job and polling its status both require a session (a no-op when
-# AUTH_PROVIDER=none).
+# AUTH_PROVIDER=none). SPEC-001: generate/cancel/regenerate need the docs
+# permission; status/page reads need plain visibility.
 router = APIRouter(
     prefix="/api/products",
     tags=["docgen"],
@@ -79,6 +86,23 @@ def _branch_page_ids(pages: Dict[str, Any], root: str) -> List[str]:
     return out
 
 
+def _submit_202(
+    job_id: str, entity_type: str, entity_id: str, is_new: bool
+) -> JSONResponse:
+    """Shared 202 body for the generate/detect/incremental endpoints."""
+    job = get_job(job_id)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": job_id,
+            "status": (job or {}).get("status", "queued"),
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "reused": not is_new,
+        },
+    )
+
+
 def _start_generate(
     db: Session, product_id: str, entity_type: str, entity_id: str,
     request_data: GenerateDocRequest, user_id: str,
@@ -94,29 +118,25 @@ def _start_generate(
         window_seconds=3600.0,
     )
 
-    # Access (rw) is enforced by the endpoint's require_product_access dep.
+    # The docs/manage permission is enforced by the endpoint's dependency.
     p_orm = product_repo.load_product_orm(db, product_id)
     if p_orm is None:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    if entity_type == "hld":
+    if entity_type == "hld" and p_orm.hld is None:
         # Pseudo-entity: auto-create the single row on first generate (the
         # worker loads it in a fresh session — commit BEFORE the job starts).
-        if p_orm.hld is None:
-            try:
-                p_orm.hld = HldORM(id=f"hld_{product_id}", product_id=product_id)
-                db.commit()
-            except IntegrityError:
-                # Lost a concurrent first-generate race: adopt the winner's
-                # row and let create_or_get_job dedup the in-flight job.
-                db.rollback()
-                p_orm.hld = db.query(HldORM).filter(
-                    HldORM.id == f"hld_{product_id}"
-                ).one_or_none()
-        entity = p_orm.hld
-    else:
-        collection = p_orm.codebases if entity_type == "codebase" else p_orm.specs
-        entity = next((e for e in collection if e.id == entity_id), None)
+        try:
+            p_orm.hld = HldORM(id=f"hld_{product_id}", product_id=product_id)
+            db.commit()
+        except IntegrityError:
+            # Lost a concurrent first-generate race: adopt the winner's
+            # row and let create_or_get_job dedup the in-flight job.
+            db.rollback()
+            p_orm.hld = db.query(HldORM).filter(
+                HldORM.id == f"hld_{product_id}"
+            ).one_or_none()
+    entity = product_repo.find_entity(p_orm, entity_type, entity_id)
     if not entity:
         raise HTTPException(status_code=404, detail=f"{entity_type.capitalize()} not found")
 
@@ -131,24 +151,14 @@ def _start_generate(
             job_id, product_id, entity_type, entity_id,
             request_data.model, request_data.language, force_pages=force_pages,
         )
-    job = get_job(job_id)
-    return JSONResponse(
-        status_code=202,
-        content={
-            "job_id": job_id,
-            "status": (job or {}).get("status", "queued"),
-            "entity_type": entity_type,
-            "entity_id": entity_id,
-            "reused": not is_new,
-        },
-    )
+    return _submit_202(job_id, entity_type, entity_id, is_new)
 
 
 @router.post("/{product_id}/codebases/{codebase_id}/generate")
 async def generate_codebase_docs(
     product_id: str, codebase_id: str,
     request_data: GenerateDocRequest, db: Session = Depends(get_db),
-    _product: ProductORM = Depends(require_product_access("rw")),
+    _product: ProductORM = Depends(require_product_permission("docs")),
     user: UserORM = Depends(get_current_user),
 ):
     return _start_generate(db, product_id, "codebase", codebase_id, request_data, user.id)
@@ -167,7 +177,7 @@ async def get_codebase_docgen_status(
 async def generate_spec_docs(
     product_id: str, spec_id: str,
     request_data: GenerateDocRequest, db: Session = Depends(get_db),
-    _product: ProductORM = Depends(require_product_access("rw")),
+    _product: ProductORM = Depends(require_product_permission("docs")),
     user: UserORM = Depends(get_current_user),
 ):
     return _start_generate(db, product_id, "spec", spec_id, request_data, user.id)
@@ -197,9 +207,10 @@ _CANCEL_SEGMENTS = _SEGMENT_TO_TYPE
 @router.post("/{product_id}/{segment}/{entity_id}/generate/cancel")
 async def cancel_docgen_generation(
     product_id: str, segment: str, entity_id: str,
-    _product: ProductORM = Depends(require_product_access("rw")),
+    _product: ProductORM = Depends(require_product_permission("docs")),
 ):
-    """Cooperatively cancel the entity's ACTIVE docgen job.
+    """Cooperatively cancel the entity's ACTIVE docgen job (docs access —
+    whoever may start a run may stop it).
 
     The worker aborts at its next checkpoint: NO new doc version is appended
     and the artifact is restored to its current version. Idempotent —
@@ -220,7 +231,7 @@ async def cancel_docgen_generation(
 async def regenerate_docgen_page(
     product_id: str, segment: str, entity_id: str, page_id: str,
     request_data: GenerateDocRequest, db: Session = Depends(get_db),
-    _product: ProductORM = Depends(require_product_access("rw")),
+    _product: ProductORM = Depends(require_product_permission("docs")),
     user: UserORM = Depends(get_current_user),
 ):
     """Per-page regeneration (codebase / database artifacts).
@@ -240,10 +251,7 @@ async def regenerate_docgen_page(
     p_orm = product_repo.load_product_orm(db, product_id)
     if p_orm is None:
         raise HTTPException(status_code=404, detail="Product not found")
-    collection = (
-        p_orm.codebases if entity_type == "codebase" else p_orm.databases
-    )
-    entity = next((e for e in collection if e.id == entity_id), None)
+    entity = product_repo.find_entity(p_orm, entity_type, entity_id)
     if not entity:
         raise HTTPException(status_code=404, detail=f"{entity_type.capitalize()} not found")
     if page_id not in (entity.pages or {}):
@@ -281,12 +289,7 @@ async def get_docgen_page(
         p_orm = product_repo.load_product_orm(db, product_id)
         if p_orm is None:
             raise HTTPException(status_code=404, detail="Product not found")
-        collection = (
-            ([p_orm.hld] if p_orm.hld else [])
-            if entity_type == "hld" else
-            (p_orm.codebases if entity_type == "codebase" else p_orm.databases)
-        )
-        entity = next((e for e in collection if e.id == entity_id), None)
+        entity = product_repo.find_entity(p_orm, entity_type, entity_id)
         if not entity:
             raise HTTPException(status_code=404, detail=f"{entity_type.capitalize()} not found")
         page, source = (entity.pages or {}).get(page_id), "current"
@@ -302,18 +305,107 @@ async def get_docgen_page(
     return {"page": page, "source": source}
 
 
+# SPEC-010: detect / incremental update are codebase/spec/database only
+# (HLD has no external source to diff against).
+_DETECT_TYPES = ("codebase", "spec", "database")
+
+
+def _detect_rate_limit(user_id: str) -> None:
+    """Same per-user bucket as generate: a database detect re-walks the catalog."""
+    enforce_user_rate_limit(
+        user_id,
+        setting_key="rate.docgen.per_user_hour",
+        env_name="RATE_DOCGEN_PER_USER_HOUR",
+        default_per_minute=10,
+        window_seconds=3600.0,
+    )
+
+
+def _require_detectable_entity(
+    db: Session, product_id: str, entity_type: str, entity_id: str
+) -> None:
+    """404-check the detect/incremental target (worker reloads it itself)."""
+    p_orm = product_repo.load_product_orm(db, product_id)
+    if p_orm is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if product_repo.find_entity(p_orm, entity_type, entity_id) is None:
+        raise HTTPException(status_code=404, detail=f"{entity_type.capitalize()} not found")
+
+
+@router.post("/{product_id}/{segment}/{entity_id}/detect")
+async def detect_docgen_changes(
+    product_id: str, segment: str, entity_id: str,
+    db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_permission("docs")),
+    user: UserORM = Depends(get_current_user),
+):
+    """SPEC-010 change detection (202 + poll): compares the stored source
+    baseline with the live source (git remote tip / fresh catalog walk /
+    content hash) and returns an impact plan in the job ``result``.
+    """
+    entity_type = _SEGMENT_TO_TYPE.get(segment)
+    if entity_type not in _DETECT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Change detection is only available for codebases, specs and databases",
+        )
+    _detect_rate_limit(user.id)
+    _require_detectable_entity(db, product_id, entity_type, entity_id)
+    job_id, is_new = submit_detect_job(product_id, entity_type, entity_id)
+    return _submit_202(job_id, entity_type, entity_id, is_new)
+
+
+@router.get("/{product_id}/{segment}/{entity_id}/detect/status")
+async def get_docgen_detect_status(
+    product_id: str, segment: str, entity_id: str,
+    job_id: str = Query(..., description="Detect job id returned by the detect endpoint"),
+    _product: ProductORM = Depends(require_product_access("ro")),
+):
+    entity_type = _SEGMENT_TO_TYPE.get(segment)
+    if entity_type not in _DETECT_TYPES:
+        raise HTTPException(status_code=400, detail="Unknown artifact type")
+    return _get_status(product_id, f"detect:{entity_type}", entity_id, job_id)
+
+
+@router.post("/{product_id}/{segment}/{entity_id}/incremental")
+async def incremental_docgen_update(
+    product_id: str, segment: str, entity_id: str,
+    request_data: GenerateDocRequest, db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_permission("docs")),
+    user: UserORM = Depends(get_current_user),
+):
+    """SPEC-010 incremental update (202 + poll, same status endpoint as
+    generate): the worker re-detects at run start — unchanged → success
+    WITHOUT a new version; changed → only the impacted pages regenerate
+    (empty impact / spec → full regeneration). The result summary rides in
+    the job ``result``. Full regeneration via ``/generate`` stays available.
+    """
+    entity_type = _SEGMENT_TO_TYPE.get(segment)
+    if entity_type not in _DETECT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Incremental updates are only available for codebases, specs and databases",
+        )
+    _detect_rate_limit(user.id)
+    _require_detectable_entity(db, product_id, entity_type, entity_id)
+    job_id, is_new = submit_incremental_job(
+        product_id, entity_type, entity_id,
+        request_data.model, request_data.language,
+    )
+    return _submit_202(job_id, entity_type, entity_id, is_new)
+
+
 @router.get("/{product_id}/docgen/active")
 async def get_active_docgen_jobs(
-    product_id: str, db: Session = Depends(get_db),
+    product_id: str,
+    _product: ProductORM = Depends(require_product_access("ro")),
 ):
-    """Active (queued/running) docgen jobs for the product.
+    """Active (queued/running) docgen jobs for the product (visible access).
 
     Lets the UI restore in-flight generation animations after a page
     reload/navigation (the job registry is in-memory and single-process: a
     backend restart kills the jobs, so there is nothing durable to poll).
     """
-    if product_repo.load_product_orm(db, product_id) is None:
-        raise HTTPException(status_code=404, detail="Product not found")
     return active_jobs_for_product(product_id)
 
 
@@ -337,6 +429,7 @@ def _get_status(product_id: str, entity_type: str, entity_id: str, job_id: str) 
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
         "docs_chars": job.get("docs_chars"),
+        "result": job.get("result"),
     }
 
 

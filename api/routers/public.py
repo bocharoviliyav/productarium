@@ -7,7 +7,7 @@ API-token-authenticated endpoints for external integrations:
 - ``POST /api/public/products/{product_id}/ask`` — reuse the expert agent to
   answer a query over a product (SSE stream).
 - ``POST /api/public/products/{product_id}/push`` — push verified docs to a
-  configured integration (Confluence / git).
+  configured git integration.
 
 All endpoints require a valid Bearer API token (``require_api_token``), which
 also updates ``last_used_at``. Only verified content (``KnowledgeNode`` /
@@ -37,7 +37,7 @@ from api.models import (
     ApiTokenORM, CodebaseORM, DatabaseORM, KnowledgeNodeORM, LinksORM,
     ProductORM, SpecORM,
 )
-from api.config.settings import get_confluence_creds, get_git_creds
+from api.config.settings import get_git_creds
 
 logger = logging.getLogger(__name__)
 
@@ -324,15 +324,12 @@ async def ask(
 
 # --- POST /api/public/products/{product_id}/push ----------------------------
 def _default_push_target() -> str:
-    """Pick a default push target from settings (Confluence first, then git)."""
-    cconf = get_confluence_creds()
-    if cconf.get("base_url") and cconf.get("token"):
-        return "confluence"
+    """Pick a default push target from settings (first configured git host)."""
     for host in _GIT_HOSTS:
         g = get_git_creds(host)
         if g.get("url") and g.get("token"):
             return host
-    return "confluence"
+    return _GIT_HOSTS[0]
 
 
 @router.post("/products/{product_id}/push")
@@ -342,7 +339,7 @@ async def push(
     tok: ApiTokenORM = Depends(require_api_token),
     db: Session = Depends(get_db),
 ):
-    """Push verified docs to a configured integration (Confluence or git)."""
+    """Push verified docs to a configured git integration."""
     product = db.get(ProductORM, product_id)
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -378,7 +375,7 @@ async def push(
         "user_id": tok.user_id,
     }
     try:
-        # P1-13: sync push functions (Confluence/git connectors do blocking
+        # P1-13: sync push functions (git connectors do blocking
         # network I/O) must not run on the event loop; native async ones are
         # awaited directly.
         if inspect.iscoroutinefunction(push_fn):
@@ -388,7 +385,7 @@ async def push(
             if inspect.isawaitable(result):
                 result = await result
     except Exception as e:
-        # Push exceptions (Confluence/git HTTP stacks) can embed authenticated
+        # Push exceptions (git HTTP stacks) can embed authenticated
         # URLs — log the details, keep the client message generic.
         logger.warning("public push to %r failed: %s", target, e, exc_info=True)
         raise HTTPException(status_code=502, detail=f"Push to '{target}' failed")

@@ -33,7 +33,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +145,18 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         unit="graph steps",
         group="LLM",
     ),
+    # SPEC-015 anti-stall watchdog: wall-clock budget for ONE codebase unit
+    # agent (the whole gated run, all gate attempts included). A unit that
+    # never finishes is cancelled; retry/fallback semantics live at the
+    # caller, the rest of the job continues.
+    TimeoutKey(
+        key="docgen_unit_wall_clock",
+        env_var="DOCGEN_UNIT_WALL_CLOCK_SECONDS",
+        default=1800.0,
+        floor=60.0,
+        label="Docgen: unit agent wall-clock budget",
+        group="LLM",
+    ),
     # Spec enrichment react agent (api/docgen/spec.py); former hardcoded 40.
     TimeoutKey(
         key="spec_recursion_limit",
@@ -239,6 +251,35 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         label="Memory backend semantic query (pgvector cosine)",
         group="Memory",
     ),
+    # --- Knowledge graph (SPEC-008, api/memory/knowledge_graph.py) ------
+    # 0/1 gate for the post-docgen LLM term extraction (read via
+    # resolve_timeout_bool; legacy env truthy-string semantics).
+    TimeoutKey(
+        key="knowledge_graph_enabled",
+        env_var="KNOWLEDGE_GRAPH_ENABLED",
+        default=1.0,
+        floor=0.0,
+        label="Knowledge graph: LLM term extraction",
+        unit="0/1",
+        group="Memory",
+    ),
+    TimeoutKey(
+        key="knowledge_graph_batch",
+        env_var="KNOWLEDGE_GRAPH_BATCH",
+        default=6.0,
+        floor=1.0,
+        label="Knowledge graph: pages per LLM extraction batch",
+        unit="pages per LLM call",
+        group="Memory",
+    ),
+    TimeoutKey(
+        key="knowledge_graph_build",
+        env_var="KNOWLEDGE_GRAPH_BUILD_SECONDS",
+        default=900.0,
+        floor=30.0,
+        label="Knowledge graph: extraction wall-clock budget",
+        group="Memory",
+    ),
     # --- Model listing / existence checks -------------------------------
     TimeoutKey(
         key="model_list",
@@ -265,12 +306,32 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         label="Git file-content fetch (GitHub/GitLab API)",
         group="Integrations",
     ),
+    # SPEC-010 detect path: git fetch + two-commit diff under the entity
+    # lock — a hung remote must fail the job, not block the entity forever.
+    TimeoutKey(
+        key="git_detect",
+        env_var="GIT_DETECT_TIMEOUT_SECONDS",
+        default=120.0,
+        floor=10.0,
+        label="Git detect fetch/diff subprocess",
+        group="Integrations",
+    ),
     TimeoutKey(
         key="mcp_stdio_wait",
         env_var="MCP_STDIO_WAIT_SECONDS",
         default=10.0,
         floor=1.0,
         label="MCP stdio subprocess wait",
+        group="Integrations",
+    ),
+    # Keycloak Admin REST API (service-account token + groups list,
+    # api/auth/keycloak.py; SPEC-001 mapping reference).
+    TimeoutKey(
+        key="keycloak_admin",
+        env_var="KEYCLOAK_ADMIN_TIMEOUT_SECONDS",
+        default=10.0,
+        floor=1.0,
+        label="Keycloak Admin API request",
         group="Integrations",
     ),
     TimeoutKey(
@@ -343,8 +404,8 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
     ),
     # 0 = unlimited on the three caps below: every non-system entity gets a
     # subpage, a description batch and (where the server can resolve it) a
-    # source fetch. The walk stays bounded by MAX_TOOL_CALLS + the wall-clock
-    # budget, the render side only builds deterministic strings.
+    # source fetch. The walk stays bounded by db_max_tool_calls + the
+    # wall-clock budget, the render side only builds deterministic strings.
     TimeoutKey(
         key="db_docgen_max_subpages",
         env_var="DB_DOCGEN_MAX_SUBPAGES",
@@ -430,6 +491,28 @@ TIMEOUT_KEYS: List[TimeoutKey] = [
         floor=1000.0,
         label="Database deep units: context bundle cap",
         unit="chars",
+        group="Databases",
+    ),
+    # SPEC-016: bounded first-rows sample for deep-unit agents — a full
+    # table read is never documentation evidence and burns the walk budget.
+    TimeoutKey(
+        key="db_deep_sample_rows",
+        env_var="DB_DEEP_SAMPLE_ROWS",
+        default=5.0,
+        floor=0.0,
+        label="Database deep units: first-rows sample size (0 = off)",
+        unit="rows",
+        group="Databases",
+    ),
+    # SPEC-015: same watchdog, database flavor — one deep-unit agent per
+    # object; on expiry the unit lands in ``failed`` and the run continues
+    # (majority failure falls back to batch enrichment as before).
+    TimeoutKey(
+        key="db_unit_wall_clock",
+        env_var="DB_UNIT_WALL_CLOCK_SECONDS",
+        default=900.0,
+        floor=30.0,
+        label="Database deep units: per-unit wall-clock budget",
         group="Databases",
     ),
 ]
@@ -610,8 +693,7 @@ def resolve_docgen_map_concurrency() -> int:
     The Phase-1 map loop (``_agentic_bottom_up_docgen``) issues one independent
     LLM call per codebase chunk; awaiting them strictly sequentially wastes wall
     clock on a local model. This knob bounds the parallelism (asyncio.Semaphore
-    + gather) so the local server is not flooded. The RLM map loop stays
-    sequential (shared REPL session). Floor 1 = sequential fallback.
+    + gather) so the local server is not flooded. Floor 1 = sequential fallback.
     """
     return resolve_timeout_int("docgen_map_concurrency")
 
@@ -634,6 +716,16 @@ def resolve_docgen_orchestrator_recursion_limit() -> int:
     unit limit.
     """
     return resolve_timeout_int("docgen_orchestrator_recursion_limit")
+
+
+def resolve_docgen_unit_wall_clock() -> float:
+    """Wall-clock budget for ONE codebase unit agent run (seconds, SPEC-015).
+
+    Covers the whole gated run (all page-gate attempts). On expiry the
+    watchdog cancels the unit and the pipeline's retry/fallback paths take
+    over while the job continues with the remaining units.
+    """
+    return resolve_timeout("docgen_unit_wall_clock")
 
 
 def resolve_spec_recursion_limit() -> int:
@@ -727,9 +819,19 @@ def resolve_git_file_content_timeout() -> float:
     return resolve_timeout("git_file_content")
 
 
+def resolve_git_detect_timeout() -> float:
+    """Subprocess timeout for the SPEC-010 detect git fetch/diff (seconds)."""
+    return resolve_timeout("git_detect")
+
+
 def resolve_mcp_stdio_wait_timeout() -> float:
     """Timeout for MCP stdio subprocess ``.wait()`` (seconds)."""
     return resolve_timeout("mcp_stdio_wait")
+
+
+def resolve_keycloak_admin_timeout() -> float:
+    """HTTP timeout for Keycloak Admin API calls (service account, seconds)."""
+    return resolve_timeout("keycloak_admin")
 
 
 def resolve_mermaid_verify_timeout() -> float:
@@ -851,6 +953,16 @@ def resolve_db_unit_bundle_chars() -> int:
     return resolve_timeout_int("db_unit_bundle_chars")
 
 
+def resolve_db_deep_sample_rows() -> int:
+    """First-rows sample size offered to deep-unit agents (0 = off)."""
+    return resolve_timeout_int("db_deep_sample_rows")
+
+
+def resolve_db_unit_wall_clock() -> float:
+    """Wall-clock budget for ONE database deep-unit agent (seconds, SPEC-015)."""
+    return resolve_timeout("db_unit_wall_clock")
+
+
 def sync_timeout_env() -> None:
     """Export admin-store timeout overrides to their canonical env vars.
 
@@ -914,6 +1026,7 @@ __all__ = [
     "resolve_docgen_map_concurrency",
     "resolve_docgen_unit_recursion_limit",
     "resolve_docgen_orchestrator_recursion_limit",
+    "resolve_docgen_unit_wall_clock",
     "resolve_spec_recursion_limit",
     "resolve_docgen_section_concurrency",
     "resolve_docgen_llm_concurrency",
@@ -924,7 +1037,9 @@ __all__ = [
     "resolve_model_list_timeout",
     "resolve_integration_http_timeout",
     "resolve_git_file_content_timeout",
+    "resolve_git_detect_timeout",
     "resolve_mcp_stdio_wait_timeout",
+    "resolve_keycloak_admin_timeout",
     "resolve_mermaid_verify_timeout",
     "resolve_mermaid_repair_timeout",
     "resolve_mermaid_max_repair_attempts",
@@ -941,6 +1056,8 @@ __all__ = [
     "resolve_db_deep_units_enabled",
     "resolve_db_entity_mcp_enabled",
     "resolve_db_unit_bundle_chars",
+    "resolve_db_deep_sample_rows",
+    "resolve_db_unit_wall_clock",
     "sync_timeout_env",
     "get_timeout_resolved_view",
 ]

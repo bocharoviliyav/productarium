@@ -79,6 +79,28 @@ class MemoryBackend(ABC):
         """
         raise NotImplementedError
 
+    async def list_page_sources(
+        self, product_id: str, source_type: str, source_id: str
+    ) -> list[str]:
+        """Distinct page-granular source ids stored for an artifact.
+
+        SPEC-010 incremental indexing uses this to detect artifacts still
+        indexed at blob level. Default: empty list (unsupported).
+        """
+        return []
+
+    async def prune_stale_sources(
+        self,
+        product_id: str,
+        source_type: str,
+        source_id: str,
+        keep_source_ids: list,
+    ) -> int:
+        """Delete blob-level + stale page chunks not in ``keep_source_ids``.
+
+        Default: no-op returning 0 (unsupported backends keep everything)."""
+        return 0
+
     async def init(self) -> None:
         """Backend startup hook. Default: no-op."""
         return None

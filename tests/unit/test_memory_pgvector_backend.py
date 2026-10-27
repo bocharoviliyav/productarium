@@ -628,7 +628,8 @@ class TestQuery:
 
         class _FakeResult:
             def fetchall(self):
-                return [("chunk one",), ("chunk two",)]
+                # (content, source_id, distance) — the source-aware row shape.
+                return [("chunk one", "cb_1::page::p1", 0.1), ("chunk two", None, 0.2)]
 
         class _FakeConn:
             def execute(self, sql, params):
@@ -654,9 +655,11 @@ class TestQuery:
 
         assert "chunk one" in result
         assert "chunk two" in result
-        # The cosine-distance ORDER BY + LIMIT shape is present.
+        # The cosine-distance ORDER BY + LIMIT shape is present (single
+        # source-aware query serves both recall legs).
         sql = executed["sql"]
         assert "knowledge_chunks" in sql
+        assert "source_id" in sql
         assert "<=>" in sql
         assert "ORDER BY" in sql
         assert "LIMIT" in sql
@@ -688,7 +691,7 @@ class TestQuery:
 
             class _FakeResult:
                 def fetchall(self):
-                    return [("chunk one",)]
+                    return [("chunk one", None, 0.1)]
 
             class _FakeConn:
                 def execute(self, sql, params):
@@ -896,9 +899,9 @@ class TestReindexProduct:
             db.close()
 
     def test_pages_not_double_indexed_when_docs_present(self, monkeypatch, isolated_db):
-        """generated_docs is indexed ONCE under the codebase id; pages are
-        section slices of it and must not be queued as well (their upserts
-        used to share the same source id and overwrite each other)."""
+        """SPEC-010: a codebase WITH pages indexes page-granular; the docs
+        blob (a redundant copy of the same content) is not queued alongside
+        the pages, so no source is double-indexed."""
         from api.memory import pgvector_backend as pb
         from api.models import CodebaseORM, KnowledgeChunkORM, ProductORM
 
@@ -930,8 +933,8 @@ class TestReindexProduct:
         result = asyncio.run(be.reindex_product("prod_1"))
         assert result["success"] is True
         assert result["reindexed_count"] == 1
-        # Exactly ONE item for the codebase (docs, not docs+pages).
-        assert indexed_sources == ["cb_1"]
+        # Page-granular items only — no redundant blob source "cb_1".
+        assert indexed_sources == ["cb_1::page::overview"]
 
     def test_legacy_pages_get_distinct_source_ids(self, monkeypatch, isolated_db):
         """A codebase with ONLY pages (no generated_docs) indexes each page

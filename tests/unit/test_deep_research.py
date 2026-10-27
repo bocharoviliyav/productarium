@@ -789,36 +789,17 @@ class TestAskRouterDeepResearch:
         assert '"planning"' not in r.text
         assert r.text.endswith("data: [DONE]\n\n")
 
-    def test_unknown_product_streams_statelessly(
-        self, isolated_db, admin_user, monkeypatch
-    ):
+    def test_unknown_product_404(self, isolated_db, admin_user, monkeypatch):
         app, client = _make_client(isolated_db, admin_user)
-        calls: List[Dict[str, Any]] = []
 
-        async def fake_deep_runner(
-            product_id,
-            query,
-            *,
-            session_id=None,
-            history=None,
-            model=None,
-            seed_history=False,
-            **kwargs,
-        ):
-            calls.append({"session_id": session_id, "seed_history": seed_history})
-            yield ExpertStreamEvent(EVENT_CONTENT, "EPHEMERAL")
+        async def deep_runner_must_not_run(*args, **kwargs):
+            raise AssertionError("deep runner used for an unknown product")
+            yield  # pragma: no cover - make it an async generator
 
         monkeypatch.setattr(
-            expert_router_module, "run_deep_research_stream", fake_deep_runner
+            expert_router_module, "run_deep_research_stream", deep_runner_must_not_run
         )
         r = client.post(
             "/api/products/ghost/ask", json={"query": QUERY, "deep_research": True}
         )
-        assert r.status_code == 200
-        # No session row → no session_id frame, no header, no persistence.
-        assert '"session_id"' not in r.text
-        assert not r.headers.get("x-session-id")
-        assert '"EPHEMERAL"' in r.text
-        assert r.text.endswith("data: [DONE]\n\n")
-        assert calls[0]["session_id"] is None
-        assert calls[0]["seed_history"] is False
+        assert r.status_code == 404

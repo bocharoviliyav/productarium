@@ -35,6 +35,12 @@ Design (deliberately hardcoded — no variability):
   the interpreter ban, so a tampered DB row still cannot execute an
   arbitrary command.
 
+``STDIO_TOOL_PRESETS`` below is a different breed: vetted one-step launch
+recipes for NON-database stdio tool servers (REA). The platform manages no
+row for them — the admin registers the server through the regular
+``/api/admin/mcp/servers`` registry and the stdio policy
+(``api/mcp/policy.py``) stays the only gate.
+
 Import-safe: nothing here touches the network or the DB at import time; the
 langchain MCP import happens inside the connection check.
 """
@@ -363,6 +369,55 @@ def presets_public_view() -> List[Dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------- #
+# Admin-registered stdio tool-server presets (non-database, SPEC-014)
+# --------------------------------------------------------------------------- #
+REA_REPO = "https://github.com/morluto/rea"
+
+
+@dataclass(frozen=True)
+class StdioServerPreset:
+    """Vetted launch recipe for a stdio TOOL MCP server (no DSN, no row).
+
+    The platform owns nothing here: the admin registers the server via
+    ``POST /api/admin/mcp/servers`` with the documented command/args and the
+    stdio policy (``api/mcp/policy.py``) is the only gate — REA's upstream
+    ``npx rea-agents`` launcher is deliberately rejected by it.
+    """
+
+    key: str
+    label: str
+    package: str
+    homepage: str
+    license: str
+    #: Example launch shape: the node BINARY by absolute path (the policy's
+    #: single interpreter carve-out) + the installed package entrypoint +
+    #: the stdio subcommand. The admin substitutes the real host paths.
+    command: str
+    args: Tuple[str, ...]
+    node_major: int
+    tools: str
+
+
+REA = StdioServerPreset(
+    key="rea",
+    label="REA — reverse engineering",
+    package="rea-agents",
+    homepage=REA_REPO,
+    license="MIT",
+    command="/usr/local/bin/node",
+    args=("/usr/local/lib/node_modules/rea-agents/rea.mjs", "mcp"),
+    node_major=22,
+    tools=(
+        "binary inspection (overview, pseudocode, assembly, strings, xrefs, "
+        "call graphs), JS/Electron bundle analysis, .NET, WASM and EVM "
+        "artifact inspection"
+    ),
+)
+
+STDIO_TOOL_PRESETS: Tuple[StdioServerPreset, ...] = (REA,)
+
+
+# --------------------------------------------------------------------------- #
 # DSN validation
 # --------------------------------------------------------------------------- #
 _EZCONNECT_RE = re.compile(
@@ -608,6 +663,10 @@ __all__ = [
     "PresetConnectionError",
     "PresetError",
     "PresetSpec",
+    "REA",
+    "REA_REPO",
+    "STDIO_TOOL_PRESETS",
+    "StdioServerPreset",
     "check_preset_connection",
     "choose_launcher",
     "get_preset",

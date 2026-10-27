@@ -66,6 +66,12 @@ Your final message is a machine-parsed document, not a reply to a person:
   complete", "Вот раздел…" — neither before nor after the section text.
 - NEVER wrap the whole section in a code fence (```markdown … ``` or any
   other): this is a Markdown page, not code.
+- NEVER emit tool machinery in the final text: `<tool_call>…</tool_call>`
+  blocks, special tokens like `<|im_start|>`/`<|im_end|>`, tool dialogs or
+  tool logs. The final message is ONLY the section text itself, as if the
+  tools did not exist.
+- Minimal structure is mandatory: the first section heading plus at least
+  one list, table, or Mermaid diagram where the contract calls for it.
 - After the section's last line (including the provenance block) — nothing:
   no wrap-ups, explanations, or questions.
 Intermediate messages may be short working notes.

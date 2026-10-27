@@ -429,6 +429,7 @@ class TestMcpAdminUrlUserinfo:
                 "name": "leaky",
                 "transport": "http",
                 "url": "http://user:pass@localhost:9000/mcp",
+                "scopes": ["expert"],
             },
         )
         assert r.status_code == 400
@@ -440,6 +441,7 @@ class TestMcpAdminUrlUserinfo:
                 "name": "clean",
                 "transport": "http",
                 "url": "http://localhost:9000/mcp",
+                "scopes": ["expert"],
             },
         )
         assert r2.status_code in (200, 201)
@@ -571,10 +573,10 @@ class TestGenericErrorDetails:
         )
 
         r = client.post(
-            "/api/public/products/prod_1/push", json={"target": "confluence"}
+            "/api/public/products/prod_1/push", json={"target": "github"}
         )
         assert r.status_code == 502
-        assert r.json()["detail"] == "Push to 'confluence' failed"
+        assert r.json()["detail"] == "Push to 'github' failed"
         assert "SECRETPUSH" not in r.text
         assert "github.internal" not in r.text
 
@@ -594,19 +596,19 @@ class TestGenericErrorDetails:
 
         def _spaces():
             raise RuntimeError(
-                "confluence http://user:SECRETTOKEN@confluence.internal/x"
+                "git http://user:SECRETTOKEN@git.internal/x"
             )
 
         fake = SimpleNamespace(list_spaces=_spaces)
         monkeypatch.setattr(integ_mod, "get_connector", lambda name: fake)
 
-        r = TestClient(app).get("/api/integrations/confluence/spaces")
+        r = TestClient(app).get("/api/integrations/github/spaces")
         assert r.status_code == 502
         assert r.json()["detail"] == (
-            "Failed to list sources for connector 'confluence'"
+            "Failed to list sources for connector 'github'"
         )
         assert "SECRETTOKEN" not in r.text
-        assert "confluence.internal" not in r.text
+        assert "git.internal" not in r.text
 
     def test_integrations_pull_generic_502(self, isolated_db, monkeypatch):
         from fastapi import FastAPI

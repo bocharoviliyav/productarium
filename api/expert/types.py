@@ -6,7 +6,7 @@ can distinguish phases (status / reasoning / content / error).
 
 Pipeline flow:
     _ExpertLLM.stream()  -> yields ExpertStreamEvent
-    _stream_answer()     -> yields ExpertStreamEvent  (RLM wraps chunks as content)
+    _stream_answer()     -> passes the LLM stream events through unchanged
     _run_expert_chat_stream() -> yields ExpertStreamEvent  (adds status events)
     expert router       -> maps ExpertStreamEvent to SSE JSON frames
 """

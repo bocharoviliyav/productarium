@@ -113,8 +113,60 @@
                         "access.token.claim": "true",
                         "userinfo.token.claim": "true"
                     }
+                },
+                {
+                    "name": "groups",
+                    "protocol": "openid-connect",
+                    "protocolMapper": "oidc-usermodel-membership-mapper",
+                    "consentRequired": false,
+                    "config": {
+                        "multivalued": "true",
+                        "userinfo.token.claim": "true",
+                        "id.token.claim": "false",
+                        "access.token.claim": "true",
+                        "claim.name": "groups",
+                        "jsonType.label": "String",
+                        "full.path": "false"
+                    }
                 }
             ]
+        },
+        {
+            "clientId": "productarium-admin-api",
+            "name": "Productarium Admin API",
+            "description": "Service account for the Keycloak Admin REST API (groups reference, SPEC-001)",
+            "enabled": true,
+            "publicClient": false,
+            "bearerOnly": false,
+            "standardFlowEnabled": false,
+            "implicitFlowEnabled": false,
+            "directAccessGrantsEnabled": false,
+            "serviceAccountsEnabled": true,
+            "secret": "change-me-admin-api-secret",
+            "protocol": "openid-connect",
+            "fullScopeAllowed": true,
+            "redirectUris": [],
+            "webOrigins": []
+        }
+    ],
+    "groups": [
+        {
+            "id": "7b7dc25b-1111-4f4e-9a35-000000000001",
+            "name": "productarium-admins",
+            "path": "/productarium-admins",
+            "subGroups": []
+        },
+        {
+            "id": "7b7dc25b-1111-4f4e-9a35-000000000002",
+            "name": "productarium-managers",
+            "path": "/productarium-managers",
+            "subGroups": []
+        },
+        {
+            "id": "7b7dc25b-1111-4f4e-9a35-000000000003",
+            "name": "productarium-users",
+            "path": "/productarium-users",
+            "subGroups": []
         }
     ],
     "users": [
@@ -132,7 +184,16 @@
                     "temporary": false
                 }
             ],
-            "realmRoles": ["admin", "user"]
+            "realmRoles": ["admin", "user"],
+            "groups": ["/productarium-admins"]
+        },
+        {
+            "username": "service-account-productarium-admin-api",
+            "enabled": true,
+            "serviceAccountClientId": "productarium-admin-api",
+            "clientRoles": {
+                "realm-management": ["query-groups"]
+            }
         }
     ],
     "defaultRoles": ["user"],

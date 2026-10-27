@@ -341,7 +341,8 @@ class TestGenerateProductSummary:
         )
         assert result == "Summary inside fence"
 
-    def test_llm_raises_returns_empty(self, monkeypatch):
+    def test_llm_raises_typed_error(self, monkeypatch):
+        """An LLM exception surfaces as SummaryLLMError (cause class + message)."""
         product = FakeProduct()
         cbs = [FakeCodebase("app", "docs")]
 
@@ -349,10 +350,8 @@ class TestGenerateProductSummary:
             async def generate(self, prompt):
                 raise RuntimeError("LLM down")
         monkeypatch.setattr(summary_mod, "_safe_build_summary_llm", lambda *a, **kw: FakeLLM())
-        result = asyncio.run(
-            summary_mod.generate_product_summary(product, cbs, [], [])
-        )
-        assert result == ""
+        with pytest.raises(summary_mod.SummaryLLMError, match="RuntimeError: LLM down"):
+            asyncio.run(summary_mod.generate_product_summary(product, cbs, [], []))
 
     def test_product_name_fallback(self, monkeypatch):
         class P:

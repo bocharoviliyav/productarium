@@ -3,7 +3,7 @@
 router (api.routers.expert) — Wave 2 scope F.
 
 Runs under pytest (pytest.ini: testpaths=test). No live LLM / memory /
-RLM / Postgres required: the LLM, memory recall, and fast-rlm are mocked.
+Postgres required: the LLM and memory recall are mocked.
 The fallback-artifact-docs test uses an isolated SQLite DB.
 """
 
@@ -11,9 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import sys
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Tuple
 
 import pytest
+
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
+from tests.conftest import build_test_client  # noqa: E402
 
 # The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
 # isolated SQLite DB + stable SETTINGS_SECRET_KEY for every
@@ -457,21 +464,27 @@ class TestThinkingParser:
 
 class TestExpertRouter:
     @pytest.fixture
-    def app_and_client(self, monkeypatch):
+    def app_and_client(self, isolated_db, monkeypatch):
         # Auth disabled -> get_current_user returns the system user (no cookie).
         import api.auth.deps as deps
         monkeypatch.setattr(deps, "AUTH_PROVIDER", "none")
-        from fastapi import FastAPI
-        from fastapi.testclient import TestClient
         import api.routers.expert as expert_router
+        from api.models import ProductORM
+
+        # P-1: /ask requires product visibility — seed the product every ask
+        # test talks to (the system admin sees it; the DB rides isolated_db).
+        with isolated_db.SessionLocal() as db:
+            db.add(ProductORM(id="prod_1", name="Acme"))
+            db.commit()
 
         # P1-17: fresh rate-limit budget per test (ask endpoints are limited).
         from api.utils.rate_limit import reset_rate_limits
 
         reset_rate_limits()
-        app = FastAPI()
-        app.include_router(expert_router.router)
-        yield app, TestClient(app)
+        app, client = build_test_client(
+            isolated_db, [expert_router], default_admin_auth=False
+        )
+        yield app, client
         reset_rate_limits()
 
     def test_ask_streams_sse_reasoning_events(self, app_and_client, monkeypatch):
@@ -518,6 +531,29 @@ class TestExpertRouter:
         _, client = app_and_client
         resp = client.post("/api/products/prod_1/ask", json={"query": ""})
         assert resp.status_code == 400
+
+    def test_ask_unknown_product_404(self, app_and_client):
+        """P-1: an unknown product is a plain 404 before any stream work."""
+        _, client = app_and_client
+        resp = client.post("/api/products/ghost/ask", json={"query": "hi"})
+        assert resp.status_code == 404
+
+    def test_ask_invisible_product_404_for_stranger(self, app_and_client):
+        """P-1: a plain user without access to the (ownerless) seeded product
+        gets the same indistinguishable 404."""
+        from datetime import datetime
+
+        import api.routers.expert as expert_router
+        from api.models import UserORM
+
+        app, client = app_and_client
+        stranger = UserORM(
+            id="u_stranger", username="stranger", role="user",
+            provider="local", created_at=datetime.utcnow(),
+        )
+        app.dependency_overrides[expert_router.get_current_user] = lambda: stranger
+        resp = client.post("/api/products/prod_1/ask", json={"query": "hi"})
+        assert resp.status_code == 404
 
     def test_ask_requires_auth_when_not_none(self, app_and_client, monkeypatch):
         app, client = app_and_client

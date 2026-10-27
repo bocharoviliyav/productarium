@@ -97,8 +97,20 @@ from api.docgen._common import (
     _product_dataset,
     _split_provenance_block,
     _index_in_background,
+    _index_pages_in_background,
+    _is_context_overflow,
     _repo_name_from_url,
+    # SPEC-015: truncation heuristics moved to the shared gate module
+    _drop_dangling_fence_tail,
+    _has_open_fence,
+    _looks_truncated,
     emit_progress,
+    utc_now_iso,
+    halve_budget_on_overflow,
+    plain_agent_tools,
+    run_with_page_gate,
+    run_with_unit_budget,
+    validate_page,
 )
 from api.docgen.prose_dedup import enforce_unique_openers, opener_dedup_enabled
 from api.docgen.corroborate import build_identifier_grounding
@@ -141,8 +153,8 @@ def _resolve_docgen_context_window() -> Optional[int]:
     """Resolve the model's actual context-window ceiling in tokens.
 
     Uses ``get_model_context_window(task="docgen")`` which checks explicit env
-    vars, admin settings, live API metadata (/api/show or /v1/models), model name
-    heuristics, and a safe default (8192).
+    vars, admin settings, the known-model catalog, live API metadata
+    (/api/show or /v1/models), and a safe default (200000).
     """
     try:
         from api.utils import get_model_context_window
@@ -150,13 +162,6 @@ def _resolve_docgen_context_window() -> Optional[int]:
     except Exception as e:
         logger.debug("Could not resolve context window in codebase docgen: %s", e)
         return 8192
-
-
-async def _resolve_rlm_context_window_async() -> Optional[int]:
-    """P1-13: off-loop wrapper — the resolver may hit live API metadata
-    (/api/show or /v1/models); calling it on the event loop stalls every
-    concurrent request. Used at all async call sites in this module."""
-    return await asyncio.to_thread(_resolve_rlm_context_window)
 
 
 # Token-counting is approximate by design: we need a budget estimate, not an
@@ -1797,6 +1802,7 @@ def _build_section_subagent_specs(
     unit_titles: Optional[Dict[str, str]] = None,
     notes_dir: Optional[str] = None,
     spec_tools: Optional[List[Any]] = None,
+    mcp_tools: Optional[List[Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Declarative deepagents SubAgent specs, one per UNIT to generate.
 
@@ -1805,15 +1811,17 @@ def _build_section_subagent_specs(
     ``system_prompt`` so the orchestrator's short dispatch message cannot
     lose or paraphrase it. ``unit_titles`` supplies child display titles
     (parents resolve from the section registry); ``notes_dir`` adds the
-    shared-notes tools and ``spec_tools`` adds the on-demand spec-lookup
-    tool to every spec. ``model`` and ``tools`` are required
-    by ``create_sub_agent``.
+    shared-notes tools, ``spec_tools`` the on-demand spec-lookup tool and
+    ``mcp_tools`` the product's codebase-scoped MCP tools to every spec.
+    ``model`` and ``tools`` are required by ``create_sub_agent``.
     """
     tools = build_repo_tools(repo_dir)
     if notes_dir:
         tools = tools + build_notes_tools(notes_dir)
     if spec_tools:
         tools = tools + list(spec_tools)
+    if mcp_tools:
+        tools = tools + list(mcp_tools)
     titles = unit_titles or {}
     specs: List[Dict[str, Any]] = []
     for unit_id, system_prompt in system_prompts.items():
@@ -1860,16 +1868,22 @@ async def _run_parallel_section_agents(
     system_prompts: Dict[str, str],
     dispatches: Dict[str, str],
     tracker: _SectionProgressTracker,
+    titles: Optional[Dict[str, str]] = None,
+    progress: Optional[Any] = None,
     notes_dir: Optional[str] = None,
     spec_tools: Optional[List[Any]] = None,
-) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
+    mcp_tools: Optional[List[Any]] = None,
+) -> Tuple[Dict[str, str], Dict[str, List[str]], Set[str]]:
     """Python-orchestration fallback: independent UNIT agents, parallel.
 
     ``asyncio.gather`` over per-unit deep agents bounded by a semaphore
-    (``DOCGEN_SECTION_CONCURRENCY``). Individual failures never raise — a
-    failed unit simply yields empty text and the caller falls back to the
-    standard-LLM path. ``notes_dir`` (optional) adds the shared-notes tools;
-    ``spec_tools`` (optional) adds the on-demand spec-lookup tool.
+    (``DOCGEN_SECTION_CONCURRENCY``), each under the SPEC-004 page gate.
+    Individual failures never raise — a failed unit simply yields empty
+    text and the caller falls back to the standard-LLM path. Returns
+    ``(texts, files_by_sid, degraded_sids)``. ``notes_dir`` (optional)
+    adds the shared-notes tools; ``spec_tools`` (optional) adds the
+    on-demand spec-lookup tool; ``mcp_tools`` (optional) adds the product's
+    codebase-scoped MCP tools.
     """
     from deepagents import create_deep_agent
 
@@ -1878,32 +1892,40 @@ async def _run_parallel_section_agents(
         repo_tools = repo_tools + build_notes_tools(notes_dir)
     if spec_tools:
         repo_tools = repo_tools + list(spec_tools)
+    if mcp_tools:
+        repo_tools = repo_tools + list(mcp_tools)
     semaphore = asyncio.Semaphore(_section_concurrency())
 
-    async def _one(sid: str) -> Tuple[str, str, List[str]]:
+    async def _one(sid: str) -> Tuple[str, str, List[str], bool]:
         async with semaphore:
             tracker.section_started(sid)
             agent = create_deep_agent(
                 model=chat, tools=repo_tools,
                 system_prompt=system_prompts[sid],
             )
-            text, files = await _run_agent_section(agent, dispatches[sid])
+            text, files, degraded = await _run_agent_section(
+                agent, dispatches[sid],
+                title=(titles or {}).get(sid, sid), progress=progress,
+            )
             tracker.section_finished(sid)
-            return sid, text, files
+            return sid, text, files, degraded
 
     results = await asyncio.gather(
         *(_one(sid) for sid in system_prompts), return_exceptions=True,
     )
     texts: Dict[str, str] = {}
     files_by_sid: Dict[str, List[str]] = {}
+    degraded_sids: Set[str] = set()
     for item in results:
         if isinstance(item, BaseException):
             logger.warning("Parallel section agent failed: %s", item)
             continue
-        sid, text, files = item
+        sid, text, files, degraded = item
         texts[sid] = text
         files_by_sid[sid] = files
-    return texts, files_by_sid
+        if degraded:
+            degraded_sids.add(sid)
+    return texts, files_by_sid, degraded_sids
 
 
 def _final_agent_text(result: Any) -> str:
@@ -1961,50 +1983,56 @@ def _agent_files_read(result: Any) -> List[str]:
     return files
 
 
-# Error-text markers of a context-window overflow on OpenAI-compatible
-# servers (400 + one of these strings). Recognized so the diagnostics name
-# the actual budgets instead of a faceless warning.
-_CONTEXT_OVERFLOW_MARKERS = (
-    "context_length_exceeded",
-    "context length",
-    "message too long",
-    "maximum context length",
-    "prompt is too long",
-    "too many tokens",
-    "max_tokens is too large",
-)
-
-
-def _is_context_overflow(exc: BaseException) -> bool:
-    """True when the error text says the request exceeded the context window."""
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return any(marker in text for marker in _CONTEXT_OVERFLOW_MARKERS)
-
-
 async def _run_agent_section(
     agent: Any,
     task_prompt: str,
-) -> Tuple[str, List[str]]:
-    """Run one section through the deepagents agent.
+    *,
+    title: str = "",
+    progress: Optional[Any] = None,
+) -> Tuple[str, List[str], bool]:
+    """Run one section through the deepagents agent under the page gate.
 
-    Returns ``(final_text, files_read)``. Never raises: an agent failure is
-    surfaced as empty text so the caller falls back to the standard-LLM path.
+    Returns ``(final_text, files_read, degraded)`` — ``degraded`` marks a
+    page kept after the gate exhausted its retries (SPEC-004). Never
+    raises: an agent failure is surfaced as empty text so the caller falls
+    back to the standard-LLM path.
     """
     from langchain_core.messages import HumanMessage
 
-    from api.config.timeout import resolve_docgen_unit_recursion_limit
+    from api.config.timeout import (
+        resolve_docgen_unit_recursion_limit,
+        resolve_docgen_unit_wall_clock,
+    )
 
-    try:
+    last: Dict[str, Any] = {}
+
+    async def _once(feedback: str) -> str:
         result = await agent.ainvoke(
-            {"messages": [HumanMessage(content=task_prompt)]},
+            {"messages": [HumanMessage(content=task_prompt + feedback)]},
             config={"recursion_limit": resolve_docgen_unit_recursion_limit()},
         )
+        last["result"] = result
+        return _clean_llm_text(_final_agent_text(result)) or ""
+
+    try:
+        # SPEC-015: the whole gated run (all gate attempts) sits under one
+        # wall-clock budget; a stalled unit cancels and falls back to "", [],
+        # False → the missing-unit machinery above re-runs or placeholder-fills it.
+        text, degraded, _attempts = await run_with_unit_budget(
+            run_with_page_gate(
+                _once, title=title, label=title or "section", progress=progress,
+            ),
+            seconds=resolve_docgen_unit_wall_clock(),
+            label=title or "section",
+        )
+    except asyncio.TimeoutError:
+        return "", [], False
     except Exception as e:  # pragma: no cover - depends on live model
         if _is_context_overflow(e):
             logger.warning(
                 "deepagents section run hit the model context limit "
                 "(ctx=%s tokens, repo_read_file cap=%s chars, dispatch ~%d "
-                "tokens); raise RLM_MODEL_CONTEXT_WINDOW or the model window: %s",
+                "tokens); raise PRODUCTARIUM_MODEL_CONTEXT_WINDOW or the model window: %s",
                 _resolve_docgen_context_window(),
                 _repo_read_max_chars(),
                 _count_tokens(task_prompt),
@@ -2012,8 +2040,8 @@ async def _run_agent_section(
             )
         else:
             logger.warning("deepagents section run failed: %s", e)
-        return "", []
-    return _clean_llm_text(_final_agent_text(result)) or "", _agent_files_read(result)
+        return "", [], False
+    return text, _agent_files_read(last.get("result")), degraded and bool(text)
 
 
 def _judge_evidence(repo_dir: str, files: List[str], cap_total: int = 24_000) -> str:
@@ -2054,47 +2082,6 @@ async def _close_chat_client(chat: Any) -> None:
 # 4096 leaves room for long sections with diagrams; the former 2048 cut
 # architecture-style pages mid-mermaid (the unclosed-fence defect).
 _COMPLETION_RESERVE_TOKENS = 4096
-
-
-def _has_open_fence(text: str) -> bool:
-    """True when a ``` fence is left unclosed (token-limit truncation)."""
-    open_ = False
-    for line in text.splitlines():
-        if line.lstrip().startswith("```"):
-            open_ = not open_
-    return open_
-
-
-def _looks_truncated(text: str) -> bool:
-    """Heuristic truncation detector for a generated unit body.
-
-    Signals: an unclosed code fence (cut mid-block) or an abrupt mid-sentence
-    ending — the last non-empty line ends with a letter or comma while the
-    body is long enough for the ending to be meaningful.
-    """
-    if not text or not text.strip():
-        return False
-    if _has_open_fence(text):
-        return True
-    if len(text) < 500:
-        return False
-    last = [ln for ln in text.splitlines() if ln.strip()][-1].rstrip()
-    return bool(last) and (last[-1].isalpha() or last[-1] == ",")
-
-
-def _drop_dangling_fence_tail(text: str) -> str:
-    """Remove a trailing unterminated ``` fence fragment (cut mid-block)."""
-    lines = text.splitlines()
-    last_open = -1
-    open_ = False
-    for i, line in enumerate(lines):
-        if line.lstrip().startswith("```"):
-            open_ = not open_
-            if open_:
-                last_open = i
-    if not open_ or last_open < 0:
-        return text
-    return "\n".join(lines[:last_open]).rstrip()
 
 
 async def _heal_truncated_unit(
@@ -2167,14 +2154,15 @@ async def _generate_section_single_call(
     """Single-call path: section prompt + codebase blob, capped to context.
 
     The codebase blob is ALWAYS appended when available so the standard LLM has
-    actual source code to generate the section from.
+    actual source code to generate the section from. A context-overflow answer
+    halves the fit budget and retries (down to the 8192 floor).
     """
     if llm is None:
         return ""
-    try:
-        ctx_win = _resolve_docgen_context_window() or 8192
-        max_p_tokens = max(1024, ctx_win - _COMPLETION_RESERVE_TOKENS)
+    ctx_win = _resolve_docgen_context_window() or 8192
+    budget = max(1024, ctx_win - _COMPLETION_RESERVE_TOKENS)
 
+    async def _call(max_p_tokens: int) -> str:
         prompt = section_prompt
         if codebase_blob:
             # Real token budget: keep whole file blocks, drop from the end.
@@ -2183,7 +2171,14 @@ async def _generate_section_single_call(
                 prefix=section_prompt + _CODEBASE_BLOCK_HEADER,
             )
             prompt = prompt + _CODEBASE_BLOCK_HEADER + fitted
-        txt = _clean_llm_text(await llm.generate(prompt))
+        return await llm.generate(prompt)
+
+    try:
+        txt = _clean_llm_text(
+            await halve_budget_on_overflow(
+                _call, budget, label="Section single call",
+            )
+        )
         if txt:
             return txt
     except Exception as e:  # pragma: no cover - depends on live LLM
@@ -2221,22 +2216,29 @@ async def _reduce_section_drafts(
         "<drafts>\n"
     )
     drafts_tail = "\n</drafts>\n\nГотовый раздел:"
-    # Real token budget: drop WHOLE drafts from the end (they are ordered by
-    # chunk index) until scaffold + drafts + tail fits the window.
-    budget = max_p_tokens - _count_tokens(scaffold) - _count_tokens(drafts_tail)
-    kept = list(drafts)
-    while len(kept) > 1 and _count_tokens("\n\n---\n\n".join(kept)) > budget:
-        kept.pop()
-    dropped = len(drafts) - len(kept)
-    joined = "\n\n---\n\n".join(kept)
-    if dropped:
-        logger.info(
-            "Section reduce dropped %d draft(s) to fit the context budget.", dropped,
-        )
-        joined += "\n\n---\n\n(... earlier draft(s) omitted ...)"
-    reduce_prompt = scaffold + joined + drafts_tail
+
+    async def _call(max_tokens: int) -> str:
+        # Real token budget: drop WHOLE drafts from the end (they are ordered
+        # by chunk index) until scaffold + drafts + tail fits the window.
+        budget = max_tokens - _count_tokens(scaffold) - _count_tokens(drafts_tail)
+        kept = list(drafts)
+        while len(kept) > 1 and _count_tokens("\n\n---\n\n".join(kept)) > budget:
+            kept.pop()
+        dropped = len(drafts) - len(kept)
+        joined = "\n\n---\n\n".join(kept)
+        if dropped:
+            logger.info(
+                "Section reduce dropped %d draft(s) to fit the context budget.", dropped,
+            )
+            joined += "\n\n---\n\n(... earlier draft(s) omitted ...)"
+        return await llm.generate(_with_verification_guard(scaffold + joined + drafts_tail))
+
     try:
-        txt = _clean_llm_text(await llm.generate(_with_verification_guard(reduce_prompt)))
+        txt = _clean_llm_text(
+            await halve_budget_on_overflow(
+                _call, max_p_tokens, label="Section reduce",
+            )
+        )
         if txt:
             return txt
     except Exception as e:  # pragma: no cover - depends on live LLM
@@ -2271,16 +2273,25 @@ async def _agentic_file_map_summary(
         from api.prompts import VERIFICATION_GUARD as _guard
     except Exception:  # pragma: no cover - import-safe
         _guard = ""
-    # Real token budget (the guard rides along and is measured too).
-    fitted = _fit_file_blocks_to_budget(
-        block_chunk, max_tokens,
-        prefix=prompt, suffix=tail + (("\n\n" + _guard) if _guard else ""),
-    )
-    # P0-8: the chunk is untrusted repo code — frame the fitted content as
-    # data (wrap_untrusted), not merely with XML-ish tags.
-    prompt = _with_verification_guard(prompt + wrap_untrusted(fitted) + tail)
+
+    async def _call(budget: int) -> str:
+        # Real token budget (the guard rides along and is measured too).
+        fitted = _fit_file_blocks_to_budget(
+            block_chunk, budget,
+            prefix=prompt, suffix=tail + (("\n\n" + _guard) if _guard else ""),
+        )
+        # P0-8: the chunk is untrusted repo code — frame the fitted content
+        # as data (wrap_untrusted), not merely with XML-ish tags.
+        return await llm.generate(
+            _with_verification_guard(prompt + wrap_untrusted(fitted) + tail)
+        )
+
     try:
-        return _clean_llm_text(await llm.generate(prompt))
+        return _clean_llm_text(
+            await halve_budget_on_overflow(
+                _call, max_tokens, label="File map summary",
+            )
+        )
     except Exception as e:
         logger.warning("Agentic file map summary call failed: %s", e)
         return ""
@@ -2392,15 +2403,6 @@ def _units_pages(
                 "relatedPages": [page_id],
             }
     return pages
-
-
-def _section_pages(sections: Dict[str, str], language: str) -> Dict[str, Any]:
-    """Legacy parent-only pages (compat wrapper over ``_units_pages``)."""
-    units = [
-        _DocUnit(unit_id=sid, sid=sid, title=get_section_title(sid, language))
-        for sid in SECTION_ORDER
-    ]
-    return _units_pages(sections, units, language)
 
 
 def _units_list_text(
@@ -2631,6 +2633,14 @@ async def generate_codebase_docs(
         # The local FS path stays in the server log only (review #5).
         logger.warning("Repo dir missing after clone: %r", repo_dir)
         raise ValueError("Repository not available locally after clone; see server logs.")
+    # SPEC-010: the commit these docs describe (detect compares against it).
+    baseline_sha: Optional[str] = None
+    try:
+        from api.clients.git import head_commit
+
+        baseline_sha = head_commit(repo_dir)
+    except Exception as e:  # non-git/local clones: detect degrades to unknown
+        logger.debug("codebase baseline sha unavailable: %s", e)
 
     documents = read_all_documents(repo_dir)
     if not documents:
@@ -2675,20 +2685,6 @@ async def generate_codebase_docs(
                     cross_parts.append(db_ctx)
         except Exception as e:  # context is never fatal
             logger.debug("Docgen database context skipped for %s: %s", pid, e)
-        # Product-level knowledge recall (Confluence pages / indexed docs).
-        try:
-            from api.expert.knowledge import _retrieve_product_knowledge
-
-            p_knowledge = await _retrieve_product_knowledge(
-                pid, "architecture functional API specifications"
-            )
-            if p_knowledge and p_knowledge.strip():
-                cross_parts.append(
-                    "### Дополнительный контекст продукта (Confluence / База знаний):\n"
-                    + p_knowledge.strip()
-                )
-        except Exception as e:
-            logger.debug("Docgen product knowledge retrieval skipped for %s: %s", pid, e)
 
     # On-demand spec details for the unit agents: the brief carries the
     # menu, this tool serves schema/operation fragments on request. Empty
@@ -2704,6 +2700,21 @@ async def generate_codebase_docs(
         except Exception as e:  # pragma: no cover - tools are optional
             logger.debug("Docgen spec tools unavailable for %s: %s", pid, e)
             spec_tools = []
+
+    # SPEC-028: codebase-scoped MCP servers join the unit agents' toolset,
+    # error-tolerant (plain_agent_tools) so one tool failure degrades a
+    # single call instead of killing a unit agent.
+    mcp_tools: List[Any] = []
+    if pid:
+        try:
+            from api.mcp.manager import gather_mcp_agent_tools
+
+            mcp_tools = plain_agent_tools(
+                await gather_mcp_agent_tools(pid, scope="codebase")
+            )
+        except Exception as e:  # pragma: no cover - tools are optional
+            logger.debug("Docgen codebase MCP tools unavailable for %s: %s", pid, e)
+            mcp_tools = []
 
     # Always split the codebase into token-budget chunks: they feed the
     # FALLBACK standard-LLM path (single call / map-reduce) when the agent
@@ -2870,6 +2881,9 @@ async def generate_codebase_docs(
             chat = None
 
     provenance_by_unit: Dict[str, Dict[str, Any]] = {}
+    # SPEC-010: units actually (re)generated this run — their pages are the
+    # only ones needing memory re-indexing (reused pages keep their chunks).
+    regenerated_uids: Set[str] = set()
     repair_llm = _make_repair_llm(
         model, llm, base_url=resolved_base_url, api_key=resolved_api_key
     )
@@ -2893,6 +2907,7 @@ async def generate_codebase_docs(
     # --- Phases 1-2: hints, decomposer, orchestrated UNIT subagents --------
     agent_units: Dict[str, str] = {}
     agent_files: Dict[str, List[str]] = {}
+    degraded_uids: Set[str] = set()
     emit_progress(progress, phase="planning", sections_total=sections_total)
     try:
         hints: Dict[str, Any] = {}
@@ -3054,7 +3069,7 @@ async def generate_codebase_docs(
                 specs = _build_section_subagent_specs(
                     chat, repo_dir, system_prompts, language,
                     unit_titles=unit_titles, notes_dir=notes_dir,
-                    spec_tools=spec_tools,
+                    spec_tools=spec_tools, mcp_tools=mcp_tools,
                 )
                 reused_lines = "\n".join(
                     f"- `{u.unit_id}` — {u.title}"
@@ -3082,13 +3097,27 @@ async def generate_codebase_docs(
                     },
                 )
                 agent_units = _extract_orchestrated_sections(result)
+                # SPEC-004: orchestrated texts bypass the per-unit agent
+                # gate — drop invalid ones so the missing-unit machinery
+                # below re-runs them through the gated python-parallel path.
+                for uid in list(agent_units):
+                    violations = validate_page(
+                        unit_titles.get(uid, uid), agent_units[uid]
+                    )
+                    if violations:
+                        logger.warning(
+                            "Quality gate: orchestrated unit %s invalid (%s); "
+                            "re-running gated",
+                            uid, "; ".join(violations),
+                        )
+                        agent_units.pop(uid)
             except Exception as e:  # pragma: no cover - depends on live model
                 if _is_context_overflow(e):
                     logger.warning(
                         "Orchestrated unit run hit the model context limit "
                         "(ctx=%s tokens, repo_read_file cap=%s chars, "
                         "chunk_budget=%d tokens); raise "
-                        "RLM_MODEL_CONTEXT_WINDOW or the model window: %s",
+                        "PRODUCTARIUM_MODEL_CONTEXT_WINDOW or the model window: %s",
                         _resolve_docgen_context_window(),
                         _repo_read_max_chars(),
                         chunk_budget,
@@ -3136,18 +3165,21 @@ async def generate_codebase_docs(
                             dict(sorted(dispatched_failed.items())),
                         )
                 try:
-                    p_texts, p_files = await _run_parallel_section_agents(
+                    p_texts, p_files, p_degraded = await _run_parallel_section_agents(
                         chat, repo_dir,
                         {uid: system_prompts[uid] for uid in missing},
                         {uid: dispatches[uid] for uid in missing},
                         tracker,
+                        titles=unit_titles,
+                        progress=progress,
                         notes_dir=notes_dir,
-                        spec_tools=spec_tools,
+                        spec_tools=spec_tools, mcp_tools=mcp_tools,
                     )
                 except Exception as e:  # pragma: no cover - depends on live model
                     logger.warning("Parallel unit agents failed: %s", e)
-                    p_texts, p_files = {}, {}
+                    p_texts, p_files, p_degraded = {}, {}, set()
                 agent_units.update(p_texts)
+                degraded_uids.update(p_degraded)
                 for uid, files in p_files.items():
                     agent_files.setdefault(uid, []).extend(files)
 
@@ -3233,6 +3265,9 @@ async def generate_codebase_docs(
                 # phase while the work actually happens (the post-loop emit
                 # covers the structure-check tail and reuse-only runs).
                 emit_progress(progress, phase="verifying")
+
+            if regen_status != "reused-unchanged":
+                regenerated_uids.add(uid)
 
             # The provenance block the unit contract mandates (assumptions,
             # gaps, confidence) moves OUT of the persisted text into
@@ -3329,6 +3364,10 @@ async def generate_codebase_docs(
                 # secret-free as the page text verify_section produced.
                 prov_report, _m = mask_secrets(prov_report)
                 unit_provenance["report"] = prov_report
+            if uid in degraded_uids:
+                # SPEC-004: the gate exhausted its retries and the sanitized
+                # page was kept — surface that in provenance.
+                unit_provenance["degraded"] = True
             if unit.is_child:
                 # Child identity for the NEXT run's diff-regen (prompt hash +
                 # family reconstruction from stored pages).
@@ -3487,15 +3526,22 @@ async def generate_codebase_docs(
     for uid, prov in provenance_by_unit.items():
         attach_provenance(pages, uid, prov)
     _persist_artifact(artifact, markdown, pages)
-    # Index the GENERATED DOCS into the active memory backend AFTER generation
-    # (non-blocking) into the product-scoped dataset. source_id = codebase id
-    # so the pgvector upsert can delete the previous chunks for this codebase
-    # before re-inserting (delete-then-insert by source_id). The generated
-    # markdown (with its citations) is indexed — previously the clone PATH
-    # string was passed as content, producing a single junk chunk.
-    _index_in_background(
-        markdown, _product_dataset(product),
-        source_type="codebase", source_id=getattr(artifact, "id", None),
+    # SPEC-010: source baseline for the next detect run + PAGE-granular
+    # memory indexing — only regenerated/new pages re-embed; reused pages
+    # keep their stored chunks and stale sources are pruned (no duplicates).
+    artifact.source_state = {
+        "kind": "codebase",
+        "baseline": baseline_sha,
+        "checked_at": utc_now_iso(),
+    }
+    _index_pages_in_background(
+        pages, _product_dataset(product),
+        source_type="codebase",
+        source_id=getattr(artifact, "id", None),
+        only={
+            *(f"page_{uid}" for uid in regenerated_uids),
+            *(pid for pid in pages if pid not in old_pages),
+        },
     )
     return markdown
 

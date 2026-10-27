@@ -6,7 +6,7 @@ Focuses on:
 - ``_validate_parent_move`` (cycle detection, self-parent, empty string -> root,
   foreign parent)
 - ``_convert_via_markitdown`` (markitdown available, UTF-8 fallback, 501 non-UTF-8)
-- ``_is_owner`` non-admin non-owner 403 on verify
+- verify RBAC: docs permission (SPEC-001), invisible product → 404
 - tree endpoint on missing product (404)
 - update_node parent_id move (drag-and-drop) + slug re-derive on empty slug
 - _node_dict / _orm_to_node / _new_node_id helper coverage
@@ -234,11 +234,11 @@ class TestMarkitdownUpload:
         assert resp.status_code == 404
 
 
-# --- _is_owner non-admin non-owner 403 --------------------------------------
+# --- verify RBAC (docs permission, invisibility → 404) -----------------------
 class TestVerifyOwnership:
-    def test_verify_non_admin_non_owner_403(self, isolated_db):
+    def test_verify_stranger_invisible_product_404(self, isolated_db):
         from api.routers import knowledge as knowledge_mod
-        from api.models import UserORM, KnowledgeNodeORM
+        from api.models import UserORM, KnowledgeNodeORM, ProductORM
 
         # Create a product with no owner + a node created by someone else.
         with isolated_db.SessionLocal() as db:
@@ -249,15 +249,14 @@ class TestVerifyOwnership:
             ))
             db.commit()
 
-        # A plain user who is not the owner or creator.
+        # A plain user without grants sees nothing (SPEC-001: 404, not 403).
         plain_user = UserORM(
             id="user_plain", username="plain", role="user",
             provider="local", created_at=datetime.utcnow(),
         )
         app, client = _build_client(isolated_db, knowledge_mod, user=plain_user)
         resp = client.post("/api/products/prod_1/knowledge/nodes/node_1/verify")
-        assert resp.status_code == 403
-        assert "owner" in resp.json()["detail"].lower()
+        assert resp.status_code == 404
 
     def test_verify_product_owner_allowed(self, isolated_db):
         """A user who owns the product can verify nodes in it."""
@@ -283,8 +282,8 @@ class TestVerifyOwnership:
         assert body["verified"] is True
         assert body["verified_by"] == "user_owner"
 
-    def test_verify_node_creator_allowed(self, isolated_db):
-        """A non-admin user who created the node can verify it."""
+    def test_verify_node_creator_without_access_404(self, isolated_db):
+        """P-3: node creation alone no longer grants verify rights."""
         from api.routers import knowledge as knowledge_mod
         from api.models import UserORM, KnowledgeNodeORM, ProductORM
 
@@ -302,8 +301,7 @@ class TestVerifyOwnership:
 
         app, client = _build_client(isolated_db, knowledge_mod, user=creator)
         resp = client.post("/api/products/prod_1/knowledge/nodes/node_1/verify")
-        assert resp.status_code == 200
-        assert resp.json()["verified_by"] == "user_creator"
+        assert resp.status_code == 404
 
 
 # --- Tree endpoint on missing product ---------------------------------------
@@ -725,6 +723,23 @@ class TestGenerateSummary:
         resp = client.post(f"/api/products/{pid}/summary")
         assert resp.status_code == 503
         assert "no content available" in resp.json()["detail"]
+
+    def test_summary_llm_error_returns_503_with_reason(self, isolated_db, monkeypatch):
+        """SPEC-026: SummaryLLMError -> 503 with the sanitized cause appended."""
+        from api.docgen.summary import SummaryLLMError
+        from api.routers import knowledge as knowledge_mod
+
+        async def _fake_summary(product, codebases, specs, nodes, **kw):
+            raise SummaryLLMError(RuntimeError("LLM down"))
+
+        monkeypatch.setattr(knowledge_mod, "generate_product_summary", _fake_summary)
+
+        app, client = _build_client(isolated_db, knowledge_mod)
+        pid = _seed_product(isolated_db)
+
+        resp = client.post(f"/api/products/{pid}/summary")
+        assert resp.status_code == 503
+        assert "unreachable: RuntimeError: LLM down" in resp.json()["detail"]
 
     def test_summary_product_not_found_404(self, isolated_db, monkeypatch):
         from api.routers import knowledge as knowledge_mod

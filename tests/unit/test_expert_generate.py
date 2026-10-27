@@ -1,7 +1,7 @@
 """Unit tests for ``api.expert.generate``.
 
-Covers (post fast-rlm removal — the expert answer is a plain langchain
-``ChatOpenAI`` call via ``_ExpertLLM``):
+Covers (the expert answer is a plain langchain ``ChatOpenAI`` call via
+``_ExpertLLM``):
 - ``_generate_answer``: LLM success (text cleaned via ``_clean_llm_text``),
   LLM returns "" , LLM unavailable (None) -> "", generate exception -> "".
 - ``_stream_answer``: LLM stream passthrough of typed events, LLM

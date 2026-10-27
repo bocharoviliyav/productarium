@@ -36,6 +36,8 @@ __all__ = [
     "get_memory_backend_name",
     "reset_memory_backend_cache",
     "index_document",
+    "list_page_sources",
+    "prune_stale_sources",
     "query_memory",
     "clear_memory",
     "reindex_product_memory",
@@ -106,6 +108,32 @@ async def reindex_product_memory(product_id: Optional[str] = None) -> Dict[str, 
     except Exception as e:
         logger.error("memory.reindex_product_memory failed: %s", e, exc_info=True)
         return {"success": False, "message": f"Reindex error: {e}", "reindexed_count": 0}
+
+
+async def list_page_sources(
+    product_id: str, source_type: str, source_id: str
+) -> list:
+    """Distinct page-granular source ids for an artifact (SPEC-010). Non-fatal."""
+    try:
+        backend = get_memory_backend()
+        fn = getattr(backend, "list_page_sources", None)
+        return await fn(product_id, source_type, source_id) if fn else []
+    except Exception as e:
+        logger.warning("memory.list_page_sources failed for %s: %s", source_id, e)
+        return []
+
+
+async def prune_stale_sources(
+    product_id: str, source_type: str, source_id: str, keep_source_ids: list
+) -> int:
+    """Delete blob-level + stale page chunks (SPEC-010). Non-fatal."""
+    try:
+        backend = get_memory_backend()
+        fn = getattr(backend, "prune_stale_sources", None)
+        return await fn(product_id, source_type, source_id, keep_source_ids) if fn else 0
+    except Exception as e:
+        logger.warning("memory.prune_stale_sources failed for %s: %s", source_id, e)
+        return 0
 
 
 async def init_memory() -> None:

@@ -2,7 +2,7 @@
 """Unit tests for api.routers.admin.
 
 Focuses on the lines NOT already covered by tests/integration/test_admin_public.py:
-- connectivity tests (POST /{group}/test) for models, git, confluence, integrations
+- connectivity tests (POST /{group}/test) for models, git, integrations
 - _ping_model_endpoint branches (success, auth-rejected, probe failure, non-200)
 - _lazy_connector / _connector_test_result helper branches
 - prompts list/get/put (including invalid filename + path traversal + missing file,
@@ -10,7 +10,7 @@ Focuses on the lines NOT already covered by tests/integration/test_admin_public.
 - GET /api/admin/openapi (read-only public API viewer)
 - generation group (GET resolved view + PUT language validation)
 - memory endpoints (GET/PUT /api/admin/memory, POST /api/admin/memory/reindex)
-- settings group GETs with ``resolved`` views (git, confluence, integrations,
+- settings group GETs with ``resolved`` views (git, integrations,
   ssl, embedder, memory, timeouts)
 - users: POST create (with + without password), POST reset-token, duplicate 409,
   invalid role 400, non-local user reset 400
@@ -182,8 +182,10 @@ class TestModelsConnectivity:
         )
         assert resp.status_code == 200
         body = resp.json()
+        # P-7: generic client-facing message; the raw error stays in the log.
         assert body["success"] is False
-        assert "refused" in body["message"]
+        assert body["message"] == "Connection test failed"
+        assert "refused" not in body["message"]
 
     def test_models_test_chat_auth_rejected(self, isolated_db, monkeypatch):
         """GET /v1/models succeeds but chat returns 401 -> auth-rejected message."""
@@ -251,7 +253,7 @@ class TestModelsConnectivity:
         assert any("embeddings" in u for u in post_urls)
 
     def test_models_test_chat_probe_non_400_note(self, isolated_db, monkeypatch):
-        """Chat probe returns >= 400 (but not 401/403) -> success with chat_note."""
+        """Chat probe 5xx (not 400/401/403) -> failure + sanitized JSON detail."""
         from api.routers import admin as admin_mod
 
         class _FakeResp:
@@ -260,6 +262,41 @@ class TestModelsConnectivity:
                 self._payload = payload or {}
 
             def json(self):
+                return self._payload
+
+        def _fake_get(url, **kw):
+            return _FakeResp(200, {"data": [{"id": "qwen/test"}]})
+
+        def _fake_post(url, **kw):
+            return _FakeResp(500, {"error": {"message": "model overloaded"}})
+
+        import requests
+        monkeypatch.setattr(requests, "get", _fake_get)
+        monkeypatch.setattr(requests, "post", _fake_post)
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.post(
+            "/api/admin/models/test",
+            json={"base_url": "http://x:1234/v1", "model": "qwen/test"},
+        )
+        body = resp.json()
+        assert body["success"] is False
+        assert "Chat probe failed" in body["message"]
+        assert "'qwen/test'" in body["message"]
+        assert "model overloaded" in body["message"]
+
+    def test_models_test_chat_probe_non_json_error(self, isolated_db, monkeypatch):
+        """Chat probe 5xx with a non-JSON body -> detail degrades to the status."""
+        from api.routers import admin as admin_mod
+
+        class _FakeResp:
+            def __init__(self, status, payload=None):
+                self.status_code = status
+                self._payload = payload
+
+            def json(self):
+                if self._payload is None:
+                    raise ValueError("no json")
                 return self._payload
 
         def _fake_get(url, **kw):
@@ -278,11 +315,118 @@ class TestModelsConnectivity:
             json={"base_url": "http://x:1234/v1", "model": "qwen/test"},
         )
         body = resp.json()
+        assert body["success"] is False
+        assert "status 500" in body["message"]
+
+    def test_models_test_chat_400_retry_success(self, isolated_db, monkeypatch):
+        """Chat 400 (max_tokens gate) -> one max_completion_tokens retry -> ok."""
+        from api.routers import admin as admin_mod
+
+        class _FakeResp:
+            def __init__(self, status, payload=None):
+                self.status_code = status
+                self._payload = payload or {}
+
+            def json(self):
+                return self._payload
+
+        posts = []
+
+        def _fake_get(url, **kw):
+            return _FakeResp(200, {"data": [{"id": "qwen/test"}]})
+
+        def _fake_post(url, headers=None, json=None, **kw):
+            posts.append(json)
+            if len(posts) == 1:
+                return _FakeResp(400, {"error": {"message": "use max_completion_tokens"}})
+            return _FakeResp(200, {"choices": [{"message": {"content": "ok"}}]})
+
+        import requests
+        monkeypatch.setattr(requests, "get", _fake_get)
+        monkeypatch.setattr(requests, "post", _fake_post)
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.post(
+            "/api/admin/models/test",
+            json={"base_url": "http://x:1234/v1", "model": "qwen/test"},
+        )
+        body = resp.json()
         assert body["success"] is True
-        assert "500" in body["message"]
+        assert "max_completion_tokens" in body["message"]
+        assert "max_tokens" in posts[0]
+        assert "max_completion_tokens" in posts[1]
+
+    def test_models_test_chat_400_retry_500(self, isolated_db, monkeypatch):
+        """Chat 400 -> retry also fails 5xx -> failure + sanitized detail."""
+        from api.routers import admin as admin_mod
+
+        class _FakeResp:
+            def __init__(self, status, payload=None):
+                self.status_code = status
+                self._payload = payload or {}
+
+            def json(self):
+                return self._payload
+
+        posts = []
+
+        def _fake_get(url, **kw):
+            return _FakeResp(200, {"data": [{"id": "qwen/test"}]})
+
+        def _fake_post(url, headers=None, json=None, **kw):
+            posts.append(json)
+            if len(posts) == 1:
+                return _FakeResp(400)
+            return _FakeResp(500, {"error": {"message": "  backend   down  "}})
+
+        import requests
+        monkeypatch.setattr(requests, "get", _fake_get)
+        monkeypatch.setattr(requests, "post", _fake_post)
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.post(
+            "/api/admin/models/test",
+            json={"base_url": "http://x:1234/v1", "model": "qwen/test"},
+        )
+        body = resp.json()
+        assert body["success"] is False
+        assert "'qwen/test'" in body["message"]
+        assert "backend down" in body["message"]  # whitespace-collapsed
+        assert len(posts) == 2
+
+    def test_models_test_model_not_listed_warning(self, isolated_db, monkeypatch):
+        """Model missing from /v1/models -> success with a warning note."""
+        from api.routers import admin as admin_mod
+
+        class _FakeResp:
+            def __init__(self, status, payload=None):
+                self.status_code = status
+                self._payload = payload or {}
+
+            def json(self):
+                return self._payload
+
+        def _fake_get(url, **kw):
+            return _FakeResp(200, {"data": [{"id": "qwen/test"}]})
+
+        def _fake_post(url, **kw):
+            return _FakeResp(200, {"choices": [{"message": {"content": "ok"}}]})
+
+        import requests
+        monkeypatch.setattr(requests, "get", _fake_get)
+        monkeypatch.setattr(requests, "post", _fake_post)
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.post(
+            "/api/admin/models/test",
+            json={"base_url": "http://x:1234/v1", "model": "ghost"},
+        )
+        body = resp.json()
+        assert body["success"] is True
+        assert "model not listed by /v1/models" in body["message"]
 
     def test_models_test_probe_exception(self, isolated_db, monkeypatch):
-        """Chat probe raises -> success with probe-failed note."""
+        """Chat probe raises -> failure with the exception class name only."""
         from api.routers import admin as admin_mod
 
         class _FakeResp:
@@ -309,11 +453,12 @@ class TestModelsConnectivity:
             json={"base_url": "http://x:1234/v1", "model": "qwen/test"},
         )
         body = resp.json()
-        assert body["success"] is True
-        assert "probe failed" in body["message"]
+        assert body["success"] is False
+        assert body["message"] == "Probe request failed (RuntimeError)."
+        assert "timeout" not in body["message"]
 
     def test_models_test_no_models_but_probe(self, isolated_db, monkeypatch):
-        """No models in /v1/models -> probe_model is empty -> skip probe."""
+        """No model resolved (cfg empty, /v1/models empty) -> probe skipped."""
         from api.routers import admin as admin_mod
 
         class _FakeResp:
@@ -327,6 +472,10 @@ class TestModelsConnectivity:
         def _fake_get(url, **kw):
             return _FakeResp(200, {"data": []})
 
+        monkeypatch.setattr(
+            admin_mod, "get_model_for_task",
+            lambda task: {"base_url": "http://x:1234/v1", "api_key": None, "model": ""},
+        )
         import requests
         monkeypatch.setattr(requests, "get", _fake_get)
 
@@ -340,7 +489,7 @@ class TestModelsConnectivity:
         assert body["models"] == []
 
 
-# --- Connectivity tests: git / confluence / integrations --------------------
+# --- Connectivity tests: git / integrations ---------------------------------
 class TestIntegrationConnectivity:
     def test_git_test_unknown_host(self, isolated_db):
         from api.routers import admin as admin_mod
@@ -411,8 +560,10 @@ class TestIntegrationConnectivity:
         app, client = _build_client(isolated_db, admin_mod)
         resp = client.post("/api/admin/git/test", json={"host": "github"})
         body = resp.json()
+        # P-7: generic client-facing message; the raw error stays in the log.
         assert body["success"] is False
-        assert "conn refused" in body["message"]
+        assert body["message"] == "'github' test failed."
+        assert "conn refused" not in body["message"]
 
     def test_git_test_connector_returns_true(self, isolated_db, monkeypatch):
         from api.routers import admin as admin_mod
@@ -457,29 +608,6 @@ class TestIntegrationConnectivity:
         body = resp.json()
         assert body["success"] is False
         assert "no test()" in body["message"]
-
-    def test_confluence_test(self, isolated_db, monkeypatch):
-        from api.routers import admin as admin_mod
-        from api.integrations import registry as reg
-
-        class _FakeConnector:
-            def __init__(self, config=None):
-                self.config = config or {}
-
-            @classmethod
-            def get_config(cls):
-                return {}
-
-            def test(self):
-                return {"success": True, "message": "confluence ok"}
-
-        monkeypatch.setattr(reg, "_REGISTRY", {"confluence": _FakeConnector})
-        monkeypatch.setattr(reg, "_DISCOVERED", True)
-
-        app, client = _build_client(isolated_db, admin_mod)
-        resp = client.post("/api/admin/confluence/test", json={})
-        body = resp.json()
-        assert body["success"] is True
 
     def test_integration_test_no_name(self, isolated_db):
         from api.routers import admin as admin_mod
@@ -885,6 +1013,103 @@ class TestMemoryEndpoints:
         assert "memory backend down" not in resp.json()["detail"]
 
 
+# --- Knowledge graph (SPEC-008): stats + forced rebuild ----------------------
+class TestMemoryGraphEndpoints:
+    def _seed_graph_row(self, isolated_db):
+        from api.models import KnowledgeGraphORM, ProductORM
+
+        with isolated_db.SessionLocal() as db:
+            db.add(ProductORM(id="prod_1", name="Acme", summary=""))
+            db.add(KnowledgeGraphORM(
+                product_id="prod_1",
+                graph={"nodes": {"term:rms": {}, "page:cb:p1": {}}, "edges": {"e1": {}}},
+                version=3,
+            ))
+            db.commit()
+
+    def test_get_memory_group_reports_graphs(self, isolated_db):
+        from api.routers import admin as admin_mod
+
+        self._seed_graph_row(isolated_db)
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.get("/api/admin/memory")
+        assert resp.status_code == 200
+        graphs = resp.json()["resolved"]["graphs"]
+        assert graphs == [{
+            "product_id": "prod_1", "nodes": 2, "edges": 1, "version": 3,
+            "updated_at": graphs[0]["updated_at"],
+        }]
+
+    def test_post_graph_reindex_single_product(self, isolated_db, monkeypatch):
+        from api.memory import knowledge_graph as kg
+        from api.routers import admin as admin_mod
+
+        self._seed_graph_row(isolated_db)
+
+        async def _fake_rebuild(pid, **kw):
+            assert pid == "prod_1"
+            return {"success": True, "product_id": pid, "nodes": 5, "edges": 4, "pages": 2}
+
+        monkeypatch.setattr(kg, "rebuild_product_graph", _fake_rebuild)
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.post("/api/admin/memory/graph/reindex", json={"product_id": "prod_1"})
+        assert resp.status_code == 200
+        assert resp.json()["nodes"] == 5
+
+    def test_post_graph_reindex_all_products(self, isolated_db, monkeypatch):
+        from api.memory import knowledge_graph as kg
+        from api.models import ProductORM
+        from api.routers import admin as admin_mod
+
+        with isolated_db.SessionLocal() as db:
+            db.add(ProductORM(id="prod_a", name="A", summary=""))
+            db.add(ProductORM(id="prod_b", name="B", summary=""))
+            db.commit()
+
+        rebuilt: list = []
+
+        async def _fake_rebuild(pid, **kw):
+            rebuilt.append(pid)  # Q-6: every product rebuilt exactly once
+            return {"success": True, "product_id": pid, "nodes": 1, "edges": 0, "pages": 1}
+
+        monkeypatch.setattr(kg, "rebuild_product_graph", _fake_rebuild)
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.post("/api/admin/memory/graph/reindex", json={})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert rebuilt == ["prod_a", "prod_b"]
+        assert body == {
+            "product_id": None,
+            "rebuilt": 2,
+            "results": [
+                {"success": True, "product_id": "prod_a", "nodes": 1, "edges": 0, "pages": 1},
+                {"success": True, "product_id": "prod_b", "nodes": 1, "edges": 0, "pages": 1},
+            ],
+        }
+
+    def test_post_graph_reindex_unknown_product_404(self, isolated_db):
+        from api.routers import admin as admin_mod
+
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.post("/api/admin/memory/graph/reindex", json={"product_id": "nope"})
+        assert resp.status_code == 404
+
+    def test_post_graph_reindex_failure_500(self, isolated_db, monkeypatch):
+        from api.memory import knowledge_graph as kg
+        from api.routers import admin as admin_mod
+
+        self._seed_graph_row(isolated_db)
+
+        async def _boom(pid, **kw):
+            raise RuntimeError("extraction exploded")
+
+        monkeypatch.setattr(kg, "rebuild_product_graph", _boom)
+        app, client = _build_client(isolated_db, admin_mod)
+        resp = client.post("/api/admin/memory/graph/reindex", json={"product_id": "prod_1"})
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == "Graph reindex failed"
+
+
 # --- Settings group GETs (resolved views) -----------------------------------
 class TestSettingsGroupGets:
     def test_get_git_group(self, isolated_db):
@@ -902,18 +1127,6 @@ class TestSettingsGroupGets:
         assert isinstance(body["resolved"]["github"], list)
         assert body["resolved"]["github"] == []
 
-    def test_get_confluence_group(self, isolated_db):
-        from api.routers import admin as admin_mod
-
-        app, client = _build_client(isolated_db, admin_mod)
-        resp = client.get("/api/admin/confluence")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["group"] == "confluence"
-        assert "resolved" in body
-        assert "base_url" in body["resolved"]
-        assert body["resolved"]["hasToken"] is False
-
     def test_get_integrations_group(self, isolated_db):
         from api.routers import admin as admin_mod
 
@@ -923,14 +1136,6 @@ class TestSettingsGroupGets:
         body = resp.json()
         assert body["group"] == "integrations"
         assert "resolved" in body
-
-    def test_get_rlm_group_removed(self, isolated_db):
-        """The rlm group was removed with fast-rlm; the route 404s now."""
-        from api.routers import admin as admin_mod
-
-        app, client = _build_client(isolated_db, admin_mod)
-        resp = client.get("/api/admin/rlm")
-        assert resp.status_code == 404
 
     def test_get_cognee_group_removed(self, isolated_db):
         """The cognee group was removed with cognee; the route 404s now."""
@@ -991,17 +1196,6 @@ class TestSettingsGroupGets:
 
 # --- Settings PUT validation ------------------------------------------------
 class TestSettingsPutValidation:
-    def test_put_rlm_group_removed(self, isolated_db):
-        """The rlm group was removed; PUT now 404s."""
-        from api.routers import admin as admin_mod
-
-        app, client = _build_client(isolated_db, admin_mod)
-        resp = client.put(
-            "/api/admin/rlm",
-            json={"rlm.expert.mode": "llm"},
-        )
-        assert resp.status_code == 404
-
     def test_put_models_max_prompt_tokens_invalid(self, isolated_db):
         from api.routers import admin as admin_mod
 

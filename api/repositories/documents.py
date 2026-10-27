@@ -333,14 +333,30 @@ def read_all_documents(path: str,
     logger.info(f"Found {len(documents)} documents")
     return documents
 
-def prepare_data_pipeline():
-    """Deprecated alias kept for backward compatibility (returns None).
+def _repo_name_from_url(repo_url_or_path: str, repo_type: Optional[str]) -> str:
+    """Clone-dir name: ``{owner}_{repo}`` for github/gitlab URLs, else the
+    trailing path segment (``.git`` stripped). Shared by ``_create_repo`` and
+    ``managed_repo_dir`` (S-18)."""
+    url_parts = repo_url_or_path.rstrip("/").split("/")
+    if repo_type in ("github", "gitlab") and len(url_parts) >= 5:
+        owner = url_parts[-2]
+        repo = url_parts[-1].replace(".git", "")
+        return f"{owner}_{repo}"
+    return url_parts[-1].replace(".git", "")
 
-    The adalflow TextSplitter + ToEmbeddings pipeline was removed in the
-    langchain migration; indexing now goes through ``api.memory``
-    (pgvector). Kept as a stub so older imports keep working.
+
+def managed_repo_dir(repo_url: str, repo_type: str = None) -> Optional[str]:
+    """Clone directory ``_create_repo`` would use for ``repo_url`` (or None).
+
+    SPEC-010 change detection resolves the existing managed clone WITHOUT
+    cloning: http(s) URLs map onto ``<repo_root>/repos/{owner}_{repo}`` — the
+    same computation ``DatabaseManager._create_repo`` performs. Local-path
+    sources return None (no remote to fetch from).
     """
-    return None
+    url = (repo_url or "").strip()
+    if not url.startswith(("https://", "http://")):
+        return None
+    return os.path.join(DEFAULT_REPO_ROOT, "repos", _repo_name_from_url(url, repo_type))
 
 
 class DatabaseManager:
@@ -388,20 +404,6 @@ class DatabaseManager:
         self.repo_url_or_path = None
         self.repo_paths = None
 
-    def _extract_repo_name_from_url(self, repo_url_or_path: str, repo_type: str) -> str:
-        # Extract owner and repo name to create unique identifier
-        url_parts = repo_url_or_path.rstrip('/').split('/')
-
-        if repo_type in ["github", "gitlab"] and len(url_parts) >= 5:
-            # GitHub URL format: https://github.com/owner/repo
-            # GitLab URL format: https://gitlab.com/owner/repo or https://gitlab.com/group/subgroup/repo
-            owner = url_parts[-2]
-            repo = url_parts[-1].replace(".git", "")
-            repo_name = f"{owner}_{repo}"
-        else:
-            repo_name = url_parts[-1].replace(".git", "")
-        return repo_name
-
     def _create_repo(
         self,
         repo_url_or_path: str,
@@ -435,7 +437,7 @@ class DatabaseManager:
             # url
             if repo_url_or_path.startswith("https://") or repo_url_or_path.startswith("http://"):
                 # Extract the repository name from the URL
-                repo_name = self._extract_repo_name_from_url(repo_url_or_path, repo_type)
+                repo_name = _repo_name_from_url(repo_url_or_path, repo_type)
                 logger.info(f"Extracted repo name: {repo_name}")
 
                 save_repo_dir = os.path.join(root_path, "repos", repo_name)
@@ -503,17 +505,3 @@ class DatabaseManager:
             included_files=included_files
         )
 
-    def prepare_retriever(self, repo_url_or_path: str, repo_type: str = None, access_token: str = None):
-        """
-        Prepare the retriever for a repository.
-        This is a compatibility method for the isolated API.
-
-        Args:
-            repo_type(str): Type of repository
-            repo_url_or_path (str): The URL or local path of the repository
-            access_token (str, optional): Access token for private repositories
-
-        Returns:
-            List[Document]: List of Document objects
-        """
-        return self.prepare_database(repo_url_or_path, repo_type, access_token)

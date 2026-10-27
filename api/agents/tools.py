@@ -689,8 +689,8 @@ def build_expert_tools(
         coroutine=_node_read,
         name="node_read",
         description=(
-            "Read a knowledge-tree page (Confluence-like node) of this "
-            "product by title or slug. Returns the Markdown content."
+            "Read a knowledge-tree page of this product by title or slug. "
+            "Returns the Markdown content."
         ),
         args_schema=_NodeArgs,
     )

@@ -161,6 +161,11 @@ class TestProductSummary:
     def test_summary_context_caps_large_input(self, monkeypatch):
         import api.docgen.summary as ks
 
+        # Deterministic small context window (env override, precedence 1 in
+        # get_model_context_window) so the fair budget hits the 20k floor and
+        # the clamp below fires regardless of the default 200k+ resolution.
+        monkeypatch.setenv("PRODUCTARIUM_MODEL_CONTEXT_WINDOW", "8192")
+
         # Context collection (via _common.collect_entity_parts) char-caps each
         # entity part by the fair budget whose floor is
         # SUMMARY_CONTEXT_MAX_CHARS (char-based _cap with a truncation suffix).
@@ -186,7 +191,7 @@ class TestProductSummary:
 
 # --- Router endpoint integration (SQLite + TestClient) -----------------------
 class TestKnowledgeRouterEndpoints:
-    def _client(self, tmp_path, monkeypatch):
+    def _client(self, tmp_path, monkeypatch, user=None):
         """Build a TestClient with a dedicated file-based SQLite engine.
 
         The foundation's ``api.db`` engine cannot be used here: Starlette's
@@ -229,12 +234,18 @@ class TestKnowledgeRouterEndpoints:
         import api.auth.deps as deps_mod
         app.dependency_overrides[deps_mod.get_db] = _get_db
 
-        # Fixed admin user so no session cookie / auth backend is required.
+        # Fixed admin user so no session cookie / auth backend is required
+        # (unless the test injects its own principal).
+        user_obj = user
+
         def _current_user():
+            if user_obj is not None:
+                return user_obj
             return UserORM(
                 id="system", username="system", role="admin",
                 provider="local", created_at=datetime.utcnow(),
             )
+
         app.dependency_overrides[kr.get_current_user] = _current_user
         return TestClient(app), TestSession
 
@@ -278,6 +289,9 @@ class TestKnowledgeRouterEndpoints:
         assert len(tree) == 1
         assert tree[0]["id"] == root_id
         assert [c["id"] for c in tree[0]["children"]] == [child_id]
+        # Q-10: the tree carries metadata only — bodies ride the node GET.
+        assert "content_md" not in tree[0]
+        assert "content_md" not in tree[0]["children"][0]
 
         # Get single node.
         r = client.get(f"/api/products/{pid}/knowledge/nodes/{child_id}")
@@ -341,6 +355,53 @@ class TestKnowledgeRouterEndpoints:
         # No artifacts/nodes -> nothing to summarize -> 503.
         r = client.post(f"/api/products/{pid}/summary")
         assert r.status_code == 503
+
+    def test_rbac_docs_matrix(self, tmp_path, monkeypatch):
+        """SPEC-001 (Q-1/P-3): writes need the docs permission; an invisible
+        product is a plain 404. An ro grantee now HAS docs rights."""
+        from api.models import ProductGrantORM, ProductORM, UserORM
+
+        def _u(uid, role):
+            return UserORM(
+                id=uid, username=uid, role=role, provider="local",
+                created_at=datetime.utcnow(),
+            )
+
+        _, TestSession = self._client(tmp_path, monkeypatch)
+        with TestSession() as db:
+            db.add(ProductORM(id="prod_1", name="Acme", owner_id="u_owner"))
+            db.add(ProductGrantORM(
+                product_id="prod_1", user_id="u_g", level="ro",
+                granted_by="u_owner",
+            ))
+            db.commit()
+
+        # Stranger: invisible -> 404 (read AND write alike).
+        client, _ = self._client(tmp_path, monkeypatch, user=_u("u_s", "user"))
+        assert client.get("/api/products/prod_1/knowledge/tree").status_code == 404
+        assert client.post(
+            "/api/products/prod_1/knowledge/nodes", json={"title": "X"}
+        ).status_code == 404
+
+        # viewer_global: pure read — tree ok, writes 403.
+        client, _ = self._client(
+            tmp_path, monkeypatch, user=_u("u_v", "viewer_global")
+        )
+        assert client.get("/api/products/prod_1/knowledge/tree").status_code == 200
+        assert client.post(
+            "/api/products/prod_1/knowledge/nodes", json={"title": "X"}
+        ).status_code == 403
+
+        # ro grantee: docs rights (SPEC-001) — create + verify 200.
+        client, _ = self._client(tmp_path, monkeypatch, user=_u("u_g", "user"))
+        r = client.post(
+            "/api/products/prod_1/knowledge/nodes", json={"title": "G"}
+        )
+        assert r.status_code == 201, r.text
+        nid = r.json()["id"]
+        assert client.post(
+            f"/api/products/prod_1/knowledge/nodes/{nid}/verify"
+        ).status_code == 200
 
     def test_summary_stores_and_returns(self, tmp_path, monkeypatch):
         client, TestSession = self._client(tmp_path, monkeypatch)

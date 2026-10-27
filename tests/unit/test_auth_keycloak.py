@@ -177,6 +177,171 @@ class TestExchangeCode:
         assert args[1] == "mysecret"
 
 
+class TestAdminConfigured:
+    def _clean_env(self, monkeypatch):
+        monkeypatch.delenv("KEYCLOAK_ADMIN_CLIENT_ID", raising=False)
+        monkeypatch.delenv("KEYCLOAK_ADMIN_CLIENT_SECRET", raising=False)
+
+    def test_false_without_credentials(self, monkeypatch):
+        self._clean_env(monkeypatch)
+        assert keycloak.admin_configured() is False
+
+    def test_false_with_id_only(self, monkeypatch):
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("KEYCLOAK_ADMIN_CLIENT_ID", "productarium-admin-api")
+        assert keycloak.admin_configured() is False
+
+    def test_true_with_id_and_secret(self, monkeypatch):
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("KEYCLOAK_ADMIN_CLIENT_ID", "productarium-admin-api")
+        monkeypatch.setenv("KEYCLOAK_ADMIN_CLIENT_SECRET", "s3cret")
+        assert keycloak.admin_configured() is True
+
+
+class TestServiceAccountToken:
+    def _configure(self, monkeypatch):
+        monkeypatch.setenv("KEYCLOAK_URL", "http://kc.example.com")
+        monkeypatch.setenv("KEYCLOAK_REALM", "productarium")
+        monkeypatch.setenv("KEYCLOAK_ADMIN_CLIENT_ID", "productarium-admin-api")
+        monkeypatch.setenv("KEYCLOAK_ADMIN_CLIENT_SECRET", "s3cret")
+
+    def test_fetches_client_credentials_token(self, monkeypatch):
+        self._configure(monkeypatch)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"access_token": "svc-tok"}
+        with patch.object(keycloak.requests, "post", return_value=mock_resp) as p:
+            assert keycloak._service_account_token() == "svc-tok"
+        url = p.call_args.args[0]
+        assert url == ("http://kc.example.com/realms/productarium/"
+                       "protocol/openid-connect/token")
+        data = p.call_args.kwargs["data"]
+        assert data["grant_type"] == "client_credentials"
+        assert data["client_id"] == "productarium-admin-api"
+        # The secret rides in the POST body only — never in a URL/log line.
+        assert "s3cret" not in url
+
+    def test_none_on_non_200(self, monkeypatch):
+        self._configure(monkeypatch)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        with patch.object(keycloak.requests, "post", return_value=mock_resp):
+            assert keycloak._service_account_token() is None
+
+    def test_none_on_exception(self, monkeypatch):
+        self._configure(monkeypatch)
+        with patch.object(
+            keycloak.requests, "post", side_effect=Exception("conn refused")
+        ):
+            assert keycloak._service_account_token() is None
+
+
+class TestListGroups:
+    def _configure(self, monkeypatch):
+        monkeypatch.setenv("KEYCLOAK_URL", "http://kc.example.com")
+        monkeypatch.setenv("KEYCLOAK_REALM", "productarium")
+        monkeypatch.setenv("KEYCLOAK_ADMIN_CLIENT_ID", "productarium-admin-api")
+        monkeypatch.setenv("KEYCLOAK_ADMIN_CLIENT_SECRET", "s3cret")
+
+    def _token_ok(self, monkeypatch):
+        mock_token = MagicMock()
+        mock_token.status_code = 200
+        mock_token.json.return_value = {"access_token": "svc-tok"}
+        monkeypatch.setattr(
+            keycloak.requests, "post", lambda *a, **kw: mock_token
+        )
+
+    def test_returns_id_name_path_rows(self, monkeypatch):
+        self._configure(monkeypatch)
+        self._token_ok(monkeypatch)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [
+            {"id": "g1", "name": "productarium-admins", "path": "/productarium-admins"},
+            {"id": "g2", "name": "productarium-managers", "path": "/productarium-managers"},
+            {"id": "g3"},  # malformed entry without a name is dropped
+        ]
+        with patch.object(keycloak.requests, "get", return_value=mock_resp) as g:
+            groups = keycloak.list_groups()
+        assert groups == [
+            {"id": "g1", "name": "productarium-admins",
+             "path": "/productarium-admins"},
+            {"id": "g2", "name": "productarium-managers",
+             "path": "/productarium-managers"},
+        ]
+        assert g.call_args.args[0] == (
+            "http://kc.example.com/admin/realms/productarium/groups"
+        )
+        assert (
+            g.call_args.kwargs["headers"]["Authorization"] == "Bearer svc-tok"
+        )
+
+    def test_none_when_token_fetch_fails(self, monkeypatch):
+        self._configure(monkeypatch)
+        mock_token = MagicMock()
+        mock_token.status_code = 401
+        monkeypatch.setattr(
+            keycloak.requests, "post", lambda *a, **kw: mock_token
+        )
+        assert keycloak.list_groups() is None
+
+    def test_none_on_upstream_failure(self, monkeypatch):
+        self._configure(monkeypatch)
+        self._token_ok(monkeypatch)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 503
+        with patch.object(keycloak.requests, "get", return_value=mock_resp):
+            assert keycloak.list_groups() is None
+
+    def test_none_on_exception(self, monkeypatch):
+        self._configure(monkeypatch)
+        self._token_ok(monkeypatch)
+        with patch.object(
+            keycloak.requests, "get", side_effect=Exception("timeout")
+        ):
+            assert keycloak.list_groups() is None
+
+
+class TestGroupRoleMapping:
+    """_map_keycloak_role: simple group NAMES map to roles (SPEC-001).
+
+    The realm export ships a Group Membership mapper with ``full.path=false``,
+    so the ``groups`` claim carries bare names ("productarium-admins"), and
+    the mapping keys must be bare names too.
+    """
+
+    def test_bare_group_names_map(self, monkeypatch):
+        from api.auth.router import _map_keycloak_role
+
+        monkeypatch.delenv("KEYCLOAK_ROLE_MAPPING", raising=False)
+        monkeypatch.setenv(
+            "KEYCLOAK_ROLE_MAPPING",
+            '{"productarium-admins": "admin", '
+            '"productarium-managers": "manager", '
+            '"productarium-users": "user"}',
+        )
+        assert _map_keycloak_role(["productarium-admins"]) == "admin"
+        assert _map_keycloak_role(["productarium-managers"]) == "manager"
+        assert _map_keycloak_role(["productarium-users"]) == "user"
+        assert _map_keycloak_role(["other-group"]) is None
+        assert _map_keycloak_role([]) is None
+
+    def test_no_mapping_configured(self, monkeypatch):
+        from api.auth.router import _map_keycloak_role
+
+        monkeypatch.delenv("KEYCLOAK_ROLE_MAPPING", raising=False)
+        assert _map_keycloak_role(["productarium-admins"]) is None
+
+    def test_invalid_role_value_ignored(self, monkeypatch):
+        from api.auth.router import _map_keycloak_role
+
+        monkeypatch.setenv(
+            "KEYCLOAK_ROLE_MAPPING",
+            '{"productarium-admins": "superadmin"}',
+        )
+        assert _map_keycloak_role(["productarium-admins"]) is None
+
+
 class TestFetchUserinfo:
     def test_returns_none_when_no_authlib(self, monkeypatch):
         monkeypatch.setattr(keycloak, "AUTHLIB_AVAILABLE", False)

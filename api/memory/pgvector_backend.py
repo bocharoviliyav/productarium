@@ -54,6 +54,10 @@ _REINDEX_PRODUCT_PAGE_SIZE = 25
 # ILIKE ANY, then the Python stage re-ranks and keeps top_k. The cap bounds
 # the scan on products with thousands of chunks.
 _LEXICAL_CANDIDATE_CAP = 200
+# SPEC-008: similarity bonus per unit of graph edge weight for chunks of
+# pages linked to the resolved query terms (one vector namespace per
+# product; the graph only re-ranks inside that scope).
+_GRAPH_BOOST = 0.25
 
 # Local embedding servers (llama.cpp / LM Studio / vLLM over nomic-style BPE
 # tokenizers) reject the WHOLE /v1/embeddings request with HTTP 400
@@ -70,7 +74,7 @@ _EMBED_STRIP_CONTROL.update({c: None for c in range(0x7F, 0xA0)})
 # known tokenizer poison. Line/paragraph separators become plain newlines.
 _EMBED_STRIP_FORMAT = {
     c: None for c in (
-        list(range(0x200B, 0x2010))   # zero-width space..RLM + general punct
+        list(range(0x200B, 0x2010))   # zero-width space/joiners + bidi marks
         + list(range(0x202A, 0x202F))  # bidi embedding/override controls
         + list(range(0x2060, 0x2070))  # word joiner / invisible operators
         + [0x00AD, 0xFEFF]             # soft hyphen, BOM / ZWNBSP
@@ -363,35 +367,66 @@ def _is_pgvector_capable() -> bool:
         return False
 
 
+def _page_source_prefix(source_type: str, source_id: str) -> str:
+    """ESCAPED LIKE pattern matching an artifact's page-granular sources.
+
+    ``_``/``%`` inside entity ids are single-char wildcards in LIKE, so the
+    literal part is escaped (callers pass ``escape="\\"``); the trailing
+    ``%`` is the intended wildcard.
+    """
+    literal = (
+        source_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
+    return f"{literal}::page::%"
+
+
+def _page_index_items(
+    pages: Any, source_type: str, owner_id: str
+) -> List[Tuple[str, str, str]]:
+    """(content, source_type, source_id) per non-empty page (SPEC-010).
+
+    Page-granular sources follow the ``{owner}::page::{page_id}`` convention
+    so each page upserts independently of the others.
+    """
+    out: List[Tuple[str, str, str]] = []
+    if not isinstance(pages, dict):
+        return out
+    for page_id, page in pages.items():
+        pc = ""
+        if isinstance(page, dict):
+            pc = page.get("content") or ""
+        elif isinstance(page, str):
+            pc = page
+        if pc and pc.strip():
+            out.append((pc.strip(), source_type, f"{owner_id}::page::{page_id}"))
+    return out
+
+
 def _extract_index_items(p_orm) -> List[Tuple[str, str, Optional[str]]]:
     """Collect (content, source_type, source_id) triples from a product's
-    children (codebases + specs + links + knowledge nodes).
+    children (codebases + databases + specs + links + knowledge nodes).
 
-    Codebases: when ``generated_docs`` is present the pages are section
-    slices of it — indexing both would duplicate the content, so only the
-    docs blob is indexed. Legacy artifacts without docs fall back to pages,
-    each under a DISTINCT source id — reusing the codebase id would make
-    every page's upsert delete the previous page's chunks.
+    Codebases and databases index PAGE-granular (SPEC-010): each page under
+    its own source id, matching the incremental indexing path; page-less
+    legacy artifacts fall back to the docs blob under the entity id.
     """
     items: List[Tuple[str, str, Optional[str]]] = []
     for c in p_orm.codebases:
+        page_items = _page_index_items(getattr(c, "pages", None), "codebase", c.id)
+        if page_items:
+            items.extend(page_items)
+            continue
         docs = getattr(c, "generated_docs", None) or ""
         if docs and docs.strip():
             items.append((docs.strip(), "codebase", c.id))
+    for d in p_orm.databases:
+        page_items = _page_index_items(getattr(d, "pages", None), "database", d.id)
+        if page_items:
+            items.extend(page_items)
             continue
-        pages = getattr(c, "pages", None) or {}
-        if isinstance(pages, dict):
-            for page_id, page in pages.items():
-                pc = ""
-                if isinstance(page, dict):
-                    pc = page.get("content") or ""
-                elif isinstance(page, str):
-                    pc = page
-                if pc and pc.strip():
-                    items.append((
-                        pc.strip(), "codebase",
-                        f"{c.id}::page::{page_id}",
-                    ))
+        docs = getattr(d, "generated_docs", None) or ""
+        if docs and docs.strip():
+            items.append((docs.strip(), "database", d.id))
     for s in p_orm.specs:
         c = getattr(s, "content", None) or ""
         if c and c.strip():
@@ -577,6 +612,95 @@ class PgVectorMemoryBackend(MemoryBackend):
 
         return await asyncio.to_thread(_do)
 
+    async def list_page_sources(
+        self, product_id: str, source_type: str, source_id: str
+    ) -> List[str]:
+        """Distinct stored page-granular source ids for an artifact ([] on error).
+
+        SPEC-010: tells the incremental indexing path whether an artifact
+        already has page-granular chunks or is still blob-indexed (legacy).
+        """
+        if not product_id or not source_id:
+            return []
+        from api.db import SessionLocal
+        from api.models import KnowledgeChunkORM
+
+        prefix = _page_source_prefix(source_type, source_id)
+
+        def _do() -> List[str]:
+            with SessionLocal() as db:
+                rows = (
+                    db.query(KnowledgeChunkORM.source_id)
+                    .filter(
+                        KnowledgeChunkORM.product_id == product_id,
+                        KnowledgeChunkORM.source_type == source_type,
+                        KnowledgeChunkORM.source_id.like(prefix, escape="\\"),
+                    )
+                    .distinct()
+                    .all()
+                )
+                return [r[0] for r in rows if r and r[0]]
+
+        try:
+            return await asyncio.to_thread(_do)
+        except Exception as e:  # pragma: no cover - non-fatal
+            logger.warning(
+                "pgvector memory: list_page_sources failed for %s/%s: %s",
+                product_id, source_id, e,
+            )
+            return []
+
+    async def prune_stale_sources(
+        self,
+        product_id: str,
+        source_type: str,
+        source_id: str,
+        keep_source_ids: List[str],
+    ) -> int:
+        """Delete legacy blob + stale page chunks not in ``keep_source_ids``.
+
+        SPEC-010: removes the artifact-level source (the pre-page-granular
+        blob) and page sources whose page no longer exists, so switching an
+        artifact to page-granular indexing or deleting pages leaves no
+        duplicate chunks in recall. Returns the number of rows deleted.
+        """
+        if not product_id or not source_id:
+            return 0
+        from api.db import SessionLocal
+        from api.models import KnowledgeChunkORM
+
+        prefix = _page_source_prefix(source_type, source_id)
+        keep = [k for k in (keep_source_ids or []) if k] or ["-never-"]
+
+        from sqlalchemy import or_ as sa_or
+
+        def _do() -> int:
+            with SessionLocal() as db:
+                deleted = (
+                    db.query(KnowledgeChunkORM)
+                    .filter(
+                        KnowledgeChunkORM.product_id == product_id,
+                        KnowledgeChunkORM.source_type == source_type,
+                        KnowledgeChunkORM.source_id.notin_(keep),
+                        sa_or(
+                            KnowledgeChunkORM.source_id == source_id,
+                            KnowledgeChunkORM.source_id.like(prefix, escape="\\"),
+                        ),
+                    )
+                    .delete(synchronize_session=False)
+                )
+                db.commit()
+                return int(deleted or 0)
+
+        try:
+            return await asyncio.to_thread(_do)
+        except Exception as e:  # pragma: no cover - non-fatal
+            logger.warning(
+                "pgvector memory: prune_stale_sources failed for %s/%s: %s",
+                product_id, source_id, e,
+            )
+            return 0
+
     async def query(self, query: str, product_id: str, top_k: int = 20) -> str:
         """Cosine recall + optional lexical boost, top-k chunks as joined text.
 
@@ -614,6 +738,13 @@ class PgVectorMemoryBackend(MemoryBackend):
             logger.warning("pgvector memory: query embedding failed: %s", e)
             qvec = None
         k = max(1, min(top_k or _DEFAULT_TOP_K, 100))
+        # Graph-aware leg (SPEC-008): resolve the query's terms in the
+        # product's knowledge graph and boost cosine rows of related pages.
+        # Any miss (no graph / no term / no rows / error) returns [] and the
+        # plain lexical + cosine path below runs unchanged (fallback).
+        graph_rows = await self._graph_boosted_rows(raw_query, qvec, product_id, k)
+        if graph_rows:
+            return "\n\n".join(graph_rows)
         # Lexical leg (runs regardless of the embedder state). Code-like
         # tokens are extracted from the RAW question — not the layer-A
         # payload — so the ILIKE patterns stay verbatim identifier names.
@@ -652,6 +783,95 @@ class PgVectorMemoryBackend(MemoryBackend):
             )
             return ""
 
+    async def _graph_boosted_rows(
+        self, raw_query: str, qvec: Optional[List[float]], product_id: str, top_k: int
+    ) -> List[str]:
+        """Cosine recall re-ranked with graph boosts (SPEC-008); [] = miss.
+
+        Terms are resolved lexically against the product graph (name +
+        aliases); candidate rows come from a source-aware cosine query (3x
+        top_k so related pages ranked below top_k can be boosted up), scores
+        get ``_GRAPH_BOOST * edge_weight`` for chunks of related pages.
+        """
+        if not qvec:
+            return []
+        try:
+            from api.memory.knowledge_graph import (
+                load_product_graph,
+                related_source_boosts,
+                resolve_query_terms,
+            )
+
+            graph = await load_product_graph(product_id)
+            term_keys = resolve_query_terms(raw_query, graph)
+            if not term_keys:
+                return []
+            boosts = related_source_boosts(graph, term_keys)
+            if not boosts:
+                return []
+            rows = await self._cosine_rows_with_source(
+                qvec, product_id, min(3 * top_k, 100)
+            )
+            if not rows:
+                return []
+            scored: List[Tuple[float, int, str]] = []
+            for rank, (content, source_id, distance) in enumerate(rows):
+                sim = 1.0 - float(distance if distance is not None else 1.0)
+                boost = boosts.get(str(source_id or ""), 0.0)
+                scored.append((sim + _GRAPH_BOOST * boost, -rank, content))
+            scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            return [content for _, _, content in scored[:top_k]]
+        except Exception as e:  # non-fatal: plain recall path stays the fallback
+            logger.debug("pgvector memory: graph boost skipped for %s: %s", product_id, e)
+            return []
+
+    async def _cosine_rows_with_source(
+        self, qvec: List[float], product_id: str, top_k: int
+    ) -> List[Tuple[str, Optional[str], Optional[float]]]:
+        """Cosine rows as (content, source_id, cosine distance); [] on timeout.
+
+        Single implementation for both recall legs (plain + graph-boosted).
+        pgvector cosine distance (smaller = more similar). The ORDER BY must
+        match the live HNSW index expression — plain vector comparison, or
+        the halfvec cast pair when the column was pinned beyond pgvector's
+        2000-dim vector-index limit (see api.db.embedding_distance_expr).
+        """
+        from api.config.timeout import resolve_timeout
+        from api.db import embedding_distance_expr, engine
+        from sqlalchemy import text
+
+        timeout = resolve_timeout("memory_query")
+        order_by, _cast = embedding_distance_expr()
+        sql = text(
+            "SELECT content, source_id, " + order_by + " AS distance "
+            "FROM knowledge_chunks "
+            "WHERE product_id = :pid "
+            f"ORDER BY {order_by} "
+            "LIMIT :k"
+        )
+        # pgvector accepts a "[1,2,3]"-style string literal for the cast.
+        vec_literal = "[" + ",".join(str(float(x)) for x in qvec) + "]"
+
+        def _do():
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    sql, {"pid": product_id, "q": vec_literal, "k": top_k}
+                ).fetchall()
+                return [
+                    (r[0], r[1], float(r[2]) if r[2] is not None else None)
+                    for r in rows
+                    if r and r[0]
+                ]
+
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(_do), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "pgvector memory: cosine query timed out after %.0fs for "
+                "product %s.", timeout, product_id,
+            )
+            return []
+
     async def _cosine_search(self, qvec: List[float], product_id: str, top_k: int) -> str:
         """Cosine recall as joined text ("" when nothing matched)."""
         rows = await self._cosine_rows(qvec, product_id, top_k)
@@ -662,43 +882,13 @@ class PgVectorMemoryBackend(MemoryBackend):
     async def _cosine_rows(
         self, qvec: List[float], product_id: str, top_k: int
     ) -> List[str]:
-        """Run the cosine-distance ORDER BY query with a timeout ([] on timeout)."""
-        from api.config.timeout import resolve_timeout
-        from api.db import engine
-        from sqlalchemy import text
-
-        query_timeout = resolve_timeout("memory_query")
-        # pgvector cosine distance (smaller = more similar). The ORDER BY must
-        # match the live HNSW index expression — plain vector comparison, or
-        # the halfvec cast pair when the column was pinned beyond pgvector's
-        # 2000-dim vector-index limit (see api.db.embedding_distance_expr).
-        from api.db import embedding_distance_expr
-
-        order_by, _cast = embedding_distance_expr()
-        sql = text(
-            "SELECT content FROM knowledge_chunks "
-            "WHERE product_id = :pid "
-            f"ORDER BY {order_by} "
-            "LIMIT :k"
-        )
-        # pgvector accepts a "[1,2,3]"-style string literal for the cast.
-        vec_literal = "[" + ",".join(str(float(x)) for x in qvec) + "]"
-
-        def _do() -> List[str]:
-            with engine.connect() as conn:
-                rows = conn.execute(
-                    sql, {"pid": product_id, "q": vec_literal, "k": top_k}
-                ).fetchall()
-                return [r[0] for r in rows if r and r[0]]
-
-        try:
-            return await asyncio.wait_for(asyncio.to_thread(_do), timeout=query_timeout)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "pgvector memory: query timed out after %.0fs for product %s.",
-                query_timeout, product_id,
+        """Cosine rows as text (thin wrapper over the source-aware query)."""
+        return [
+            content
+            for content, _source_id, _distance in await self._cosine_rows_with_source(
+                qvec, product_id, top_k
             )
-            return []
+        ]
 
     async def _lexical_search(
         self, product_id: str, tokens: List[str], top_k: int

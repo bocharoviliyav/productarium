@@ -91,8 +91,24 @@ async def _startup() -> None:
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("bootstrap_admin failed (non-fatal): %s", e)
 
+    # SPEC-009: cron-driven scheduled docgen. Non-fatal: a scheduler failure
+    # only means "no automatic runs" (manual generation stays available).
+    try:
+        from api.docgen.scheduler import start_scheduler
+
+        start_scheduler()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Docgen scheduler disabled (non-fatal): %s", e)
+
 
 async def _shutdown() -> None:
+    # Stop the SPEC-009 docgen scheduler first (in-flight ticks). Non-fatal.
+    try:
+        from api.docgen.scheduler import shutdown_scheduler
+
+        shutdown_scheduler()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Docgen scheduler shutdown skipped (non-fatal): %s", e)
     # Close the process-wide agent checkpointer (its Postgres saver owns a
     # pipeline + connection that must not outlive the app). Non-fatal by design.
     try:

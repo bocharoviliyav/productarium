@@ -1,6 +1,6 @@
 """Thin wrapper over the ``markitdown`` package (plan section G / item 2).
 
-Converts uploaded files and Confluence attachments (docx/pdf/pptx/html/xlsx/
+Converts uploaded files and integration attachments (docx/pdf/pptx/html/xlsx/
 images/...) to markdown. The ``markitdown`` import is lazy so this module is
 always import-safe even when the package (or one of its optional converter
 deps) is missing — callers get a clear placeholder string instead of an

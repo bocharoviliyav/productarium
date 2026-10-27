@@ -338,6 +338,50 @@ class TestRunDocgenJobAsyncErrors:
         assert "Generator exploded" not in job["error"]
         assert job["finished_at"] is not None
 
+    def test_value_error_appends_first_llm_cause(self, isolated_db, monkeypatch):
+        """SPEC-026: a ValueError failure carries the first LLM-failure warning
+        captured from the worker-thread logs."""
+        from api.models import ProductORM, CodebaseORM
+
+        db = isolated_db.SessionLocal()
+        try:
+            p = ProductORM(id="prod_job_cause", name="TestProduct")
+            db.add(p)
+            db.commit()
+            cb = CodebaseORM(
+                id="cb_job_cause", product_id="prod_job_cause", name="repo",
+                repo_url="https://github.com/o/repo",
+            )
+            db.add(cb)
+            db.commit()
+        finally:
+            db.close()
+
+        monkeypatch.setattr(jobs_mod, "SessionLocal", isolated_db.SessionLocal)
+
+        async def failing_generate(artifact, product, model=None, language="ru", progress=None, **kwargs):
+            logging.getLogger("api.docgen.codebase").warning(
+                "Standard LLM section generation failed: %s", "connection refused"
+            )
+            raise ValueError("LLM недоступен или превысил таймаут")
+
+        import api.docgen.codebase as codebase_mod
+        monkeypatch.setattr(codebase_mod, "generate_codebase_docs", failing_generate)
+
+        job_id = jobs_mod.create_job("prod_job_cause", "codebase", "cb_job_cause")
+        asyncio.run(jobs_mod._run_docgen_job_async(
+            job_id, "prod_job_cause", "codebase", "cb_job_cause", None, "ru"
+        ))
+
+        job = jobs_mod.get_job(job_id)
+        assert job["status"] == "failed"
+        expected = (
+            "LLM недоступен или превысил таймаут"
+            " (первая причина: Standard LLM section generation failed: connection refused)"
+        )
+        assert job["error"] == expected
+        assert job["indexing_message"] == f"Ошибка генерации документации: {expected}"
+
 
 # ============================================================================
 # _run_docgen_job (worker thread entry point)

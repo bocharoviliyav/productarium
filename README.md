@@ -167,6 +167,12 @@ No polymorphic artifact entity — separate typed ORM models per entity kind:
 - **LinksORM** (`links`): `id, product_id, name, content (Text — JSON array), verified…, source, timestamps`.
 - **DatabaseORM** (`databases`): `id, product_id, name, dsn_masked (Text — raw DSN masked on acceptance, never persisted), mcp_server_id (optional pin), generated_docs, pages, verified…, source, timestamps`.
 - **KnowledgeNodeORM** (`knowledge_nodes`): `id, product_id, parent_id, title, slug, node_type (page|folder|branch), content_md, source, verified…, created_by, timestamps` — self-referential tree.
+- **HldORM** (`hlds`) — one-per-product High-Level Design pseudo-entity (`id = hld_{product_id}`, auto-created on first generate): docs + pages + verify columns mirroring Codebase; read-only in the viewer.
+- **DocVersionORM** (`productarium_doc_versions`) — immutable version snapshots; `current_version` pointers on the artifact rows; SPEC-012 delta rows store only the overridden pages (`base_version`); sources `baseline|generate|edit|rollback|schedule`.
+- **DocgenScheduleORM** (`docgen_schedules`) — cron-driven docgen runs (SPEC-009), unique per (product, entity).
+- **ProductGrantORM** (`product_grants`) — per-product access grants (`ro`|`rw`), composite PK.
+- **KnowledgeGraphORM** (`knowledge_graphs`) — one term/page knowledge graph per product (SPEC-008).
+- **ChatAttachmentORM** (`chat_attachments`) — Markdown renditions of expert-chat attachments (conversation-context only).
 - **UserORM** (`productarium_users`), **SettingORM** (`settings`, Fernet-encrypted), **ApiTokenORM** (`api_tokens`, sha256).
 - **ChatSessionORM / ChatMessageORM** — per-user expert chat sessions + transcripts.
 - **McpServerORM** (`mcp_servers`) — admin-managed outbound MCP server registry (headers/env Fernet-encrypted at rest, masked on read).
@@ -216,7 +222,7 @@ Bodies externalized to `refs/prompts/*.md`; `load_prompt_file()` applies `_wrap_
 ### `clients/`, `tools/`, `utils/`, `formats/`
 - `clients/openai_client.py` — low-level OpenAI-compatible client for local servers.
 - `tools/rate_limiter.py` — embedder rate limiting (semaphore + spacing + 429 retry; admin store > env > default).
-- `utils/` — `logging.py` (console-only, logfmt/json), `fs.py` (`open_read_nofollow` — symlink-safe reads), `llm_helpers.py` (`cap`), `llm_tokens.py` (context window / token counting, `RLM_MODEL_CONTEXT_WINDOW`).
+- `utils/` — `logging.py` (console-only, logfmt/json), `fs.py` (`open_read_nofollow` — symlink-safe reads), `llm_helpers.py` (`cap`), `llm_tokens.py` (context window / token counting, `PRODUCTARIUM_MODEL_CONTEXT_WINDOW`).
 - `formats/mermaid.py` — Node-based Mermaid verification + LLM repair (`MERMAID_VERIFY`, `MERMAID_*_TIMEOUT`).
 
 ---
@@ -227,8 +233,11 @@ Auto-discovered via `api/routers/__init__.py` + the foundation auth router. To a
 
 - **`products.py`** — product + codebase/spec/links CRUD. Router-level auth (`get_current_user`).
 - **`databases.py`** — database CRUD (raw DSN masked on acceptance) + reverse-engineering generate/status. Router-level auth; `verify` adds owner/admin.
-- **`docgen.py`** — per-type generate endpoints (202 + job_id) + status polls + `GET /{product_id}/docgen/active` (running jobs so the UI restores in-flight generations after a reload). Router-level auth.
-- **`expert.py`** — expert agent SSE chat, doc generation, chat-session CRUD. Auth on every endpoint.
+- **`docgen.py`** — per-type generate endpoints (202 + job_id, per-user hourly rate limit) + status polls + `GET /{product_id}/docgen/active` (running jobs so the UI restores in-flight generations after a reload) + per-page / branch regeneration, job cancellation, lazy per-page reads (`GET .../pages/{page_id}?version=N`) and the SPEC-010 incremental endpoints (`POST .../{codebases|databases|specs}/{id}/detect`, `GET .../detect/status`, `POST .../incremental`). Router-level auth.
+- **`hld.py`** — the product's High-Level Design: `POST /{id}/hld/generate` (auto-creates `hld_{product_id}`, 6 fixed pages), read-only viewer endpoints + per-page verify.
+- **`doc_versions.py`** — version history REST: list/detail (`?light=1`), restore (rw), DELETE version (manage; 409 guards for the current/only/baseline version — SPEC-012/013).
+- **`schedules.py`** — admin-only cron schedules `GET/PUT/DELETE /api/products/{id}/schedules` (SPEC-009).
+- **`expert.py`** — expert agent SSE chat, doc generation, chat-session CRUD, file attachments. Auth on every endpoint.
 - **`knowledge.py`** — knowledge tree CRUD, markitdown upload, verified toggle (owner/admin), AI product summary.
 - **`integrations.py`** — connector list/test/pull (git pulls create codebases; non-git pulls create knowledge nodes).
 - **`mcp_admin.py`** — admin MCP server registry CRUD + bounded health-check + cached tool discovery (`/api/admin/mcp/servers`).
@@ -247,6 +256,8 @@ Auto-discovered via `api/routers/__init__.py` + the foundation auth router. To a
 - `local.py` — bcrypt passwords, reset tokens (sha256, 7-day TTL).
 - `tokens.py` — session JWTs (HS256 via `SETTINGS_SECRET_KEY`/`JWT_SECRET_KEY`), httpOnly `SameSite=Lax` cookie; `COOKIE_SECURE=true` adds `Secure` (set it behind HTTPS).
 - `keycloak.py` — OIDC via authlib; `bootstrap.py` — one-shot admin from `BOOTSTRAP_ADMIN_*`.
+
+**Roles & product access.** Global roles: `admin`, `manager` (docs-level on every product), `user` (per-product grants only), `viewer_global` (read-only on every product). Keycloak groups (the `groups` claim) map to roles via `KEYCLOAK_ROLE_MAPPING` or the admin panel → Auth block (the bundled realm ships `productarium-admins/-managers/-users`). Per-product grants (`product_grants`, levels `ro` = read + docs workflow — edit pages, regenerate, verify; `rw` = full manage incl. granting others) are managed on the product page ("Product users", manage-level only) or in the admin panel ("Access mapping" matrix); owners and admins manage implicitly. `GET /api/admin/keycloak/groups` (optional service-account client `KEYCLOAK_ADMIN_CLIENT_*`) feeds the mapping UI's group reference.
 
 ---
 
@@ -267,7 +278,25 @@ Admins configure credentials (Fernet-encrypted in the settings store) and test c
 Model Context Protocol in two directions:
 
 - **Outbound** (`manager.py`) — admin-registered servers (`http` and `stdio` transports; headers/env encrypted at rest via `secrets.py`; stdio commands validated against `policy.py` — no shells/interpreters/env injection). Products bind servers with an optional `allowed_tools` allowlist. Discovery is cached by config fingerprint, bounded by `MCP_DISCOVERY_TIMEOUT_SECONDS`, negatively cached for `MCP_NEGATIVE_CACHE_SECONDS`; tool calls are bounded by `MCP_TOOL_CALL_TIMEOUT_SECONDS` and result-capped by `MCP_TOOL_RESULT_MAX_CHARS`. Bound tools are appended to the expert agent best-effort (a dead server is skipped, never fatal). URLs with embedded credentials (`user:pass@host`) are rejected — auth belongs in the encrypted headers.
-- **Inbound** (`inbound.py`) — Productarium itself as an MCP server (FastMCP, streamable HTTP) at `/api/mcp`, authenticated by Bearer API tokens. Tools: `list_products`, `get_product_knowledge`, `search_knowledge`, `ask_expert` (bounded by `MCP_ASK_TIMEOUT_SECONDS`).
+- **Inbound** (`inbound.py`) — Productarium itself as an MCP server (FastMCP, streamable HTTP) at `/api/mcp`, authenticated by Bearer API tokens (checked on every request; per-token-owner rate limit shared with the public API). Tools: `list_products`, `get_product_knowledge` (verified-only export), `knowledge_search` (graph-aware search with citations, SPEC-008), `knowledge_graph` (product term/page graph, optional `focus_term`), `ask_expert` (bounded by `MCP_ASK_TIMEOUT_SECONDS`).
+
+### stdio tool-server presets (admin, one step)
+
+`api/mcp/presets.py::STDIO_TOOL_PRESETS` holds vetted launch recipes for non-database stdio MCP tool servers — registered through the regular admin registry, no code changes. Current preset: **REA** ([morluto/rea](https://github.com/morluto/rea), MIT) — reverse-engineering tools for native binaries (Hopper/Ghidra/IDA pseudocode, assembly, strings, xrefs, call graphs), JS/Electron bundles, .NET, WASM and EVM artifacts.
+
+**Connect REA:** on the API host install Node.js 22+ and `npm install --global rea-agents`, then register the server:
+
+```json
+POST /api/admin/mcp/servers
+{
+  "name": "rea",
+  "transport": "stdio",
+  "command": "/usr/local/bin/node",
+  "args": ["/usr/local/lib/node_modules/rea-agents/rea.mjs", "mcp"]
+}
+```
+
+Replace the example paths with the real ones on your host: `command` is the node **binary by absolute path** (the single interpreter exception the stdio policy grants, SPEC-014 — REA's upstream `npx rea-agents` launcher is deliberately rejected, as are bare `node`/`npx` and every other interpreter); `args[0]` is the installed entrypoint, resolved after the global install with `readlink -f "$(command -v rea)"`, followed by the stdio subcommand `mcp`. After `POST .../servers/{id}/test` succeeds, bind the server to a product (optional `allowed_tools`); the expert agent gains REA's inspection tools, bounded by the same `MCP_TOOL_CALL_TIMEOUT_SECONDS` / result-cap gates as every other MCP server.
 
 ---
 
@@ -280,7 +309,7 @@ JSON files with `${ENV_VAR}` placeholders, resolved at load time. Custom directo
 - **`repo.json`** — file filters for repository reading.
 - **`lang.json`** — supported languages (`en`, `ru`; default `ru`).
 
-Every timeout lives in `timeout.py`'s registry (env fallback; per-key floor) and is surfaced in the admin panel across topical tabs: **Models** (LLM request budgets + docgen agent knobs), **Agent Memory** (memory group), **Databases** (DB-RE budgets), and **Timeouts** (expert / integrations / Mermaid).
+Every timeout lives in `timeout.py`'s registry (admin store > env > default; per-key floor) and is surfaced on topical admin tabs only (no dedicated Timeouts screen): **Models** (LLM + Expert + Mermaid groups), **Integrations**, **Memory**, **Databases**.
 
 ---
 
@@ -312,13 +341,21 @@ flowchart TD
 
 Each subagent explores the clone itself (`repo_list_files` / `repo_read_file` / `repo_grep`, per-result caps adapt to the model context window) and produces exactly one section; no section ever sees the others' drafts. Verification pipeline (`docgen/verification.py`): citation validation against the sources the agent actually read, an LLM judge pass (disable with `DOCGEN_JUDGE_ENABLED=false`), Node-based Mermaid syntax verification with bounded LLM repair, a provenance diff (tree-hash fingerprint decides reuse vs. regenerate), and DSN masking for database artifacts.
 
-Small-context models: every scaffold piece scales with the resolved context window (`repo_read_file` cap, router hints, section instructions, completion `max_tokens` ≈ ctx/6), prompts are fitted to a real tiktoken budget by dropping WHOLE file blocks from the end, and context-overflow errors log the actual budgets. The window is resolved live per server (`/v1/models` -> LM Studio `/api/v0/models` -> llama.cpp `/props` -> Ollama `/api/show`, cached 5 min; explicit `RLM_MODEL_CONTEXT_WINDOW` or the admin Models -> max_prompt_tokens override wins) — a 262k model no longer silently clamps to 8192; if every probe misses, a WARNING names the 8192 fallback.
+Small-context models: every scaffold piece scales with the resolved context window (`repo_read_file` cap, router hints, section instructions, completion `max_tokens` ≈ ctx/6), prompts are fitted to a real tiktoken budget by dropping WHOLE file blocks from the end, and context-overflow errors log the actual budgets. The window is resolved live per server (`/v1/models` -> LM Studio `/api/v0/models` -> llama.cpp `/props` -> Ollama `/api/show`, cached 5 min; explicit `PRODUCTARIUM_MODEL_CONTEXT_WINDOW` or the admin Models -> max_prompt_tokens override wins) — a 262k model no longer silently clamps to 8192; if every probe misses, a WARNING names the 200000 fallback.
 
 Cross-context (admin panel → Models → LLM, default on): the repo brief carries supplementary product context as SEPARATE blocks, each with its own share of the brief budget (a long README can no longer truncate them away) — a compact **spec digest** (`DOCGEN_SPEC_CONTEXT_ENABLED`: the product's own API contracts plus external client contracts, one menu line per spec with operations/channels/schemas) and a **DB digest** (`DOCGEN_DB_CONTEXT_ENABLED`: schemas, top tables by FK degree). With specs enabled, every unit agent also gets the read-only **`spec_lookup`** tool for on-demand schema/operation details (dotted paths into the parsed spec, capped). All blocks are explicitly marked NOT to be cited as repo paths — the citation guard relies on this marker.
 
 Agent budgets (admin panel → Models → LLM): `DOCGEN_UNIT_RECURSION_LIMIT` (unit-agent graph steps, default 256) and `DOCGEN_ORCHESTRATOR_RECURSION_LIMIT` (default 400, also inherited by task-spawned subagents) keep large-repo explorations from dying with "Recursion limit reached"; `DOCGEN_SECTION_CONCURRENCY` bounds the Python-fallback section agents, and `DOCGEN_LLM_CONCURRENCY` (default 8) is a semaphore on the one chat instance shared by the orchestrator and its subagents — it caps the total in-flight LLM calls (both plain and streaming: `_agenerate` and `_astream` hold it for the whole call), so a burst of spawned subagents cannot exceed the local server's parallel-request limit (429).
 
-Per-type generation: `codebases/{id}/generate` runs the pipeline above; `specs/{id}/generate` parses the spec and enriches a skeleton (LangGraph flow); `databases/{id}/generate` runs the MCP introspection flow. Links do not generate. All generation is async: `202 + job_id`, the frontend polls `/generate/status?job_id=` (progress: phase + sections_done/current_section). After a reload the page restores running jobs from `GET /docgen/active` and shows a `3/7 · System Architecture` counter on the card.
+Output contract & anti-stall watchdogs (SPEC-015): every unit prompt carries the shared `_unit_output_contract` block, and unit outputs pass LLM-free structural validation — a truncated final answer (chop detection) earns a bounded retry instead of silently persisting a half page. Two wall-clock watchdogs cancel stalled unit agents so one hung call cannot freeze a run: `DOCGEN_UNIT_WALL_CLOCK_SECONDS` (codebase units, default 1800 s) and `DB_UNIT_WALL_CLOCK_SECONDS` (database deep units, default 900 s) — on expiry the unit fails/degrades and the job continues with the rest.
+
+Per-type generation: `codebases/{id}/generate` runs the pipeline above; `specs/{id}/generate` parses the spec and enriches a skeleton (LangGraph flow); `databases/{id}/generate` runs the MCP introspection flow; `POST /{id}/hld/generate` writes the 6-page High-Level Design from ALL entities' context. Links do not generate. All generation is async: `202 + job_id`, the frontend polls `/generate/status?job_id=` (progress: phase + sections_done/current_section). After a reload the page restores running jobs from `GET /docgen/active` and shows a `3/7 · System Architecture` counter on the card.
+
+Incremental updates (SPEC-010): `POST .../{codebases|databases|specs}/{id}/detect` compares the source against the hidden server-side `source_state` baseline (git fetch+diff for codebases under `GIT_DETECT_TIMEOUT_SECONDS`, catalog-pack fingerprint for databases, content hash for specs) and returns a page-level impact plan; `POST .../incremental` regenerates only the affected pages (`force_pages`, one budget-capped add-only LLM expansion) — unchanged or unverifiable sources finish successfully WITHOUT a new version.
+
+Scheduled regeneration (SPEC-009): admins set per-entity cron schedules (admin UI «Автогенерация» / `GET/PUT/DELETE /api/products/{id}/schedules`); the in-process scheduler (60 s tick, UTC) submits ordinary jobs labelled `source="schedule"` (full generate, or incremental when a SPEC-010 baseline exists), records `skipped_busy` when the entity is occupied, and never backfills missed windows.
+
+Doc versioning: every successful run, content edit and rollback appends an immutable snapshot; page-level edits append SPEC-012 delta versions (only the overridden pages, materialized on read); restore appends `source="rollback"`, and DELETE is guarded (409 for the current, only, or baseline version — SPEC-013).
 
 The 7 sections — Overview, Architecture, Functional description, Technical details, CI/CD & SRE, QA (testing), Data Model — are generated by isolated unit subagents. Functional / Technical / Data Model are parent pages with subpages (children generated first, then the parent aggregating them; per-unit caps: ≤10 capabilities, ≤12 technical units, ≤6 data layers). On diff regeneration, unchanged units — parent or child — are reused verbatim; a changed child set forces the parent to regenerate.
 
@@ -341,7 +378,7 @@ flowchart TD
 
 ### Introspection walk (deterministic)
 
-Discovered tools are classified into roles by name tokens (schemas / tables / describe / ddl / indexes / constraints / relationships / views / routines / triggers / sequences / types / sql). The walk lists schemas → tables → per-table structure (describe, DDL fallback) → category listings → optional read-only SQL catalog packs (`_PG_SQL_PACK` / `_ORACLE_SQL_PACK`, allowed only after a SELECT-only constant + identifier-regex guard) that fill FK edges, indexes, triggers, routines, sequences, materialized views and types; pack rows are AUTHORITATIVE for their categories — a successful-but-empty answer replaces an adapter listing (extension-only catalogs genuinely have no user objects). System objects stay out: PostgreSQL skips `pg_*`/`information_schema` schemas and `pg_depend` extension-owned routines/types/triggers (pgvector et al.), Oracle skips the built-in AND maintenance owners (SYSMAN, PERFSTAT, APEX_*/FLOWS_* releases…) both in SQL and in a python-side owner filter applied to owners and pack categories — and `BIN$` recyclebin leftovers. Oracle with a sql role first takes a cross-schema BULK walk — one `ALL_TABLES` owners query, then columns + comments per owner, every catalog query (bulk AND SQL packs) fetched in `ROWNUM`-windowed pages of 1 200 rows that stay under the tool-result char cap — a single wide ask was silently chopped mid-table by that cap and the parser lost everything after the cut — with no per-schema table cap — because the pinned oracle-mcp-server caches ONE schema; a failed bulk walk falls back to the adapter path. Every Oracle catalog projection is NULL-proofed (`NVL`, no LONG `data_default`) — the pinned server's formatter crashes on any NULL cell — and its anti-injection result envelope is unwrapped, so bulk errors carry the real server message. Oracle specifics: `ALL_SOURCE` line rows are regrouped into one row per object; PL/SQL objects get their full source fetched — but only for objects whose owner matches the server's effective schema (`SYS_CONTEXT('USERENV','SESSION_USER')`: `DBMS_METADATA` answers ORA-31603 for everything else and the tool has no owner argument), and server error texts (`ORA-*`, `Database error`, `Unexpected error`, `Error retrieving …`) are never stored as a source nor accepted as an authoritative "empty" pack answer. The overall walk budget defaults to 30 minutes (`DB_INTROSPECTION_TIMEOUT_SECONDS`) — a multi-schema monolith legitimately needs tens of paged queries. The output is a structured payload (facts, never prose), cached on disk between runs (`CACHE_FORMAT_VERSION` 4; walk-affecting budgets participate in the cache key). Categories probed but empty are recorded in `unavailable` and documented as such.
+Discovered tools are classified into roles by name tokens (schemas / tables / describe / ddl / indexes / constraints / relationships / views / routines / triggers / sequences / types / sql). The walk lists schemas → tables → per-table structure (describe, DDL fallback) → category listings → optional read-only SQL catalog packs (`_PG_SQL_PACK` / `_ORACLE_SQL_PACK`, allowed only after a SELECT-only constant + identifier-regex guard) that fill FK edges, indexes, triggers, routines, sequences, materialized views and types; pack rows are AUTHORITATIVE for their categories — a successful-but-empty answer replaces an adapter listing (extension-only catalogs genuinely have no user objects). System objects stay out: PostgreSQL skips `pg_*`/`information_schema` schemas and `pg_depend` extension-owned routines/types/triggers (pgvector et al.), Oracle skips the built-in AND maintenance owners (SYSMAN, PERFSTAT, APEX_*/FLOWS_* releases…) both in SQL and in a python-side owner filter applied to owners and pack categories — and `BIN$` recyclebin leftovers. Oracle with a sql role first takes a cross-schema BULK walk — one `ALL_TABLES` owners query, then columns + comments per owner, every catalog query (bulk AND SQL packs) fetched in `ROWNUM`-windowed pages of 1 200 rows that stay under the tool-result char cap — a single wide ask was silently chopped mid-table by that cap and the parser lost everything after the cut — with no per-schema table cap — because the pinned oracle-mcp-server caches ONE schema; a failed bulk walk falls back to the adapter path. Every Oracle catalog projection is NULL-proofed (`NVL`, no LONG `data_default`) — the pinned server's formatter crashes on any NULL cell — and its anti-injection result envelope is unwrapped, so bulk errors carry the real server message. Oracle specifics: `ALL_SOURCE` line rows are regrouped into one row per object; PL/SQL objects get their full source fetched — but only for objects whose owner matches the server's effective schema (`SYS_CONTEXT('USERENV','SESSION_USER')`: `DBMS_METADATA` answers ORA-31603 for everything else and the tool has no owner argument), and server error texts (`ORA-*`, `Database error`, `Unexpected error`, `Error retrieving …`) are never stored as a source nor accepted as an authoritative "empty" pack answer. The overall walk budget defaults to 6 h (`DB_INTROSPECTION_TIMEOUT_SECONDS` — night-scale for full-coverage Oracle walks), with tool calls capped by `DB_MAX_TOOL_CALLS` (default 20 000). The output is a structured payload (facts, never prose), cached on disk between runs (`CACHE_FORMAT_VERSION` 6; walk-affecting budgets — `DB_MAX_TOOL_CALLS`, `DB_FK_EVIDENCE_TABLES`, `DB_SOURCE_OBJECTS`, the subpage/description caps — participate in the cache key). Categories probed but empty are recorded in `unavailable` and documented as such.
 
 ### Page tree — root pages + per-entity subpages
 
@@ -350,11 +387,15 @@ Discovered tools are classified into roles by name tokens (schemas / tables / de
 - **Per-table subpages** — columns, indexes, constraints, DDL and the LLM description; FK-adjacent tables cross-link via `relatedPages`; optional blocks for triggers/relations that affect the table. Subpage titles are schema-qualified (`OWNER.TABLE`) — bare names collide across schemas.
 - **Category roots** (created only when the walk found evidence): Views (incl. materialized), Triggers, Routines (procedures/functions), Sequences, Types — each object gets a subpage with its full source/DDL.
 
-Subpages are capped by `DB_DOCGEN_MAX_SUBPAGES` (default 200), ranked FK-degree → column count → name; surplus objects stay on the root page as folded (`<details>`) rows — hidden, never dropped. The tables root folds its name list at 60 visible rows.
+Subpage and description caps are **0 = unlimited by default** (`DB_DOCGEN_MAX_SUBPAGES`, `DB_DOCGEN_MAX_DESCRIPTIONS`); a finite cap ranks FK-degree → column count → name and folds the surplus on the root page as `<details>` rows — hidden, never dropped. The tables root folds its name list at 60 visible rows.
 
 ### LLM enrichment — batched, admin-tunable
 
-One overview call, one categories call, and table descriptions in **strict-JSON batches** of `DB_DOCGEN_ENRICH_BATCH` tables per call (default 40, floor 5) — a 61-table database costs a handful of calls, an Oracle monolith dozens rather than thousands. Names not present in the batch are discarded from the response. `DB_DOCGEN_MAX_DESCRIPTIONS` (default 250) bounds how many objects get LLM text at all; structure/DDL subpages stay deterministic. All three knobs live in the timeout registry (admin panel → Databases; admin store > env > default, per-key floor) and are re-read on every generation — an admin change applies to the next run without a restart.
+One overview call, one categories call, and table descriptions in **strict-JSON batches** of `DB_DOCGEN_ENRICH_BATCH` tables per call (default 40, floor 5) — a 61-table database costs a handful of calls, an Oracle monolith dozens rather than thousands. Names not present in the batch are discarded from the response. `DB_DOCGEN_MAX_DESCRIPTIONS` (0 = unlimited by default) bounds how many objects get LLM text at all; structure/DDL subpages stay deterministic. All three knobs live in the timeout registry (admin panel → Databases; admin store > env > default, per-key floor) and are re-read on every generation — an admin change applies to the next run without a restart.
+
+### Deep per-entity units & coverage honesty (SPEC-015/016)
+
+`DB_DEEP_UNITS_ENABLED` (default on) gives every table/view/job/… its own deepagents subagent. A fingerprint-matched stored page is reused wholesale; otherwise the unit agent documents the object from a capped evidence bundle (`DB_UNIT_BUNDLE_CHARS`, default 8 000 chars) plus `entity_source`/`db_lookup` tools (`DB_ENTITY_MCP_ENABLED`) and a bounded first-rows sample (`DB_DEEP_SAMPLE_ROWS`, default 5; 0 = off — a full table read is never documentation evidence). Each unit runs under the `DB_UNIT_WALL_CLOCK_SECONDS` watchdog (default 900 s); majority failure falls back to batch enrichment. Truncated tool results are detected (`…[truncated` chop marker) and refetched with a halved row window; category listings are cross-checked with `COUNT(*)`, and discrepancies land in `walk_stats` plus the overview's `_coverage_section` honesty report — the docs state exactly what was and was not covered.
 
 ### Cross-context with codebase docs
 
@@ -374,6 +415,7 @@ Free LLM prose exists only where it can be checked: the overview goes through th
 - The embedder is rate-limited (semaphore + spacing + 429 retry; `EMBEDDER_MAX_CONCURRENCY`, `EMBEDDER_DELAY_SECONDS`, `EMBEDDER_RATE_LIMIT_RPS`).
 - On timeout or in SQLite degraded mode, recall returns nothing and callers fall back to artifact docs + recent chunks.
 - The admin panel can switch the backend and trigger a reindex (`POST /api/admin/memory/reindex`).
+- **Knowledge graph (SPEC-008)** — each product also owns a term/page graph (`knowledge_graphs`), built incrementally after page indexing by batched LLM term extraction (gate `KNOWLEDGE_GRAPH_ENABLED`, batch `KNOWLEDGE_GRAPH_BATCH`, wall-clock `KNOWLEDGE_GRAPH_BUILD_SECONDS`). `knowledge_search` resolves query terms in the graph and boosts related pages' chunks; admin: graph stats in `GET /api/admin/memory` + `POST /api/admin/memory/graph/reindex`.
 
 ---
 
@@ -384,6 +426,7 @@ A product-scoped agent over all entities and knowledge nodes.
 - `POST /api/products/{id}/ask` — SSE chat stream. Events: session announcement (`session_id` + `X-Session-Id` header), `status`, `tool_call`/`tool_result`, `reasoning`, `content` deltas, terminating `data: [DONE]`.
 - Sessions are per-user and persistent (LangGraph checkpointer: Postgres-only). `GET .../chat/sessions`, `GET .../chat/sessions/{id}/messages`; other users' sessions are invisible (404/hidden).
 - **Deep Research** toggle: a bounded multi-iteration research loop (`DEEP_RESEARCH_TIMEOUT_SECONDS`) with intermediate findings.
+- **Attachments** — `POST /api/products/{id}/ask/attachments` (multipart, ≤5 per turn, size-capped via `UPLOAD_MAX_BYTES`) converts files to Markdown (markitdown → UTF-8 fallback → 501 for unconvertible binary; 50k-char rendition cap); renditions are inlined into the turn's context only — never indexed into product memory. `GET .../ask/attachments/{id}` downloads a rendition.
 - `POST /api/products/{id}/ask/doc` — self-contained Markdown document.
 - Tools: knowledge recall over the product's pgvector chunks, entity readers (spec/codebase/database), plus every bound enabled MCP server's tools (after allowlist).
 
@@ -395,8 +438,8 @@ A product-scoped agent over all entities and knowledge nodes.
 
 - `app/page.tsx` — products dashboard (bento grid, inline create/delete).
 - `app/products/[productId]/page.tsx` — product detail: codebase cards + generate, spec sidebar, links spoiler, database cards (DSN masked, MCP pin, RE generate), expert agent panel, knowledge tree, MCP bindings (Zed-style server list + tool allowlist).
-- `app/products/[productId]/artifacts/[artifactId]/page.tsx` — entity docs viewer (codebase/spec/links/database via `findEntity`): pages nav tree (collapsible groups with child counts; the active page's group auto-opens), Markdown + Mermaid, scoped Ask, editor.
-- `components/` — `Ask.tsx` (chat + Deep Research), `ExpertChat.tsx` (SSE + sessions), `Mermaid.tsx` (pan/zoom + auto-fix), `Markdown.tsx`, `knowledge/KnowledgeTree.tsx`, shared `ui.tsx` primitives.
+- `app/products/[productId]/artifacts/[artifactId]/page.tsx` — entity docs viewer (codebase/spec/links/database/HLD via `findEntity`; the HLD viewer is read-only): pages nav tree (collapsible groups with child counts; the active page's group auto-opens), Markdown + Mermaid, scoped Ask, editor, version history.
+- `components/` — `ExpertChat.tsx` (SSE + sessions + attachments), `Mermaid.tsx` (pan/zoom + auto-fix), `Markdown.tsx`, `ProvenancePanel.tsx` (judge verdict + provenance report under the page text), `DetectChangesModal.tsx` (incremental detect), `ProductSchedulesPanel.tsx` (admin cron «Автогенерация»), `ProductUsersPanel.tsx` (product grants), `knowledge/KnowledgeTree.tsx`, `mcp/McpServersPanel.tsx`, shared `ui.tsx` primitives.
 - `contexts/` — Auth, Language (next-intl), Notifications, Theme.
 - Proxy: `next.config.ts` rewrites `/api/*` → `SERVER_BASE_URL`.
 
@@ -426,18 +469,20 @@ Self-signed certificates: place `.crt`/`.pem` files in a `certs/` directory and 
 
 - **Local OpenAI-compatible API**: `LOCAL_OPENAI_BASE_URL` / `LOCAL_OPENAI_API_KEY` / `LOCAL_OPENAI_MODEL`.
 - **Database**: `DB_PROVIDER` (`postgres` | `sqlite`), `DB_HOST/PORT/NAME/USERNAME/PASSWORD`, `PRODUCTARIUM_STATE_DIR`, `PRODUCTARIUM_ALLOW_LOCAL_CLONES`.
-- **Timeouts** (admin store > env > default; registry in `api/config/timeout.py`): `LLM_REQUEST_TIMEOUT_SECONDS`, `LLM_RETRY_MAX_TIME_SECONDS`, `MODEL_LIST_TIMEOUT_SECONDS`, `PROVIDER_TEST_TIMEOUT_SECONDS`, `DOCGEN_INDEXING_DRAIN_SECONDS`, `MEMORY_QUERY_TIMEOUT_SECONDS`, `INTEGRATION_HTTP_TIMEOUT_SECONDS`, `GIT_FILE_CONTENT_TIMEOUT_SECONDS`, `MCP_STDIO_WAIT_SECONDS`, `MERMAID_VERIFY_TIMEOUT`, `MERMAID_REPAIR_TIMEOUT`, `MERMAID_MAX_REPAIR_ATTEMPTS`.
-- **Docgen**: `DOCGEN_MAX_WORKERS`, `DOCGEN_JUDGE_ENABLED`, `MERMAID_VERIFY`, `RLM_MODEL_CONTEXT_WINDOW` (legacy-named context-window knob); agent budgets (admin panel → Models → LLM): `DOCGEN_UNIT_RECURSION_LIMIT` (unit-agent graph steps, default 256, floor 16), `DOCGEN_ORCHESTRATOR_RECURSION_LIMIT` (orchestrator run, default 400, floor 32), `DOCGEN_SECTION_CONCURRENCY` (parallel section agents in the Python fallback, default 3), `DOCGEN_LLM_CONCURRENCY` (max in-flight LLM calls on the shared docgen chat instance, default 8 — caps the subagent burst so a local server does not answer 429); cross-context toggles (same admin tab, default on): `DOCGEN_SPEC_CONTEXT_ENABLED` (spec digest + `spec_lookup` tool in codebase docgen) and `DOCGEN_DB_CONTEXT_ENABLED` (DB digest in codebase docgen briefs).
+- **Timeouts & pacing** (admin store > env > default; registry in `api/config/timeout.py`): `LLM_REQUEST_TIMEOUT_SECONDS`, `LLM_RETRY_MAX_TIME_SECONDS`, `LLM_RATE_LIMIT_RPS` (process-wide per-(base_url, model) RPS ceiling, default 5, 0 disables), `MODEL_LIST_TIMEOUT_SECONDS`, `PROVIDER_TEST_TIMEOUT_SECONDS`, `DOCGEN_INDEXING_DRAIN_SECONDS`, `MEMORY_QUERY_TIMEOUT_SECONDS`, `INTEGRATION_HTTP_TIMEOUT_SECONDS`, `GIT_FILE_CONTENT_TIMEOUT_SECONDS`, `GIT_DETECT_TIMEOUT_SECONDS` (SPEC-010 detect fetch/diff), `KEYCLOAK_ADMIN_TIMEOUT_SECONDS`, `MCP_STDIO_WAIT_SECONDS`, `MERMAID_VERIFY_TIMEOUT`, `MERMAID_REPAIR_TIMEOUT`, `MERMAID_MAX_REPAIR_ATTEMPTS`, `MERMAID_REPAIR_DEADLINE_SECONDS`.
+- **Docgen**: `DOCGEN_MAX_WORKERS`, `DOCGEN_JUDGE_ENABLED`, `MERMAID_VERIFY`, `PRODUCTARIUM_MODEL_CONTEXT_WINDOW` (context-window override for prompt budgeting); agent budgets (admin panel → Models → LLM): `DOCGEN_UNIT_RECURSION_LIMIT` (unit-agent graph steps, default 256, floor 16), `DOCGEN_ORCHESTRATOR_RECURSION_LIMIT` (orchestrator run, default 400, floor 32), `DOCGEN_SECTION_CONCURRENCY` (parallel section agents in the Python fallback, default 3), `DOCGEN_LLM_CONCURRENCY` (max in-flight LLM calls on the shared docgen chat instance, default 8 — caps the subagent burst so a local server does not answer 429); SPEC-015 anti-stall budgets: `DOCGEN_UNIT_WALL_CLOCK_SECONDS` (codebase unit-agent watchdog, default 1800) and `DB_UNIT_WALL_CLOCK_SECONDS` (database deep units, default 900); cross-context toggles (same admin tab, default on): `DOCGEN_SPEC_CONTEXT_ENABLED` (spec digest + `spec_lookup` tool in codebase docgen) and `DOCGEN_DB_CONTEXT_ENABLED` (DB digest in codebase docgen briefs).
 - **Agent runtime**: `PRODUCTARIUM_CHECKPOINTER=memory` (test-only in-memory checkpointer override; default is Postgres-only — no Postgres, no app start).
-- **Expert**: `DEEP_RESEARCH_TIMEOUT_SECONDS`.
-- **Database RE**: `DB_INTROSPECTION_TIMEOUT_SECONDS`, `DB_CONNECT_CHECK_SECONDS`, `DB_INTROSPECTION_CACHE_TTL_SECONDS`, plus admin-tunable counts (admin panel → Databases; see [§14](#14-database-reverse-engineering)): `DB_DOCGEN_ENRICH_BATCH` (tables per LLM batch, default 40), `DB_DOCGEN_MAX_SUBPAGES` (200), `DB_DOCGEN_MAX_DESCRIPTIONS` (250), `DB_FK_EVIDENCE_TABLES` / `DB_SOURCE_OBJECTS` (walk budgets, part of the introspection cache key); cross-context toggle `DOCGEN_DB_CONTEXT_ENABLED` — see the Docgen group above.
+- **Expert**: `DEEP_RESEARCH_TIMEOUT_SECONDS`, `EXPERT_STREAM_TIMEOUT_SECONDS` (ask-turn wall clock), `EXPERT_RECURSION_LIMIT`.
+- **Database RE**: `DB_INTROSPECTION_TIMEOUT_SECONDS` (default 6 h), `DB_MAX_TOOL_CALLS` (default 20 000), `DB_CONNECT_CHECK_SECONDS`, `DB_INTROSPECTION_CACHE_TTL_SECONDS`, plus admin-tunable counts (admin panel → Databases; see [§14](#14-database-reverse-engineering)): `DB_DOCGEN_ENRICH_BATCH` (tables per LLM batch, default 40), `DB_DOCGEN_MAX_SUBPAGES` / `DB_DOCGEN_MAX_DESCRIPTIONS` / `DB_SOURCE_OBJECTS` (0 = unlimited), `DB_FK_EVIDENCE_TABLES` (walk budgets, part of the introspection cache key); deep units: `DB_DEEP_UNITS_ENABLED`, `DB_ENTITY_MCP_ENABLED`, `DB_UNIT_BUNDLE_CHARS` (default 8000), `DB_DEEP_SAMPLE_ROWS` (default 5, 0 = off), `DB_UNIT_WALL_CLOCK_SECONDS` (default 900); cross-context toggle `DOCGEN_DB_CONTEXT_ENABLED` — see the Docgen group above.
 - **MCP**: `MCP_DISCOVERY_TIMEOUT_SECONDS`, `MCP_ASK_TIMEOUT_SECONDS`, `MCP_TOOL_CALL_TIMEOUT_SECONDS`, `MCP_TOOL_RESULT_MAX_CHARS`, `MCP_NEGATIVE_CACHE_SECONDS`.
 - **Embedder rate limits**: `EMBEDDER_MAX_CONCURRENCY`, `EMBEDDER_DELAY_SECONDS`, `EMBEDDER_RATE_LIMIT_RPS`.
+- **Knowledge graph**: `KNOWLEDGE_GRAPH_ENABLED` (0/1 gate), `KNOWLEDGE_GRAPH_BATCH` (pages per LLM batch), `KNOWLEDGE_GRAPH_BUILD_SECONDS` (extraction wall clock).
+- **Rate limits & uploads**: `RATE_DOCGEN_PER_USER_HOUR` (generation endpoints), `RATE_PUBLIC_PER_USER_MINUTE` (public ask + inbound MCP), `UPLOAD_MAX_BYTES` (knowledge/chat uploads, default 50 MiB).
 - **Auth**: `AUTH_PROVIDER`, `BOOTSTRAP_ADMIN_*`, `SETTINGS_SECRET_KEY`, `JWT_SECRET_KEY`, `SESSION_TOKEN_TTL`, `COOKIE_SECURE`; Keycloak: `KEYCLOAK_*`.
 - **HTTP security**: `CORS_ORIGINS` (comma-separated allowlist; `*` disables credentials).
 - **Integrations**: `GITHUB_ENTERPRISE_URL`, `GITLAB_SELF_HOSTED_URL`, `CONFLUENCE_*` (env fallbacks; the admin panel is primary).
 - **SSL/TLS**: `SSL_CA_BUNDLE` / `SSL_VERIFY`.
-- **Application/logging**: `PORT`, `SERVER_BASE_URL`, `DEEPWIKI_CONFIG_DIR`, `NODE_ENV`, `LOG_LEVEL`, `LOG_FORMAT`, `LOG_MAX_RECORD_CHARS`.
+- **Application/logging**: `PORT`, `SERVER_BASE_URL`, `DEEPWIKI_CONFIG_DIR`, `NODE_ENV`, `PRODUCTARIUM_IN_CONTAINER` (forces container-mode `localhost`→`host.docker.internal` DSN rewriting for the bundled DB MCP presets), `LOG_LEVEL`, `LOG_FORMAT`, `LOG_MAX_RECORD_CHARS`.
 
 ---
 

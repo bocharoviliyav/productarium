@@ -178,8 +178,10 @@ class TestSseContract:
         # Header mirrors the announced session id.
         assert resp.headers.get("x-session-id") == session_id
 
-    def test_error_frame_then_done(self, client, monkeypatch):
+    def test_error_frame_then_done(self, client, isolated_db, monkeypatch):
         import api.routers.expert as expert_router
+
+        _seed_product(isolated_db)
 
         async def _boom(*args, **kwargs):
             yield _ev("status", "retrieving")
@@ -194,9 +196,11 @@ class TestSseContract:
         # Controlled ValueError messages still surface verbatim.
         assert errors == ["LLM unavailable"]
 
-    def test_unexpected_error_frame_is_generic(self, client, monkeypatch):
+    def test_unexpected_error_frame_is_generic(self, client, isolated_db, monkeypatch):
         """Non-ValueError exceptions leak nothing (review #5)."""
         import api.routers.expert as expert_router
+
+        _seed_product(isolated_db)
 
         async def _boom(*args, **kwargs):
             raise RuntimeError("http://internal-host:8000/v1 exploded")
@@ -210,22 +214,15 @@ class TestSseContract:
         assert errors == ["Expert agent stream failed; see server logs"]
         assert "internal-host" not in resp.text
 
-    def test_empty_query_400(self, client):
+    def test_empty_query_400(self, client, isolated_db):
+        _seed_product(isolated_db)
         resp = client.post("/api/products/prod_1/ask", json={"query": "  "})
         assert resp.status_code == 400
 
-    def test_unknown_product_streams_without_session(self, client, monkeypatch):
-        """Legacy behavior: unknown product still streams (no 404), no session."""
-        import api.routers.expert as expert_router
-
-        events = [_ev("content", "answer")]
-        monkeypatch.setattr(expert_router, "run_agent_chat_stream", _fake_stream(events))
+    def test_unknown_product_404(self, client):
+        """P-1: an unknown product is a plain 404 before any stream starts."""
         resp = client.post("/api/products/ghost/ask", json={"query": "hi"})
-        assert resp.status_code == 200
-        frames = _frames(resp)
-        assert frames[-1] == "[DONE]"
-        assert all("session_id" not in f for f in frames if isinstance(f, dict))
-        assert "x-session-id" not in resp.headers
+        assert resp.status_code == 404
 
 
 # --- Session lifecycle -------------------------------------------------------
@@ -356,18 +353,20 @@ class TestRequestLimits:
     """Oversized queries / history are rejected with 422 BEFORE any agent or
     DB work (pydantic Field limits on the request models)."""
 
-    def test_oversize_query_422(self, client):
+    def test_oversize_query_422(self, client, isolated_db):
         from api.routers.expert import MAX_QUERY_CHARS
 
+        _seed_product(isolated_db)
         resp = client.post(
             "/api/products/prod_1/ask",
             json={"query": "x" * (MAX_QUERY_CHARS + 1)},
         )
         assert resp.status_code == 422
 
-    def test_oversize_history_message_422(self, client):
+    def test_oversize_history_message_422(self, client, isolated_db):
         from api.routers.expert import MAX_QUERY_CHARS
 
+        _seed_product(isolated_db)
         resp = client.post(
             "/api/products/prod_1/ask",
             json={
@@ -379,9 +378,10 @@ class TestRequestLimits:
         )
         assert resp.status_code == 422
 
-    def test_too_many_history_items_422(self, client):
+    def test_too_many_history_items_422(self, client, isolated_db):
         from api.routers.expert import MAX_HISTORY_ITEMS
 
+        _seed_product(isolated_db)
         resp = client.post(
             "/api/products/prod_1/ask",
             json={

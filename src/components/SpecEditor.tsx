@@ -14,7 +14,9 @@
  *  - edit → PUT  /api/products/{id}/specs/{specId}   (body: {content}; name/kind read-only)
  *
  * Delete: DELETE /api/products/{id}/specs/{specId}, redirect to product page.
- * Verify: POST /api/products/{id}/specs/{specId}/verify (owner/admin only).
+ * Verify: POST /api/products/{id}/specs/{specId}/verify (docs access, SPEC-001).
+ * SPEC-010: detect (content hash vs baseline) → summary → incremental run
+ * (a spec change always regenerates the single doc page in full).
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -25,11 +27,13 @@ import {
   ArrowLeft,
   Eye,
   FileText,
+  MagnifyingGlass,
   PencilSimple,
   Trash,
 } from "@phosphor-icons/react";
 import { ArrowsOutSimple } from "@phosphor-icons/react";
 import { AppHeader } from "@/components/AppHeader";
+import { useAuth } from "@/contexts/AuthContext";
 import { useLanguage } from "@/contexts/LanguageContext";
 import { useNotifications } from "@/contexts/NotificationContext";
 import { VerifiedBadge, VerifiedButton } from "@/components/VerifiedBadge";
@@ -55,8 +59,11 @@ import {
   type Spec,
   type SpecKind,
   generateId,
+  productAccess,
 } from "@/lib/types";
 import { SpecViewer } from "@/components/SpecViewer";
+import { DetectChangesModal } from "@/components/DetectChangesModal";
+import { useIncrementalDocs } from "@/hooks/useIncrementalDocs";
 
 type View = "edit" | "split" | "preview";
 
@@ -69,10 +76,13 @@ interface SpecEditorProps {
 export function SpecEditor({ productId, specId }: SpecEditorProps) {
   const router = useRouter();
   const { notify } = useNotifications();
+  const { user } = useAuth();
   const { messages, fmt } = useLanguage();
   const t = messages?.specEditor ?? {};
   const tArt = messages?.artifactTypes ?? {};
   const tc = messages?.common ?? {};
+  // SPEC-010 labels live in the shared artifact section (single source).
+  const tInc = messages?.artifact ?? {};
 
   const isNew = !specId;
 
@@ -105,6 +115,11 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
   const viewingArchive = viewVersion !== null;
   // Archived versions are read-only; the preview renders their snapshot.
   const displayContent = viewingArchive ? (versionDetail?.content ?? "") : content;
+  // Access matrix (SPEC-001) for EXISTING specs (new-spec creation is gated
+  // on the product page): docs = edit/verify, manage = rw (delete/rollback).
+  const access = productAccess(user, product);
+  const canManage = access === "manage";
+  const canDocs = canManage || access === "docs";
 
   // New specs edit immediately; existing specs open in preview-only view and
   // switch to editing (split) when the user clicks Edit.
@@ -185,6 +200,31 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
     setVersionDetail(null);
     fetchVersions();
   }, [fetchVersions]);
+
+  // SPEC-010 detect + incremental update — the shared polling hook (labels
+  // from the artifact i18n section; baseUrl stays empty for new specs, where
+  // the actions are not rendered).
+  const {
+    detectChecking,
+    detectResult,
+    setDetectResult,
+    updateStarting,
+    updateJob,
+    checkChanges: handleDetectChanges,
+    applyUpdate: handleIncrementalUpdate,
+  } = useIncrementalDocs({
+    baseUrl: specId ? `/api/products/${productId}/specs/${specId}` : "",
+    onApplied: async (outcome) => {
+      // A completed run replaced the stored doc — drop any stale draft so
+      // fetchAll can apply the new content (P2-28), then refresh versions.
+      if (outcome === "succeeded") {
+        dirtyRef.current = false;
+        setDirty(false);
+      }
+      await fetchAll();
+      if (outcome === "succeeded") await fetchVersions();
+    },
+  });
 
   // Archived snapshot (read-only): fetched on select, dropped on deselect.
   useEffect(() => {
@@ -458,19 +498,41 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
                   <Tag tone="yellow">
                     {fmt(t.archivedVersion ?? "Version v{n} (archived)", { n: String(viewVersion) })}
                   </Tag>
-                  <Button
-                    type="button"
-                    variant="subtle"
-                    size="sm"
-                    onClick={() => setConfirmRestore(viewVersion)}
-                    disabled={restoring}
-                  >
-                    <ArrowCounterClockwise size={14} weight="regular" />
-                    {t.rollback ?? "Rollback"}
-                  </Button>
+                  {canManage && (
+                    <Button
+                      type="button"
+                      variant="subtle"
+                      size="sm"
+                      onClick={() => setConfirmRestore(viewVersion)}
+                      disabled={restoring}
+                    >
+                      <ArrowCounterClockwise size={14} weight="regular" />
+                      {t.rollback ?? "Rollback"}
+                    </Button>
+                  )}
                 </>
               )}
-              {!isNew && !editing && !viewingArchive && (
+              {!isNew && (updateStarting || updateJob) && (
+                <span className="flex items-center gap-2 font-mono text-xs text-muted">
+                  <Spinner className="h-3.5 w-3.5" />
+                  {tInc.updatingDocs ?? "Updating documentation…"}
+                </span>
+              )}
+              {!isNew && !editing && !viewingArchive && canDocs && (
+                <Button
+                  type="button"
+                  variant="subtle"
+                  size="sm"
+                  onClick={() => void handleDetectChanges()}
+                  disabled={detectChecking || updateStarting || updateJob !== null}
+                >
+                  {detectChecking ? <Spinner /> : <MagnifyingGlass size={14} weight="regular" />}
+                  {detectChecking
+                    ? (tInc.detectRunning ?? "Checking changes…")
+                    : (tInc.detectButton ?? "Check changes")}
+                </Button>
+              )}
+              {!isNew && !editing && !viewingArchive && canDocs && (
                 <Button
                   type="button"
                   variant="subtle"
@@ -479,6 +541,7 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
                     setEditing(true);
                     setView("split");
                   }}
+                  disabled={detectChecking || updateStarting || updateJob !== null}
                 >
                   <PencilSimple size={14} weight="regular" />
                   {t.edit ?? "Edit"}
@@ -507,21 +570,24 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
                     verified={verified}
                     verifyUrl={`/api/products/${productId}/specs/${specId}/verify`}
                     ownerId={product?.owner_id ?? null}
+                    canVerify={canDocs}
                     onVerified={(next) => {
                       setVerified(next.verified);
                       setVerifiedBy(next.verified_by ?? null);
                     }}
                   />
-                  <Button
-                    type="button"
-                    variant="danger"
-                    size="sm"
-                    onClick={remove}
-                    disabled={deleting}
-                  >
-                    {deleting ? <Spinner /> : <Trash size={14} weight="regular" />}
-                    {t.delete ?? "Delete"}
-                  </Button>
+                  {canManage && (
+                    <Button
+                      type="button"
+                      variant="danger"
+                      size="sm"
+                      onClick={remove}
+                      disabled={deleting}
+                    >
+                      {deleting ? <Spinner /> : <Trash size={14} weight="regular" />}
+                      {t.delete ?? "Delete"}
+                    </Button>
+                  )}
                 </>
               )}
             </div>
@@ -605,7 +671,7 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
                     title={t.noContent ?? "No content yet"}
                     description={t.noContentDesc ?? "Add the spec content from the edit button."}
                     action={
-                      viewingArchive ? undefined : (
+                      viewingArchive || !canDocs ? undefined : (
                         <Button
                           variant="subtle"
                           size="sm"
@@ -707,6 +773,14 @@ export function SpecEditor({ productId, specId }: SpecEditorProps) {
             </Button>
           </div>
         </Modal>
+
+        {/* SPEC-010: detect summary — the modal itself is the confirmation
+            for the incremental (full spec) update */}
+        <DetectChangesModal
+          result={detectResult}
+          onClose={() => setDetectResult(null)}
+          onUpdate={() => void handleIncrementalUpdate()}
+        />
       </main>
     </div>
   );

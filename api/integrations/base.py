@@ -9,8 +9,8 @@ by implementing three methods:
   connectivity / credentials. Never raises; failures are reported via the
   returned dict so admin UIs can surface them.
 - ``list_spaces()``   -> ``list[{"id", "title", "type", ...}]`` — enumerate the
-  top-level sources the connector can pull from (GitHub repos, Confluence
-  spaces, ...).
+  top-level sources the connector can pull from (GitHub repos, wiki spaces,
+  ...).
 - ``pull(source_id, opts=None)`` -> ``{"title", "markdown", "attachments", ...}``
   — fetch a single space/repo/page and return its markdown representation.
   ``attachments`` is a list of ``{"filename", "markdown"}`` for converted
@@ -57,7 +57,7 @@ class IntegrationConnector(ABC):
     requires_credentials: bool = True
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
-        # The resolved config (e.g. git creds / confluence creds).
+        # The resolved config (e.g. git creds).
         # Connectors should treat missing keys gracefully.
         self.config: Dict[str, Any] = dict(config or {})
 
@@ -67,8 +67,8 @@ class IntegrationConnector(ABC):
         """Load this connector's config from the settings store.
 
         Default returns an empty dict (connector has no persisted config).
-        Subclasses override to read e.g. ``get_git_creds`` / ``get_confluence_creds``
-        / ``get_integration_config``. This must be import-safe (no network) and
+        Subclasses override to read e.g. ``get_git_creds`` /
+        ``get_integration_config``. This must be import-safe (no network) and
         must not raise — the settings store already degrades gracefully when
         the DB is down.
         """

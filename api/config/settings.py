@@ -1,6 +1,6 @@
 """Encrypted key/value settings store over ``SettingORM`` (admin config, item 8).
 
-Persistence layer for admin-configured models, git credentials, Confluence,
+Persistence layer for admin-configured models, git credentials,
 and integrations. Secrets are encrypted with ``cryptography.fernet`` using
 ``SETTINGS_SECRET_KEY``. If the key is unset, a stable-per-process dev key is
 generated and a WARNING is logged (NOT for production).
@@ -11,7 +11,6 @@ never crash. Grouped convenience getters read-through with env fallback:
 
 - ``get_model_for_task(task)``     -> {provider, model, base_url, api_key}
 - ``get_git_creds(host)``          -> {url, token}
-- ``get_confluence_creds()``       -> {base_url, token, space}
 - ``get_integration_config(name)`` -> dict (JSON value)
 """
 
@@ -538,21 +537,6 @@ def resolve_git_token(
         if _git_account_host(account.get("url"), provider) == repo_host:
             return account.get("token") or None
     return None
-
-
-def get_confluence_creds() -> Dict[str, Optional[str]]:
-    """Resolve Confluence configuration: {base_url, token, username, space}.
-
-    (The former ``mode``/``mcp_server``/``mcp_tool`` keys were removed together
-    with the legacy hand-written MCP client — external MCP servers are now
-    managed by the Wave C MCP platform, see ``api/mcp/``.)
-    """
-    return {
-        "base_url": get_setting("confluence.base_url") or os.environ.get("CONFLUENCE_BASE_URL"),
-        "token": get_secret("confluence.token") or os.environ.get("CONFLUENCE_TOKEN"),
-        "username": get_setting("confluence.username") or os.environ.get("CONFLUENCE_USERNAME"),
-        "space": get_setting("confluence.space") or os.environ.get("CONFLUENCE_SPACE"),
-    }
 
 
 def get_integration_config(name: str) -> Dict[str, Any]:

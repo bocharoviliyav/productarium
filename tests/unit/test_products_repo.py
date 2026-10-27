@@ -150,9 +150,9 @@ class TestFromPydanticMappers:
         assert orm.source == "manual"
 
     def test_codebase_orm_from_pydantic_preserves_explicit_source(self):
-        c = _make_codebase(source="confluence")
+        c = _make_codebase(source="api")
         orm = pr._codebase_orm_from_pydantic(c)
-        assert orm.source == "confluence"
+        assert orm.source == "api"
 
     def test_spec_orm_from_pydantic_copies_all_fields(self):
         s = _make_spec()
@@ -213,7 +213,7 @@ class TestOrmToProduct:
         p_orm = _seed_product(session)
         session.add(CodebaseORM(id="cb_1", product_id="prod_1", name="A", repo_url="u", source="github"))
         session.add(SpecORM(id="spec_1", product_id="prod_1", name="S", kind="asyncapi", content="c", source="github"))
-        session.add(LinksORM(id="links_1", product_id="prod_1", name="L", content="[]", source="confluence"))
+        session.add(LinksORM(id="links_1", product_id="prod_1", name="L", content="[]", source="api"))
         session.commit()
         session.refresh(p_orm)
 
@@ -226,7 +226,7 @@ class TestOrmToProduct:
         assert prod.specs[0].kind == "asyncapi"
         assert prod.specs[0].source == "github"
         assert len(prod.links) == 1
-        assert prod.links[0].source == "confluence"
+        assert prod.links[0].source == "api"
 
     def test_verified_fields_roundtrip(self, session):
         p_orm = _seed_product(session)

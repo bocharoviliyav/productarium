@@ -2,7 +2,7 @@
 
 Covers:
 - ``_retrieve_product_knowledge``: memory-backend recall mocked + fallback
-  artifact docs + confluence fallback + all-empty.
+  artifact docs + all-empty.
 - ``_fallback_artifact_docs``: codebase generated_docs, codebase pages (dict +
   str), spec content, missing product, empty.
 - ``_product_name_by_id``: found + missing + DB-down.
@@ -21,7 +21,6 @@ import os
 import sys
 import types
 from datetime import datetime
-from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -342,126 +341,3 @@ class TestRetrieveProductKnowledge:
         # No product -> no artifacts -> empty.
         result = asyncio.run(_retrieve_product_knowledge("prod_missing", "query"))
         assert result == ""
-
-    def test_confluence_fallback_when_memory_and_artifacts_empty(self, monkeypatch, isolated_db):
-        async def _fake_query_memory(query, product_id, top_k=20):
-            return ""
-
-        _install_fake_memory(monkeypatch, _fake_query_memory)
-
-        # Mock the Confluence connector path.
-        fake_connector = SimpleNamespace()
-        fake_connector.is_configured = lambda: True
-        fake_connector.list_spaces = lambda: [{"key": "DEV"}]
-        fake_connector.pull = lambda sp_id, opts=None: {"markdown": "confluence content"}
-
-        import api.integrations.registry as reg_mod
-        monkeypatch.setattr(reg_mod, "get_connector", lambda name: fake_connector if name == "confluence" else None)
-
-        result = asyncio.run(_retrieve_product_knowledge("prod_missing", "query"))
-        # P0-8: untrusted Confluence content is wrapped as data, never raw.
-        assert "confluence content" in result
-        assert "<untrusted_content>" in result and "</untrusted_content>" in result
-        assert "UNTRUSTED DATA" in result
-
-    def test_confluence_fallback_not_configured(self, monkeypatch, isolated_db):
-        async def _fake_query_memory(query, product_id, top_k=20):
-            return ""
-
-        _install_fake_memory(monkeypatch, _fake_query_memory)
-
-        fake_connector = SimpleNamespace()
-        fake_connector.is_configured = lambda: False
-
-        import api.integrations.registry as reg_mod
-        monkeypatch.setattr(reg_mod, "get_connector", lambda name: fake_connector if name == "confluence" else None)
-
-        result = asyncio.run(_retrieve_product_knowledge("prod_missing", "query"))
-        assert result == ""
-
-    def test_confluence_fallback_no_spaces(self, monkeypatch, isolated_db):
-        async def _fake_query_memory(query, product_id, top_k=20):
-            return ""
-
-        _install_fake_memory(monkeypatch, _fake_query_memory)
-
-        fake_connector = SimpleNamespace()
-        fake_connector.is_configured = lambda: True
-        fake_connector.list_spaces = lambda: []
-
-        import api.integrations.registry as reg_mod
-        monkeypatch.setattr(reg_mod, "get_connector", lambda name: fake_connector if name == "confluence" else None)
-
-        result = asyncio.run(_retrieve_product_knowledge("prod_missing", "query"))
-        assert result == ""
-
-    def test_confluence_fallback_no_markdown(self, monkeypatch, isolated_db):
-        async def _fake_query_memory(query, product_id, top_k=20):
-            return ""
-
-        _install_fake_memory(monkeypatch, _fake_query_memory)
-
-        fake_connector = SimpleNamespace()
-        fake_connector.is_configured = lambda: True
-        fake_connector.list_spaces = lambda: [{"key": "DEV"}]
-        fake_connector.pull = lambda sp_id, opts=None: {"markdown": ""}
-
-        import api.integrations.registry as reg_mod
-        monkeypatch.setattr(reg_mod, "get_connector", lambda name: fake_connector if name == "confluence" else None)
-
-        result = asyncio.run(_retrieve_product_knowledge("prod_missing", "query"))
-        assert result == ""
-
-    def test_confluence_fallback_exception_returns_empty(self, monkeypatch, isolated_db):
-        async def _fake_query_memory(query, product_id, top_k=20):
-            return ""
-
-        _install_fake_memory(monkeypatch, _fake_query_memory)
-
-        def _boom(name):
-            raise RuntimeError("registry crashed")
-
-        import api.integrations.registry as reg_mod
-        monkeypatch.setattr(reg_mod, "get_connector", _boom)
-
-        result = asyncio.run(_retrieve_product_knowledge("prod_missing", "query"))
-        assert result == ""
-
-    def test_confluence_fallback_connector_none(self, monkeypatch, isolated_db):
-        async def _fake_query_memory(query, product_id, top_k=20):
-            return ""
-
-        _install_fake_memory(monkeypatch, _fake_query_memory)
-
-        import api.integrations.registry as reg_mod
-        monkeypatch.setattr(reg_mod, "get_connector", lambda name: None)
-
-        result = asyncio.run(_retrieve_product_knowledge("prod_missing", "query"))
-        assert result == ""
-
-    def test_confluence_fallback_space_id_from_id_key(self, monkeypatch, isolated_db):
-        async def _fake_query_memory(query, product_id, top_k=20):
-            return ""
-
-        _install_fake_memory(monkeypatch, _fake_query_memory)
-
-        captured = {}
-
-        class _FakeConnector:
-            def is_configured(self):
-                return True
-
-            def list_spaces(self):
-                return [{"id": "SPACE123"}]
-
-            def pull(self, sp_id, opts=None):
-                captured["sp_id"] = sp_id
-                return {"markdown": "content from id-keyed space"}
-
-        import api.integrations.registry as reg_mod
-        monkeypatch.setattr(reg_mod, "get_connector", lambda name: _FakeConnector())
-
-        result = asyncio.run(_retrieve_product_knowledge("prod_missing", "query"))
-        assert "content from id-keyed space" in result
-        assert "<untrusted_content>" in result  # P0-8 data framing
-        assert captured["sp_id"] == "SPACE123"

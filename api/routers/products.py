@@ -6,6 +6,7 @@ Endpoints (prefix ``/api/products``, tags ``products``):
 - ``POST   /api/products``                                    — create product
 - ``GET    /api/products/{product_id}``                       — get product
 - ``PUT    /api/products/{product_id}``                       — update product
+- ``PATCH  /api/products/{product_id}``                       — partial update (SPEC-002)
 - ``DELETE /api/products/{product_id}``                       — delete product
 - ``POST   /api/products/{product_id}/codebases``             — add codebase
 - ``DELETE /api/products/{product_id}/codebases/{codebase_id}`` — delete codebase
@@ -38,11 +39,26 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from api.db import get_db
+# Q-9: shared with the databases router (tests monkeypatch this module alias).
+from api.docgen._common import reindex_entity as _reindex
 from api.docgen.jobs import EntityBusyError
 from api.models import ProductGrantORM, ProductORM, UserORM
 from api.repositories import product_repo
-from api.schemas import Codebase, Links, Product, ProductListItem, Spec
-from api.auth.deps import get_current_user, require_product_access
+from api.schemas import (
+    Codebase,
+    Links,
+    Product,
+    ProductListItem,
+    ProductPatch,
+    Spec,
+)
+from api.auth.deps import (
+    get_current_user,
+    get_product_grant,
+    product_access,
+    require_product_access,
+    require_product_permission,
+)
 from api.utils.repo_url import validate_repo_url
 
 logger = logging.getLogger(__name__)
@@ -218,6 +234,42 @@ async def update_product(
     return _maybe_light(result, light)
 
 
+@router.patch("/{product_id}", response_model=Product)
+async def patch_product(
+    product_id: str,
+    body: ProductPatch,
+    db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_permission("edit")),
+    light: bool = Query(False),
+):
+    """Partial update of name/description/owner_id (SPEC-002).
+
+    Absent fields stay unchanged (unlike the full-replace PUT); the owner
+    must already exist. Product settings are edit-level (SPEC-023): owner or
+    admin — an rw grant is not enough.
+    """
+    name = body.name.strip() if body.name is not None else None
+    if name == "":
+        raise HTTPException(status_code=400, detail="name must not be empty")
+    if body.owner_id is not None and db.get(UserORM, body.owner_id) is None:
+        raise HTTPException(
+            status_code=400, detail="owner_id must reference an existing user"
+        )
+    try:
+        p_orm = product_repo.patch_product(
+            db,
+            product_id,
+            name=name,
+            description=body.description,
+            owner_id=body.owner_id,
+        )
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return _maybe_light(product_repo.orm_to_product(p_orm), light)
+
+
 @router.delete("/{product_id}")
 async def delete_product(
     product_id: str,
@@ -229,27 +281,7 @@ async def delete_product(
 
 
 # --- Codebases --------------------------------------------------------------
-def _reindex(
-    product_id: str,
-    indexed_text: Optional[str],
-    entity_id: str,
-    *,
-    source_type: str = "codebase",
-) -> None:
-    """Re-index edited text into the per-product memory backend (fire-and-forget).
-
-    ``source_id`` = entity id so the pgvector upsert deletes the previous chunks
-    for that entity before re-inserting.
-    """
-    if indexed_text and indexed_text.strip():
-        try:
-            from api.docgen import _index_in_background
-            _index_in_background(
-                indexed_text, f"prod_{product_id}",
-                source_type=source_type, source_id=entity_id,
-            )
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("Memory re-index failed for entity %s: %s", entity_id, e)
+# ``_reindex`` is the shared ``reindex_entity`` imported above (Q-9).
 
 
 @router.post("/{product_id}/codebases", response_model=Product)
@@ -297,7 +329,7 @@ async def update_codebase_docs(
     codebase_id: str,
     body: CodebaseDocUpdate,
     db: Session = Depends(get_db),
-    _product: ProductORM = Depends(require_product_access("rw")),
+    _product: ProductORM = Depends(require_product_permission("docs")),
     light: bool = Query(False),
 ):
     """Edit a codebase's generated documentation (WYSIWYG editor saves)."""
@@ -317,7 +349,10 @@ async def update_codebase_docs(
         msg = str(e)
         status = 400 if "Provide one of" in msg else 404
         raise HTTPException(status_code=status, detail=msg)
-    _reindex(product_id, indexed_text, codebase_id, source_type="codebase")
+    _reindex(
+        product_id, indexed_text, codebase_id, source_type="codebase",
+        page_id=body.page_id, pages=body.pages,
+    )
     return _maybe_light(product, light)
 
 
@@ -360,7 +395,7 @@ async def update_spec(
     spec_id: str,
     body: ContentUpdate,
     db: Session = Depends(get_db),
-    _product: ProductORM = Depends(require_product_access("rw")),
+    _product: ProductORM = Depends(require_product_permission("docs")),
     light: bool = Query(False),
 ):
     """Replace a spec's raw content (authored directly, no generation)."""
@@ -415,7 +450,7 @@ async def update_links(
     links_id: str,
     body: ContentUpdate,
     db: Session = Depends(get_db),
-    _product: ProductORM = Depends(require_product_access("rw")),
+    _product: ProductORM = Depends(require_product_permission("docs")),
     light: bool = Query(False),
 ):
     """Replace a links collection's raw content."""
@@ -431,7 +466,7 @@ async def update_links(
     return _maybe_light(product, light)
 
 
-# --- Verification (item 5) — owner or admin -------------------------------
+# --- Verification (item 5) — docs permission (SPEC-001) --------------------
 def _verify_entity(
     db: Session,
     product_id: str,
@@ -444,11 +479,15 @@ def _verify_entity(
     product = product_repo.load_product_orm(db, product_id)
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
-    # Only the product owner or an admin may verify an entity.
-    if user.role != "admin" and (not product.owner_id or product.owner_id != user.id):
+    # Any docs-level access may verify (SPEC-001): owner, grant holders,
+    # managers — but not the pure read-only viewer_global.
+    access = product_access(user, product, get_product_grant(db, product_id, user.id))
+    if access.level is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if not access.can_docs:
         raise HTTPException(
             status_code=403,
-            detail="Only the product owner or an admin can verify",
+            detail="Documentation rights required to verify",
         )
     try:
         if page_id is None:
@@ -504,6 +543,116 @@ async def verify_links(
     light: bool = Query(False),
 ):
     return _verify_entity(db, product_id, links_id, "links", user, light=light)
+
+
+# --- Product user management (SPEC-001) --------------------------------------
+_GRANT_LEVELS = ("ro", "rw")
+
+
+class ProductGrantUpdate(BaseModel):
+    user_id: str
+    level: str  # ro | rw
+
+
+@router.get("/{product_id}/grants")
+def list_product_grants(
+    product_id: str,
+    _product: ProductORM = Depends(require_product_permission("configure")),
+    db: Session = Depends(get_db),
+):
+    """Grants of one product — configure right (SPEC-023: owner / manager /
+    admin; grants do NOT delegate this)."""
+    rows = (
+        db.query(ProductGrantORM)
+        .filter(ProductGrantORM.product_id == product_id)
+        .all()
+    )
+    # Usernames only for the granted users — never the full user list (P-6).
+    user_ids = {g.user_id for g in rows}
+    usernames = (
+        dict(
+            db.query(UserORM.id, UserORM.username)
+            .filter(UserORM.id.in_(user_ids))
+            .all()
+        )
+        if user_ids
+        else {}
+    )
+    return [
+        {
+            "product_id": g.product_id,
+            "user_id": g.user_id,
+            "level": g.level,
+            "granted_by": g.granted_by,
+            "created_at": g.created_at,
+            "username": usernames.get(g.user_id),
+        }
+        for g in rows
+    ]
+
+
+@router.put("/{product_id}/grants")
+def upsert_product_grant(
+    product_id: str,
+    body: ProductGrantUpdate,
+    product: ProductORM = Depends(require_product_permission("configure")),
+    user: UserORM = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Grant or update a user's access to this product (level ro|rw)."""
+    if body.level not in _GRANT_LEVELS:
+        raise HTTPException(status_code=400, detail="level must be 'ro' or 'rw'.")
+    target = db.get(UserORM, body.user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.role == "admin":
+        raise HTTPException(
+            status_code=400,
+            detail="Admins already have full access; grants are redundant.",
+        )
+    if target.id == product.owner_id:
+        raise HTTPException(
+            status_code=400,
+            detail="The product owner already has manage rights.",
+        )
+    grant = db.get(ProductGrantORM, {"product_id": product_id, "user_id": body.user_id})
+    if grant is None:
+        grant = ProductGrantORM(
+            product_id=product_id,
+            user_id=body.user_id,
+            level=body.level,
+            granted_by=user.id,
+        )
+        db.add(grant)
+    else:
+        grant.level = body.level
+        grant.granted_by = user.id
+    db.commit()
+    logger.info(
+        "%r set grant %s -> %s (%s).",
+        user.username, product_id, target.username, body.level,
+    )
+    return {
+        "product_id": grant.product_id,
+        "user_id": grant.user_id,
+        "level": grant.level,
+        "granted_by": grant.granted_by,
+    }
+
+
+@router.delete("/{product_id}/grants")
+def delete_product_grant(
+    product_id: str,
+    user_id: str = Query(...),
+    _product: ProductORM = Depends(require_product_permission("configure")),
+    db: Session = Depends(get_db),
+):
+    """Revoke a user's grant on this product (configure right, idempotent)."""
+    grant = db.get(ProductGrantORM, {"product_id": product_id, "user_id": user_id})
+    if grant is not None:
+        db.delete(grant)
+        db.commit()
+    return {"message": "Grant removed"}
 
 
 __all__ = ["router"]

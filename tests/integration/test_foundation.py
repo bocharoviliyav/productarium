@@ -194,22 +194,12 @@ class TestSettingsStore:
         assert creds["url"] == "https://ghe.example.com"
         assert creds["token"] is None
 
-    def test_get_confluence_creds(self):
-        mods = _reload_modules()
-        mods["db"].init_db()
-        ss = mods["settings_store"]
-        ss.set_setting("confluence.base_url", "https://confluence.example.com")
-        ss.set_setting("confluence.space", "ENG")
-        c = ss.get_confluence_creds()
-        assert c["base_url"] == "https://confluence.example.com"
-        assert c["space"] == "ENG"
-
     def test_get_integration_config_json(self):
         mods = _reload_modules()
         mods["db"].init_db()
         ss = mods["settings_store"]
-        ss.set_setting("integrations.confluence", '{"base_url":"https://x","space":"S"}')
-        cfg = ss.get_integration_config("confluence")
+        ss.set_setting("integrations.wiki", '{"base_url":"https://x","space":"S"}')
+        cfg = ss.get_integration_config("wiki")
         assert cfg.get("base_url") == "https://x"
         assert cfg.get("space") == "S"
 

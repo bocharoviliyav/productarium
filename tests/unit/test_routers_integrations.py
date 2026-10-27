@@ -118,12 +118,12 @@ class _FakeGitConnector:
         }
 
 
-class _FakeConfluenceConnector:
-    """Minimal fake connector for non-git (confluence) operations."""
+class _FakeWikiConnector:
+    """Minimal fake connector for non-git (wiki) operations."""
 
-    name = "confluence"
-    display_name = "Confluence"
-    description = "Confluence connector"
+    name = "wiki"
+    display_name = "Wiki"
+    description = "Wiki connector"
     kind = "web"
     requires_credentials = True
 
@@ -156,9 +156,9 @@ class _FakeConfluenceConnector:
 class _FakeMultiPageConnector:
     """Connector that returns multiple pages for the multi-page tree path."""
 
-    name = "confluence"
-    display_name = "Confluence"
-    description = "Confluence connector"
+    name = "wiki"
+    display_name = "Wiki"
+    description = "Wiki connector"
     kind = "web"
     requires_credentials = True
 
@@ -193,9 +193,9 @@ class _FakeMultiPageConnector:
 class _ErrorConnector:
     """Connector whose methods raise for testing error paths."""
 
-    name = "confluence"
-    display_name = "Confluence"
-    description = "Confluence"
+    name = "wiki"
+    display_name = "Wiki"
+    description = "Wiki"
     kind = "web"
     requires_credentials = True
 
@@ -409,7 +409,7 @@ class TestConnectorTest:
         from api.routers import integrations as integ_mod
 
         app, client = _build_client(isolated_db, integ_mod)
-        resp = client.post("/api/integrations/confluence/test")
+        resp = client.post("/api/integrations/wiki/test")
         assert resp.status_code == 200
         body = resp.json()
         assert body["success"] is False
@@ -442,14 +442,14 @@ class TestConnectorSpaces:
         from api.routers import integrations as integ_mod
 
         app, client = _build_client(isolated_db, integ_mod)
-        resp = client.get("/api/integrations/confluence/spaces")
+        resp = client.get("/api/integrations/wiki/spaces")
         assert resp.status_code == 502
 
 
 # --- POST codebases/from-integration ---------------------------------------
 class TestCodebaseFromIntegration:
     def test_non_git_connector_400(self, isolated_db, monkeypatch):
-        _patch_registry(monkeypatch, _FakeConfluenceConnector)
+        _patch_registry(monkeypatch, _FakeWikiConnector)
         from api.routers import integrations as integ_mod
 
         app, client = _build_client(isolated_db, integ_mod)
@@ -457,7 +457,7 @@ class TestCodebaseFromIntegration:
 
         resp = client.post(
             f"/api/products/{pid}/codebases/from-integration",
-            json={"connector": "confluence", "source_id": "page1"},
+            json={"connector": "wiki", "source_id": "page1"},
         )
         assert resp.status_code == 400
         assert "does not produce a codebase" in resp.json()["detail"]
@@ -503,7 +503,7 @@ class TestCodebaseFromIntegration:
         _patch_registry(monkeypatch, _ErrorConnector)
         from api.routers import integrations as integ_mod
 
-        # _ErrorConnector is registered as "confluence", but codebase needs "github".
+        # _ErrorConnector is registered as "wiki", but codebase needs "github".
         # We need a github-named error connector.
         class _GithubErrorConnector(_ErrorConnector):
             name = "github"
@@ -580,18 +580,18 @@ class TestCodebaseFromIntegration:
 # --- POST knowledge/from-integration ---------------------------------------
 class TestKnowledgeFromIntegration:
     def test_product_not_found_404(self, isolated_db, monkeypatch):
-        _patch_registry(monkeypatch, _FakeConfluenceConnector)
+        _patch_registry(monkeypatch, _FakeWikiConnector)
         from api.routers import integrations as integ_mod
 
         app, client = _build_client(isolated_db, integ_mod)
         resp = client.post(
             "/api/products/prod_ghost/knowledge/from-integration",
-            json={"connector": "confluence", "source_id": "page1"},
+            json={"connector": "wiki", "source_id": "page1"},
         )
         assert resp.status_code == 404
 
     def test_connector_not_found_404(self, isolated_db, monkeypatch):
-        _patch_registry(monkeypatch, _FakeConfluenceConnector)
+        _patch_registry(monkeypatch, _FakeWikiConnector)
         from api.routers import integrations as integ_mod
 
         app, client = _build_client(isolated_db, integ_mod)
@@ -605,7 +605,7 @@ class TestKnowledgeFromIntegration:
 
     def test_pull_value_error_400(self, isolated_db, monkeypatch):
         class _ConfValueErrorConnector(_ValueErrorConnector):
-            name = "confluence"
+            name = "wiki"
 
         _patch_registry(monkeypatch, _ConfValueErrorConnector)
         from api.routers import integrations as integ_mod
@@ -615,7 +615,7 @@ class TestKnowledgeFromIntegration:
 
         resp = client.post(
             f"/api/products/{pid}/knowledge/from-integration",
-            json={"connector": "confluence", "source_id": "bad"},
+            json={"connector": "wiki", "source_id": "bad"},
         )
         assert resp.status_code == 400
 
@@ -628,12 +628,12 @@ class TestKnowledgeFromIntegration:
 
         resp = client.post(
             f"/api/products/{pid}/knowledge/from-integration",
-            json={"connector": "confluence", "source_id": "page1"},
+            json={"connector": "wiki", "source_id": "page1"},
         )
         assert resp.status_code == 502
 
     def test_single_page_success(self, isolated_db, monkeypatch):
-        _patch_registry(monkeypatch, _FakeConfluenceConnector)
+        _patch_registry(monkeypatch, _FakeWikiConnector)
         from api.routers import integrations as integ_mod
 
         app, client = _build_client(isolated_db, integ_mod)
@@ -641,7 +641,7 @@ class TestKnowledgeFromIntegration:
 
         resp = client.post(
             f"/api/products/{pid}/knowledge/from-integration",
-            json={"connector": "confluence", "source_id": "page1"},
+            json={"connector": "wiki", "source_id": "page1"},
         )
         assert resp.status_code == 201, resp.text
         body = resp.json()
@@ -650,7 +650,7 @@ class TestKnowledgeFromIntegration:
         assert body["node_type"] == "page"
 
     def test_single_page_with_explicit_name(self, isolated_db, monkeypatch):
-        _patch_registry(monkeypatch, _FakeConfluenceConnector)
+        _patch_registry(monkeypatch, _FakeWikiConnector)
         from api.routers import integrations as integ_mod
 
         app, client = _build_client(isolated_db, integ_mod)
@@ -658,7 +658,7 @@ class TestKnowledgeFromIntegration:
 
         resp = client.post(
             f"/api/products/{pid}/knowledge/from-integration",
-            json={"connector": "confluence", "source_id": "page1", "name": "Custom"},
+            json={"connector": "wiki", "source_id": "page1", "name": "Custom"},
         )
         assert resp.status_code == 201
         assert resp.json()["title"] == "Custom"
@@ -672,7 +672,7 @@ class TestKnowledgeFromIntegration:
 
         resp = client.post(
             f"/api/products/{pid}/knowledge/from-integration",
-            json={"connector": "confluence", "source_id": "space1"},
+            json={"connector": "wiki", "source_id": "space1"},
         )
         assert resp.status_code == 201, resp.text
         root = resp.json()
@@ -721,13 +721,13 @@ class TestKnowledgeFromIntegration:
 
         resp = client.post(
             f"/api/products/{pid}/knowledge/from-integration",
-            json={"connector": "confluence", "source_id": "space1"},
+            json={"connector": "wiki", "source_id": "space1"},
         )
         assert resp.status_code == 500
         assert "Persist failed" in resp.json()["detail"]
 
     def test_single_page_commit_failure_500(self, isolated_db, monkeypatch):
-        _patch_registry(monkeypatch, _FakeConfluenceConnector)
+        _patch_registry(monkeypatch, _FakeWikiConnector)
         from api.routers import integrations as integ_mod
 
         app, client = _build_client(isolated_db, integ_mod)
@@ -742,7 +742,7 @@ class TestKnowledgeFromIntegration:
 
         resp = client.post(
             f"/api/products/{pid}/knowledge/from-integration",
-            json={"connector": "confluence", "source_id": "page1"},
+            json={"connector": "wiki", "source_id": "page1"},
         )
         assert resp.status_code == 500
         assert "Persist failed" in resp.json()["detail"]

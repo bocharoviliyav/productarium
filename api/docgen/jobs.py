@@ -25,6 +25,7 @@ from sqlalchemy.orm import selectinload
 from api.db import SessionLocal
 from api.docgen._common import JobCancelledError
 from api.models import ProductORM
+from api.repositories import product_repo
 
 logger = logging.getLogger(__name__)
 
@@ -48,23 +49,6 @@ _JOBS_LOCK = threading.Lock()
 def job_key(product_id: str, entity_type: str, entity_id: str) -> Tuple[str, str, str]:
     """Canonical dedup/serialization key: one active job per product entity."""
     return (product_id, entity_type, entity_id)
-
-
-def request_cancel(job_id: str) -> bool:
-    """Flag a queued/running job for cooperative cancellation.
-
-    The worker's pipelines poll the flag at safe checkpoints (between clone /
-    planning / per-unit LLM calls) and raise ``JobCancelledError``, which rolls
-    the artifact back to its pre-run version WITHOUT appending a new one.
-    Returns False for unknown/finished jobs.
-    """
-    with _JOBS_LOCK:
-        job = _docgen_jobs.get(job_id)
-        if job is None or job.get("status") not in ("queued", "running"):
-            return False
-        job["cancel_requested"] = True
-        logger.info("Docgen job %s: cancellation requested", job_id)
-        return True
 
 
 # --- Progress model -----------------------------------------------------------
@@ -310,8 +294,12 @@ def _docgen_prune_old_jobs(max_age_seconds: int = 3600) -> None:
         _docgen_jobs.pop(jid, None)
 
 
-def _register_job(key: Tuple[str, str, str]) -> str:
-    """Insert a fresh queued job. Precondition: caller holds ``_JOBS_LOCK``."""
+def _register_job(key: Tuple[str, str, str], source: Optional[str] = None) -> str:
+    """Insert a fresh queued job. Precondition: caller holds ``_JOBS_LOCK``.
+
+    ``source`` labels the trigger (``generate`` default, ``schedule`` for
+    SPEC-009 runs) and rides onto the appended doc version.
+    """
     job_id = uuid.uuid4().hex
     _docgen_jobs[job_id] = {
         "job_id": job_id,
@@ -327,11 +315,14 @@ def _register_job(key: Tuple[str, str, str]) -> str:
         "error": None,
         "docs_chars": None,
         "cancel_requested": False,
+        "source": source or "generate",
     }
     return job_id
 
 
-def create_job(product_id: str, entity_type: str, entity_id: str) -> str:
+def create_job(
+    product_id: str, entity_type: str, entity_id: str, source: Optional[str] = None
+) -> str:
     """Register a NEW queued job unconditionally (no dedup) and return its id.
 
     Request paths must prefer ``create_or_get_job`` — this entry point exists
@@ -339,11 +330,14 @@ def create_job(product_id: str, entity_type: str, entity_id: str) -> str:
     """
     with _JOBS_LOCK:
         _docgen_prune_old_jobs()
-        return _register_job(job_key(product_id, entity_type, entity_id))
+        return _register_job(job_key(product_id, entity_type, entity_id), source)
 
 
 def create_or_get_job(
-    product_id: str, entity_type: str, entity_id: str
+    product_id: str,
+    entity_type: str,
+    entity_id: str,
+    source: Optional[str] = None,
 ) -> Tuple[str, bool]:
     """Atomic check-then-act job creation with in-flight dedup (fork H3/H4).
 
@@ -362,7 +356,7 @@ def create_or_get_job(
                     job["job_id"], entity_type, entity_id,
                 )
                 return job["job_id"], False
-        return _register_job(key), True
+        return _register_job(key, source), True
 
 
 def submit_job(
@@ -373,6 +367,7 @@ def submit_job(
     model: Optional[str],
     language: Optional[str],
     force_pages: Optional[List[str]] = None,
+    incremental: bool = False,
 ) -> None:
     """Submit the job to the worker thread pool.
 
@@ -382,12 +377,79 @@ def submit_job(
     admin panel applies to jobs that were still queued. ``force_pages`` (per-
     page regeneration) limits the run to those pages: codebase units are
     forced past diff-reuse, database pages are merged at persist.
+    ``incremental`` (SPEC-010) re-detects source changes at run start.
     """
     _docgen_executor.submit(
         _run_docgen_job,
         job_id, product_id, entity_type, entity_id, model, language, force_pages,
+        incremental,
     )
     logger.info("Submitted docgen job %s for %s %s", job_id, entity_type, entity_id)
+
+
+def submit_detect_job(
+    product_id: str,
+    entity_type: str,
+    entity_id: str,
+    model: Optional[str] = None,
+) -> Tuple[str, bool]:
+    """Register + run a SPEC-010 change-detection job; ``(job_id, is_new)``.
+
+    Registry dedup is scoped to detect jobs (key ``detect:{entity_type}``) so
+    a repeated POST re-attaches to the in-flight check, while the worker
+    takes the REAL per-entity lock — a running generation fails the detect
+    job fast with the busy message instead of racing the artifact row.
+    """
+    job_id, is_new = create_or_get_job(
+        product_id, f"detect:{entity_type}", entity_id
+    )
+    if is_new:
+        _docgen_executor.submit(
+            _run_detect_job, job_id, product_id, entity_type, entity_id, model,
+        )
+        logger.info("Submitted detect job %s for %s %s", job_id, entity_type, entity_id)
+    return job_id, is_new
+
+
+def submit_incremental_job(
+    product_id: str,
+    entity_type: str,
+    entity_id: str,
+    model: Optional[str] = None,
+    language: Optional[str] = None,
+    source: Optional[str] = None,
+) -> Tuple[str, bool]:
+    """Programmatic detect-then-update entry (SPEC-010; SPEC-009 scheduler).
+
+    Registers under the REAL entity key (dedup against any in-flight
+    generation for the same entity). The worker re-detects at run start:
+    unchanged → success WITHOUT appending a version; changed → the run is
+    limited to the impacted pages (empty impact → full regeneration).
+    """
+    job_id, is_new = create_or_get_job(product_id, entity_type, entity_id, source)
+    if is_new:
+        submit_job(
+            job_id, product_id, entity_type, entity_id, model, language,
+            incremental=True,
+        )
+    return job_id, is_new
+
+
+def entity_busy(entity_type: str, entity_id: str) -> bool:
+    """True while ANY queued/running job holds the entity lock.
+
+    Detect jobs are registered under ``detect:{entity_type}`` yet take the
+    SAME real per-entity lock, so they count as busy too (mirrors
+    ``lock_for_entity`` semantics: entity_type + entity_id).
+    """
+    types = (entity_type, f"detect:{entity_type}")
+    with _JOBS_LOCK:
+        return any(
+            job.get("entity_id") == entity_id
+            and job.get("entity_type") in types
+            and job.get("status") in ("queued", "running")
+            for job in _docgen_jobs.values()
+        )
 
 
 def request_cancel_for_entity(
@@ -395,15 +457,20 @@ def request_cancel_for_entity(
 ) -> Optional[str]:
     """Flag the entity's ACTIVE job for cancellation; returns its job_id.
 
+    The real entity key is matched first; a running detect job (registered
+    as ``detect:{entity_type}``, same entity lock) is stoppable the same way.
     None when no queued/running job exists for the entity (idempotent cancel).
     """
-    key = job_key(product_id, entity_type, entity_id)
-    with _JOBS_LOCK:
-        for job in _docgen_jobs.values():
-            if job.get("key") == key and job.get("status") in ("queued", "running"):
-                job["cancel_requested"] = True
-                logger.info("Docgen job %s: cancellation requested", job["job_id"])
-                return job["job_id"]
+    for key in (
+        job_key(product_id, entity_type, entity_id),
+        job_key(product_id, f"detect:{entity_type}", entity_id),
+    ):
+        with _JOBS_LOCK:
+            for job in _docgen_jobs.values():
+                if job.get("key") == key and job.get("status") in ("queued", "running"):
+                    job["cancel_requested"] = True
+                    logger.info("Docgen job %s: cancellation requested", job["job_id"])
+                    return job["job_id"]
     return None
 
 
@@ -439,6 +506,63 @@ def active_jobs_for_product(product_id: str) -> list:
 
 # --- Worker-thread docgen pipeline -------------------------------------------
 
+# SPEC-026: sanitized first-cause capture for failed docgen jobs. WARNING+
+# records from THIS job's worker thread whose message looks like an LLM /
+# pipeline failure; the first cause rides into the client-facing job error
+# (one line, ~200 chars — no stack traces, headers, or tokens).
+_LLM_FAILURE_MARKERS = (
+    "generation failed",
+    "exhausted retries",
+    "llm call failed",
+    "section run failed",
+    "unit agents failed",
+    "hit the model context limit",
+)
+
+
+class _FirstCauseHandler(logging.Handler):
+    """Bounded WARNING+ capture of LLM-failure causes for one running job."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        # Concurrent jobs run on separate worker threads; never swap causes.
+        self._thread_id = threading.get_ident()
+        self.causes: List[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.thread != self._thread_id or len(self.causes) >= 5:
+            return
+        msg = " ".join(str(record.getMessage()).split())
+        if any(m in msg.lower() for m in _LLM_FAILURE_MARKERS):
+            self.causes.append(msg[:200])
+
+
+def _load_docgen_entity(
+    db: Any, product_id: str, entity_type: str, entity_id: str
+) -> Tuple[Any, Any]:
+    """(product_orm, entity_orm) with children preloaded; ValueError if absent."""
+    p_orm = (
+        db.query(ProductORM)
+        .options(
+            selectinload(ProductORM.codebases),
+            selectinload(ProductORM.specs),
+            selectinload(ProductORM.databases),
+            selectinload(ProductORM.hld),
+        )
+        .filter(ProductORM.id == product_id)
+        .first()
+    )
+    if p_orm is None:
+        raise ValueError("Product not found")
+    try:
+        entity = product_repo.find_entity(p_orm, entity_type, entity_id)
+    except KeyError:
+        raise ValueError(f"Unsupported docgen entity_type: {entity_type}") from None
+    if entity is None:
+        raise ValueError(f"{entity_type.capitalize()} not found")
+    return p_orm, entity
+
+
 async def _run_docgen_job_async(
     job_id: str,
     product_id: str,
@@ -447,6 +571,7 @@ async def _run_docgen_job_async(
     model: Optional[str],
     language: str,
     force_pages: Optional[List[str]] = None,
+    incremental: bool = False,
 ) -> None:
     """Async body of a docgen job: loads the entity in a FRESH DB session
     (the request session is closed by now), generates docs, commits, and
@@ -468,6 +593,8 @@ async def _run_docgen_job_async(
     # First phase transition is emitted by the generate_* pipeline itself
     # (cloning for codebase, planning for spec/database).
     progress_cb = _progress_reporter(job_id)
+    cause_handler = _FirstCauseHandler()
+    logging.getLogger("api").addHandler(cause_handler)
     db = SessionLocal()
     try:
         # 2.2 embedder preflight: one short probe BEFORE the (potentially
@@ -492,19 +619,7 @@ async def _run_docgen_job_async(
         # Fork H4: the worker entry point (_run_docgen_job) already holds the
         # per-entity lock (refcounted lock_for_entity context manager) for the
         # whole job, so this async body runs serialized — no inner lock here.
-        p_orm = (
-            db.query(ProductORM)
-            .options(
-                selectinload(ProductORM.codebases),
-                selectinload(ProductORM.specs),
-                selectinload(ProductORM.databases),
-                selectinload(ProductORM.hld),
-            )
-            .filter(ProductORM.id == product_id)
-            .first()
-        )
-        if p_orm is None:
-            raise ValueError("Product not found")
+        p_orm, entity = _load_docgen_entity(db, product_id, entity_type, entity_id)
 
         # Cooperative cancellation: pipelines poll this closure at safe
         # checkpoints; a queued job that was cancelled before start raises at
@@ -512,19 +627,35 @@ async def _run_docgen_job_async(
         def should_cancel() -> bool:
             return bool(job.get("cancel_requested"))
 
-        collections = {
-            "codebase": p_orm.codebases,
-            "spec": p_orm.specs,
-            "database": p_orm.databases,
-            "hld": [p_orm.hld] if p_orm.hld else [],
-        }
-        if entity_type not in collections:
-            raise ValueError(f"Unsupported docgen entity_type: {entity_type}")
-        entity = next(
-            (e for e in collections[entity_type] if e.id == entity_id), None
-        )
-        if entity is None:
-            raise ValueError(f"{entity_type.capitalize()} not found")
+        # SPEC-010 incremental: re-detect at run start (a stored detect
+        # summary may be stale). Unchanged/unverifiable → success WITHOUT
+        # appending a version; changed → force_pages = impacted pages
+        # (empty impact → None = full regeneration).
+        if incremental:
+            from api.docgen.incremental import detect_changes
+
+            detect = await detect_changes(entity, p_orm, entity_type, model=model)
+            job["result"] = detect
+            if detect.get("changed") is not True:
+                db.commit()  # persist source_state.checked_at
+                job["status"] = "succeeded"
+                job["indexing_status"] = "succeeded"
+                job["indexing_message"] = (
+                    "Изменений не обнаружено."
+                    if detect.get("changed") is False
+                    else f"Изменения не удалось проверить: {detect.get('reason', '')}"
+                )
+                job["finished_at"] = time.time()
+                job["docs_chars"] = 0
+                report_progress(job_id, phase="done")
+                logger.info(
+                    "Incremental docgen job %s: no update needed for %s %s",
+                    job_id, entity_type, entity_id,
+                )
+                return
+            force_pages = (
+                [p["id"] for p in detect.get("impacted_pages") or []] or None
+            )
 
         # Vault-style versioning: bootstrap a v1 snapshot of legacy docs BEFORE
         # the run (committed eagerly — survives a failed run), then append the
@@ -581,7 +712,8 @@ async def _run_docgen_job_async(
 
         doc_version_repo.append_version(
             db, entity_type, entity,
-            source="generate", model=model, job_id=job_id,
+            source=job.get("source") or "generate", model=model, job_id=job_id,
+            force_pages=force_pages,
         )
         db.commit()
         job["status"] = "succeeded"
@@ -601,29 +733,14 @@ async def _run_docgen_job_async(
         # partial docs onto the row (see _checkpoint_partial_docs).
         try:
             db.rollback()
-            p2 = (
-                db.query(ProductORM)
-                .options(
-                    selectinload(ProductORM.codebases),
-                    selectinload(ProductORM.specs),
-                    selectinload(ProductORM.databases),
-                    selectinload(ProductORM.hld),
-                )
-                .filter(ProductORM.id == product_id)
-                .first()
+            _, ent = _load_docgen_entity(db, product_id, entity_type, entity_id)
+            doc_version_repo.restore_entity_from_current_version(
+                db, entity_type, ent
             )
-            coll = ({
-                "codebase": p2.codebases,
-                "spec": p2.specs,
-                "database": p2.databases,
-                "hld": [p2.hld] if p2.hld else [],
-            }.get(entity_type) or []) if p2 is not None else []
-            ent = next((e for e in coll if e.id == entity_id), None)
-            if ent is not None:
-                doc_version_repo.restore_entity_from_current_version(
-                    db, entity_type, ent
-                )
-                db.commit()
+            db.commit()
+        except ValueError:
+            # Product/entity deleted mid-run: nothing to restore.
+            pass
         except Exception:  # pragma: no cover - restore is best-effort
             try:
                 db.rollback()
@@ -649,9 +766,12 @@ async def _run_docgen_job_async(
         job["indexing_status"] = "failed"
         # Controlled validation messages from our own docgen layer (entity
         # not found, unusable MCP surface, LLM fully unavailable) — safe to
-        # surface to the polling client.
-        job["indexing_message"] = f"Ошибка генерации документации: {e}"
-        job["error"] = str(e)
+        # surface to the polling client, plus the sanitized first LLM cause
+        # captured from the worker-thread logs (SPEC-026).
+        first_cause = cause_handler.causes[0] if cause_handler.causes else ""
+        suffix = f" (первая причина: {first_cause})" if first_cause else ""
+        job["indexing_message"] = f"Ошибка генерации документации: {e}{suffix}"
+        job["error"] = str(e) + suffix
         job["finished_at"] = time.time()
         logger.warning("Docgen job %s failed: %s", job_id, e)
     except Exception as e:
@@ -671,6 +791,7 @@ async def _run_docgen_job_async(
         job["finished_at"] = time.time()
         logger.error("Docgen job %s failed: %s", job_id, e, exc_info=True)
     finally:
+        logging.getLogger("api").removeHandler(cause_handler)
         try:
             db.close()
         except Exception:
@@ -691,6 +812,7 @@ def _run_docgen_job(
     model: Optional[str],
     language: str,
     force_pages: Optional[List[str]] = None,
+    incremental: bool = False,
 ) -> None:
     """Worker-thread entry point: runs the async job in a brand-new event loop
     so the heavy sync work (git clone, file read, LLM calls) never touches the
@@ -708,7 +830,7 @@ def _run_docgen_job(
                 loop.run_until_complete(
                     _run_docgen_job_async(
                         job_id, product_id, entity_type, entity_id, model, language,
-                        force_pages,
+                        force_pages, incremental,
                     )
                 )
         except EntityBusyError:
@@ -736,6 +858,100 @@ def _run_docgen_job(
             logger.warning("Docgen background drain error for job %s: %s", job_id, e)
     finally:
         _close_progress_bar(job_id)
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+# --- Worker-thread detect pipeline (SPEC-010) ---------------------------------
+async def _run_detect_job_async(
+    job_id: str,
+    product_id: str,
+    entity_type: str,
+    entity_id: str,
+    model: Optional[str],
+) -> None:
+    """Async body of a detect job: fresh session, detect, persist checked_at."""
+    job = _docgen_jobs[job_id]
+    job["status"] = "running"
+    job["indexing_status"] = "idle"
+    job["indexing_message"] = "Проверка изменений..."
+    job["started_at"] = time.time()
+    db = SessionLocal()
+    try:
+        p_orm, entity = _load_docgen_entity(
+            db, product_id, entity_type, entity_id
+        )
+        from api.docgen.incremental import detect_changes
+
+        result = await detect_changes(entity, p_orm, entity_type, model=model)
+        db.commit()  # persist source_state.checked_at
+        job["result"] = result
+        job["status"] = "succeeded"
+        job["indexing_status"] = "succeeded"
+        job["indexing_message"] = "Проверка изменений завершена."
+        job["finished_at"] = time.time()
+        report_progress(job_id, phase="done")
+        logger.info(
+            "Detect job %s finished for %s %s (changed=%s)",
+            job_id, entity_type, entity_id, result.get("changed"),
+        )
+    except ValueError as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        job["status"] = "failed"
+        job["indexing_status"] = "failed"
+        job["indexing_message"] = f"Ошибка проверки изменений: {e}"
+        job["error"] = str(e)
+        job["finished_at"] = time.time()
+        logger.warning("Detect job %s failed: %s", job_id, e)
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        job["status"] = "failed"
+        job["indexing_status"] = "failed"
+        # Unexpected exceptions may embed local paths/clone stderr — generic
+        # client message, full context in the server log only.
+        job["indexing_message"] = (
+            "Ошибка проверки изменений (подробности в логах сервера)"
+        )
+        job["error"] = f"Detect failed ({type(e).__name__}); see server logs"
+        job["finished_at"] = time.time()
+        logger.error("Detect job %s failed: %s", job_id, e, exc_info=True)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _run_detect_job(
+    job_id: str,
+    product_id: str,
+    entity_type: str,
+    entity_id: str,
+    model: Optional[str],
+) -> None:
+    """Worker-thread entry point for detect jobs (own loop, real entity lock;
+    no indexing handoff — detect never indexes, so no drain is needed)."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        try:
+            with lock_for_entity(entity_type, entity_id):
+                loop.run_until_complete(
+                    _run_detect_job_async(
+                        job_id, product_id, entity_type, entity_id, model,
+                    )
+                )
+        except EntityBusyError:
+            _fail_job_with_busy(job_id, entity_type, entity_id)
+    finally:
         try:
             loop.close()
         except Exception:

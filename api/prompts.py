@@ -132,6 +132,26 @@ _UNWRAPPED_PROMPTS = frozenset({
     "database_categories.md",
     "database_relations.md",
     "database_entity.md",
+    # SPEC-015: the unified unit output contract is a shared utility block,
+    # not a standalone generation prompt.
+    "_unit_output_contract.md",
+})
+
+
+# SPEC-015: UNIT prompts — files whose output a docgen unit consumes
+# verbatim (page Markdown) or as strict JSON. ``load_prompt_file`` composes
+# the unified output contract (``_unit_output_contract.md`` from the same
+# language dir) onto the END of every file listed here, so the contract has
+# ONE source instead of a copy per file. A registry test trips when a new
+# unit-shaped prompt file appears outside this set.
+UNIT_PROMPT_FILES = frozenset({
+    "docgen_agent_section.md",
+    "docgen_sections.md",
+    "docgen_subpages.md",
+    "database_entity.md",
+    "database_tables.md",
+    "database_categories.md",
+    "database_relations.md",
 })
 
 
@@ -211,6 +231,8 @@ DATABASE_RELATIONS_PROMPT = ""
 DATABASE_ENTITY_PROMPT = ""
 HLD_PAGE_PROMPT = ""
 MERMAID_REPAIR_PROMPT = ""
+# SPEC-015: unified unit output contract, composed onto UNIT_PROMPT_FILES.
+UNIT_OUTPUT_CONTRACT = ""
 # Docgen pipeline (Wave F): consolidated section contracts + router +
 # orchestrator. DOCGEN_SECTIONS_PROMPT is the RAW parsed file;
 # SECTION_PROMPTS below holds the per-section bodies. DOCGEN_SUBPAGES_PROMPT
@@ -365,7 +387,23 @@ def load_prompt_file(
                 content = f.read().strip()
     except Exception as e:
         logger.warning(f"Error loading prompt from {filename}: {e}")
+    content = _append_unit_contract(filename, content, language)
     return _maybe_wrap(filename, content)
+
+
+def _append_unit_contract(
+    filename: str, content: str, language: Optional[str]
+) -> str:
+    """SPEC-015: compose the unified output contract onto a UNIT prompt.
+
+    The contract block (``_unit_output_contract.md``) is appended to the end
+    of every :data:`UNIT_PROMPT_FILES` member, resolved in the SAME language
+    dir as the prompt itself. No-op for non-unit files and empty content.
+    """
+    if filename not in UNIT_PROMPT_FILES or not content:
+        return content
+    contract = load_prompt_file("_unit_output_contract.md", "", language=language)
+    return f"{content}\n\n{contract}" if contract else content
 
 
 # Registry mapping filename -> module attribute name for all prompts loaded
@@ -390,6 +428,7 @@ PROMPT_FILES: Dict[str, str] = {
     "asyncapi_doc.md": "ASYNCAPI_DOC_PROMPT",
     "mermaid_repair.md": "MERMAID_REPAIR_PROMPT",
     "_verification_guard.md": "VERIFICATION_GUARD",
+    "_unit_output_contract.md": "UNIT_OUTPUT_CONTRACT",
     # Wave D (docgen verification pipeline).
     "docgen_judge.md": "DOCGEN_JUDGE_PROMPT",
     "spec_agent_system.md": "SPEC_AGENT_SYSTEM_PROMPT",
@@ -490,7 +529,7 @@ def reload_prompt_file(filename: str, language: Optional[str] = None) -> bool:
     except Exception as e:
         logger.warning("reload_prompt_file: error reading %r: %s", filename, e)
         return False
-    content = _maybe_wrap(filename, content)
+    content = _append_unit_contract(filename, _maybe_wrap(filename, content), language)
     # Update the module-level constant.
     globals()[attr_name] = content
     # The consolidated section contracts file feeds the SECTION_PROMPTS
@@ -572,6 +611,9 @@ HLD_PAGE_PROMPT = load_prompt_file("hld_page.md", HLD_PAGE_PROMPT)
 
 MERMAID_REPAIR_PROMPT = load_prompt_file("mermaid_repair.md", MERMAID_REPAIR_PROMPT)
 VERIFICATION_GUARD = load_prompt_file("_verification_guard.md", VERIFICATION_GUARD)
+UNIT_OUTPUT_CONTRACT = load_prompt_file(
+    "_unit_output_contract.md", UNIT_OUTPUT_CONTRACT
+)
 
 # ============================================================================
 # SECTION_PROMPTS registry (maps section_id -> parsed section contract body)

@@ -194,15 +194,6 @@ def filter_ungrounded_prose(
 # --------------------------------------------------------------------------- #
 # Grounding evidence builders (entity-typed)
 # --------------------------------------------------------------------------- #
-def grounding_from_text(*texts: Optional[str]) -> Set[str]:
-    """Identifiers (>= 3 chars) harvested from free-form evidence text."""
-    tokens: Set[str] = set()
-    for text in texts:
-        if text:
-            tokens.update(_WORD_RE.findall(text))
-    return tokens
-
-
 def build_identifier_grounding(
     repo_dir: str,
     rel_files: Sequence[str],

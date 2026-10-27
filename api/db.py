@@ -12,6 +12,7 @@ instead of crashing the FastAPI application.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -228,6 +229,7 @@ def init_db() -> bool:
         _ensure_pgvector_extension()
         Base.metadata.create_all(bind=engine)
         _ensure_schema_columns()
+        _backfill_mcp_server_scopes()
         _ensure_hnsw_index()
         _db_ready = True
         logger.info("SQLAlchemy tables ready (url=%s).", _safe_url(DATABASE_URL))
@@ -248,6 +250,14 @@ _SCHEMA_COLUMN_SHIMS: tuple = (
     ("codebases", "current_version", "INTEGER"),
     ("databases", "current_version", "INTEGER"),
     ("specs", "current_version", "INTEGER"),
+    # Server-owned incremental-update state (SPEC-010).
+    ("codebases", "source_state", "JSON"),
+    ("databases", "source_state", "JSON"),
+    ("specs", "source_state", "JSON"),
+    # Delta versioning chain parent (SPEC-012).
+    ("productarium_doc_versions", "base_version", "INTEGER"),
+    # MCP server scopes (SPEC-028).
+    ("mcp_servers", "scopes", "JSON"),
 )
 
 
@@ -270,6 +280,34 @@ def _ensure_schema_columns() -> None:
             logger.warning(
                 "Schema shim for %s.%s failed (non-fatal): %s", table, column, e
             )
+
+
+def _backfill_mcp_server_scopes() -> None:
+    """Idempotent SPEC-028 backfill for ``mcp_servers.scopes``.
+
+    Preset rows (``preset_key`` set) are database-only by purpose; every other
+    existing server keeps the pre-scopes visibility (expert chat + DB
+    introspection fallback): ``["expert", "database"]``. Rows with scopes
+    already set are untouched, so the UPDATE is safe to run every start.
+    """
+    from sqlalchemy import text
+
+    plans = (
+        (["database"], "preset_key IS NOT NULL"),
+        (["expert", "database"], "preset_key IS NULL"),
+    )
+    try:
+        with engine.begin() as conn:
+            for scopes, condition in plans:
+                conn.execute(
+                    text(
+                        "UPDATE mcp_servers SET scopes = :scopes "
+                        f"WHERE scopes IS NULL AND {condition}"
+                    ),
+                    {"scopes": json.dumps(scopes)},
+                )
+    except Exception as e:
+        logger.warning("MCP scopes backfill failed (non-fatal): %s", e)
 
 
 def _ensure_pgvector_extension() -> None:

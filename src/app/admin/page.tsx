@@ -18,7 +18,6 @@ import {
   Plugs,
   Plus,
   Rocket,
-  SealCheck,
   Shield,
   Spinner,
   Trash,
@@ -32,6 +31,7 @@ import {
   Banner,
   Button,
   Card,
+  Combobox,
   Input,
   Label,
   Modal,
@@ -52,10 +52,12 @@ import type {
   McpServer,
   McpTestResult,
   McpTransport,
+  ProductListItem,
   User,
   UserCreateResult,
   UserRole,
 } from "@/lib/types";
+import { MCP_SCOPES, mcpScopeLabel } from "@/lib/types";
 import { useLanguage } from "@/contexts/LanguageContext";
 
 /* ------------------------------------------------------------------ */
@@ -241,6 +243,9 @@ interface ModelResolvedEntry {
   hasApiKey: boolean;
   max_prompt_tokens: number | null;
   dimensions: number | null;
+  // Resolved context window (env > max_prompt_tokens > catalog > fallback);
+  // read-only, computed server-side without live probes.
+  context_window: number | null;
 }
 
 const DEFAULT_MODEL_CFG: ModelCfg = {
@@ -265,6 +270,7 @@ function ModelsSection() {
   const t = messages?.admin ?? {};
   const tm = t?.models ?? {};
   const [cfg, setCfg] = useState<ModelsConfig | null>(null);
+  const [windows, setWindows] = useState<Partial<Record<ModelTask, number>>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState<string | null>(null);
   const [testing, setTesting] = useState<string | null>(null);
@@ -278,6 +284,7 @@ function ModelsSection() {
       const data = await getJson<ModelGroupResponse>("/api/admin/models");
       const resolved = data?.resolved ?? {};
       const next = {} as ModelsConfig;
+      const nextWindows: Partial<Record<ModelTask, number>> = {};
       for (const task of MODEL_TASKS) {
         const r = resolved[task];
         next[task] = {
@@ -289,8 +296,10 @@ function ModelsSection() {
             r?.max_prompt_tokens != null ? String(r.max_prompt_tokens) : "",
           dimensions: r?.dimensions != null ? String(r.dimensions) : "",
         };
+        if (r?.context_window != null) nextWindows[task] = r.context_window;
       }
       setCfg(next);
+      setWindows(nextWindows);
     } catch (e) {
       notify({
         tone: "error",
@@ -385,12 +394,18 @@ function ModelsSection() {
       </p>
       {MODEL_TASKS.map((task) => {
         const c = cfg?.[task] ?? DEFAULT_MODEL_CFG;
+        const win = windows[task];
         return (
           <Card key={task} className="p-5">
             <div className="mb-4 flex items-center justify-between">
               <h3 className="font-editorial text-base tracking-tight text-ink">
                 {task}
               </h3>
+              {win != null && (
+                <span className="text-xs text-muted">
+                  {tm.contextWindow ?? "Context window"}: {win.toLocaleString()}
+                </span>
+              )}
             </div>
             <div className="grid gap-4 md:grid-cols-2">
               <Field
@@ -715,176 +730,6 @@ function GitSection() {
           </Card>
         );
       })}
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* Confluence block (rendered inside the Integrations section)         */
-/* ------------------------------------------------------------------ */
-
-interface ConfluenceCfg {
-  base_url: string;
-  token: string;
-  space: string;
-  // UI-only: true when a token is already stored (redacted on the server).
-  hasToken: boolean;
-}
-
-// GET /api/admin/confluence returns { group, settings, resolved }; the
-// editable creds live under `resolved` (token redacted as hasToken).
-interface ConfluenceGroupResponse {
-  group: string;
-  settings: Record<string, unknown>;
-  resolved: {
-    base_url: string | null;
-    token: string | null;
-    space: string | null;
-    hasToken: boolean;
-  } | null;
-}
-
-function ConfluenceSection() {
-  const { getJson, putJson, postJson, notify } = useAdminApi();
-  const { messages } = useLanguage();
-  const t = messages?.admin ?? {};
-  const tc = t?.confluence ?? {};
-  const [cfg, setCfg] = useState<ConfluenceCfg>({
-    base_url: "",
-    token: "",
-    space: "",
-    hasToken: false,
-  });
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [testing, setTesting] = useState(false);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await getJson<ConfluenceGroupResponse>("/api/admin/confluence");
-      const r = data?.resolved;
-      setCfg({
-        base_url: r?.base_url ?? "",
-        token: "",
-        space: r?.space ?? "",
-        hasToken: Boolean(r?.hasToken),
-      });
-    } catch (e) {
-      notify({
-        tone: "error",
-        title: t.loadFailedTitle ?? "Load failed",
-        message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
-      });
-    } finally {
-      setLoading(false);
-    }
-  }, [getJson, notify, t]);
-
-  useEffect(() => {
-    void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      // PUT contract expects flat keys `confluence.{base_url,token,space}`.
-      // Only send the token when the admin typed a new value.
-      const body: Record<string, string> = {
-        "confluence.base_url": cfg.base_url,
-        "confluence.space": cfg.space,
-      };
-      if (cfg.token) body["confluence.token"] = cfg.token;
-      await putJson("/api/admin/confluence", body);
-      await load();
-      notify({ tone: "success", title: tc.savedToast ?? "Saved Confluence config." });
-    } catch (e) {
-      notify({
-        tone: "error",
-        title: t.saveFailedTitle ?? "Save failed",
-        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const test = async () => {
-    setTesting(true);
-    try {
-      const res = (await postJson("/api/admin/confluence/test", {})) as {
-        success?: boolean;
-        ok?: boolean;
-        message?: string;
-      };
-      const ok = Boolean(res.success ?? res.ok);
-      notify({
-        tone: ok ? "success" : "error",
-        title: ok ? (tc.reachableTitle ?? "Reachable") : (t.testFailedTitle ?? "Test failed"),
-        message: res.message || (ok ? (tc.reachable ?? "Reachable") : (t.testFailed ?? "Test failed")),
-      });
-    } catch (e) {
-      notify({
-        tone: "error",
-        title: t.testFailedTitle ?? "Test failed",
-        message: e instanceof Error ? e.message : (t.testFailed ?? "Test failed"),
-      });
-    } finally {
-      setTesting(false);
-    }
-  };
-
-  if (loading)
-    return (
-      <div className="flex items-center gap-2 text-sm text-muted">
-        <Spinner /> {tc.loading ?? "Loading…"}
-      </div>
-    );
-
-  return (
-    <div className="space-y-6">
-      <SectionHeader
-        title={tc.title ?? "Confluence"}
-        subtitle={tc.subtitle ?? ""}
-      />
-      <Card className="p-5">
-        <div className="grid gap-4 md:grid-cols-3">
-          <Field
-            label={tc.baseUrl ?? "Base URL"}
-            value={cfg.base_url}
-            onChange={(v) => setCfg((p) => ({ ...p, base_url: v }))}
-            placeholder="https://company.atlassian.net"
-          />
-          <Field
-            label={tc.apiToken ?? "API token"}
-            value={cfg.token}
-            onChange={(v) => setCfg((p) => ({ ...p, token: v }))}
-            placeholder={
-              cfg.hasToken
-                ? (tc.tokenStored ?? "stored · type to replace")
-                : (tc.tokenPlaceholder ?? "type to set")
-            }
-            secret
-          />
-          <Field
-            label={tc.spaceKey ?? "Space key"}
-            value={cfg.space}
-            onChange={(v) => setCfg((p) => ({ ...p, space: v }))}
-            placeholder="e.g. ENG"
-          />
-        </div>
-        <div className="mt-4 flex items-center gap-2">
-          <Button size="sm" onClick={save} disabled={saving}>
-            {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />}{" "}
-            {tc.save ?? "Save"}
-          </Button>
-          <Button size="sm" variant="ghost" onClick={test} disabled={testing}>
-            {testing ? <SpinnerIcon /> : <Wrench size={14} weight="regular" />}{" "}
-            {tc.test ?? "Test"}
-          </Button>
-        </div>
-      </Card>
     </div>
   );
 }
@@ -1582,6 +1427,7 @@ interface McpFormState {
   argsText: string;
   headersText: string;
   envText: string;
+  scopes: string[];
   enabled: boolean;
 }
 
@@ -1593,6 +1439,7 @@ const EMPTY_MCP_FORM: McpFormState = {
   argsText: "",
   headersText: "",
   envText: "",
+  scopes: ["expert"],
   enabled: true,
 };
 
@@ -1681,6 +1528,7 @@ function McpSection() {
       // only send values when typed ("type to replace" pattern).
       headersText: "",
       envText: "",
+      scopes: s.scopes ?? [],
       enabled: s.enabled,
     });
     setFormOpen(true);
@@ -1719,6 +1567,7 @@ function McpSection() {
       const body: Record<string, unknown> = {
         name: form.name.trim(),
         transport: form.transport,
+        scopes: form.scopes,
         enabled: form.enabled,
       };
       if (form.transport === "http" || form.transport === "sse") {
@@ -1880,6 +1729,15 @@ function McpSection() {
                   <tr key={s.id} className="hover:bg-surface-2">
                     <td className="px-4 py-3">
                       <div className="font-medium text-ink">{s.name}</div>
+                      {(s.scopes ?? []).length > 0 && (
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {(s.scopes ?? []).map((sc) => (
+                            <Tag key={sc} tone="neutral">
+                              {mcpScopeLabel(sc, tc)}
+                            </Tag>
+                          ))}
+                        </div>
+                      )}
                       {maskedMeta && (
                         <div className="mt-0.5 font-mono text-[11px] text-muted">
                           {maskedMeta}
@@ -2001,6 +1859,43 @@ function McpSection() {
             </div>
           </div>
 
+          <div>
+            <Label>{tm.scopesLabel ?? "Scopes"}</Label>
+            <div className="flex flex-wrap gap-2">
+              {MCP_SCOPES.map((sc) => {
+                const on = form.scopes.includes(sc);
+                return (
+                  <button
+                    key={sc}
+                    type="button"
+                    aria-pressed={on}
+                    onClick={() =>
+                      setForm((p) => ({
+                        ...p,
+                        scopes: on
+                          ? p.scopes.filter((x) => x !== sc)
+                          : [...p.scopes, sc],
+                      }))
+                    }
+                    className={cn(
+                      "rounded-full border px-2.5 py-0.5 text-xs",
+                      on
+                        ? "border-tag-blue-border bg-tag-blue-bg text-tag-blue-fg"
+                        : "border-divider bg-surface text-muted hover:text-ink",
+                    )}
+                  >
+                    {mcpScopeLabel(sc, tc)}
+                  </button>
+                );
+              })}
+            </div>
+            <p className="mt-1 text-xs text-muted">
+              {form.scopes.length === 0
+                ? (tm.scopesRequired ?? "Select at least one scope.")
+                : (tm.scopesHint ?? "")}
+            </p>
+          </div>
+
           {form.transport !== "stdio" ? (
             <>
               <div>
@@ -2086,7 +1981,10 @@ function McpSection() {
             <Button type="button" variant="ghost" onClick={() => setFormOpen(false)}>
               {tc.cancel ?? "Cancel"}
             </Button>
-            <Button type="submit" disabled={saving || !form.name.trim()}>
+            <Button
+              type="submit"
+              disabled={saving || !form.name.trim() || form.scopes.length === 0}
+            >
               {saving ? <SpinnerIcon /> : <Gear size={14} weight="regular" />}
               {tm.save ?? "Save"}
             </Button>
@@ -2142,8 +2040,6 @@ function McpSection() {
         )}
       </Modal>
 
-      {/* Confluence pull credentials (former standalone section). */}
-      <ConfluenceSection />
     </div>
   );
 }
@@ -2225,6 +2121,14 @@ function RateLimitCard({
 /* Memory section (active backend switch + reindex)                   */
 /* ------------------------------------------------------------------ */
 
+interface KnowledgeGraphStat {
+  product_id: string;
+  nodes: number;
+  edges: number;
+  version: number;
+  updated_at?: string | null;
+}
+
 interface MemoryGroupResponse {
   group: string;
   settings: Record<string, { value: string | null }>;
@@ -2234,6 +2138,7 @@ interface MemoryGroupResponse {
     available?: boolean;
     chunk_count?: number;
     product_count?: number;
+    graphs?: KnowledgeGraphStat[];
   };
 }
 
@@ -2247,8 +2152,10 @@ function MemorySection() {
   const [available, setAvailable] = useState<boolean | null>(null);
   const [chunkCount, setChunkCount] = useState<number | null>(null);
   const [productCount, setProductCount] = useState<number | null>(null);
+  const [graphs, setGraphs] = useState<KnowledgeGraphStat[]>([]);
   const [loading, setLoading] = useState(true);
   const [reindexing, setReindexing] = useState(false);
+  const [graphRebuilding, setGraphRebuilding] = useState(false);
   const [reindexProductId, setReindexProductId] = useState("");
 
   // Rate-limit state (embedder).
@@ -2267,6 +2174,7 @@ function MemorySection() {
       setAvailable(typeof r.available === "boolean" ? r.available : null);
       setChunkCount(typeof r.chunk_count === "number" ? r.chunk_count : null);
       setProductCount(typeof r.product_count === "number" ? r.product_count : null);
+      setGraphs(Array.isArray(r.graphs) ? r.graphs : []);
 
       // Load the embedder rate-limit settings (a separate setting group on
       // the backend).
@@ -2320,6 +2228,43 @@ function MemorySection() {
       });
     } finally {
       setReindexing(false);
+    }
+  };
+
+  const rebuildGraph = async () => {
+    setGraphRebuilding(true);
+    try {
+      const body = reindexProductId.trim()
+        ? { product_id: reindexProductId.trim() }
+        : {};
+      const res = (await postJson("/api/admin/memory/graph/reindex", body)) as {
+        success?: boolean;
+        message?: string;
+        results?: { success?: boolean; message?: string }[];
+      };
+      const many = Array.isArray(res.results);
+      const ok = many
+        ? (res.results?.length ?? 0) > 0 && (res.results ?? []).every((r) => r?.success)
+        : Boolean(res.success);
+      const message = many
+        ? (res.results ?? []).map((r) => r?.message ?? "").filter(Boolean).join("; ")
+        : res.message;
+      notify({
+        tone: ok ? "success" : "error",
+        title: ok ? (tm.graphRebuildOkTitle ?? "Graph rebuilt") : (t.failed ?? "Failed"),
+        message:
+          message ||
+          (ok ? (tm.graphRebuildOkMsg ?? "Knowledge graph rebuilt.") : "Graph rebuild failed"),
+      });
+      if (ok) void load();
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.failed ?? "Failed",
+        message: e instanceof Error ? e.message : "Graph rebuild failed",
+      });
+    } finally {
+      setGraphRebuilding(false);
     }
   };
 
@@ -2423,8 +2368,58 @@ function MemorySection() {
         </div>
       </Card>
 
+      <Card className="p-5">
+        <SectionHeader
+          title={tm.graphHeader ?? "Knowledge graph"}
+          subtitle={
+            tm.graphSub ??
+            "Per-product term/page graph (SPEC-008): node/edge stats and a forced rebuild. Leave the product id blank to rebuild all products."
+          }
+        />
+        {graphs.length === 0 ? (
+          <p className="mt-4 text-sm text-muted">
+            {tm.graphEmpty ??
+              "No graphs built yet — they appear after documentation is indexed."}
+          </p>
+        ) : (
+          <div className="mt-4 space-y-2">
+            {graphs.map((g) => (
+              <div key={g.product_id} className="flex flex-wrap items-center gap-2 text-sm">
+                <span className="font-mono text-[13px]">{g.product_id}</span>
+                <Tag tone="neutral">
+                  {(tm.nodes ?? "nodes")}: {g.nodes}
+                </Tag>
+                <Tag tone="neutral">
+                  {(tm.edges ?? "edges")}: {g.edges}
+                </Tag>
+                <Tag tone="neutral">v{g.version}</Tag>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="mt-4 flex flex-wrap items-center gap-2">
+          <div className="min-w-[220px] flex-1">
+            <Input
+              value={reindexProductId}
+              onChange={(e) => setReindexProductId(e.target.value)}
+              placeholder={tm.productIdPlaceholder ?? "product id (blank = all)"}
+            />
+          </div>
+          <Button size="sm" variant="subtle" onClick={rebuildGraph} disabled={graphRebuilding}>
+            {graphRebuilding ? (
+              <SpinnerIcon />
+            ) : (
+              <ArrowsCounterClockwise size={14} weight="bold" />
+            )}
+            {graphRebuilding
+              ? (tm.graphRebuilding ?? "Rebuilding…")
+              : (tm.graphRebuildBtn ?? "Rebuild graph")}
+          </Button>
+        </div>
+      </Card>
+
       {/* Memory-group knobs of the timeout registry (query timeout + docgen
-          indexing drain; saves only these keys). */}
+          indexing drain + knowledge-graph budgets; saves only these keys). */}
       <TimeoutFieldsCard fields={MEMORY_TIMEOUT_FIELDS} />
     </div>
   );
@@ -2462,6 +2457,9 @@ const LLM_TIMEOUT_FIELDS: TimeoutFieldSpec[] = [
 const MEMORY_TIMEOUT_FIELDS: TimeoutFieldSpec[] = [
   { key: "docgen_indexing_drain", group: "Memory" },
   { key: "memory_query", group: "Memory" },
+  { key: "knowledge_graph_enabled", group: "Memory" },
+  { key: "knowledge_graph_batch", group: "Memory" },
+  { key: "knowledge_graph_build", group: "Memory" },
 ];
 
 // Databases tab: connection check + RE docgen budgets.
@@ -2920,13 +2918,13 @@ function PromptsSection() {
             </nav>
           </aside>
           {/* Editor */}
-          <Card className="p-4">
+          <Card className="flex flex-col p-4">
             {loadingFile ? (
               <div className="flex items-center gap-2 text-sm text-muted">
                 <Spinner /> {tp.loadingFile ?? "Loading file…"}
               </div>
             ) : (
-              <div className="space-y-3">
+              <div className="flex flex-1 flex-col gap-3">
                 <div className="flex items-center justify-between">
                   <span className="flex min-w-0 items-center gap-2 font-mono text-sm text-muted">
                     <span className="truncate">{selected}</span>
@@ -2946,7 +2944,7 @@ function PromptsSection() {
                   onChange={(e) => setContent(e.target.value)}
                   rows={20}
                   spellCheck={false}
-                  className="font-mono text-sm"
+                  className="flex-1 font-mono text-sm"
                 />
               </div>
             )}
@@ -3034,6 +3032,12 @@ function UsersSection() {
   // Revealed credentials (temp password + reset token) shown once.
   const [revealed, setRevealed] = useState<UserCreateResult | null>(null);
 
+  const roleLabel = (r: UserRole) =>
+    r === "admin" ? (tu.roleAdmin ?? "admin")
+      : r === "manager" ? (tu.roleManager ?? "manager")
+      : r === "viewer_global" ? (tu.roleViewerGlobal ?? "viewer_global")
+      : (tu.roleUser ?? "user");
+
   const load = useCallback(async () => {
     setLoading(true);
     try {
@@ -3057,12 +3061,13 @@ function UsersSection() {
   }, [load]);
 
   const setRole = async (u: User, role: UserRole) => {
+    if (role === u.role) return;
     setBusy(u.id);
     try {
       // Backend PUT /api/admin/users expects { user_id, role }.
       await putJson("/api/admin/users", { user_id: u.id, role });
       setUsers((prev) => prev.map((x) => (x.id === u.id ? { ...x, role } : x)));
-      notify({ tone: "success", title: fmt(tu.roleChangedToast ?? "{name} is now {role}.", { name: u.username, role }) });
+      notify({ tone: "success", title: fmt(tu.roleChangedToast ?? "{name} is now {role}.", { name: u.username, role: roleLabel(role) }) });
     } catch (e) {
       notify({
         tone: "error",
@@ -3176,8 +3181,9 @@ function UsersSection() {
               value={nRole}
               onChange={(e) => setNRole(e.target.value as UserRole)}
             >
-              <option value="user">{tu.roleUser ?? "user"}</option>
-              <option value="admin">{tu.roleAdmin ?? "admin"}</option>
+              {ROLES.map((r) => (
+                <option key={r} value={r}>{roleLabel(r)}</option>
+              ))}
             </Select>
           </div>
           <div>
@@ -3256,9 +3262,16 @@ function UsersSection() {
                 </td>
                 <td className="px-4 py-3 text-muted">{u.provider}</td>
                 <td className="px-4 py-3">
-                  <Tag tone={u.role === "admin" ? "blue" : "neutral"}>
-                    {u.role === "admin" ? (tu.roleAdmin ?? "admin") : (tu.roleUser ?? "user")}
-                  </Tag>
+                  <Select
+                    value={u.role}
+                    onChange={(e) => void setRole(u, e.target.value as UserRole)}
+                    disabled={busy === u.id}
+                    className="w-44 text-xs"
+                  >
+                    {ROLES.map((r) => (
+                      <option key={r} value={r}>{roleLabel(r)}</option>
+                    ))}
+                  </Select>
                 </td>
                 <td className="px-4 py-3 text-right">
                   <div className="inline-flex items-center gap-2">
@@ -3278,27 +3291,6 @@ function UsersSection() {
                         {tu.resetTokenAction ?? "Reset token"}
                       </Button>
                     )}
-                    {u.role === "admin" ? (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => setRole(u, "user")}
-                        disabled={busy === u.id}
-                      >
-                        <UserCircleGear size={14} weight="regular" />
-                        {tu.demote ?? "Demote"}
-                      </Button>
-                    ) : (
-                      <Button
-                        size="sm"
-                        variant="subtle"
-                        onClick={() => setRole(u, "admin")}
-                        disabled={busy === u.id}
-                      >
-                        <SealCheck size={14} weight="regular" />
-                        {tu.promote ?? "Promote"}
-                      </Button>
-                    )}
                   </div>
                 </td>
               </tr>
@@ -3313,6 +3305,9 @@ function UsersSection() {
           </tbody>
         </table>
       </Card>
+
+      {/* Access mapping (SPEC-020): grants matrix + KC groups below the table */}
+      <MappingSection />
     </div>
   );
 }
@@ -3523,6 +3518,336 @@ function TokensSection() {
           </table>
         </Card>
       )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Access mapping (SPEC-001) — embedded into UsersSection (SPEC-020)   */
+/* ------------------------------------------------------------------ */
+
+type AdminGrantRow = {
+  product_id: string;
+  user_id: string;
+  level: "ro" | "rw";
+  username?: string | null;
+};
+
+const ROLES: UserRole[] = ["admin", "manager", "user", "viewer_global"];
+
+function MappingSection() {
+  const { getJson, putJson, del, notify } = useAdminApi();
+  const { messages } = useLanguage();
+  const t = messages?.admin ?? {};
+  const tm = t?.mapping ?? {};
+  const [grants, setGrants] = useState<AdminGrantRow[] | null>(null);
+  const [products, setProducts] = useState<ProductListItem[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  // Keycloak group -> global role (setting auth.keycloak.role_mapping,
+  // stored server-side as a JSON string).
+  const [mapping, setMapping] = useState<Record<string, string>>({});
+  // Groups reference from the Keycloak Admin API; null until fetched.
+  const [groups, setGroups] = useState<string[] | null>(null);
+  const [groupsFailed, setGroupsFailed] = useState(false);
+  const [productFilter, setProductFilter] = useState("");
+  const [userFilter, setUserFilter] = useState("");
+  const [busyCell, setBusyCell] = useState<string | null>(null);
+  const [newGroup, setNewGroup] = useState("");
+  const [newRole, setNewRole] = useState<UserRole>("user");
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const [g, p, u, auth] = await Promise.all([
+        getJson<AdminGrantRow[]>("/api/admin/grants"),
+        getJson<ProductListItem[]>("/api/products?limit=500"),
+        getJson<{ users?: User[] }>("/api/admin/users"),
+        getJson<{ settings?: Record<string, { value?: string | null }> }>(
+          "/api/admin/auth",
+        ),
+      ]);
+      setGrants(g);
+      setProducts(p);
+      setUsers(u?.users ?? []);
+      try {
+        const raw = auth?.settings?.["auth.keycloak.role_mapping"]?.value;
+        setMapping(raw ? (JSON.parse(raw) as Record<string, string>) : {});
+      } catch {
+        setMapping({});
+      }
+    } catch (e) {
+      setGrants([]);
+      notify({
+        tone: "error",
+        title: t.loadFailedTitle ?? "Load failed",
+        message: e instanceof Error ? e.message : (t.loadFailed ?? "Load failed"),
+      });
+    }
+  }, [getJson, notify, t.loadFailedTitle, t.loadFailed]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // Groups reference (service-account Admin API): 501/502 degrades to
+  // free-text group inputs.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const data = await getJson<{ groups?: { name?: string }[] }>(
+          "/api/admin/keycloak/groups",
+        );
+        setGroups((data?.groups ?? []).map((x) => x.name ?? "").filter(Boolean));
+      } catch {
+        setGroupsFailed(true);
+      }
+    })();
+  }, [getJson]);
+
+  const cellKey = (productId: string, userId: string) => `${productId}|${userId}`;
+
+  const setCell = async (productId: string, userId: string, next: string) => {
+    setBusyCell(cellKey(productId, userId));
+    try {
+      if (!next) {
+        await del(
+          `/api/admin/grants?product_id=${encodeURIComponent(productId)}&user_id=${encodeURIComponent(userId)}`,
+        );
+      } else {
+        await putJson("/api/admin/grants", {
+          product_id: productId,
+          user_id: userId,
+          level: next,
+        });
+      }
+      setGrants(await getJson<AdminGrantRow[]>("/api/admin/grants"));
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.saveFailedTitle ?? "Save failed",
+        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
+      });
+    } finally {
+      setBusyCell(null);
+    }
+  };
+
+  const saveMapping = async () => {
+    setSaving(true);
+    try {
+      // The backend persists non-string values via json.dumps — the object
+      // rides as-is.
+      await putJson("/api/admin/auth", {
+        "auth.keycloak.role_mapping": mapping,
+      });
+      notify({ tone: "success", title: tm.mappingSaved ?? "Mapping saved" });
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.saveFailedTitle ?? "Save failed",
+        message: e instanceof Error ? e.message : (t.saveFailed ?? "Save failed"),
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (grants === null) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-muted">
+        <Spinner /> {tm.loading ?? "Loading…"}
+      </div>
+    );
+  }
+
+  const grantMap = new Map(
+    grants.map((g) => [cellKey(g.product_id, g.user_id), g.level]),
+  );
+  const shownProducts = products.filter(
+    (p) => !productFilter || p.name === productFilter,
+  );
+  const shownUsers = users.filter(
+    (u) => !userFilter || u.username === userFilter,
+  );
+
+  return (
+    <div className="space-y-8">
+      <p className="text-[15px] text-muted">{tm.intro ?? ""}</p>
+
+      {/* Matrix products x users (owner implicit, admins/viewers skipped) */}
+      <Card className="overflow-hidden">
+        <div className="flex flex-wrap items-center gap-3 border-b border-divider p-4">
+          <Combobox
+            value={productFilter}
+            onChange={setProductFilter}
+            options={Array.from(new Set(products.map((p) => p.name)))}
+            placeholder={tm.searchProducts ?? "Products…"}
+            emptyOption={tm.all ?? "all"}
+            className="w-56"
+          />
+          <Combobox
+            value={userFilter}
+            onChange={setUserFilter}
+            options={users.map((u) => u.username)}
+            placeholder={tm.searchUsers ?? "Users…"}
+            emptyOption={tm.all ?? "all"}
+            className="w-56"
+          />
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-surface-2 text-left text-xs uppercase tracking-wide text-muted">
+              <tr>
+                <th className="sticky left-0 z-[1] bg-surface-2 px-4 py-3 font-medium">
+                  {tm.product ?? "Product"}
+                </th>
+                {shownUsers.map((u) => (
+                  <th key={u.id} className="px-4 py-3 font-medium">
+                    {u.username}
+                    <span className="ml-1 font-mono text-[10px] normal-case text-muted">
+                      {u.role}
+                    </span>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-divider">
+              {shownProducts.map((p) => (
+                <tr key={p.id} className="hover:bg-surface-2">
+                  <td className="sticky left-0 z-[1] bg-canvas px-4 py-3 font-medium text-ink">
+                    {p.name}
+                  </td>
+                  {shownUsers.map((u) => {
+                    if (u.role === "admin" || p.owner_id === u.id) {
+                      return (
+                        <td key={u.id} className="px-4 py-3">
+                          <Tag tone={u.role === "admin" ? "blue" : "green"}>
+                            {u.role === "admin"
+                              ? (tm.tagAdmin ?? "admin")
+                              : (tm.tagOwner ?? "owner")}
+                          </Tag>
+                        </td>
+                      );
+                    }
+                    if (u.role === "viewer_global") {
+                      return (
+                        <td key={u.id} className="px-4 py-3">
+                          <Tag tone="neutral">{tm.tagViewer ?? "view all"}</Tag>
+                        </td>
+                      );
+                    }
+                    const key = cellKey(p.id, u.id);
+                    return (
+                      <td key={u.id} className="px-4 py-3">
+                        <Select
+                          value={grantMap.get(key) ?? ""}
+                          onChange={(e) => void setCell(p.id, u.id, e.target.value)}
+                          disabled={busyCell === key}
+                          className="w-24 text-xs"
+                        >
+                          <option value="">{tm.noAccess ?? "—"}</option>
+                          <option value="ro">ro</option>
+                          <option value="rw">rw</option>
+                        </Select>
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      {/* Keycloak groups -> global roles */}
+      <Card className="p-5">
+        <SectionHeader
+          title={tm.kcTitle ?? "Keycloak groups → roles"}
+          subtitle={tm.kcSubtitle ?? ""}
+        />
+        {groupsFailed && (
+          <p className="mt-3 text-xs text-tag-yellow-fg">{tm.kcUnavailable ?? ""}</p>
+        )}
+        <datalist id="kc-groups">
+          {(groups ?? []).map((g) => (
+            <option key={g} value={g} />
+          ))}
+        </datalist>
+        <div className="mt-4 grid gap-2">
+          {Object.entries(mapping).map(([group, role]) => (
+            <div key={group} className="grid grid-cols-[1fr_180px_auto] items-center gap-2">
+              <Input value={group} readOnly className="font-mono text-xs" />
+              <Select
+                value={role}
+                onChange={(e) =>
+                  setMapping((prev) => {
+                    const next = { ...prev };
+                    if (e.target.value) next[group] = e.target.value;
+                    else delete next[group];
+                    return next;
+                  })
+                }
+                className="text-xs"
+              >
+                {ROLES.map((r) => (
+                  <option key={r} value={r}>{r}</option>
+                ))}
+              </Select>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() =>
+                  setMapping((prev) => {
+                    const next = { ...prev };
+                    delete next[group];
+                    return next;
+                  })
+                }
+              >
+                <Trash size={14} weight="regular" />
+              </Button>
+            </div>
+          ))}
+          <div className="grid grid-cols-[1fr_180px_auto] items-center gap-2">
+            <Input
+              value={newGroup}
+              onChange={(e) => setNewGroup(e.target.value)}
+              placeholder={tm.groupPlaceholder ?? "productarium-admins"}
+              list="kc-groups"
+              className="font-mono text-xs"
+            />
+            <Select
+              value={newRole}
+              onChange={(e) => setNewRole(e.target.value as UserRole)}
+              className="text-xs"
+            >
+              {ROLES.map((r) => (
+                <option key={r} value={r}>{r}</option>
+              ))}
+            </Select>
+            <Button
+              size="sm"
+              variant="subtle"
+              disabled={!newGroup.trim()}
+              onClick={() => {
+                const g = newGroup.trim();
+                if (!g) return;
+                setMapping((prev) => ({ ...prev, [g]: newRole }));
+                setNewGroup("");
+              }}
+            >
+              <Plus size={14} weight="bold" />
+              {tm.addMapping ?? "Add"}
+            </Button>
+          </div>
+        </div>
+        <div className="mt-4 flex justify-end">
+          <Button size="sm" onClick={() => void saveMapping()} disabled={saving}>
+            {saving ? <SpinnerIcon /> : null}
+            {tm.saveMapping ?? "Save"}
+          </Button>
+        </div>
+      </Card>
     </div>
   );
 }

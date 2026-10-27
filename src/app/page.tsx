@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -26,6 +26,14 @@ import {
   Textarea,
   cn,
 } from "@/components/ui";
+import {
+  ApiAbortError,
+  ApiError,
+  deleteJson,
+  getJson,
+  onApiError,
+  postJson,
+} from "@/lib/api";
 import { type Product, type ProductListItem, generateId } from "@/lib/types";
 
 export default function ProductsDashboard() {
@@ -42,6 +50,9 @@ export default function ProductsDashboard() {
   >([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // SPEC-003: backend unreachable/degraded — quiet inline chip, no banner.
+  const [degraded, setDegraded] = useState(false);
+  const fetchAbortRef = useRef<AbortController | null>(null);
 
   // Create-product form state
   const [showForm, setShowForm] = useState(false);
@@ -50,32 +61,59 @@ export default function ProductsDashboard() {
   const [isCreating, setIsCreating] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  const fetchProducts = useCallback(async () => {
-    setIsLoading(true);
-    setError(null);
-    try {
-      const res = await fetch("/api/products", {
-        credentials: "include",
-        cache: "no-store",
-      });
-      if (res.status === 401) {
-        router.replace("/login?next=/");
-        return;
+  const fetchProducts = useCallback(
+    async (silent = false) => {
+      // Supersede any in-flight list fetch (fresh data wins over stale).
+      fetchAbortRef.current?.abort();
+      const abort = new AbortController();
+      fetchAbortRef.current = abort;
+      if (!silent) setIsLoading(true);
+      try {
+        const data = await getJson<(ProductListItem & Partial<Product>)[]>(
+          "/api/products",
+          { signal: abort.signal },
+        );
+        setProducts(data);
+        setError(null);
+        setDegraded(false);
+      } catch (e) {
+        if (e instanceof ApiAbortError) return; // unmount/navigation — silent
+        if (onApiError(e, router)) return;
+        if (e instanceof ApiError && e.unavailable) {
+          // Network/5xx after client retries: keep whatever data we have;
+          // the recheck loop below reconnects once the backend is back.
+          setDegraded(true);
+          return;
+        }
+        setError(e instanceof Error ? e.message : "Failed to load products.");
+      } finally {
+        if (!silent) setIsLoading(false);
       }
-      if (!res.ok) throw new Error(`Failed to load products (${res.status})`);
-      const data = (await res.json()) as (ProductListItem &
-        Partial<Product>)[];
-      setProducts(data);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load products.");
-    } finally {
-      setIsLoading(false);
-    }
-  }, [router]);
+    },
+    [router],
+  );
 
   useEffect(() => {
     fetchProducts();
+    return () => fetchAbortRef.current?.abort();
   }, [fetchProducts]);
+
+  // SPEC-003: while degraded, silently re-check every 5 s so a short backend
+  // outage recovers on its own (chained, not interval — no overlapping calls).
+  useEffect(() => {
+    if (!degraded) return;
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const recheck = async () => {
+      await fetchProducts(true);
+      if (alive) timer = setTimeout(recheck, 5_000);
+    };
+    timer = setTimeout(recheck, 5_000);
+    return () => {
+      alive = false;
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [degraded, fetchProducts]);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -90,28 +128,14 @@ export default function ProductsDashboard() {
         specs: [],
         links: [],
       };
-      const res = await fetch("/api/products", {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(draft),
-      });
-      if (res.status === 401) {
-        router.replace("/login?next=/");
-        return;
-      }
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(
-          err.detail || `Failed to create product (${res.status})`,
-        );
-      }
-      const saved = (await res.json()) as Product;
+      // Non-GET failures surface normally via notify (SPEC-003).
+      const saved = await postJson<Product>("/api/products", draft);
       setProducts((prev) => [saved, ...prev]);
       setName("");
       setDescription("");
       setShowForm(false);
     } catch (e) {
+      if (onApiError(e, router)) return;
       notify({
         tone: "error",
         title: t.createFailedTitle ?? "Failed to create product",
@@ -126,17 +150,10 @@ export default function ProductsDashboard() {
     if (!confirm(t.deleteConfirm ?? "Delete this product and all its artifacts?")) return;
     setDeletingId(id);
     try {
-      const res = await fetch(`/api/products/${id}`, {
-        method: "DELETE",
-        credentials: "include",
-      });
-      if (res.status === 401) {
-        router.replace("/login?next=/");
-        return;
-      }
-      if (!res.ok) throw new Error(`Failed to delete (${res.status})`);
+      await deleteJson(`/api/products/${id}`);
       setProducts((prev) => prev.filter((p) => p.id !== id));
     } catch (e) {
+      if (onApiError(e, router)) return;
       notify({
         tone: "error",
         title: t.deleteFailedTitle ?? "Failed to delete product",
@@ -223,13 +240,21 @@ export default function ProductsDashboard() {
           </div>
         )}
 
+        {/* Quiet degraded indicator (SPEC-003): non-blocking, auto-recovers */}
+        {degraded && !error && (
+          <div className="mt-8 inline-flex items-center gap-2 rounded-md border border-divider bg-surface px-3 py-2 text-xs text-muted">
+            <Spinner />
+            {t.degraded ?? "Backend unavailable — retrying…"}
+          </div>
+        )}
+
         {/* Content */}
         <div className="mt-12">
           {isLoading ? (
             <div className="flex items-center gap-2 text-sm text-muted">
               <Spinner /> {t.loadingProducts ?? "Loading products…"}
             </div>
-          ) : products.length === 0 ? (
+          ) : degraded ? null : products.length === 0 ? ( // no false "no products" while backend is down
             <EmptyState
               icon={<Briefcase size={20} weight="regular" />}
               title={t.noProductsTitle ?? "No products yet"}

@@ -22,6 +22,7 @@ helpers live in ``api.docgen._common``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -46,6 +47,7 @@ from api.docgen._common import (
     _index_in_background,
     _product_name,
     emit_progress,
+    utc_now_iso,
 )
 from api.docgen.fact_fold import fold, rank_split
 from api.docgen.verification import judge_enabled, judge_section, mask_secrets
@@ -776,6 +778,12 @@ async def _guard_node(state: SpecDocState) -> Dict[str, Any]:
     # Specs carry a single ``content`` field: write the enriched doc back.
     try:
         spec.content = docs
+        # Incremental baseline (SPEC-010): hash of the persisted content.
+        spec.source_state = {
+            "kind": "spec",
+            "baseline": hashlib.sha256((docs or "").encode("utf-8")).hexdigest()[:16],
+            "checked_at": utc_now_iso(),
+        }
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("Could not write enriched docs onto spec: %s", e)
 

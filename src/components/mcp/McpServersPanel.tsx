@@ -44,6 +44,7 @@ import type {
   McpToolInfo,
   McpTransport,
 } from "@/lib/types";
+import { MCP_SCOPES, mcpScopeLabel } from "@/lib/types";
 
 /** Transport tag tone (shared by the binding rows and the attach picker). */
 function transportTone(transport: string) {
@@ -81,6 +82,7 @@ interface CreateServerFormState {
   command: string;
   argsText: string;
   envText: string;
+  scopes: string[];
   enabled: boolean;
 }
 
@@ -92,6 +94,7 @@ const EMPTY_CREATE_FORM: CreateServerFormState = {
   command: "",
   argsText: "",
   envText: "",
+  scopes: ["expert"],
   enabled: true,
 };
 
@@ -236,6 +239,9 @@ export function McpServersPanel({ productId }: { productId: string }) {
   const { notify } = useNotifications();
   const { messages, fmt } = useLanguage();
   const tm = (messages?.product?.mcp ?? {}) as any;
+  const tc = (messages?.common ?? {}) as any;
+  // Scope captions are shared with the admin registry form.
+  const ta = (messages?.admin?.mcp ?? {}) as any;
 
   const isAdmin = user?.role === "admin";
 
@@ -536,6 +542,7 @@ export function McpServersPanel({ productId }: { productId: string }) {
       const body: Record<string, unknown> = {
         name: createForm.name.trim(),
         transport: createForm.transport,
+        scopes: createForm.scopes,
         enabled: createForm.enabled,
       };
       if (isHttp) {
@@ -671,6 +678,9 @@ export function McpServersPanel({ productId }: { productId: string }) {
                         <span className="flex flex-wrap items-center gap-2">
                           <span className="truncate text-sm font-medium text-ink">{b.name}</span>
                           <Tag tone={transportTone(b.transport)}>{b.transport}</Tag>
+                          {(b.scopes ?? []).map((sc) => (
+                            <Tag key={sc} tone="neutral">{mcpScopeLabel(sc, tc)}</Tag>
+                          ))}
                           {!b.enabled && <Tag tone="yellow">{tm.disabled ?? "off"}</Tag>}
                         </span>
                         <span className="mt-0.5 block text-xs text-muted">{counterText(b)}</span>
@@ -750,6 +760,43 @@ export function McpServersPanel({ productId }: { productId: string }) {
             }}
             className="grid gap-4"
           >
+            <div>
+              <Label>{ta.scopesLabel ?? "Scopes"}</Label>
+              <div className="flex flex-wrap gap-2">
+                {MCP_SCOPES.map((sc) => {
+                  const on = createForm.scopes.includes(sc);
+                  return (
+                    <button
+                      key={sc}
+                      type="button"
+                      aria-pressed={on}
+                      onClick={() =>
+                        setCreateForm((p) => ({
+                          ...p,
+                          scopes: on
+                            ? p.scopes.filter((x) => x !== sc)
+                            : [...p.scopes, sc],
+                        }))
+                      }
+                      className={cn(
+                        "rounded-full border px-2.5 py-0.5 text-xs",
+                        on
+                          ? "border-tag-blue-border bg-tag-blue-bg text-tag-blue-fg"
+                          : "border-divider bg-surface text-muted hover:text-ink",
+                      )}
+                    >
+                      {mcpScopeLabel(sc, tc)}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="mt-1 text-xs text-muted">
+                {createForm.scopes.length === 0
+                  ? (ta.scopesRequired ?? "Select at least one scope.")
+                  : (ta.scopesHint ?? "")}
+              </p>
+            </div>
+
             <div className="grid gap-4 md:grid-cols-[1fr_180px]">
               <div>
                 <Label>{tm.nameLabel ?? "Name"}</Label>
@@ -872,6 +919,7 @@ export function McpServersPanel({ productId }: { productId: string }) {
                 disabled={
                   creating ||
                   !createForm.name.trim() ||
+                  createForm.scopes.length === 0 ||
                   (createForm.transport !== "stdio"
                     ? !createForm.url.trim()
                     : !createForm.command.trim())
@@ -914,6 +962,9 @@ export function McpServersPanel({ productId }: { productId: string }) {
                       <span className="flex items-center gap-2">
                         <span className="truncate text-sm font-medium text-ink">{s.name}</span>
                         <Tag tone={transportTone(s.transport)}>{s.transport}</Tag>
+                        {(s.scopes ?? []).map((sc) => (
+                          <Tag key={sc} tone="neutral">{mcpScopeLabel(sc, tc)}</Tag>
+                        ))}
                         {!s.enabled && <Tag tone="yellow">{tm.disabled ?? "off"}</Tag>}
                       </span>
                       {(s.url || s.command) && (

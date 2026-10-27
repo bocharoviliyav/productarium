@@ -50,7 +50,7 @@ _GIT_CONNECTORS = {"github", "gitlab"}
 
 # --- Request / response models ----------------------------------------------
 class FromIntegrationRequest(BaseModel):
-    connector: str = Field(..., description="Connector name (e.g. github, confluence).")
+    connector: str = Field(..., description="Connector name (e.g. github, gitlab).")
     source_id: str = Field(..., description="Connector-specific source id (repo URL, page id, ...).")
     name: Optional[str] = Field(
         None, description="Name for the created codebase/node. Defaults to the pulled title."
@@ -295,7 +295,7 @@ async def knowledge_from_integration(
 ):
     """Pull a space/page from any connector and create KnowledgeNode(s) (rw).
 
-    Multi-page Confluence trees become a root node + children (parent links
+    Multi-page pulls become a root node + children (parent links
     preserved). The pulled markdown (+ converted attachments) is indexed into
     the product-scoped pgvector memory in the background (non-fatal).
     """
@@ -307,7 +307,7 @@ async def knowledge_from_integration(
         )
 
     try:
-        # P1-13: connector.pull does sync network I/O (Confluence API, git) —
+        # P1-13: connector.pull does sync network I/O (remote APIs, git) —
         # run it off the event loop in a worker thread.
         pulled = await asyncio.to_thread(connector.pull, body.source_id, body.opts)
     except ValueError as e:

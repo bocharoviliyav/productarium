@@ -3,7 +3,6 @@
 
 Covers:
 - ``api.integrations.registry`` auto-discovery + get_connector + list_connectors
-- ``api.integrations.confluence`` connector with a mocked HTTP layer
 - ``api.formats.markitdown.convert_to_markdown`` with a mocked markitdown + the
   graceful-placeholder path when markitdown is unavailable
 - ``api.integrations._git_base.GitConnector.extract_repo_name``
@@ -13,8 +12,6 @@ settings store uses an isolated SQLite env (mirrors test_foundation.py).
 """
 
 from __future__ import annotations
-
-from typing import Any, Dict, Optional
 
 import pytest
 
@@ -31,10 +28,10 @@ class TestRegistry:
 
         reset_registry()
         names = {c["name"] for c in list_connectors()}
-        # The three built-in connectors must be auto-discovered. (The legacy
+        # The two built-in connectors must be auto-discovered. (The legacy
         # hand-written "mcp" connector was removed with the Wave C MCP
         # platform — external MCP servers now live in api/mcp/ + admin CRUD.)
-        assert {"github", "gitlab", "confluence"} <= names
+        assert {"github", "gitlab"} <= names
         assert "mcp" not in names
 
     def test_list_connectors_has_required_fields(self):
@@ -52,11 +49,11 @@ class TestRegistry:
 
     def test_get_connector_instantiates_known(self):
         from api.integrations.registry import reset_registry, get_connector
-        from api.integrations.confluence import ConfluenceConnector
+        from api.integrations.gitlab import GitLabConnector
 
         reset_registry()
-        conn = get_connector("confluence")
-        assert isinstance(conn, ConfluenceConnector)
+        conn = get_connector("gitlab")
+        assert isinstance(conn, GitLabConnector)
 
     def test_explicit_register_decorator(self):
         from api.integrations.base import IntegrationConnector
@@ -120,176 +117,6 @@ class TestGitBase:
             GitConnector.extract_repo_name("https://gitlab.com/group/sub/repo", "gitlab")
             == "sub_repo"
         )
-
-
-# --- Confluence connector (mocked HTTP) -------------------------------------
-def _confluence_with_mocks(monkeypatch, *, pages=None, children=None, attachments=None, spaces=None):
-    """Build a ConfluenceConnector with its HTTP layer mocked."""
-    from api.integrations.confluence import ConfluenceConnector
-
-    conn = ConfluenceConnector(
-        config={
-            "base_url": "https://example.atlassian.net",
-            "token": "fake-token",
-            "username": "user@example.com",
-        }
-    )
-
-    def _page_id_from(path: str, suffix: str) -> str:
-        # path like /wiki/api/v2/pages/{id}/children
-        return path.split("/pages/")[1].split(suffix)[0]
-
-    def fake_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        if path.startswith("/wiki/api/v2/spaces"):
-            return {"results": spaces or [], "_links": {}}
-        if path.startswith("/wiki/api/v2/pages/") and "/children" in path:
-            pid = _page_id_from(path, "/children")
-            # `children` is a dict {page_id: [child dicts]}.
-            return {"results": (children or {}).get(pid, [])}
-        if path.startswith("/wiki/api/v2/pages/") and "/attachments" in path:
-            pid = _page_id_from(path, "/attachments")
-            # `attachments` is a dict {page_id: [attachment dicts]}.
-            return {"results": (attachments or {}).get(pid, [])}
-        if path.startswith("/wiki/api/v2/pages/"):
-            # Page fetch — return the canned page matching the id in the path.
-            page_id = path.rstrip("/").split("/")[-1].split("?")[0]
-            page = next((p for p in (pages or []) if str(p.get("id")) == page_id), None)
-            if page is None:
-                raise ValueError(f"mock: no page {page_id}")
-            return page
-        raise ValueError(f"mock: unexpected path {path}")
-
-    monkeypatch.setattr(conn, "_get", fake_get)
-    monkeypatch.setattr(conn, "_get_bytes", lambda url: b"FAKE-ATTACHMENT-BYTES")
-    return conn
-
-
-class TestConfluenceConnector:
-    def test_is_configured_requires_base_and_token(self):
-        from api.integrations.confluence import ConfluenceConnector
-
-        assert ConfluenceConnector(config={}).is_configured() is False
-        assert ConfluenceConnector(config={"base_url": "x"}).is_configured() is False
-        assert (
-            ConfluenceConnector(config={"base_url": "x", "token": "t"}).is_configured()
-            is True
-        )
-
-    def test_auth_headers_basic_when_username(self):
-        from api.integrations.confluence import ConfluenceConnector
-
-        conn = ConfluenceConnector(
-            config={"base_url": "x", "token": "t", "username": "u@example.com"}
-        )
-        headers = conn._auth_headers()
-        assert headers["Authorization"].startswith("Basic ")
-        # Bearer used when no username.
-        conn2 = ConfluenceConnector(config={"base_url": "x", "token": "t"})
-        assert conn2._auth_headers()["Authorization"] == "Bearer t"
-
-    def test_test_success(self, monkeypatch):
-        conn = _confluence_with_mocks(monkeypatch, spaces=[{"id": "1", "name": "Eng", "key": "ENG"}])
-        result = conn.test()
-        assert result["success"] is True
-        assert "Confluence" in result["message"]
-
-    def test_test_not_configured(self):
-        from api.integrations.confluence import ConfluenceConnector
-
-        result = ConfluenceConnector(config={}).test()
-        assert result["success"] is False
-
-    def test_list_spaces(self, monkeypatch):
-        conn = _confluence_with_mocks(
-            monkeypatch,
-            spaces=[
-                {"id": "1", "name": "Engineering", "key": "ENG"},
-                {"id": "2", "name": "Product", "key": "PROD"},
-            ],
-        )
-        spaces = conn.list_spaces()
-        assert len(spaces) == 2
-        assert {s["key"] for s in spaces} == {"ENG", "PROD"}
-        assert all(s["type"] == "space" for s in spaces)
-
-    def test_list_spaces_not_configured(self):
-        from api.integrations.confluence import ConfluenceConnector
-
-        assert ConfluenceConnector(config={}).list_spaces() == []
-
-    def test_list_spaces_filters_to_configured_space(self, monkeypatch):
-        conn = _confluence_with_mocks(
-            monkeypatch,
-            spaces=[
-                {"id": "1", "name": "Engineering", "key": "ENG"},
-                {"id": "2", "name": "Product", "key": "PROD"},
-            ],
-        )
-        conn.config["space"] = "PROD"
-        spaces = conn.list_spaces()
-        assert [s["key"] for s in spaces] == ["PROD"]
-
-    def test_pull_single_page_with_attachments(self, monkeypatch):
-        pages = [
-            {
-                "id": "123",
-                "title": "Architecture",
-                "body": {"representation": "storage", "value": "<p>Overview</p>"},
-                "spaceId": "1",
-            }
-        ]
-        attachments = {
-            "123": [
-                {
-                    "title": "spec.docx",
-                    "_links": {"download": "/wiki/api/v2/attachments/9/download"},
-                }
-            ]
-        }
-        conn = _confluence_with_mocks(monkeypatch, pages=pages, attachments=attachments)
-        # Mock markitdown conversion so we don't need the real package behavior.
-        monkeypatch.setattr(
-            "api.integrations.confluence.convert_to_markdown",
-            lambda raw, filename=None: f"MD({filename})",
-        )
-        result = conn.pull("123")
-        assert result["title"] == "Architecture"
-        assert result["page_id"] == "123"
-        assert result["page_count"] == 1
-        assert "<p>Overview</p>" in result["markdown"]
-        assert result["attachments"] == [{"filename": "spec.docx", "markdown": "MD(spec.docx)"}]
-
-    def test_pull_recursive_walks_children(self, monkeypatch):
-        pages = [
-            {
-                "id": "1",
-                "title": "Root",
-                "body": {"value": "<p>root</p>"},
-                "spaceId": "S",
-            },
-            {
-                "id": "2",
-                "title": "Child",
-                "body": {"value": "<p>child</p>"},
-                "spaceId": "S",
-            },
-        ]
-        children = {"1": [{"id": "2", "title": "Child"}]}
-        conn = _confluence_with_mocks(
-            monkeypatch,
-            pages=pages,
-            children=children,
-        )
-        result = conn.pull("1", opts={"recursive": True})
-        assert result["page_count"] == 2
-        assert "Root" in result["markdown"]
-        assert "Child" in result["markdown"]
-
-    def test_pull_not_configured_raises(self):
-        from api.integrations.confluence import ConfluenceConnector
-
-        with pytest.raises(ValueError):
-            ConfluenceConnector(config={}).pull("123")
 
 
 # --- markitdown client (mocked) ---------------------------------------------

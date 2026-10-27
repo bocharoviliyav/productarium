@@ -21,41 +21,93 @@ logger = logging.getLogger(__name__)
 _MODEL_CTX_CACHE: Dict[Tuple[str, str], Tuple[float, int]] = {}
 _CACHE_TTL_SECONDS = 300.0
 
+# Fallback when nothing advertised the window (unknown model, empty probes).
+# 200k matches modern mid-size models; the old 8192 silently clamped every
+# docgen budget on 262k-token servers that publish no metadata.
+DEFAULT_CONTEXT_WINDOW = 200_000
+
+_CONTEXT_WINDOW_ENV = "PRODUCTARIUM_MODEL_CONTEXT_WINDOW"
+# Legacy alias from the previous stack name; still read (with a
+# deprecation WARNING pointing at the new name) so existing installs keep
+# working.
+_LEGACY_CONTEXT_WINDOW_ENV = "RLM_MODEL_CONTEXT_WINDOW"
+
+# Static known-model catalog: lowercase name substring -> window. Checked
+# AFTER env/admin overrides and BEFORE live probes, so a silent server
+# running a known model family resolves without any network round-trip.
+_KNOWN_MODEL_WINDOWS: Tuple[Tuple[str, int], ...] = (
+    ("qwen3", 262_144),
+    ("deepseek", 131_072),
+    ("llama-3", 131_072),
+    ("gemini", 1_048_576),
+    ("gpt-4o", 128_000),
+    ("gpt-5", 128_000),
+    ("claude", 200_000),
+)
+
+
+def _catalog_context_window(model_name: str) -> Optional[int]:
+    """First known-model catalog window matching the model name (substring)."""
+    name = (model_name or "").lower()
+    for needle, window in _KNOWN_MODEL_WINDOWS:
+        if needle in name:
+            return window
+    return None
+
+
+def _env_window(name: str) -> Optional[int]:
+    """Positive int from an env var; None when unset/invalid/non-positive."""
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    try:
+        val = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None
+
 
 def get_model_context_window(
     base_url: Optional[str] = None,
     model_name: Optional[str] = None,
     api_key: Optional[str] = None,
     task: Optional[str] = None,
+    allow_probes: bool = True,
 ) -> int:
-    """Dynamically resolve the context window size (in tokens) for a given model/endpoint.
+    """Dynamically resolve the context window size (in tokens) for a model.
 
     Order of precedence:
-    1. Explicit env var `RLM_MODEL_CONTEXT_WINDOW`
-    2. Task/admin config `models.<task>.max_prompt_tokens`
-    3. Live API metadata query (cached for 5 minutes), in order:
+    1. Env ``PRODUCTARIUM_MODEL_CONTEXT_WINDOW``
+    2. Legacy env ``RLM_MODEL_CONTEXT_WINDOW`` (deprecation WARNING logged)
+    3. Task/admin config ``models.<task>.max_prompt_tokens``
+    4. Known-model catalog (substring match on the model name)
+    5. Live API metadata query (cached for 5 minutes), in order:
        - OpenAI-compatible: GET {base_url}/v1/models -> `max_model_len` /
          `context_window` / `max_tokens` / `max_context_length` / `n_ctx`
          (vLLM advertises these; LM Studio / llama.cpp / Ollama do NOT)
        - LM Studio native: GET {origin}/api/v0/models -> `maxContextLength`
        - llama.cpp: GET {origin}/props -> `default_generation_settings.n_ctx`
        - Ollama: POST {origin}/api/show -> `model_info["*.context_length"]`
-    4. Safe fallback default: 8192 tokens (logged as a WARNING that names
-       the manual overrides — a silent 8192 previously clamped every docgen
-       budget on 262k-token models whose server does not advertise the
-       window via /v1/models)
-    """
-    # 1. Environment variable override
-    raw = os.environ.get("RLM_MODEL_CONTEXT_WINDOW")
-    if raw:
-        try:
-            val = int(str(raw).strip())
-            if val > 0:
-                return val
-        except (TypeError, ValueError):
-            pass
+    6. Fallback ``DEFAULT_CONTEXT_WINDOW`` (200000), with a WARNING naming
+       the manual overrides.
 
-    # 2. Admin setting override
+    ``allow_probes=False`` skips step 5 entirely (offline, no cache writes)
+    for cheap non-blocking resolution, e.g. the admin panel Models view.
+    """
+    # 1-2. Environment overrides (legacy name logs a deprecation warning).
+    val = _env_window(_CONTEXT_WINDOW_ENV)
+    if val:
+        return val
+    legacy = _env_window(_LEGACY_CONTEXT_WINDOW_ENV)
+    if legacy:
+        logger.warning(
+            "%s is deprecated and will be removed in a future release; "
+            "rename it to %s.",
+            _LEGACY_CONTEXT_WINDOW_ENV, _CONTEXT_WINDOW_ENV,
+        )
+        return legacy
+
+    # 3. Admin setting override
     if task:
         try:
             from api.config.settings import get_model_for_task
@@ -85,9 +137,50 @@ def get_model_context_window(
         if now - ts < _CACHE_TTL_SECONDS:
             return cached_val
 
+    # 4. Known-model catalog: silent servers running a known family resolve
+    # without any network round-trip; probes never outrank the catalog.
+    catalog = _catalog_context_window(model)
+    if catalog:
+        _MODEL_CTX_CACHE[cache_key] = (now, catalog)
+        logger.info(
+            "Resolved model context window for %s from the known-model "
+            "catalog: %d tokens", model, catalog,
+        )
+        return catalog
+
     ctx_found: Optional[int] = None
 
-    # 3. Live endpoint queries
+    # 5. Live endpoint queries
+    if allow_probes:
+        ctx_found = _probe_advertised_window(model, url, api_key)
+
+    final_ctx = ctx_found or DEFAULT_CONTEXT_WINDOW
+    if ctx_found is None and allow_probes:
+        logger.warning(
+            "No advertised context window for %s at %s (probed /v1/models, "
+            "LM Studio /api/v0/models, llama.cpp /props, Ollama /api/show); "
+            "falling back to %d tokens. If the real window is smaller, set "
+            "%s or the admin Models -> max_prompt_tokens override.",
+            model, url, DEFAULT_CONTEXT_WINDOW, _CONTEXT_WINDOW_ENV,
+        )
+    if allow_probes:
+        # Probe-free resolution must not poison the runtime cache with an
+        # unprobed value a later live call would want to refine.
+        _MODEL_CTX_CACHE[cache_key] = (now, final_ctx)
+    logger.info("Resolved model context window for %s at %s: %d tokens", model, url, final_ctx)
+    return final_ctx
+
+
+def _probe_advertised_window(
+    model: str,
+    url: str,
+    api_key: Optional[str],
+) -> Optional[int]:
+    """Live context-window probes (step 5 of :func:`get_model_context_window`).
+
+    Best-effort by design: every failure is a DEBUG log, never a raise.
+    """
+    ctx_found: Optional[int] = None
     try:
         from api.config.ssl import requests_verify
         from api.config.settings import _sanitize_api_key
@@ -115,7 +208,7 @@ def get_model_context_window(
 
         model_l = model.lower()
 
-        # 3a. OpenAI-compatible /v1/models (vLLM advertises max_model_len &
+        # 5a. OpenAI-compatible /v1/models (vLLM advertises max_model_len &
         # friends here; LM Studio / llama.cpp / Ollama list bare ids only).
         oai_url = url if url.endswith("/v1") else url.rstrip("/") + "/v1"
         data = _get(f"{oai_url}/models")
@@ -134,7 +227,7 @@ def get_model_context_window(
                 if ctx_found:
                     break
 
-        # 3b-d. Server-NATIVE probes: these servers do not publish the
+        # 5b-d. Server-NATIVE probes: these servers do not publish the
         # context window through /v1/models, only through their own endpoints.
         # origin = the OpenAI base without the /v1 suffix.
         origin = oai_url[: -len("/v1")].rstrip("/") if oai_url.endswith("/v1") else oai_url.rstrip("/")
@@ -143,7 +236,7 @@ def get_model_context_window(
             # LM Studio native REST API.
             data = _get(f"{origin}/api/v0/models")
             if isinstance(data, dict):
-                for mobj in data.get("data", []) or []:
+                for mobj in data.get("data", []):
                     if not isinstance(mobj, dict):
                         continue
                     entry_id = str(mobj.get("id") or "").strip().lower()
@@ -189,21 +282,7 @@ def get_model_context_window(
                 logger.debug("Context-window probe %s/api/show failed: %s", origin, e)
     except Exception as e:
         logger.debug("get_model_context_window fetch exception: %s", e)
-
-    final_ctx = ctx_found or 8192
-    if ctx_found is None:
-        logger.warning(
-            "No advertised context window for %s at %s (probed /v1/models, "
-            "LM Studio /api/v0/models, llama.cpp /props, Ollama /api/show); "
-            "falling back to 8192 tokens. If the real window is larger, set "
-            "RLM_MODEL_CONTEXT_WINDOW or the admin Models -> "
-            "max_prompt_tokens override.",
-            model, url,
-        )
-
-    _MODEL_CTX_CACHE[cache_key] = (now, final_ctx)
-    logger.info("Resolved model context window for %s at %s: %d tokens", model, url, final_ctx)
-    return final_ctx
+    return ctx_found
 
 
 # P1-23: hybrid token counting. The default is the cheap chars/4 heuristic
@@ -283,6 +362,7 @@ async def get_model_context_window_async(
     model_name: Optional[str] = None,
     api_key: Optional[str] = None,
     task: Optional[str] = None,
+    allow_probes: bool = True,
 ) -> int:
     """Async variant of :func:`get_model_context_window` (P1-13).
 
@@ -299,4 +379,5 @@ async def get_model_context_window_async(
         model_name=model_name,
         api_key=api_key,
         task=task,
+        allow_probes=allow_probes,
     )

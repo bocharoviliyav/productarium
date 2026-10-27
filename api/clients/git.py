@@ -234,6 +234,81 @@ def download_repo(
     except Exception as e:
         raise ValueError(f"An unexpected error occurred: {str(e)}")
 
+def head_commit(local_path: str) -> str:
+    """HEAD commit SHA of an existing clone (ValueError on any failure)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", local_path, "rev-parse", "HEAD"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return result.stdout.decode("utf-8").strip()
+    except Exception as e:
+        raise ValueError(f"Could not read HEAD of {local_path}: {e}") from e
+
+
+def fetch_remote_tip(
+    local_path: str,
+    repo_url: str,
+    repo_type: str = None,
+    access_token: str = None,
+) -> str:
+    """Fetch the remote tip into an EXISTING clone; return FETCH_HEAD's SHA.
+
+    SPEC-010 change detection: unlike ``download_repo(force_refresh=True)``
+    this never resets/cleans the working tree — a detect run must not touch
+    the checkout a concurrent reader may be using, and the comparison is a
+    pure commit-hash check followed by a two-commit tree diff.
+    """
+    from api.config.timeout import resolve_git_detect_timeout
+
+    validate_repo_url(repo_url)
+    fetch_url = _build_authed_clone_url(repo_url, repo_type, access_token)
+    try:
+        subprocess.run(
+            ["git", "-C", local_path, "fetch", "--depth=1", fetch_url],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=resolve_git_detect_timeout(),
+        )
+        result = subprocess.run(
+            ["git", "-C", local_path, "rev-parse", "FETCH_HEAD"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=resolve_git_detect_timeout(),
+        )
+        sha = result.stdout.decode("utf-8").strip()
+        if not sha:
+            raise ValueError("empty FETCH_HEAD")
+        return sha
+    except subprocess.CalledProcessError as e:
+        err = _sanitize_git_stderr(
+            (e.stderr or b"").decode("utf-8", errors="replace"), access_token or ""
+        )
+        raise ValueError(f"Fetch failed: {err}") from e
+    except subprocess.TimeoutExpired as e:
+        # A hung remote must fail the detect job (→ changed=None), not hold
+        # the entity lock forever.
+        raise ValueError(f"Fetch timed out after {e.timeout}s") from e
+
+
+def diff_commit_names(local_path: str, from_sha: str, to_sha: str) -> list:
+    """Repo-relative paths that differ between two commits (ValueError on
+    failure — the caller decides to fall back conservatively)."""
+    from api.config.timeout import resolve_git_detect_timeout
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", local_path, "diff", "--name-only", from_sha, to_sha],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=resolve_git_detect_timeout(),
+        )
+        return [
+            line.strip() for line in
+            result.stdout.decode("utf-8", errors="replace").splitlines()
+            if line.strip()
+        ]
+    except Exception as e:
+        raise ValueError(f"Could not diff {from_sha}..{to_sha}: {e}") from e
+
+
 def get_github_file_content(repo_url: str, file_path: str, access_token: str = None) -> str:
     """
     Retrieves the content of a file from a GitHub repository using the GitHub API.

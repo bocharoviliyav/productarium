@@ -1,9 +1,10 @@
 """Knowledge tree router (contract J, section E).
 
-Confluence-like tree of knowledge pages scoped to a Product, plus the Verified
+Tree of knowledge pages scoped to a Product, plus the Verified
 toggle (item 5) and the AI product summary (item 4). All endpoints are mounted
-under ``/api/products/{product_id}/...`` and reuse the foundation auth
-dependencies (``get_current_user`` / ``require_admin``) and ``get_db``.
+under ``/api/products/{product_id}/...`` and enforce the SPEC-001 product
+permissions: reads need product access (``ro``), writes need the ``docs``
+permission; an unknown/invisible product is a plain 404.
 
 Endpoints:
 - ``GET    /api/products/{product_id}/knowledge/tree``
@@ -26,6 +27,8 @@ Design notes:
 - The summary uses ``api.docgen.summary.generate_product_summary`` (self-
   contained, decoupled from ``api.expert``) and stores the result onto
   ``ProductORM.summary``.
+- The tree response carries node metadata only (Q-10): ``content_md`` is
+  served per node by the single-node GET.
 """
 
 from __future__ import annotations
@@ -38,9 +41,13 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session, selectinload
 
-from api.auth.deps import get_current_user, require_product_access
+from api.auth.deps import (
+    get_current_user,
+    require_product_access,
+    require_product_permission,
+)
 from api.db import get_db
-from api.docgen.summary import generate_product_summary
+from api.docgen.summary import SummaryLLMError, generate_product_summary
 from api.expert.attachments import (
     convert_via_markitdown as _convert_via_markitdown,
     upload_max_bytes as _upload_max_bytes,
@@ -52,6 +59,7 @@ from api.schemas import (
     KnowledgeNodeUpdate,
 )
 from api.models import UserORM
+from api.utils.rate_limit import enforce_user_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -99,14 +107,13 @@ def _orm_to_node(n: KnowledgeNodeORM) -> KnowledgeNode:
 
 
 def _node_dict(n: KnowledgeNodeORM) -> Dict[str, Any]:
-    """A serializable node dict (no children) for the tree response."""
+    """Tree metadata dict (no children, no content body — Q-10)."""
     return {
         "id": n.id,
         "product_id": n.product_id,
         "parent_id": n.parent_id,
         "title": n.title,
         "slug": n.slug,
-        "content_md": n.content_md,
         "node_type": n.node_type,
         "artifact_id": n.artifact_id,
         "source": n.source,
@@ -139,28 +146,11 @@ def build_tree(nodes: List[KnowledgeNodeORM]) -> List[Dict[str, Any]]:
     return roots
 
 
-def _load_product(db: Session, product_id: str) -> ProductORM:
-    p = db.get(ProductORM, product_id)
-    if p is None:
-        raise HTTPException(status_code=404, detail="Product not found")
-    return p
-
-
 def _load_node(db: Session, product_id: str, node_id: str) -> KnowledgeNodeORM:
     n = db.get(KnowledgeNodeORM, node_id)
     if n is None or n.product_id != product_id:
         raise HTTPException(status_code=404, detail="Knowledge node not found")
     return n
-
-
-def _is_owner(product: ProductORM, node: Optional[KnowledgeNodeORM], user: UserORM) -> bool:
-    if user.role == "admin":
-        return True
-    if product.owner_id and product.owner_id == user.id:
-        return True
-    if node is not None and node.created_by and node.created_by == user.id:
-        return True
-    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -191,10 +181,10 @@ def create_node(
     body: KnowledgeNodeCreate,
     db: Session = Depends(get_db),
     user: UserORM = Depends(get_current_user),
-    _product: ProductORM = Depends(require_product_access("rw")),
+    _product: ProductORM = Depends(require_product_permission("docs")),
 ) -> KnowledgeNode:
     """Create a knowledge node. Validates parent belongs to the same product."""
-    # (visibility/rw was enforced by require_product_access above)
+    # (access was enforced by the docs permission dependency above)
     if body.parent_id:
         parent = db.get(KnowledgeNodeORM, body.parent_id)
         if parent is None or parent.product_id != product_id:
@@ -286,14 +276,14 @@ def update_node(
     node_id: str,
     body: KnowledgeNodeUpdate,
     db: Session = Depends(get_db),
-    _product: ProductORM = Depends(require_product_access("rw")),
+    _product: ProductORM = Depends(require_product_permission("docs")),
 ) -> KnowledgeNode:
     """Update a node's title/slug/content_md/node_type/parent_id.
 
     WYSIWYG saves ``content_md``; drag-and-drop saves ``parent_id``. When
     ``content_md`` changes, the new text is re-indexed into the product's
     pgvector memory in the background (fire-and-forget, non-fatal) so expert
-    Ask/summary stay in sync with manual page edits (and future MCP/Confluence/
+    Ask/summary stay in sync with manual page edits (and future MCP/
     webhook-pulled content).
     """
     node = _load_node(db, product_id, node_id)
@@ -332,7 +322,7 @@ def delete_node(
     product_id: str,
     node_id: str,
     db: Session = Depends(get_db),
-    _product: ProductORM = Depends(require_product_access("rw")),
+    _product: ProductORM = Depends(require_product_permission("docs")),
 ) -> Dict[str, str]:
     """Delete a node; its subtree is removed by the DB ON DELETE CASCADE."""
     node = _load_node(db, product_id, node_id)
@@ -354,7 +344,7 @@ async def upload_node_content(
     request: Request,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    _product: ProductORM = Depends(require_product_access("rw")),
+    _product: ProductORM = Depends(require_product_permission("docs")),
 ) -> KnowledgeNode:
     """Convert an uploaded file to Markdown via markitdown and store as content_md.
 
@@ -405,7 +395,7 @@ async def upload_node_content(
 
 
 # --------------------------------------------------------------------------- #
-# Verified toggle (item 5) — owner or admin
+# Verified toggle (item 5) — docs permission (SPEC-001)
 # --------------------------------------------------------------------------- #
 @router.post(
     "/api/products/{product_id}/knowledge/nodes/{node_id}/verify",
@@ -416,15 +406,10 @@ def verify_node(
     node_id: str,
     db: Session = Depends(get_db),
     user: UserORM = Depends(get_current_user),
+    _product: ProductORM = Depends(require_product_permission("docs")),
 ) -> KnowledgeNode:
-    """Mark a node as verified (owner of the product/node or admin only)."""
-    product = _load_product(db, product_id)
+    """Mark a node as verified (product docs permission)."""
     node = _load_node(db, product_id, node_id)
-    if not _is_owner(product, node, user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the product/node owner or an admin can verify",
-        )
     node.verified = True
     node.verified_by = user.id
     node.verified_at = datetime.utcnow()
@@ -440,7 +425,8 @@ def verify_node(
 async def generate_summary(
     product_id: str,
     db: Session = Depends(get_db),
-    _product: ProductORM = Depends(require_product_access("rw")),
+    user: UserORM = Depends(get_current_user),
+    _product: ProductORM = Depends(require_product_permission("docs")),
 ) -> Dict[str, Any]:
     """Generate an AI summary over ALL the product's nested entities.
 
@@ -448,6 +434,15 @@ async def generate_summary(
     standard local LLM for a concise summary, stores it onto ``ProductORM.summary``
     and returns it.
     """
+    # Shares the per-user docgen budget with generate: summary is the same
+    # class of expensive LLM operation (SPEC-017 security review finding).
+    enforce_user_rate_limit(
+        user.id,
+        setting_key="rate.docgen.per_user_hour",
+        env_name="RATE_DOCGEN_PER_USER_HOUR",
+        default_per_minute=10,
+        window_seconds=3600.0,
+    )
     product = (
         db.query(ProductORM)
         .options(
@@ -466,10 +461,20 @@ async def generate_summary(
         .filter(KnowledgeNodeORM.product_id == product_id)
         .all()
     )
-    summary = await generate_product_summary(
-        product, product.codebases, product.specs, nodes,
-        databases=product.databases, links=product.links,
-    )
+    try:
+        summary = await generate_product_summary(
+            product, product.codebases, product.specs, nodes,
+            databases=product.databases, links=product.links,
+        )
+    except SummaryLLMError as e:
+        # SPEC-026: surface the sanitized LLM failure cause in the 503 detail.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Could not generate summary: no content available or the LLM is "
+                f"unreachable: {e}"
+            ),
+        ) from e
     if not summary:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

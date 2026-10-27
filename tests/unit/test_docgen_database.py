@@ -156,10 +156,11 @@ def _patch_generation(monkeypatch, *, llm_text, tools=None):
 
     indexing: list = []
 
-    def track_indexing(content, dataset, *, source_type="codebase", source_id=None):
-        indexing.append((content, dataset, source_type, source_id))
+    def track_indexing(pages, dataset, *, source_type="codebase", source_id=None,
+                       only=None):
+        indexing.append((pages, dataset, source_type, source_id))
 
-    monkeypatch.setattr(db_doc_mod, "_index_in_background", track_indexing)
+    monkeypatch.setattr(db_doc_mod, "_index_pages_in_background", track_indexing)
     return indexing
 
 
@@ -1671,14 +1672,19 @@ class TestOracleBulkWalk:
         assert info["unavailable"] == []
         # Catalog queries run paged (ROWNUM windows) with the page size as
         # the row cap — a single wide ask was chopped by the tool-result
-        # char cap and the parser lost everything after the cut.
-        cols_calls = [c for c in sql.calls if "all_tab_columns" in c["sql"]]
+        # char cap and the parser lost everything after the cut. (The COUNT
+        # preflight calls carry no ROWNUM/max_rows and are filtered out.)
+        cols_calls = [
+            c for c in sql.calls
+            if "all_tab_columns" in c["sql"] and "ROWNUM <=" in c["sql"]
+        ]
         assert cols_calls and all(
-            c["max_rows"] == db_doc_mod._ORA_PAGE_ROWS
-            and 'ROWNUM <=' in c["sql"]
-            for c in cols_calls
+            c["max_rows"] == db_doc_mod._ORA_PAGE_ROWS for c in cols_calls
         )
-        owners_call = next(c for c in sql.calls if "GROUP BY owner" in c["sql"])
+        owners_call = next(
+            c for c in sql.calls
+            if "GROUP BY owner" in c["sql"] and "ROWNUM <=" in c["sql"]
+        )
         assert owners_call["max_rows"] == db_doc_mod._ORA_PAGE_ROWS
 
     def test_bulk_failure_falls_back_to_adapter_walk(self):
@@ -1774,7 +1780,10 @@ class TestOracleBulkWalk:
         assert len(info["tables"]) == 700
         assert info["tables"]["ALC.T0000"]["columns"][0]["name"] == "ID"
         assert info["tables"]["ALC.T0699"]["columns"][-1]["name"] == "NOTE"
-        pages = [c for c in sql.calls if "all_tab_columns" in c["sql"]]
+        pages = [
+            c for c in sql.calls
+            if "all_tab_columns" in c["sql"] and "ROWNUM <=" in c["sql"]
+        ]
         assert len(pages) == 2
 
     def test_maintenance_owners_never_walked(self):
@@ -1801,7 +1810,10 @@ class TestOracleBulkWalk:
         assert info["schemas"] == ["ALC"]
         assert set(info["tables"]) == {"ALC.T"}
         # Only ALC was worth a columns query — not three maintenance owners.
-        cols = [c for c in sql.calls if "all_tab_columns" in c["sql"]]
+        cols = [
+            c for c in sql.calls
+            if "all_tab_columns" in c["sql"] and "ROWNUM <=" in c["sql"]
+        ]
         assert len(cols) == 1 and "'ALC'" in cols[0]["sql"]
 
     def _source_guard_surface(self, session_owner, source_response):
@@ -2011,6 +2023,10 @@ class TestOracleFullCatalogPack:
 
         def responder(a):
             q = str(a.get("sql") or "")
+            if q.startswith("SELECT COUNT(*)"):
+                # COUNT preflight (SPEC-016): ok-empty — the count cross-check
+                # stays disabled for this fixture.
+                return self._envelope(self._OK_EMPTY)
             if "GROUP BY owner" in q:
                 return self._page(q, "| owner |\n| --- |\n", ["| APP |"])
             if "all_tab_columns" in q:
@@ -3203,6 +3219,100 @@ class TestRunDeepUnits:
         assert set(out["failed"]) == {"page_tbl_public_orders"}
         assert set(out["texts"]) == {"page_tbl_public_users"}
 
+    def test_gate_retry_with_feedback_recovers(self, monkeypatch):
+        """SPEC-004: tool-call echo sanitizes to empty text, fails the gate;
+        the retry prompt carries the <quality_gate> violations block and the
+        second attempt passes."""
+        import deepagents
+        from api.llm import client as llm_client
+
+        seen: list = []
+        good = "Назначение подтверждено: таблица хранит заказы клиентов магазина."
+
+        def fake_create(*, model, tools, system_prompt, **kw):
+            class FakeAgent:
+                async def ainvoke(self, payload, config=None):
+                    message = payload["messages"][0][1]
+                    name = re.search(r"for `(.*?)`", message).group(1)
+                    seen.append((name, message))
+                    if name == "public.orders" and sum(
+                        1 for n, _ in seen if n == name
+                    ) == 1:
+                        content = '<tool_call>{"name": "db_lookup"}</tool_call>'
+                    else:
+                        content = good if name == "public.orders" else "u" * 60
+                    return SimpleNamespace(messages=[
+                        SimpleNamespace(type="ai", content=content)
+                    ])
+
+            return FakeAgent()
+
+        monkeypatch.setattr(deepagents, "create_deep_agent", fake_create)
+        monkeypatch.setattr(llm_client, "build_chat_model", lambda **kw: object())
+        monkeypatch.setattr(db_doc_mod, "_entity_mcp_enabled", lambda: False)
+
+        out = self._run(_sample_info())
+
+        orders_msgs = [m for n, m in seen if n == "public.orders"]
+        assert len(orders_msgs) == 2  # 1 run + 1 gate retry
+        assert "<quality_gate>" in orders_msgs[1]
+        assert out["degraded"] == [] and out["failed"] == {}
+        assert out["texts"]["page_tbl_public_orders"] == good
+
+    def test_gate_exhaustion_saves_sanitized_degraded(self, monkeypatch):
+        """SPEC-004: persistent agent-echo text (the deepagents error
+        wrapper) exhausts the gate; the page is still saved (>=40 chars) and
+        the unit lands in out['degraded'] for provenance marking."""
+        echo = "We cannot invoke subagent due to error: 429 rate limit"
+        self._patch_stack(
+            monkeypatch,
+            lambda name: echo if name == "public.orders" else "u" * 60,
+        )
+        out = self._run(_sample_info())
+        assert out["degraded"] == ["page_tbl_public_orders"]
+        assert out["failed"] == {}
+        assert out["texts"]["page_tbl_public_orders"] == echo
+
+    def test_wall_clock_watchdog_cancels_stalled_unit(self, monkeypatch):
+        """SPEC-015: a never-completing unit agent is cancelled by its
+        wall-clock budget, recorded in ``failed`` with the budget message,
+        and the other units finish normally (no majority → no fallback)."""
+        import deepagents
+        from api.config import timeout as timeout_mod
+        from api.llm import client as llm_client
+
+        cancelled: list = []
+
+        def fake_create(*, model, tools, system_prompt, **kw):
+            class FakeAgent:
+                async def ainvoke(self, payload, config=None):
+                    name = re.search(
+                        r"for `(.*?)`", payload["messages"][0][1]
+                    ).group(1)
+                    if name == "public.orders":
+                        try:
+                            await asyncio.sleep(999)
+                        except asyncio.CancelledError:
+                            cancelled.append(name)
+                            raise
+                    return SimpleNamespace(messages=[
+                        SimpleNamespace(type="ai", content="u" * 60)
+                    ])
+
+            return FakeAgent()
+
+        monkeypatch.setattr(deepagents, "create_deep_agent", fake_create)
+        monkeypatch.setattr(llm_client, "build_chat_model", lambda **kw: object())
+        monkeypatch.setattr(db_doc_mod, "_entity_mcp_enabled", lambda: False)
+        monkeypatch.setattr(timeout_mod, "resolve_db_unit_wall_clock", lambda: 0.05)
+
+        out = self._run(_sample_info())
+
+        assert cancelled == ["public.orders"]
+        assert set(out["texts"]) == {"page_tbl_public_users"}
+        assert "wall-clock budget exceeded" in out["failed"]["page_tbl_public_orders"]
+        assert out["fallback"] is False  # 1 of 2 failed is not a majority
+
     def test_cancellation_propagates(self, monkeypatch):
         cancel = db_doc_mod.JobCancelledError
 
@@ -3232,8 +3342,9 @@ class TestRunDeepUnits:
         created = self._patch_stack(monkeypatch, lambda name: "x" * 60)
         monkeypatch.setattr(db_doc_mod, "_entity_mcp_enabled", lambda: True)
 
-        async def fake_gather(product_id):
+        async def fake_gather(product_id, session_factory=None, scope="expert"):
             assert product_id == "p1"
+            assert scope == "database"  # SPEC-028: deep units are DB-scoped
             return [FakeTool("mcp_probe")]
 
         monkeypatch.setattr(mcp_manager, "gather_mcp_agent_tools", fake_gather)
@@ -3257,7 +3368,7 @@ class TestRunDeepUnits:
             async def ainvoke(self, args):
                 return ["Query executed with errors"]
 
-        async def fake_gather(product_id):
+        async def fake_gather(product_id, session_factory=None, scope="expert"):
             return [PoisonedTool()]
 
         monkeypatch.setattr(mcp_manager, "gather_mcp_agent_tools", fake_gather)
@@ -3516,10 +3627,10 @@ class TestGenerateDatabaseDocs:
         # DB-context digest for the codebase flow lands on the tables page.
         db_ctx = entity.pages["page_tables"]["provenance"]["db_context"]
         assert db_ctx["counts"]["tables"] == 2
-        # Indexing: final docs, product dataset, database source scoping.
+        # Indexing: page-granular, product dataset, database source scoping.
         assert len(indexing) == 1
-        content, dataset, source_type, source_id = indexing[0]
-        assert content == result
+        pages, dataset, source_type, source_id = indexing[0]
+        assert "page_overview" in pages
         assert dataset == "prod_prod_1"
         assert source_type == "database"
         assert source_id == "db_1"
@@ -4069,3 +4180,194 @@ class TestJobsDatabaseDispatch:
         job = jobs_mod.get_job(job_id)
         assert job["status"] == "failed"
         assert "unreachable" in job["error"]
+
+
+# ============================================================================
+# SPEC-016: chop detection + halving + COUNT(*) completeness cross-check
+# ============================================================================
+class TestPagedRowsChopCompleteness:
+    """The manager's 100k tool-result cap used to chop a wide catalog page
+    mid-table; the parser read the chopped page as SHORT and silently ended
+    the walk at ~51 of 836 tables. Every page must now be checked for the
+    truncation marker and the SAME window re-fetched with a halved page
+    size until it fits."""
+
+    _CAP = 100_000  # the manager's tool-result char cap
+    _COLS_HEAD = (
+        "| table_schema | table_name | column_id | column_name"
+        " | data_type | nullable | num_rows |"
+        "\n| --- | --- | --- | --- | --- | --- | --- |\n"
+    )
+
+    @classmethod
+    def _chop(cls, text):
+        # Same contract as _call_tool / the manager's bounded wrapper.
+        if len(text) <= cls._CAP:
+            return text
+        return text[: cls._CAP] + f"\n…[truncated: {len(text)} chars total]"
+
+    @classmethod
+    def _page_env(cls, page_rows):
+        return cls._chop(
+            TestOracleBulkWalk._envelope(cls._COLS_HEAD + "\n".join(page_rows))
+        )
+
+    def _sql_tool(self, col_rows, *, count, hard_cap=None):
+        def responder(a):
+            q = str(a.get("sql") or "")
+            if q.startswith("SELECT COUNT(*)"):
+                if "all_tab_columns" in q:
+                    return TestOracleBulkWalk._envelope(
+                        f"| cnt |\n| --- |\n| {count} |"
+                    )
+                if "GROUP BY owner" in q:
+                    return TestOracleBulkWalk._envelope("| cnt |\n| --- |\n| 1 |")
+                return TestOracleBulkWalk._envelope(
+                    "Query executed successfully, but returned no rows."
+                )
+            if "GROUP BY owner" in q:
+                return TestOracleBulkWalk._envelope("| owner |\n| --- |\n| ALC |")
+            if "all_tab_columns" in q:
+                lo = int(re.search(r'"rnum" > (\d+)', q).group(1))
+                hi = int(re.search(r"ROWNUM <= (\d+)", q).group(1))
+                if hard_cap is not None:
+                    hi = min(hi, hard_cap)
+                page = col_rows[lo:hi]
+                if not page:
+                    return TestOracleBulkWalk._envelope(
+                        "Query executed successfully, but returned no rows."
+                    )
+                return self._page_env(page)
+            return TestOracleBulkWalk._envelope(
+                "Query executed successfully, but returned no rows."
+            )
+
+        return FakeTool("run_sql_query", {"sql": {}, "max_rows": {}}, responder)
+
+    def test_836_wide_tables_survive_page_chops(self, caplog):
+        # The spec's regression: 836 tables x 3 columns (~120-char rows) —
+        # a 1 200-row page is ~145k chars and gets chopped; the walk must
+        # halve, refetch the SAME window and still collect all 836 tables.
+        col_rows = [
+            f"| ALC | T{i:04d} | {cid} | {cname}_{i:04d}_"
+            + "X" * 88
+            + " | VARCHAR2 | Y | 0 |"
+            for i in range(836)
+            for cid, cname in ((1, "ID"), (2, "NAME_PAD"), (3, "NOTE"))
+        ]
+        sql = self._sql_tool(col_rows, count=len(col_rows))
+        roles = db_doc_mod._classify_introspection_tools([sql])
+
+        with caplog.at_level("WARNING"):
+            info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
+
+        assert len(info["tables"]) == 836
+        assert info["tables"]["ALC.T0000"]["columns"][0]["name"].startswith("ID")
+        assert info["tables"]["ALC.T0835"]["columns"][-1]["name"].startswith("NOTE")
+        stats = info["walk_stats"]["columns"]
+        assert stats["fetched"] == stats["expected"] == len(col_rows)
+        assert stats["chopped"] >= 1
+        assert any("chopped page" in r.getMessage() for r in caplog.records)
+
+    def test_chopped_first_page_halves_and_finishes(self, caplog):
+        # ~890-char rows: the window shrinks 1200→600→300→150→75 until one
+        # page fits the cap — every halving re-fetches the SAME window.
+        col_rows = [
+            f"| ALC | T{i:04d} | 1 | C{i:04d}_" + "Y" * 860 + " | VARCHAR2 | Y | 0 |"
+            for i in range(130)
+        ]
+        sql = self._sql_tool(col_rows, count=130)
+        roles = db_doc_mod._classify_introspection_tools([sql])
+
+        with caplog.at_level("WARNING"):
+            info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
+
+        assert len(info["tables"]) == 130
+        assert info["walk_stats"]["columns"] == {
+            "expected": 130, "fetched": 130, "chopped": 4,
+        }
+        windows = [
+            (
+                re.search(r'"rnum" > (\d+)', c["sql"]).group(1),
+                re.search(r"ROWNUM <= (\d+)", c["sql"]).group(1),
+            )
+            for c in sql.calls
+            if "all_tab_columns" in c["sql"] and "ROWNUM <=" in c["sql"]
+        ]
+        assert windows[0] == ("0", str(db_doc_mod._ORA_PAGE_ROWS))
+        assert ("0", "75") in windows  # the fit size for this row width
+
+    def test_count_mismatch_visible_in_coverage(self, caplog):
+        # The server hard-caps every response at 60 rows (markerless — the
+        # old walk called it a genuine end): COUNT says 100, the coverage
+        # report and a WARNING must surface the 40-row gap.
+        col_rows = [
+            f"| ALC | T{i:04d} | 1 | ID | NUMBER | N | 5 |" for i in range(100)
+        ]
+        sql = self._sql_tool(col_rows, count=100, hard_cap=60)
+        roles = db_doc_mod._classify_introspection_tools([sql])
+
+        with caplog.at_level("WARNING"):
+            info = asyncio.run(db_doc_mod._introspect(roles, engine="oracle"))
+
+        assert len(info["tables"]) == 60
+        stats = info["walk_stats"]["columns"]
+        assert stats["expected"] == 100 and stats["fetched"] == 60
+        assert any(
+            "fetched 60 of 100 expected rows" in r.getMessage()
+            for r in caplog.records
+        )
+        assert "| columns | 60 | 100 | 0 |" in db_doc_mod._coverage_section(
+            info, None, {}, {}
+        )
+
+
+class TestDeepUnitSamplingGate:
+    """SPEC-016: a bounded ``sample_rows`` tool joins the entity tools when a
+    live sql tool exists and the DB_DEEP_SAMPLE_ROWS gate is on."""
+
+    def test_sample_rows_bounded_and_gated(self, monkeypatch):
+        sql = FakeTool(
+            "run_sql_query", {"sql": {}},
+            json.dumps({"columns": ["ID"], "rows": [[1], [2]]}),
+        )
+        monkeypatch.setattr(db_doc_mod, "_deep_sample_rows", lambda: 5)
+        tools = db_doc_mod.build_entity_tools(_sample_info(), sql_tool=sql)
+        assert [t.name for t in tools] == ["entity_source", "db_lookup", "sample_rows"]
+
+        out = asyncio.run(tools[2].ainvoke({"full_name": "public.users"}))
+        assert '"ID"' in out
+        assert sql.calls[0]["sql"] == (
+            "SELECT * FROM public.users FETCH FIRST 5 ROWS ONLY"
+        )
+        # Injection-shaped names never reach the server.
+        assert asyncio.run(
+            tools[2].ainvoke({"full_name": "users; DROP TABLE users"})
+        ).startswith("ERROR")
+
+        # Gate off or no live sql tool → the classic two-tool surface.
+        monkeypatch.setattr(db_doc_mod, "_deep_sample_rows", lambda: 0)
+        assert len(db_doc_mod.build_entity_tools(_sample_info(), sql_tool=sql)) == 2
+        monkeypatch.setattr(db_doc_mod, "_deep_sample_rows", lambda: 5)
+        assert len(db_doc_mod.build_entity_tools(_sample_info())) == 2
+
+
+class TestDeepUnitsCheckpoint:
+    def test_finished_units_checkpointed_to_progress(self, monkeypatch):
+        # SPEC-016: finished deep units land in jobs state via the progress
+        # callback, so a rerun (or an operator) can see exactly what survived.
+        TestRunDeepUnits._patch_stack(monkeypatch, lambda name: "u" * 60)
+        seen: list = []
+        out = asyncio.run(db_doc_mod._run_deep_units(
+            _sample_info(), database_name="Main DB", product_id="p1",
+            model="m", base_url=None, api_key=None, language="ru",
+            product_context="", old_pages={}, force_pages=None,
+            progress=lambda **fields: seen.append(fields),
+        ))
+        checkpoints = [
+            f["deep_units_checkpoint"] for f in seen if "deep_units_checkpoint" in f
+        ]
+        assert checkpoints  # the final checkpoint always lands
+        assert set(checkpoints[-1]["done"]) == set(out["texts"])
+        assert checkpoints[-1]["failed"] == 0
+        assert checkpoints[-1]["at"]

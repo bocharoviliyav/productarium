@@ -7,6 +7,9 @@ Admin CRUD + health-check + cached tool list over an isolated SQLite DB:
 - validation 400s: bad URL scheme, shell-metachar/``..``/whitespace commands,
   bogus transport, cross-field mismatches, oversize args/secrets, empty name.
 - duplicate name -> 409; transport immutable on PUT -> 400.
+- scopes (SPEC-028): required non-empty subset of MCP_SCOPES on create,
+  unknown value -> 400, silent dedup, PUT absent-keeps / present-replaces,
+  GET returns them.
 - PUT secret-dict presence semantics (absent keeps, present replaces).
 - DELETE -> 200, bindings cascade, second DELETE -> 404.
 - POST /test persists status via a faked manager; GET /tools serves the cache
@@ -99,6 +102,7 @@ _HTTP_BODY = {
     "transport": "http",
     "url": "http://localhost:9000/mcp",
     "headers": {"Authorization": "Bearer s3cret-value"},
+    "scopes": ["expert", "database"],
 }
 
 
@@ -114,6 +118,7 @@ class TestCreateMcpServer:
         assert body["transport"] == "http"
         assert body["url"] == "http://localhost:9000/mcp"
         assert body["enabled"] is True
+        assert body["scopes"] == ["expert", "database"]
         assert body["status"] == "unknown"
         assert body["status_checked_at"] is None
 
@@ -143,6 +148,7 @@ class TestCreateMcpServer:
                 "command": "/usr/local/bin/mcp-server",
                 "args": ["--verbose", "--port", "9000"],
                 "env": {"API_TOKEN": "tok"},
+                "scopes": ["database"],
             },
         )
         assert resp.status_code == 200, resp.text
@@ -166,7 +172,10 @@ class TestCreateMcpServer:
         client.post("/api/admin/mcp/servers", json=_HTTP_BODY)
         client.post(
             "/api/admin/mcp/servers",
-            json={"name": "beta", "transport": "stdio", "command": "/bin/srv"},
+            json={
+                "name": "beta", "transport": "stdio", "command": "/bin/srv",
+                "scopes": ["expert"],
+            },
         )
         resp = client.get("/api/admin/mcp/servers")
         assert resp.status_code == 200
@@ -177,7 +186,11 @@ class TestCreateMcpServer:
 # --- validation ---------------------------------------------------------------
 class TestCreateValidation:
     def _post(self, client, payload):
-        return client.post("/api/admin/mcp/servers", json=payload)
+        # SPEC-028: scopes are required on create — inject a valid default so
+        # these tests exercise TRANSPORT/secret validation, not 422s.
+        return client.post(
+            "/api/admin/mcp/servers", json={"scopes": ["expert"], **payload}
+        )
 
     def test_bad_url_scheme(self, isolated_db, monkeypatch):
         app, client, _ = _build_client(isolated_db, _mod(), monkeypatch)
@@ -304,6 +317,72 @@ class TestCreateValidation:
     def test_whitespace_only_name_rejected(self, isolated_db, monkeypatch):
         app, client, _ = _build_client(isolated_db, _mod(), monkeypatch)
         r = self._post(client, {**_HTTP_BODY, "name": "   "})
+        assert r.status_code == 400
+
+
+# --- scopes (SPEC-028) ------------------------------------------------------------
+class TestScopesContract:
+    def test_missing_scopes_422(self, isolated_db, monkeypatch):
+        app, client, _ = _build_client(isolated_db, _mod(), monkeypatch)
+        body = {k: v for k, v in _HTTP_BODY.items() if k != "scopes"}
+        assert client.post("/api/admin/mcp/servers", json=body).status_code == 422
+
+    def test_empty_scopes_422(self, isolated_db, monkeypatch):
+        app, client, _ = _build_client(isolated_db, _mod(), monkeypatch)
+        r = client.post("/api/admin/mcp/servers", json={**_HTTP_BODY, "scopes": []})
+        assert r.status_code == 422
+
+    def test_unknown_scope_400(self, isolated_db, monkeypatch):
+        app, client, _ = _build_client(isolated_db, _mod(), monkeypatch)
+        r = client.post(
+            "/api/admin/mcp/servers", json={**_HTTP_BODY, "scopes": ["wat"]}
+        )
+        assert r.status_code == 400
+        assert "scopes" in r.json()["detail"]
+
+    def test_dedup_preserves_first_seen_order(self, isolated_db, monkeypatch):
+        app, client, _ = _build_client(isolated_db, _mod(), monkeypatch)
+        r = client.post(
+            "/api/admin/mcp/servers",
+            json={**_HTTP_BODY, "scopes": ["database", "expert", "database"]},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["scopes"] == ["database", "expert"]
+
+    def test_put_absent_keeps_stored_scopes(self, isolated_db, monkeypatch):
+        app, client, _ = _build_client(isolated_db, _mod(), monkeypatch)
+        created = client.post("/api/admin/mcp/servers", json=_HTTP_BODY).json()
+        r = client.put(
+            f"/api/admin/mcp/servers/{created['id']}", json={"enabled": False}
+        )
+        assert r.status_code == 200
+        assert r.json()["scopes"] == ["expert", "database"]
+
+    def test_put_replaces_scopes(self, isolated_db, monkeypatch):
+        app, client, _ = _build_client(isolated_db, _mod(), monkeypatch)
+        created = client.post("/api/admin/mcp/servers", json=_HTTP_BODY).json()
+        r = client.put(
+            f"/api/admin/mcp/servers/{created['id']}",
+            json={"scopes": ["codebase"]},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["scopes"] == ["codebase"]
+
+    def test_put_unknown_scope_400(self, isolated_db, monkeypatch):
+        app, client, _ = _build_client(isolated_db, _mod(), monkeypatch)
+        created = client.post("/api/admin/mcp/servers", json=_HTTP_BODY).json()
+        r = client.put(
+            f"/api/admin/mcp/servers/{created['id']}",
+            json={"scopes": ["nope"]},
+        )
+        assert r.status_code == 400
+
+    def test_put_empty_scopes_400(self, isolated_db, monkeypatch):
+        app, client, _ = _build_client(isolated_db, _mod(), monkeypatch)
+        created = client.post("/api/admin/mcp/servers", json=_HTTP_BODY).json()
+        r = client.put(
+            f"/api/admin/mcp/servers/{created['id']}", json={"scopes": []}
+        )
         assert r.status_code == 400
 
 
@@ -462,7 +541,8 @@ class TestUpdateMcpServer:
         created = client.post(
             "/api/admin/mcp/servers",
             json={"name": "s", "transport": "stdio",
-                  "command": "/usr/local/bin/mcp-server"},
+                  "command": "/usr/local/bin/mcp-server",
+                  "scopes": ["expert"]},
         ).json()
 
         r = client.put(

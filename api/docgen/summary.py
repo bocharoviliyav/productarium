@@ -99,6 +99,19 @@ def _safe_build_summary_llm(
         return None
 
 
+class SummaryLLMError(RuntimeError):
+    """The summary LLM call itself failed (SPEC-026).
+
+    Carries a sanitized cause — original exception class + one ~200-char
+    line, no stack trace — so the knowledge router can surface a real reason
+    in its 503 detail.
+    """
+
+    def __init__(self, cause: BaseException) -> None:
+        detail = " ".join(str(cause).split())[:200]
+        super().__init__(f"{type(cause).__name__}: {detail}")
+
+
 def _clean_text(text: Optional[str]) -> str:
     """Strip surrounding whitespace, a wrapping ```markdown fence, and any inline
     line-number prefixes the LLM emitted inside code blocks."""
@@ -146,9 +159,9 @@ async def generate_product_summary(
     Codebases + specs + nodes (legacy positional contract) plus databases and
     links (keyword-only; empty defaults keep old callers/tests working).
 
-    Returns the cleaned summary text (possibly empty on LLM failure or when the
-    product has no content to summarize). NEVER raises: callers store/return the
-    result directly.
+    Returns the cleaned summary text (possibly empty when the product has no
+    content to summarize). Raises :class:`SummaryLLMError` when the LLM call
+    itself fails — callers surface the sanitized cause (knowledge router 503).
     """
     product_name = getattr(product, "name", "") or "product"
 
@@ -197,9 +210,9 @@ async def generate_product_summary(
         return ""
     try:
         raw = _clean_text(await llm.generate(_build_summary_prompt(product_name, content)))
-    except Exception as e:  # pragma: no cover - depends on live LLM
+    except Exception as e:
         logger.warning("Summary LLM generation failed: %s", e)
-        return ""
+        raise SummaryLLMError(e) from e
     finally:
         # P1-14: release httpx pools. Duck-typed close — tests (and future
         # callers) may swap ``_safe_build_summary_llm`` for objects without
@@ -216,4 +229,4 @@ async def generate_product_summary(
     return masked
 
 
-__all__ = ["generate_product_summary"]
+__all__ = ["SummaryLLMError", "generate_product_summary"]

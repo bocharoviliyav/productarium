@@ -2,7 +2,7 @@
 
 Split out of the former ``api/expert_agent.py`` (Step 6). Owns:
 - ``_retrieve_product_knowledge``: semantic recall over the product-scoped
-  memory chunks with artifact-docs + live-Confluence fallbacks. Never raises;
+  memory chunks with artifact-docs fallback. Never raises;
   returns "" when nothing is available.
 - ``_fallback_artifact_docs``: concatenates artifact ``generated_docs`` / page
   content when memory recall is empty (own short-lived DB session, non-fatal).
@@ -94,7 +94,7 @@ def _fallback_artifact_docs(product_id: str) -> str:
 
 async def _retrieve_product_knowledge(product_id: str, query: str) -> str:
     """Retrieve product knowledge via the active memory backend (pgvector);
-    fall back to concatenated artifact docs or live Confluence. Never raises;
+    fall back to concatenated artifact docs. Never raises;
     returns "" if nothing available.
     """
     try:
@@ -116,32 +116,10 @@ async def _retrieve_product_knowledge(product_id: str, query: str) -> str:
             "Expert: memory recall failed for product %r: %s", product_id, e
         )
 
-    # P1-13: sync DB reads / connector HTTP must not block the event loop.
+    # P1-13: sync DB reads must not block the event loop.
     fallback_docs = await asyncio.to_thread(_fallback_artifact_docs, product_id)
     if fallback_docs:
         return fallback_docs
-
-    # Fallback to live Confluence (direct or MCP) if configured
-    try:
-        from api.integrations.registry import get_connector
-        c_connector = get_connector("confluence")
-        if c_connector and c_connector.is_configured():
-            spaces = await asyncio.to_thread(c_connector.list_spaces)
-            if spaces:
-                sp_id = spaces[0].get("key") or spaces[0].get("id")
-                if sp_id:
-                    pulled = await asyncio.to_thread(
-                        c_connector.pull, sp_id, opts={"recursive": False}
-                    )
-                    if pulled and pulled.get("markdown"):
-                        # P0-8: third-party wiki content is untrusted — frame it
-                        # as data before it reaches the LLM prompt.
-                        from api.utils.llm_helpers import wrap_untrusted
-
-                        return wrap_untrusted(pulled["markdown"])
-    except Exception as e:
-        logger.debug("Expert live Confluence fallback skipped for %s: %s", product_id, e)
-
     return ""
 
 

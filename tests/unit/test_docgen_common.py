@@ -160,6 +160,139 @@ class TestCleanLlmText:
 
 
 # ============================================================================
+# SPEC-004: agent-echo sanitizer + page quality gate
+# ============================================================================
+class TestStripAgentArtifacts:
+    def test_strips_closed_and_unclosed_tool_calls(self):
+        closed = 'A\n<tool_call>{"name": "t"}</tool_call>\nB'
+        assert c._strip_agent_artifacts(closed) == "A\nB"
+        # Unclosed echo is cut to the END OF THE LINE, not the whole text.
+        unclosed = 'A\n<tool_call>{"name"\nB'
+        assert c._strip_agent_artifacts(unclosed) == "A\nB"
+
+    def test_strips_repeated_tool_call_blocks(self):
+        text = '<tool_call>{"a": 1}</tool_call>' * 5 + "хвост"
+        assert c._strip_agent_artifacts(text) == "хвост"
+
+    def test_strips_special_tokens_and_empty_fences(self):
+        text = "<|im_start|>assistant\n# T\n<|im_end|>\n```python\n\n```\nbody"
+        out = c._strip_agent_artifacts(text)
+        assert "<|" not in out and "```" not in out
+        assert "# T" in out and "body" in out
+
+    def test_strips_repeated_fence_stubs(self):
+        assert c._strip_agent_artifacts("# T\n```\n```\n```\n```") == "# T"
+
+    def test_keeps_content_fences(self):
+        text = "# T\n\n```python\nx = 1\n```"
+        assert c._strip_agent_artifacts(text) == text
+
+    def test_clean_llm_text_removes_tool_echo(self):
+        text = (
+            '<tool_call>{"name": "t"}</tool_call>\n'
+            '<tool_call>{"name": "t2"\n'
+            "```markdown\n# Title\n\nContent.\n```"
+        )
+        assert c._clean_llm_text(text) == "# Title\n\nContent."
+
+
+class TestValidatePage:
+    def _valid(self):
+        return "# Обзор\n\n- пункт один\n- пункт два\n\n" + "Текст раздела. " * 30
+
+    def test_valid_page_passes(self):
+        assert c.validate_page("Обзор", self._valid()) == []
+
+    def test_empty_title_and_short_text_flagged(self):
+        violations = c.validate_page("", "коротко")
+        assert any("заголовок" in v for v in violations)
+        assert any("короче" in v for v in violations)
+
+    def test_residual_markers_flagged(self):
+        page = "# T\n\n- x\n" + "Текст. " * 60 + "\n<tool_call>"
+        assert any(
+            "служебной разметки" in v for v in c.validate_page("T", page)
+        )
+        subagent = "We cannot invoke subagent due to error: 429 " + "x" * 250
+        assert any(
+            "subagent" in v for v in c.validate_page("T", subagent)
+        )
+
+    def test_wall_of_prose_without_structure_flagged(self):
+        page = "Простой текст без структуры. " * 30
+        assert any(
+            "заголовка, списка" in v for v in c.validate_page("T", page)
+        )
+
+    def test_short_entity_page_passes_without_structure(self):
+        text = "Таблица хранит заказы клиентов и суммы их покупок."
+        assert c.validate_page(
+            "orders", text, min_chars=40, require_structure=False
+        ) == []
+
+
+class TestRunWithPageGate:
+    def test_first_pass_ok(self):
+        async def run_once(feedback):
+            assert feedback == ""
+            return "# T\n\n- x\n\n" + "Текст. " * 60
+
+        text, degraded, attempts = asyncio.run(
+            c.run_with_page_gate(run_once, title="T")
+        )
+        assert degraded is False and attempts == 1
+        assert text.startswith("# T")
+
+    def test_retry_with_feedback_then_ok(self):
+        seen = []
+
+        async def run_once(feedback):
+            seen.append(feedback)
+            if len(seen) == 1:
+                return "мусор"
+            assert "<quality_gate>" in feedback
+            return "# T\n\n- x\n\n" + "Текст. " * 60
+
+        text, degraded, attempts = asyncio.run(
+            c.run_with_page_gate(run_once, title="T")
+        )
+        assert degraded is False and attempts == 2 and len(seen) == 2
+
+    def test_exhaustion_returns_sanitized_degraded(self):
+        async def run_once(feedback):
+            return 'Таблица заказов. ' + '<tool_call>{"n": 1}</tool_call>' * 5
+
+        text, degraded, attempts = asyncio.run(
+            c.run_with_page_gate(run_once, title="T")
+        )
+        assert degraded is True
+        assert attempts == 1 + c.PAGE_GATE_MAX_RETRIES
+        assert "<tool_call" not in text and "Таблица заказов." in text
+
+    def test_exception_propagates(self):
+        async def run_once(feedback):
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(c.run_with_page_gate(run_once, title="T"))
+
+    def test_progress_gets_gate_fields(self):
+        events = []
+
+        async def run_once(feedback):
+            return "мусор"
+
+        asyncio.run(c.run_with_page_gate(
+            run_once, title="T", label="lbl",
+            progress=lambda **kw: events.append(kw),
+        ))
+        assert any(
+            e.get("gate_section") == "lbl" and e.get("gate_attempt") == 1
+            for e in events
+        )
+
+
+# ============================================================================
 # _carry_page_verify_flags
 # ============================================================================
 class TestCarryPageVerifyFlags:
@@ -680,3 +813,86 @@ class TestPlainAgentTools:
 
         wrapped = c.plain_agent_tools([self._adapter_tool(ok)])[0]
         assert asyncio.run(wrapped.ainvoke({"sql": "SELECT 1"})) == "plain"
+
+
+# ============================================================================
+# reindex_entity (Q-9 router dedup + S-12 page prune)
+# ============================================================================
+class TestReindexEntity:
+    def test_page_edit_targets_page_source(self, monkeypatch):
+        import api.memory as memory_mod
+
+        calls = []
+
+        async def fake_index(content, product_id, *, source_type="codebase", source_id=None):
+            calls.append((content, product_id, source_type, source_id))
+
+        monkeypatch.setattr(memory_mod, "index_document", fake_index)
+
+        async def _run():
+            c.reindex_entity("p1", "page text", "cb_1", page_id="pg_1")
+            await asyncio.sleep(0.05)
+
+        asyncio.run(_run())
+        assert calls == [("page text", "p1", "codebase", "cb_1::page::pg_1")]
+
+    def test_blob_edit_targets_entity_source(self, monkeypatch):
+        import api.memory as memory_mod
+
+        calls = []
+
+        async def fake_index(content, product_id, *, source_type="codebase", source_id=None):
+            calls.append((content, product_id, source_type, source_id))
+
+        monkeypatch.setattr(memory_mod, "index_document", fake_index)
+
+        async def _run():
+            c.reindex_entity("p1", "doc blob", "spec_1", source_type="spec")
+            await asyncio.sleep(0.05)
+
+        asyncio.run(_run())
+        assert calls == [("doc blob", "p1", "spec", "spec_1")]
+
+    def test_cleared_page_prunes_only_that_page(self, monkeypatch):
+        """S-12: an emptied page drops ITS chunks; blob + other pages stay."""
+        import api.memory as memory_mod
+
+        prunes = []
+        indexed = []
+
+        async def fake_list(product_id, source_type, source_id):
+            # list_page_sources returns PAGE-granular sources only.
+            return ["cb_1::page::pg_1", "cb_1::page::other"]
+
+        async def fake_prune(product_id, source_type, source_id, keep):
+            prunes.append((product_id, source_type, source_id, keep))
+
+        async def fake_index(content, product_id, *, source_type="codebase", source_id=None):
+            indexed.append(source_id)
+
+        monkeypatch.setattr(memory_mod, "list_page_sources", fake_list)
+        monkeypatch.setattr(memory_mod, "prune_stale_sources", fake_prune)
+        monkeypatch.setattr(memory_mod, "index_document", fake_index)
+
+        async def _run():
+            c.reindex_entity("p1", "", "cb_1", page_id="pg_1")
+            await asyncio.sleep(0.05)
+
+        asyncio.run(_run())
+        assert prunes == [
+            ("p1", "codebase", "cb_1", ["cb_1", "cb_1::page::other"])
+        ]
+        assert indexed == []
+
+    def test_pages_replace_delegates_to_page_indexer(self, monkeypatch):
+        delegated = []
+        monkeypatch.setattr(
+            c, "_index_pages_in_background",
+            lambda pages, dataset, *, source_type, source_id: delegated.append(
+                (pages, dataset, source_type, source_id)
+            ),
+        )
+        c.reindex_entity("p1", None, "cb_1", pages={"a": {"content": "x"}})
+        assert delegated == [
+            ({"a": {"content": "x"}}, "prod_p1", "codebase", "cb_1")
+        ]

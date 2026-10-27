@@ -4,7 +4,7 @@ Split out of the former ``api/expert_agent.py`` (Step 6). Owns:
 - ``_generate_answer``: non-streaming answer (standard LLM -> "").
 - ``_stream_answer``: streaming answer over the expert LLM stream.
 
-The former fast-rlm long-context path was removed with the LangChain
+The long-context engine of the former stack was removed with the LangChain
 migration: the expert agent is a plain ChatOpenAI call (a LangGraph agent
 lands with Wave B). Imports ``_safe_build_llm`` from ``api.expert.llm`` and
 ``_clean_llm_text`` from ``api.expert.prompt`` as top-level names so they

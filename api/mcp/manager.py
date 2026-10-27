@@ -219,9 +219,11 @@ def _cap_tool_result(result: Any, limit: int) -> Any:
             text = str(result)
     if len(text) <= limit:
         return result
+    # Marker prefix «…[truncated» is a shared contract: api.docgen.database
+    # detects it to re-fetch chopped catalog pages at a smaller page size.
     return (
         text[:limit]
-        + f"\n…[MCP tool result truncated: {len(text)} chars total, kept first {limit}]"
+        + f"\n…[truncated MCP tool result: {len(text)} chars total, kept first {limit}]"
     )
 
 
@@ -256,10 +258,22 @@ def _wrap_bounded_tool(tool: Any) -> Any:
                 timeout,
             )
             return f"MCP tool {name!r} timed out after {timeout:.0f}s and was aborted."
+        except Exception as e:
+            # Adapter tools' content_and_artifact error path (a bare list of
+            # blocks on isError) raises ValueError inside langchain — degrade
+            # to a short error string instead of killing the agent graph.
+            logger.warning(
+                "mcp manager: MCP tool %r call failed: %s", name, e
+            )
+            return f"ERROR: {_short_error(e)}"
         return _cap_tool_result(result, limit)
 
     try:
-        return tool.model_copy(update={"coroutine": _bounded})
+        # response_format="content" drops the tuple contract of the copy:
+        # the wrapped coroutine returns plain content (never a two-tuple).
+        return tool.model_copy(
+            update={"coroutine": _bounded, "response_format": "content"}
+        )
     except Exception:
         return tool
 
@@ -380,11 +394,17 @@ class McpToolManager:
             return False, _short_error(e), []
 
     # -- product tools ----------------------------------------------------------
-    def _load_bindings(self, product_id: str, session_factory: Optional[Any]) -> List[Any]:
+    def _load_bindings(
+        self,
+        product_id: str,
+        session_factory: Optional[Any],
+        scope: Optional[str] = None,
+    ) -> List[Any]:
         """Enabled bindings of enabled servers for the product.
 
-        Returns ``[(binding, server), ...]``. Raises on DB failure (the caller
-        wraps best-effort).
+        Returns ``[(binding, server), ...]``. ``scope`` (SPEC-028) keeps only
+        servers whose ``scopes`` list contains it. Raises on DB failure (the
+        caller wraps best-effort).
         """
         from api.models import McpServerORM, ProductMcpServerORM
 
@@ -403,6 +423,10 @@ class McpToolManager:
                 .order_by(ProductMcpServerORM.created_at, ProductMcpServerORM.id)
                 .all()
             )
+            if scope is not None:
+                rows = [
+                    r for r in rows if scope in (getattr(r[1], "scopes", None) or [])
+                ]
             return list(rows)
         finally:
             session.close()
@@ -411,10 +435,12 @@ class McpToolManager:
         self,
         product_id: str,
         session_factory: Optional[Any] = None,
+        scope: Optional[str] = None,
     ) -> List[Any]:
         """LangChain tools of every ENABLED binding to an ENABLED server.
 
-        Discovery for all bound servers runs in PARALLEL (a dead server
+        ``scope`` restricts the walk to servers carrying that scope
+        (SPEC-028). Discovery for all bound servers runs in PARALLEL (a dead server
         costs its own timeout, not the sum of all timeouts) and failed
         discoveries are negatively cached (short TTL), so repeated agent
         builds don't re-dial known-dead servers. Per binding: name allowlist
@@ -428,7 +454,7 @@ class McpToolManager:
             # Sync SQLAlchemy off the event loop (it blocks all requests on
             # this worker while it runs).
             bindings = await asyncio.to_thread(
-                self._load_bindings, product_id, session_factory
+                self._load_bindings, product_id, session_factory, scope
             )
         except Exception as e:
             logger.warning(
@@ -505,16 +531,17 @@ def reset_mcp_manager() -> McpToolManager:
 async def gather_mcp_agent_tools(
     product_id: str,
     session_factory: Optional[Any] = None,
+    scope: str = "expert",
 ) -> List[Any]:
-    """Best-effort MCP tools for the expert agent (never raises, never hangs).
+    """Best-effort MCP tools for a scoped consumer (never raises, never hangs).
 
     Wraps :meth:`McpToolManager.get_tools_for_product`; any failure (DB down,
     dependency missing) logs and returns ``[]`` so an MCP outage can never
-    break the agent.
+    break the agent. Default scope ``expert`` (expert chat + Deep Research).
     """
     try:
         return await get_mcp_manager().get_tools_for_product(
-            product_id, session_factory=session_factory
+            product_id, session_factory=session_factory, scope=scope
         )
     except Exception as e:
         logger.warning(

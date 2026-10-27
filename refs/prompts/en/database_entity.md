@@ -33,7 +33,9 @@ head is truncated, read the full source page by page before concluding.
    relations to other objects, pitfalls — facts from the bundle/tools only.
 
 Forbidden: restating column lists, constraints, indexes or DDL — the page
-renders them automatically. Do not invent identifiers; mark assumptions
-explicitly ("judging by the name/source …"). Write in {language_name}
-(technical terms in English). The final message must contain ONLY the finished
-text — no preamble, no commentary.
+renders them automatically. Also forbidden: any tool machinery in the final
+text (``<tool_call>…</tool_call>`` blocks, special tokens like
+``<|im_start|>``/``<|im_end|>``, tool dialogs or logs). Do not invent
+identifiers; mark assumptions explicitly ("judging by the name/source …").
+Write in {language_name} (technical terms in English). The final message must
+contain ONLY the finished text — no preamble, no commentary.

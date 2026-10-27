@@ -12,6 +12,11 @@ Two modes:
 
 If ``authlib`` is not installed, ``AUTHLIB_AVAILABLE`` is False and the auth
 router returns 501 for the Keycloak endpoints.
+
+Admin REST API (SPEC-001): a separate confidential service-account client
+(``KEYCLOAK_ADMIN_CLIENT_ID`` + ``KEYCLOAK_ADMIN_CLIENT_SECRET``) lists realm
+groups for the admin roles↔groups mapping reference; it never handles user
+sessions. Unconfigured -> the admin endpoint reports 501.
 """
 
 from __future__ import annotations
@@ -21,7 +26,11 @@ import hashlib
 import logging
 import os
 import secrets
-from typing import Optional
+from typing import List, Optional
+
+import requests
+
+from api.config.timeout import resolve_keycloak_admin_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -150,3 +159,71 @@ def fetch_userinfo(access_token: str) -> Optional[dict]:
 def new_state() -> str:
     """Generate a random OAuth state token."""
     return secrets.token_urlsafe(16)
+
+
+# --- Admin REST API (SPEC-001 groups reference) -----------------------------
+def _admin_cfg() -> dict:
+    """Service-account client config (client credentials grant)."""
+    return {
+        "url": os.environ.get("KEYCLOAK_URL", "http://localhost:8080").rstrip("/"),
+        "client_id": os.environ.get("KEYCLOAK_ADMIN_CLIENT_ID", ""),
+        "client_secret": os.environ.get("KEYCLOAK_ADMIN_CLIENT_SECRET", ""),
+        "realm": os.environ.get("KEYCLOAK_REALM", "productarium"),
+    }
+
+
+def admin_configured() -> bool:
+    """True when the Admin API service-account client id + secret are set."""
+    c = _admin_cfg()
+    return bool(c["client_id"] and c["client_secret"])
+
+
+def _service_account_token() -> Optional[str]:
+    """Client-credentials access token for the Admin API (or None)."""
+    c = _admin_cfg()
+    try:
+        r = requests.post(
+            f"{c['url']}/realms/{c['realm']}/protocol/openid-connect/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": c["client_id"],
+                "client_secret": c["client_secret"],
+            },
+            timeout=resolve_keycloak_admin_timeout(),
+        )
+        if r.status_code == 200:
+            return r.json().get("access_token")
+        logger.warning("Keycloak admin token fetch failed: HTTP %s", r.status_code)
+    except Exception as e:
+        logger.warning("Keycloak admin token fetch error: %s", e)
+    return None
+
+
+def list_groups() -> Optional[List[dict]]:
+    """Top-level realm groups ``[{id, name, path}]`` for the mapping reference.
+
+    None = unconfigured/upstream failure (the endpoint degrades to 502);
+    names are simple (no leading slash), matching the ``groups`` claim mapper
+    with ``full.path=false`` that role mapping compares against.
+    """
+    token = _service_account_token()
+    if token is None:
+        return None
+    c = _admin_cfg()
+    try:
+        r = requests.get(
+            f"{c['url']}/admin/realms/{c['realm']}/groups",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"briefRepresentation": "true"},
+            timeout=resolve_keycloak_admin_timeout(),
+        )
+        if r.status_code == 200:
+            return [
+                {"id": g.get("id"), "name": g.get("name"), "path": g.get("path")}
+                for g in r.json()
+                if isinstance(g, dict) and g.get("name")
+            ]
+        logger.warning("Keycloak admin groups fetch failed: HTTP %s", r.status_code)
+    except Exception as e:
+        logger.warning("Keycloak admin groups fetch error: %s", e)
+    return None

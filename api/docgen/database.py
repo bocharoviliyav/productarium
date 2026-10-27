@@ -43,8 +43,8 @@ Stages:
    each, and — only when introspection found NO foreign keys — an
    explicitly-marked inference pass. Subpages stay deterministic; every
    LLM sentence is corroborated against the introspected identifiers.
-   Product knowledge from the semantic memory (codebase docs, specs,
-   Confluence) is attached as SUPPLEMENTARY context. LLM failure degrades
+   Product knowledge from the semantic memory (codebase docs, specs) is
+   attached as SUPPLEMENTARY context. LLM failure degrades
    to the deterministic skeleton — only a dead/unusable MCP surface is a
    hard error (an honest failed job, never empty docs).
 3. **Guard (verification)** — mermaid repair loop on pages carrying
@@ -86,12 +86,18 @@ from api.docgen._common import (
     _close_owned_llm,
     _product_dataset,
     _index_in_background,
+    _index_pages_in_background,
     _llm_or_none,
+    utc_now_iso,
     _make_repair_llm,
     _persist_artifact,
     _resolve_docgen_model,
+    _strip_agent_artifacts,
     emit_progress,
+    extract_json,
     plain_agent_tools,
+    run_with_page_gate,
+    run_with_unit_budget,
 )
 from api.docgen.corroborate import (
     filter_ungrounded_prose,
@@ -117,9 +123,10 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 # Budgets (introspection walk + render/enrich knobs)
 # --------------------------------------------------------------------------- #
-#: Sanity ceilings only — the de-facto bounds are MAX_TOOL_CALLS and the
-#: wall-clock budget (the adapter path spends >=1 tool call per schema and
-#: >=2 per table; the Oracle bulk walk takes 2-3 paged calls per owner).
+#: Sanity ceilings only — the de-facto walk bounds resolve through the
+#: timeout registry (``db_max_tool_calls`` / ``db_introspection_timeout``;
+#: the adapter path spends >=1 tool call per schema and >=2 per table; the
+#: Oracle bulk walk takes 2-3 paged calls per owner).
 #: Non-system entities are never truncated for coverage reasons.
 MAX_SCHEMAS = 100_000
 MAX_TABLES_PER_SCHEMA = 100_000
@@ -132,25 +139,6 @@ _SOURCE_FULL_CHARS = 500_000
 MAX_SCHEMA_DUMP_CHARS = 120_000
 #: Max characters of the product-knowledge context block inside prompts.
 _MAX_PRODUCT_CONTEXT_CHARS = 8_000
-
-
-def _env_float(name: str, default: float) -> float:
-    """Import-time env parsing that never crashes on garbage values."""
-    raw = (os.environ.get(name) or "").strip()
-    try:
-        return float(raw)
-    except ValueError:
-        if raw:
-            logger.warning("Invalid %s=%r; using default %s", name, raw, default)
-        return default
-
-
-#: Legacy defaults of the two walk budgets — the LIVE values resolve through
-#: the timeout registry (``db_max_tool_calls`` / ``db_introspection_timeout``;
-#: admin store > env > default) with night-scale defaults (20 000 calls /
-#: 6 h) for full-coverage Oracle walks. The constants stay as import seams.
-INTROSPECTION_TIMEOUT_SECONDS = _env_float("DB_INTROSPECTION_TIMEOUT_SECONDS", 21600.0)
-MAX_TOOL_CALLS = 20_000
 
 
 def _max_tool_calls() -> int:
@@ -186,6 +174,13 @@ def _unit_bundle_chars() -> int:
     from api.config.timeout import resolve_db_unit_bundle_chars
 
     return resolve_db_unit_bundle_chars()
+
+
+def _deep_sample_rows() -> int:
+    """First-rows sample size offered to deep-unit agents (0 = off)."""
+    from api.config.timeout import resolve_db_deep_sample_rows
+
+    return resolve_db_deep_sample_rows()
 
 
 # Admin-tunable render/enrich knobs over the timeout registry (admin store >
@@ -284,13 +279,13 @@ async def _tools_for_pinned_server(
 
 
 async def _resolve_mcp_tools(entity: Any, product_id: str) -> List[Any]:
-    """MCP tools for the artifact: pinned server or all bound enabled servers."""
+    """MCP tools for the artifact: pinned server or database-scoped servers."""
     mcp_server_id = getattr(entity, "mcp_server_id", None)
     if mcp_server_id:
         return await _tools_for_pinned_server(product_id, mcp_server_id)
     from api.mcp.manager import gather_mcp_agent_tools
 
-    tools = await gather_mcp_agent_tools(product_id)
+    tools = await gather_mcp_agent_tools(product_id, scope="database")
     return list(tools or [])
 
 
@@ -760,6 +755,10 @@ _ORA_SCHED_PAGE_ROWS = 200
 #: worst-case walk time; the real bounds are the registry budgets
 #: (``db_max_tool_calls`` + the wall-clock timeout).
 _ORA_MAX_PAGES = 500
+#: Truncation marker shared by the two tool-path char caps (``_call_tool``
+#: below and the manager's bounded wrapper): a page carrying it has LOST
+#: rows and must be re-fetched smaller — never mistaken for the catalog end.
+_CHOP_MARKER = "…[truncated"
 #: Owner names interpolated into the bulk queries below are catalog-derived
 #: (all_tables.owner), never user input; this charset regex additionally
 #: excludes quotes/semicolons, so the interpolated literal is inert.
@@ -1675,23 +1674,11 @@ def _parse_pipe_table(text: str) -> List[Dict[str, Any]]:
 def _parse_json_array(text: str) -> List[Dict[str, Any]]:
     """Strict JSON array of objects from an LLM batch reply (best-effort).
 
-    Tolerates a wrapping code fence and stray prose around the array; any
-    parse failure returns [] (the caller keeps the deterministic render).
+    Thin wrapper over ``_common.extract_json`` (code fences and stray prose
+    around the array are handled there); any parse failure returns [] (the
+    caller keeps the deterministic render).
     """
-    if not text:
-        return []
-    t = text.strip()
-    if t.startswith("```"):
-        t = re.sub(r"^```[a-zA-Z]*\n?", "", t)
-        if t.endswith("```"):
-            t = t[:-3]
-    start, end = t.find("["), t.rfind("]")
-    if start == -1 or end <= start:
-        return []
-    try:
-        data = json.loads(t[start:end + 1])
-    except (ValueError, TypeError):
-        return []
+    data = extract_json(text)
     if not isinstance(data, list):
         return []
     return [row for row in data if isinstance(row, dict)]
@@ -1907,6 +1894,12 @@ _SOURCE_TYPE_BY_CATEGORY = {
 #: Categories the oracle source tool can serve with a kind-derived type.
 _SOURCE_KIND_CATEGORIES = frozenset({"routines", "packages"})
 _SOURCE_META_KEYS = ("definition", "source", "ddl", "query", "text", "create_statement")
+#: Schema-qualified object name accepted by the bounded ``sample_rows`` tool
+#: (catalog-derived identifiers only — same charset contract as the owner
+#: literals interpolated into the bulk queries).
+_SQL_IDENT_RE = re.compile(r"^[A-Za-z0-9_$#]{1,128}(\.[A-Za-z0-9_$#]{1,128})?$")
+#: Deep-unit progress checkpoint cadence (units between jobs-state saves).
+_DEEP_UNITS_CHECKPOINT_EVERY = 25
 
 
 def _category_entry(row: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -2005,40 +1998,98 @@ def _ora_page_query(query: str, lo: int, hi: int) -> str:
     )
 
 
+async def _count_rows(
+    sql_tool: Any, bounded_call: Callable[..., str], query: str
+) -> Optional[int]:
+    """COUNT(*) preflight over one catalog query (None = unavailable).
+
+    The completeness cross-check of a windowed walk: fetched < expected
+    means rows were lost (chop, page ceiling, a server-side cap) — never a
+    complete catalog. Any failure is silent: the count is a cross-check,
+    not a dependency.
+    """
+    raw = await bounded_call(
+        sql_tool,
+        _sql_args(sql_tool, f'SELECT COUNT(*) AS "cnt" FROM ({query}) cnt_q'),
+    )
+    for row in _rows_from_sql_result(raw):
+        value = str(row.get("cnt") or "").strip()
+        if value.isdigit():
+            return int(value)
+    return None
+
+
+def _merge_walk_stats(
+    stats: Optional[Dict[str, Dict[str, Any]]], label: str, entry: Dict[str, Any]
+) -> None:
+    """Sum one query execution into its per-query stats slot."""
+    if stats is None:
+        return
+    current = stats.get(label)
+    if current is None:
+        stats[label] = dict(entry)
+        return
+    for key in ("fetched", "chopped"):
+        current[key] = current.get(key, 0) + entry.get(key, 0)
+    if entry.get("expected") is not None:
+        current["expected"] = (current.get("expected") or 0) + entry["expected"]
+
+
 async def _paged_rows(
     sql_tool: Any,
     bounded_call: Callable[..., str],
     query: str,
     page_rows: int = _ORA_PAGE_ROWS,
-) -> Tuple[str, List[Dict[str, Any]]]:
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     """All rows of a catalog query, fetched in char-cap-safe pages.
 
-    ``page_rows`` shrinks the page for wide/line-based queries (see
-    ``_ORA_PACK_PAGE_ROWS``) so one page always fits the manager's char cap —
-    a chopped page parses as SHORT and the early stop would drop the rest.
-    Stops on the first short page (or the page ceiling). Returns the LAST
-    raw response — diagnostics for the caller's error messages — plus the
-    aggregated rows.
+    Chop detection (SPEC-016): every raw page is checked for the
+    ``…[truncated`` marker of the tool-path char caps and re-fetched with a
+    halved page size until it fits — a chopped page parses SHORT and must
+    never be mistaken for the end of the catalog. The genuine end is a
+    short page WITHOUT the marker, or ``fetched == expected`` from the
+    COUNT(*) preflight. Returns the LAST raw response (diagnostics for the
+    caller's error messages), the aggregated rows and the walk stats.
     """
+    expected = await _count_rows(sql_tool, bounded_call, query)
     page_rows = max(1, int(page_rows))
     rows: List[Dict[str, Any]] = []
     raw = ""
+    chopped = 0
     for page in range(_ORA_MAX_PAGES):
-        raw = await bounded_call(
-            sql_tool,
-            _sql_args(
+        while True:
+            lo = len(rows)
+            raw = await bounded_call(
                 sql_tool,
-                _ora_page_query(
-                    query, page * page_rows, (page + 1) * page_rows
+                _sql_args(
+                    sql_tool,
+                    _ora_page_query(query, lo, lo + page_rows),
+                    max_rows=page_rows,
                 ),
-                max_rows=page_rows,
-            ),
-        )
-        chunk = _rows_from_sql_result(raw)
+            )
+            chunk = _rows_from_sql_result(raw)
+            if _CHOP_MARKER not in raw or page_rows <= 1:
+                break  # fits — or one row exceeds the cap: best effort
+            chopped += 1
+            logger.warning(
+                "database walk: chopped page %d (rows %d-%d, %d rows/page); "
+                "halving to %d and refetching the window",
+                page + 1, lo + 1, lo + page_rows, page_rows, page_rows // 2,
+            )
+            page_rows = max(1, page_rows // 2)
         rows.extend(chunk)
-        if len(chunk) < page_rows:
+        if expected is not None and len(rows) >= expected:
             break
-    return raw, rows
+        if len(chunk) < page_rows:
+            break  # short page without a chop marker = genuine end
+    if expected is not None and len(rows) < expected:
+        logger.warning(
+            "database walk: fetched %d of %d expected rows for %s…",
+            len(rows), expected, _cap(query, 60),
+        )
+    return raw, rows, {
+        "expected": expected, "fetched": len(rows), "chopped": chopped,
+    }
 
 
 async def _oracle_session_schema(
@@ -2075,7 +2126,10 @@ def _looks_like_server_error(text: str) -> bool:
 
 
 async def _oracle_bulk_tables(
-    sql_tool: Any, bounded_call: Callable[..., str], errors: List[str]
+    sql_tool: Any,
+    bounded_call: Callable[..., str],
+    errors: List[str],
+    walk_stats: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Optional[Tuple[List[str], Dict[str, Dict[str, Any]]]]:
     """Cross-schema table walk via the read-only sql tool (ALL_* catalog).
 
@@ -2087,10 +2141,12 @@ async def _oracle_bulk_tables(
     queries — the caller falls back to the adapter walk.
     """
 
-    async def _q(sql: str) -> Tuple[str, List[Dict[str, Any]]]:
-        return await _paged_rows(sql_tool, bounded_call, sql)
+    async def _q(sql: str, label: str) -> Tuple[str, List[Dict[str, Any]]]:
+        raw, rows, entry = await _paged_rows(sql_tool, bounded_call, sql)
+        _merge_walk_stats(walk_stats, label, entry)
+        return raw, rows
 
-    _, owner_rows = await _q(_ORA_OWNERS_QUERY)
+    _, owner_rows = await _q(_ORA_OWNERS_QUERY, "owners")
     owners = [
         str(row.get("owner") or "") for row in owner_rows
         if _ORA_IDENTIFIER_RE.match(str(row.get("owner") or ""))
@@ -2101,7 +2157,7 @@ async def _oracle_bulk_tables(
 
     tables: Dict[str, Dict[str, Any]] = {}
     for owner in owners:
-        raw, rows = await _q(_ORA_COLUMNS_QUERY.format(owner=owner))
+        raw, rows = await _q(_ORA_COLUMNS_QUERY.format(owner=owner), "columns")
         if not rows:
             # The WHY travels with the error: empty result, server-side ORA-*,
             # or the pinned formatter's None-cell crash all look identical
@@ -2132,7 +2188,7 @@ async def _oracle_bulk_tables(
         comments = {
             str(r.get("table_name") or ""): str(r.get("comments") or "")
             for r in (
-                await _q(_ORA_COMMENTS_QUERY.format(owner=owner))
+                await _q(_ORA_COMMENTS_QUERY.format(owner=owner), "table_comments")
             )[1]
             if r.get("comments")
         }
@@ -2140,7 +2196,9 @@ async def _oracle_bulk_tables(
             (str(r.get("table_name") or ""), str(r.get("column_name") or "")):
                 str(r.get("comments") or "")
             for r in (
-                await _q(_ORA_COL_COMMENTS_QUERY.format(owner=owner))
+                await _q(
+                    _ORA_COL_COMMENTS_QUERY.format(owner=owner), "column_comments"
+                )
             )[1]
             if r.get("comments")
         }
@@ -2204,6 +2262,7 @@ async def _introspect(
     schema_names: List[str] = []
     errors: List[str] = []
     dependencies: List[Dict[str, Any]] = []
+    walk_stats: Dict[str, Dict[str, Any]] = {}
     calls = 0
     tool_budget = _max_tool_calls()
 
@@ -2226,7 +2285,9 @@ async def _introspect(
     # sql-only surface is a complete walk too. None → adapter/generic path.
     bulk: Optional[Tuple[List[str], Dict[str, Dict[str, Any]]]] = None
     if engine == "oracle" and sql_tool is not None:
-        bulk = await _oracle_bulk_tables(sql_tool, _bounded_call, errors)
+        bulk = await _oracle_bulk_tables(
+            sql_tool, _bounded_call, errors, walk_stats
+        )
         if bulk is not None:
             schema_names, tables = bulk
             tools_used["tables"] = getattr(sql_tool, "name", "")
@@ -2469,10 +2530,11 @@ async def _introspect(
                 logger.warning("SQL pack query %r failed the read-only guard", name)
                 continue
             if engine == "oracle":
-                raw, rows = await _paged_rows(
+                raw, rows, entry = await _paged_rows(
                     sql_tool, _bounded_call, query,
                     page_rows=_ORA_PACK_PAGE_ROWS.get(name, _ORA_PAGE_ROWS),
                 )
+                _merge_walk_stats(walk_stats, name, entry)
             else:
                 raw = await _bounded_call(
                     sql_tool, _sql_args(sql_tool, query)
@@ -2899,6 +2961,7 @@ async def _introspect(
         **{cat: categories[cat] for cat in _CATEGORIES},
         "tools_used": tools_used,
         "unavailable": unavailable,
+        "walk_stats": walk_stats,
     }
 
 
@@ -3685,7 +3748,7 @@ def build_database_relations_prompt(
 # Cross-context (semantic memory ↔ DB docs ↔ codebase docs)
 # --------------------------------------------------------------------------- #
 async def _product_knowledge_context(product_id: str) -> str:
-    """Recall product knowledge (codebase docs/specs/Confluence) for prompts.
+    """Recall product knowledge (codebase docs/specs) for prompts.
 
     Attached as SUPPLEMENTARY context (never schema evidence): the DB
     descriptions gain domain meaning, grounding stays introspection-only.
@@ -4235,8 +4298,13 @@ def _resolve_unit_object(
     return None
 
 
-def build_entity_tools(info: Dict[str, Any]) -> List[Any]:
-    """Read-only entity_source / db_lookup tools over the introspected payload."""
+def build_entity_tools(info: Dict[str, Any], sql_tool: Any = None) -> List[Any]:
+    """Read-only entity_source / db_lookup tools over the introspected payload.
+
+    With a live ``sql_tool`` and the SPEC-016 sample gate on, a bounded
+    ``sample_rows`` tool joins: the first N rows of a table are evidence a
+    unit agent can use without ever triggering a full-table read.
+    """
     from langchain_core.tools import tool
 
     sources = _unit_sources(info)
@@ -4298,7 +4366,27 @@ def build_entity_tools(info: Dict[str, Any]) -> List[Any]:
             )
         return _unit_bundle(info, cat, name)
 
-    return [entity_source, db_lookup]
+    tools: List[Any] = [entity_source, db_lookup]
+    sample = _deep_sample_rows()
+    if sql_tool is None or sample <= 0:
+        return tools
+
+    @tool
+    async def sample_rows(full_name: str) -> str:
+        """First few data rows of a table (bounded sample; never a full read)."""
+        ident = (full_name or "").strip()
+        if not _SQL_IDENT_RE.match(ident):
+            return f"ERROR: invalid table name {full_name!r}"
+        return await _call_tool(
+            sql_tool,
+            _sql_args(
+                sql_tool,
+                f"SELECT * FROM {ident} FETCH FIRST {sample} ROWS ONLY",
+            ),
+        )
+
+    tools.append(sample_rows)
+    return tools
 
 
 _DATABASE_ENTITY_FALLBACK = (
@@ -4370,16 +4458,14 @@ def _final_agent_text(result: Any) -> str:
     return ""
 
 
-def _entity_fingerprint(
-    info: Dict[str, Any],
-    cat: str,
-    full: str,
-    *,
-    model: str,
-    language: str,
-    prompt_template: str,
-) -> str:
-    """Stable per-entity fingerprint: a match reuses the stored page (no LLM)."""
+def _evidence_payload(
+    info: Dict[str, Any], cat: str, full: str
+) -> Dict[str, Any]:
+    """Introspection-only evidence of one object (no model/prompt noise).
+
+    Shared by the page-reuse fingerprint (below) and the SPEC-010 source
+    fingerprint, so both change exactly when the catalog evidence changes.
+    """
     meta = (
         (info.get("tables") or {}).get(full)
         if cat == "tables" else (info.get(cat) or {}).get(full)
@@ -4397,7 +4483,7 @@ def _entity_fingerprint(
         and str((tm.get("meta") or {}).get("table") or "").lower()
         in (bare, full.lower())
     )
-    payload = {
+    return {
         "entity": {
             k: meta.get(k) for k in (
                 "kind", "comment", "row_count", "columns", "constraints",
@@ -4407,14 +4493,54 @@ def _entity_fingerprint(
         "edges": touching,
         "deps": [deps_out, deps_in],
         "triggers": trig,
-        "model": model,
-        "language": language,
-        "prompt": hashlib.sha256(
-            prompt_template.encode("utf-8")
-        ).hexdigest()[:10],
     }
+
+
+def _entity_fingerprint(
+    info: Dict[str, Any],
+    cat: str,
+    full: str,
+    *,
+    model: str,
+    language: str,
+    prompt_template: str,
+) -> str:
+    """Stable per-entity fingerprint: a match reuses the stored page (no LLM)."""
+    payload = _evidence_payload(info, cat, full)
+    payload["model"] = model
+    payload["language"] = language
+    payload["prompt"] = hashlib.sha256(
+        prompt_template.encode("utf-8")
+    ).hexdigest()[:10]
     blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def source_fingerprint(info: Dict[str, Any], cat: str, full: str) -> str:
+    """SPEC-010 evidence-only fingerprint of one catalog object.
+
+    Deliberately excludes model/language/prompt: the detect path compares
+    the SOURCE state, not the generation setup, so switching models does not
+    mark every object as changed.
+    """
+    blob = json.dumps(
+        _evidence_payload(info, cat, full),
+        ensure_ascii=False, sort_keys=True, default=str,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def database_source_baseline(info: Dict[str, Any]) -> str:
+    """sha256 over sorted ``page_id:fingerprint`` of every documented unit.
+
+    The SPEC-010 database baseline: stable while the catalog evidence is
+    unchanged, sensitive to any object/edge change among documented units.
+    """
+    rows = sorted(
+        f"{pid}:{source_fingerprint(info, cat, full)}"
+        for cat, full, pid in _subpage_units(info)
+    )
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
 
 
 def _split_entity_text(text: str) -> Tuple[str, str]:
@@ -4452,6 +4578,7 @@ async def _run_deep_units(
         from deepagents import create_deep_agent
 
         from api.config.timeout import (
+            resolve_db_unit_wall_clock,
             resolve_docgen_llm_concurrency,
             resolve_docgen_unit_recursion_limit,
         )
@@ -4481,13 +4608,18 @@ async def _run_deep_units(
         try:
             from api.mcp.manager import gather_mcp_agent_tools
 
-            mcp_tools = await gather_mcp_agent_tools(str(product_id))
+            mcp_tools = await gather_mcp_agent_tools(
+                str(product_id), scope="database"
+            )
         except Exception as e:  # pragma: no cover - gather is never-fatal
             logger.warning("deep units: MCP tools unavailable (%s).", e)
         # Adapter tools' content_and_artifact error path raises inside
         # langchain and kills the unit agent; plain text tools degrade.
         mcp_tools = plain_agent_tools(mcp_tools)
-    entity_tools = build_entity_tools(info)
+    sql_role = _classify_introspection_tools(mcp_tools).get("sql") or []
+    entity_tools = build_entity_tools(
+        info, sql_tool=sql_role[0] if sql_role else None
+    )
 
     template = load_prompt_file(
         "database_entity.md", _DATABASE_ENTITY_FALLBACK, language=language
@@ -4496,6 +4628,7 @@ async def _run_deep_units(
     texts: Dict[str, str] = {}
     fingerprints: Dict[str, str] = {}
     failed: Dict[str, str] = {}
+    degraded: List[str] = []
     reused: List[str] = []
     runnable: List[Tuple[str, str, str]] = []
     forced = set(force_pages or ())
@@ -4542,19 +4675,42 @@ async def _run_deep_units(
                 tools=[*entity_tools, *mcp_tools],
                 system_prompt=system_prompt,
             )
-            try:
+
+            # SPEC-004 page gate: entity pages are deliberately short
+            # 1-3 sentence paragraphs — structure heuristic off, 40-char floor.
+            async def _once(feedback: str) -> str:
                 result = await agent.ainvoke(
-                    {"messages": [("user", f"Write the documentation page for `{full}` now.")]},
+                    {"messages": [(
+                        "user",
+                        f"Write the documentation page for `{full}` now.{feedback}",
+                    )]},
                     config={"recursion_limit": resolve_docgen_unit_recursion_limit()},
                 )
-                text = _clean_llm_text(_final_agent_text(result))
+                return _clean_llm_text(_final_agent_text(result))
+
+            # SPEC-015: one wall-clock budget per unit — a stalled agent is
+            # cancelled, recorded in ``failed`` and the run continues.
+            unit_budget = resolve_db_unit_wall_clock()
+            try:
+                text, is_degraded, _attempts = await run_with_unit_budget(
+                    run_with_page_gate(
+                        _once, title=full, label=full, progress=progress,
+                        min_chars=40, require_structure=False,
+                    ),
+                    seconds=unit_budget, label=full,
+                )
             except JobCancelledError:
                 raise
+            except asyncio.TimeoutError:
+                failed[pid] = f"unit wall-clock budget exceeded ({int(unit_budget)}s)"
+                text, is_degraded = "", False
             except Exception as e:
                 failed[pid] = f"{type(e).__name__}: {e}".split("\n")[0][:200]
-                text = ""
+                text, is_degraded = "", False
             if len(text) >= 40:
                 texts[pid] = text
+                if is_degraded:
+                    degraded.append(pid)
             else:
                 failed[pid] = failed.get(pid) or "agent returned no usable text"
         done += 1
@@ -4562,6 +4718,13 @@ async def _run_deep_units(
             progress, phase="sections", current_section="deep-units",
             sections_total=total, sections_done=len(reused) + done,
         )
+        # SPEC-016 checkpoint: the finished unit ids ride in the jobs state
+        # so a long 800+ unit run shows (and keeps) its progress.
+        if done % _DEEP_UNITS_CHECKPOINT_EVERY == 0:
+            emit_progress(progress, deep_units_checkpoint={
+                "done": sorted(texts), "failed": len(failed),
+                "at": utc_now_iso(),
+            })
 
     results = await asyncio.gather(
         *(_one(*unit) for unit in runnable), return_exceptions=True,
@@ -4574,18 +4737,22 @@ async def _run_deep_units(
     for item in results:
         if isinstance(item, BaseException):
             logger.warning("database deep unit agent failed: %s", item)
+    emit_progress(progress, deep_units_checkpoint={
+        "done": sorted(texts), "failed": len(failed), "at": utc_now_iso(),
+    })
     out = {
         "texts": texts,
         "fingerprints": fingerprints,
         "failed": failed,
+        "degraded": degraded,
         "reused": reused,
         "total": total,
         "fallback": len(failed) > total // 2,
     }
     logger.info(
         "database deep units: %d unit(s): %d documented, %d reused, "
-        "%d failed%s",
-        total, len(texts), len(reused), len(failed),
+        "%d failed, %d degraded%s",
+        total, len(texts), len(reused), len(failed), len(degraded),
         " (fallback to batch enrichment)" if out["fallback"] else "",
     )
     return out
@@ -4630,6 +4797,25 @@ def _coverage_section(
         failures = deep_result.get("failed") or {}
         for pid, reason in list(failures.items())[:10]:
             lines.append(f"- `{pid}`: {reason}")
+    walk_stats = info.get("walk_stats") or {}
+    if walk_stats:
+        # SPEC-016 per-query honesty: fetched < expected (COUNT preflight)
+        # or chopped pages are visible gaps, never silent incompleteness.
+        lines.extend([
+            "",
+            "catalog walk coverage:",
+            "",
+            "| query | fetched | expected | chopped pages |",
+            "| --- | --- | --- | --- |",
+        ])
+        for label in sorted(walk_stats):
+            stat = walk_stats[label]
+            expected = stat.get("expected")
+            lines.append(
+                f"| {label} | {stat.get('fetched', 0)} | "
+                f"{expected if expected is not None else '—'} | "
+                f"{stat.get('chopped', 0)} |"
+            )
     unavailable = info.get("unavailable") or []
     if unavailable:
         lines.extend([
@@ -4655,6 +4841,90 @@ def _schema_fingerprint(info: Dict[str, Any]) -> str:
 # --------------------------------------------------------------------------- #
 # Main flow
 # --------------------------------------------------------------------------- #
+async def _walk_catalog_fresh(
+    entity: Any,
+    product_id: str,
+    cache_key: Optional[str],
+    progress: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Live MCP catalog walk (generate cache-miss branch, shared w/ detect).
+
+    Raises ValueError exactly like the generate flow on an unusable surface
+    or a walk timeout; a successful walk refreshes the introspection disk
+    cache so the following generate/detect reuses it.
+    """
+    # 1) MCP tools (pinned server or all bound enabled servers).
+    tools = await _resolve_mcp_tools(entity, product_id)
+    if not tools:
+        raise ValueError(
+            "No MCP tools are available for this product; bind a database "
+            "MCP server before generating documentation."
+        )
+
+    # 2) Classify + deterministic introspection walk. Known preset
+    # surfaces (dbhub / oracle-mcp-server) get dedicated adapters before
+    # the generic name heuristics — the heuristics misclassify their
+    # tools (``search_objects`` matches nothing, ``get_tables_schema``
+    # would be misused as a table lister).
+    roles = preset_adapter_roles(tools, db_type=getattr(entity, "db_type", None))
+    if roles is None:
+        roles = _classify_introspection_tools(tools)
+    if not (roles["tables"] or roles["describe"] or roles["ddl"]):
+        available = ", ".join(sorted(filter(None, (
+            getattr(t, "name", "") for t in tools
+        )))) or "(none)"
+        raise ValueError(
+            "None of the product's MCP tools look like database "
+            "introspection tools (list_schemas/list_tables/describe_table/"
+            f"get_table_ddl…). Available tools: {available}"
+        )
+    # Overall wall-clock budget for the whole walk (review #4): per-call
+    # timeouts bound ONE call, this bounds the walk; a timeout is an honest
+    # job failure (ValueError), never an empty-docs success.
+    emit_progress(
+        progress, phase="sections", sections_total=1,
+        current_section="introspection",
+    )
+    t_introspect = time.monotonic()
+    walk_budget = _introspection_timeout()
+    try:
+        info = await asyncio.wait_for(
+            _introspect(roles, engine=_detect_engine(entity, tools)),
+            timeout=walk_budget,
+        )
+    except asyncio.TimeoutError:
+        raise ValueError(
+            "Database introspection exceeded the overall time budget of "
+            f"{int(walk_budget)}s; the MCP surface is too "
+            "slow — pin a faster server or narrow the scope and retry."
+        )
+    emit_progress(
+        progress, section_done="introspection",
+        section_seconds=time.monotonic() - t_introspect,
+    )
+    if cache_key is not None:
+        store_introspection_cache(cache_key, info)
+    return info
+
+
+async def fresh_database_info(
+    entity: Any, product_id: str
+) -> Dict[str, Any]:
+    """Cache-bypassing introspection for SPEC-010 change detection.
+
+    Re-walks the live catalog (the disk cache may hold the state the current
+    docs were generated FROM, which is exactly what detect must NOT trust)
+    and stores the fresh payload so the following incremental generate hits
+    the cache instead of walking twice.
+    """
+    cache_key: Optional[str] = None
+    try:
+        cache_key = introspection_cache_key(entity, product_id)
+    except Exception as e:  # pragma: no cover - key computation is never fatal
+        logger.debug("introspection cache key unavailable: %s", e)
+    return await _walk_catalog_fresh(entity, product_id, cache_key)
+
+
 async def generate_database_docs(
     entity: Any,
     product: Any,
@@ -4712,57 +4982,7 @@ async def generate_database_docs(
             cache_state = "hit"
 
     if info is None:
-        # 1) MCP tools (pinned server or all bound enabled servers).
-        tools = await _resolve_mcp_tools(entity, product_id)
-        if not tools:
-            raise ValueError(
-                "No MCP tools are available for this product; bind a database "
-                "MCP server before generating documentation."
-            )
-
-        # 2) Classify + deterministic introspection walk. Known preset
-        # surfaces (dbhub / oracle-mcp-server) get dedicated adapters before
-        # the generic name heuristics — the heuristics misclassify their
-        # tools (``search_objects`` matches nothing, ``get_tables_schema``
-        # would be misused as a table lister).
-        roles = preset_adapter_roles(tools, db_type=getattr(entity, "db_type", None))
-        if roles is None:
-            roles = _classify_introspection_tools(tools)
-        if not (roles["tables"] or roles["describe"] or roles["ddl"]):
-            available = ", ".join(sorted(filter(None, (
-                getattr(t, "name", "") for t in tools
-            )))) or "(none)"
-            raise ValueError(
-                "None of the product's MCP tools look like database "
-                "introspection tools (list_schemas/list_tables/describe_table/"
-                f"get_table_ddl…). Available tools: {available}"
-            )
-        # Overall wall-clock budget for the whole walk (review #4): per-call
-        # timeouts bound ONE call, this bounds the walk; a timeout is an honest
-        # job failure (ValueError), never an empty-docs success.
-        emit_progress(
-            progress, phase="sections", sections_total=1,
-            current_section="introspection",
-        )
-        t_introspect = time.monotonic()
-        walk_budget = _introspection_timeout()
-        try:
-            info = await asyncio.wait_for(
-                _introspect(roles, engine=_detect_engine(entity, tools)),
-                timeout=walk_budget,
-            )
-        except asyncio.TimeoutError:
-            raise ValueError(
-                "Database introspection exceeded the overall time budget of "
-                f"{int(walk_budget)}s; the MCP surface is too "
-                "slow — pin a faster server or narrow the scope and retry."
-            )
-        emit_progress(
-            progress, section_done="introspection",
-            section_seconds=time.monotonic() - t_introspect,
-        )
-        if cache_key is not None:
-            store_introspection_cache(cache_key, info)
+        info = await _walk_catalog_fresh(entity, product_id, cache_key, progress)
     else:
         logger.info(
             "Database introspection served from the disk cache (key=%s…): "
@@ -4935,9 +5155,13 @@ async def generate_database_docs(
     finally:
         await _close_owned_llm(repair_llm)
 
+    # SPEC-004: sanitize EVERY page (reused legacy ones included) before the
+    # final guards — no agent-echo markup can survive into storage.
     masked_per_page: Dict[str, int] = {}
     for page_id in order:
-        content = (pages[page_id] or {}).get("content") or ""
+        content = _strip_agent_artifacts(
+            (pages[page_id] or {}).get("content") or ""
+        )
         content, findings = mask_secrets(content)
         masked_per_page[page_id] = len(findings)
         pages[page_id]["content"] = content
@@ -5022,6 +5246,8 @@ async def generate_database_docs(
         }
     reused_pages = set((deep_result or {}).get("reused") or [])
     deep_text_pages = set((deep_result or {}).get("texts") or {})
+    deep_degraded = set((deep_result or {}).get("degraded") or [])
+    unit_by_pid = {pid: (cat, full) for cat, full, pid in _subpage_units(info)}
     prompt_file_by_root: Dict[str, str] = {
         "page_overview": "database_doc.md",
         "page_tables": "database_tables.md",
@@ -5069,8 +5295,14 @@ async def generate_database_docs(
             ) if page_id == "page_overview" else None,
         )
         prov["generator"] = generator
+        unit = unit_by_pid.get(page_id)
+        if unit is not None:
+            # SPEC-010: evidence-only source fingerprint for detect.
+            prov["object_fingerprint"] = source_fingerprint(info, unit[0], unit[1])
         if deep_result and page_id in (deep_result.get("fingerprints") or {}):
             prov["entity_fingerprint"] = deep_result["fingerprints"][page_id]
+        if page_id in deep_degraded:
+            prov["degraded"] = True  # SPEC-004: kept after gate exhaustion
         prov["tools_used"] = dict(info.get("tools_used") or {})
         prov["schema_fingerprint"] = fingerprint
         prov["schema_fingerprint_source"] = "mcp_introspection"
@@ -5094,20 +5326,25 @@ async def generate_database_docs(
     emit_progress(progress, phase="indexing")
     docs = _assemble_docs(pages, order)
     _persist_artifact(entity, docs, pages)
-    _index_in_background(
-        docs,
-        _product_dataset(product),
+    # SPEC-010: source baseline for the next detect run + page-granular
+    # memory indexing (only the forced pages on incremental/per-page runs).
+    entity.source_state = {
+        "kind": "database",
+        "baseline": database_source_baseline(info),
+        "checked_at": utc_now_iso(),
+    }
+    _index_pages_in_background(
+        pages, _product_dataset(product),
         source_type="database",
         source_id=getattr(entity, "id", None),
+        only=(set(force_pages) & set(pages)) if force_pages else None,
     )
     return docs
 
 
 __all__ = [
-    "INTROSPECTION_TIMEOUT_SECONDS",
     "MAX_SCHEMAS",
     "MAX_TABLES_PER_SCHEMA",
-    "MAX_TOOL_CALLS",
     "build_database_doc_prompt",
     "db_context_enabled",
     "generate_database_docs",

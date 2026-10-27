@@ -125,8 +125,8 @@ def _patch_flow(monkeypatch, *, tools=None, binding_inputs=None, llm_text="DB DO
     indexing: list = []
     monkeypatch.setattr(
         db_doc_mod,
-        "_index_in_background",
-        lambda content, dataset, **kw: indexing.append((content, dataset, kw)),
+        "_index_pages_in_background",
+        lambda pages, dataset, **kw: indexing.append((pages, dataset, kw)),
     )
     return indexing, resolve_log, tools
 

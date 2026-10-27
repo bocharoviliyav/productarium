@@ -7,7 +7,7 @@ Covers:
 - ``_fernet`` (env > persisted > dev key precedence).
 - ``bootstrap_secret_key`` (env present -> no-op; env absent -> persisted).
 - Grouped getters: ``get_model_for_task`` / ``get_git_creds`` /
-  ``get_confluence_creds`` / ``get_integration_config`` (read-through + env fallback).
+  ``get_integration_config`` (read-through + env fallback).
 - ``_sanitize_api_key`` (quotes, Bearer prefix, whitespace).
 - ``_parse_int_setting`` (valid, empty, negative, non-numeric).
 """
@@ -360,33 +360,6 @@ class TestResolveGitToken:
         settings_mod.set_setting("git.gitlab.accounts.0.url", "https://gitlab.corp.com", encrypt=False)
         settings_mod.set_setting("git.gitlab.accounts.0.token", "corp-tok", encrypt=True)
         assert settings_mod.resolve_git_token("https://gitlab.corp.com/a/b") == "corp-tok"
-
-
-class TestGetConfluenceCreds:
-    def test_env_fallback(self, monkeypatch, isolated_db):
-        monkeypatch.setenv("CONFLUENCE_BASE_URL", "https://wiki.corp.com")
-        monkeypatch.setenv("CONFLUENCE_TOKEN", "conf-tok")
-        monkeypatch.setenv("CONFLUENCE_SPACE", "ENG")
-        creds = settings_mod.get_confluence_creds()
-        assert creds["base_url"] == "https://wiki.corp.com"
-        assert creds["token"] == "conf-tok"
-        assert creds["space"] == "ENG"
-
-    def test_store_overrides(self, monkeypatch, isolated_db):
-        monkeypatch.setenv("CONFLUENCE_BASE_URL", "https://env.com")
-        monkeypatch.setenv("CONFLUENCE_USERNAME", "env-user")
-        settings_mod.set_setting("confluence.base_url", "https://store.com", encrypt=False)
-        settings_mod.set_setting("confluence.username", "store-user", encrypt=False)
-        creds = settings_mod.get_confluence_creds()
-        assert creds["base_url"] == "https://store.com"
-        assert creds["username"] == "store-user"
-
-    def test_no_mcp_keys(self, isolated_db):
-        """The legacy MCP-mode keys were removed with the old MCP client."""
-        creds = settings_mod.get_confluence_creds()
-        assert "mcp_server" not in creds
-        assert "mcp_tool" not in creds
-        assert "mode" not in creds
 
 
 class TestGetIntegrationConfig:

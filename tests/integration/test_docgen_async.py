@@ -11,10 +11,11 @@ Covers:
 The heavy ``generate_codebase_docs`` pipeline is monkeypatched with an
 instant async fake so the worker thread completes in milliseconds. The worker
 thread reads ``api.docgen.jobs.SessionLocal`` at runtime (its import site), so
-the test rebinds it to the isolated StaticPool SQLite engine (one shared
-connection, ``check_same_thread=False``) — the same trick the other test
-modules use so the worker's own session sees the seeded data and persists into
-the test DB.
+the test rebinds it to the isolated per-test FILE SQLite DB (conftest env:
+separate connections per session, WAL + busy timeout). A shared single
+in-memory connection (StaticPool) must NOT be used here: the polling requests
+and the worker share one sqlite connection, and one thread's session
+rollback can abort the other's in-flight transaction (lost baseline version).
 """
 
 from __future__ import annotations
@@ -26,9 +27,6 @@ import time
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 # The autouse ``_isolated_env`` fixture from ``tests/conftest.py`` provides the
 # isolated SQLite DB + stable SETTINGS_SECRET_KEY for every
@@ -63,17 +61,11 @@ def _clear_app_overrides():
 
 
 def _setup_db():
-    """Rebind api.db to an isolated StaticPool in-memory SQLite engine."""
+    """Reload api.db against the per-test isolated FILE SQLite DB (conftest
+    ``_isolated_env`` env vars): real per-connection isolation between the
+    test thread, request sessions and docgen worker threads."""
     import api.db as db
     importlib.reload(db)
-    engine = create_engine(
-        "sqlite:///:memory:",
-        poolclass=StaticPool,
-        connect_args={"check_same_thread": False},
-        future=True,
-    )
-    db.engine = engine
-    db.SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     db.init_db()
     return db
 
@@ -141,12 +133,10 @@ def _seed(db_mod):
 def _read_codebase(db_mod, entity_id="art_1", timeout=3.0):
     """Read the codebase row with a bounded retry.
 
-    The test DB uses one shared StaticPool SQLite connection checked out by
-    both the test thread and the docgen worker threads; under load the read
-    can land in the brief window where the worker's commit is not yet visible
-    on the connection even though the job registry already says "succeeded".
-    Retrying in FRESH sessions for a few seconds keeps the assertion strict
-    (the docs MUST appear) without the flake.
+    Under load the read can land in the brief window where the worker's
+    commit is not yet visible even though the job registry already says
+    "succeeded". Retrying in FRESH sessions for a few seconds keeps the
+    assertion strict (the docs MUST appear) without the flake.
     """
     from api.models import CodebaseORM
 
@@ -380,8 +370,8 @@ class TestAsyncDocgen:
             # Simulate a total generation failure: every section is the
             # placeholder string. generate_codebase_docs raises before persist.
             raise ValueError(
-                "Не удалось сгенерировать ни один раздел документации (LLM/RLM "
-                "недоступны или превысили таймаут). Проверьте подключение к модели "
+                "Не удалось сгенерировать ни один раздел документации (LLM "
+                "недоступен или превысил таймаут). Проверьте подключение к модели "
                 "и перезапустите генерацию."
             )
 
@@ -782,3 +772,52 @@ class TestDocgenVersioning:
             json={},
         )
         assert r.status_code == 400
+
+    def test_page_regenerate_lands_as_delta_version(self, monkeypatch):
+        """SPEC-012: per-page regen appends a DELTA version (only the changed
+        page stored); the archived page read materializes it end-to-end."""
+        db_mod = _setup_db()
+        _seed_legacy(db_mod)
+        _app, client = _build_app(db_mod, monkeypatch)
+
+        import api.docgen.codebase as adg
+
+        async def _fake(artifact, product, **kwargs):
+            pages = {pid: dict(p) for pid, p in (artifact.pages or {}).items()}
+            pages["page_overview"] = {**pages["page_overview"], "content": "# regenerated"}
+            artifact.pages = pages
+            return artifact.generated_docs
+
+        monkeypatch.setattr(adg, "generate_codebase_docs", _fake)
+
+        resp = client.post(
+            "/api/products/prod_1/codebases/art_1/pages/page_overview/regenerate",
+            json={},
+        )
+        assert resp.status_code == 202
+        assert _poll_terminal(client, resp.json()["job_id"])["status"] == "succeeded"
+
+        from api.models import DocVersionORM
+
+        with db_mod.SessionLocal() as db:
+            rows = (
+                db.query(DocVersionORM)
+                .filter(DocVersionORM.entity_id == "art_1")
+                .order_by(DocVersionORM.version)
+                .all()
+            )
+            assert [(r.version, r.source, r.base_version) for r in rows] == [
+                (1, "baseline", None), (2, "generate", 1),
+            ]
+            assert list(rows[1].pages) == ["page_overview"]  # override only
+            assert rows[1].generated_docs is None
+
+        lst = client.get("/api/products/prod_1/codebases/art_1/versions").json()
+        assert [(v["version"], v["scope"]) for v in lst["versions"]] == [
+            (2, "page"), (1, "full"),
+        ]
+        page = client.get(
+            "/api/products/prod_1/codebases/art_1/pages/page_overview?version=2"
+        ).json()
+        assert page["source"] == "archive"
+        assert page["page"]["content"] == "# regenerated"

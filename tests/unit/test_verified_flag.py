@@ -169,6 +169,8 @@ class TestVerifiedServerOwned:
         assert cb["verified"] is True
 
     def test_non_owner_cannot_verify(self, isolated_db):
+        # SPEC-001: a stranger without a grant is INVISIBLE — 404, not 403
+        # (no product-existence leak).
         _seed(isolated_db)
         app, client = _build_client(isolated_db, _user("user_stranger", "user"))
         with isolated_db.SessionLocal() as db:
@@ -178,4 +180,4 @@ class TestVerifiedServerOwned:
             db.commit()
 
         r = client.post("/api/products/prod_1/codebases/cb_1/verify")
-        assert r.status_code == 403
+        assert r.status_code == 404

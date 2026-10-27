@@ -30,6 +30,7 @@ import pytest
 from api.models import (
     DatabaseORM,
     McpServerORM,
+    ProductGrantORM,
     ProductMcpServerORM,
     ProductORM,
     UserORM,
@@ -78,11 +79,15 @@ def _seed_database(db_mod, pid: str = "prod_1", dbid: str = "db_1", **overrides)
 
 
 def _seed_mcp_server(db_mod, *, server_id="mcp_1", enabled=True,
-                     bound=True, binding_enabled=True):
+                     bound=True, binding_enabled=True,
+                     scopes=("expert", "database")):
+    # ``scopes`` (SPEC-028): the default carries the ``database`` scope a pin
+    # requires; tests of the rejection path pass a scope-less subset.
     with db_mod.SessionLocal() as s:
         s.add(McpServerORM(
             id=server_id, name=f"srv-{server_id}", transport="http",
             url="http://localhost:9000/sse", enabled=enabled,
+            scopes=list(scopes),
         ))
         if bound:
             s.add(ProductMcpServerORM(
@@ -272,6 +277,18 @@ class TestAddDatabase:
         r = client.post("/api/products/prod_1/databases", json=payload)
         assert r.status_code == 200
         assert r.json()["databases"][0]["mcp_server_id"] == "mcp_1"
+
+    def test_add_mcp_pin_without_database_scope_400(self, isolated_db):
+        # SPEC-028: only database-scoped servers can back a database artifact.
+        _seed_product(isolated_db)
+        _seed_mcp_server(isolated_db, scopes=("expert",))
+        app, client = _make_client(isolated_db)
+        r = client.post(
+            "/api/products/prod_1/databases",
+            json=_database_payload(mcp_server_id="mcp_1"),
+        )
+        assert r.status_code == 400
+        assert "database" in r.json()["detail"]
 
 
 # --------------------------------------------------------------------------- #
@@ -472,6 +489,17 @@ class TestUpdateDatabaseMeta:
         )
         assert r.status_code == 400
 
+    def test_update_pin_without_database_scope_400(self, isolated_db):
+        _seed_product(isolated_db)
+        _seed_database(isolated_db)
+        _seed_mcp_server(isolated_db, scopes=("codebase",))
+        app, client = _make_client(isolated_db)
+        r = client.put(
+            "/api/products/prod_1/databases/db_1",
+            json={"mcp_server_id": "mcp_1"},
+        )
+        assert r.status_code == 400
+
     def test_update_meta_missing_database_404(self, isolated_db):
         _seed_product(isolated_db)
         app, client = _make_client(isolated_db)
@@ -511,12 +539,27 @@ class TestVerifyDatabase:
         assert r.status_code == 200
         assert r.json()["databases"][0]["verified"] is True
 
-    def test_non_owner_403(self, isolated_db):
+    def test_non_owner_without_grant_invisible_404(self, isolated_db):
+        # SPEC-001: a plain user with no grant does not see the product at
+        # all — verify on a foreign product 404s instead of leaking existence.
         _seed_product(isolated_db, owner_id="someone_else")
         _seed_database(isolated_db)
         app, client = _client_with_user(isolated_db, _regular_user())
         r = client.post("/api/products/prod_1/databases/db_1/verify")
-        assert r.status_code == 403
+        assert r.status_code == 404
+
+    def test_ro_grant_can_verify(self, isolated_db):
+        # SPEC-001 docs rights: an ro grant holder may verify.
+        _seed_product(isolated_db, owner_id="someone_else")
+        _seed_database(isolated_db)
+        with isolated_db.SessionLocal() as s:
+            s.add(ProductGrantORM(
+                product_id="prod_1", user_id="user_regular", level="ro"
+            ))
+            s.commit()
+        app, client = _client_with_user(isolated_db, _regular_user())
+        r = client.post("/api/products/prod_1/databases/db_1/verify")
+        assert r.status_code == 200
 
     def test_verify_missing_product_404(self, isolated_db, admin_user):
         app, client = _client_with_user(isolated_db, admin_user)
@@ -723,6 +766,7 @@ class TestAddPresetDatabase:
             assert server is not None
             assert server.name == "preset-postgresql-dbp_1"
             assert server.preset_key == "postgresql"
+            assert server.scopes == ["database"]  # SPEC-028: presets are DB-only
             assert server.transport == "stdio"
             assert server.command == "dbhub"
             assert server.args == ["--transport", "stdio"]

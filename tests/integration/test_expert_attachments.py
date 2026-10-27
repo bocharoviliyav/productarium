@@ -116,23 +116,27 @@ class TestUpload:
             assert row.content_md == "deploy notes"
             assert row.product_id == "prod_1"
 
-    def test_too_many_files_400(self, client):
+    def test_too_many_files_400(self, client, isolated_db):
+        _seed(isolated_db)
         resp = _upload(client, *[(f"f{i}.txt", b"x", "text/plain") for i in range(6)])
         assert resp.status_code == 400
         assert "At most 5" in resp.json()["detail"]
 
-    def test_empty_file_400(self, client):
+    def test_empty_file_400(self, client, isolated_db):
+        _seed(isolated_db)
         resp = _upload(client, ("empty.txt", b"", "text/plain"))
         assert resp.status_code == 400
         assert resp.json()["detail"] == "Uploaded file is empty"
 
-    def test_binary_501(self, client):
+    def test_binary_501(self, client, isolated_db):
+        _seed(isolated_db)
         resp = _upload(
             client, ("blob.bin", b"\x00\x01\x02\x03\xff", "application/octet-stream")
         )
         assert resp.status_code == 501
 
-    def test_oversized_413(self, client, monkeypatch):
+    def test_oversized_413(self, client, isolated_db, monkeypatch):
+        _seed(isolated_db)
         monkeypatch.setenv("UPLOAD_MAX_BYTES", "10")
         resp = _upload(client, ("big.txt", b"x" * 40, "text/plain"))
         assert resp.status_code == 413
@@ -140,7 +144,8 @@ class TestUpload:
 
 # --- download -------------------------------------------------------------------
 class TestDownload:
-    def test_download_returns_markdown_with_sanitized_name(self, client):
+    def test_download_returns_markdown_with_sanitized_name(self, client, isolated_db):
+        _seed(isolated_db)
         up = _upload(client, ("my notes v1.txt", b"the content", "text/plain")).json()
         resp = client.get(f"/api/products/prod_1/ask/attachments/{up[0]['id']}")
         assert resp.status_code == 200
@@ -159,11 +164,18 @@ class TestDownload:
 
     def test_other_users_attachment_404_for_non_admin(self, client, isolated_db):
         import api.routers.expert as expert_router
-        from api.models import ChatAttachmentORM, UserORM
+        from api.models import ChatAttachmentORM, ProductGrantORM, UserORM
 
+        _seed(isolated_db)  # P-1: ask endpoints require product visibility
         with isolated_db.SessionLocal() as db:
             db.add(UserORM(id="u_a", username="a", role="user"))
             db.add(UserORM(id="u_b", username="b", role="user"))
+            db.add(ProductGrantORM(
+                product_id="prod_1", user_id="u_a", level="ro"
+            ))
+            db.add(ProductGrantORM(
+                product_id="prod_1", user_id="u_b", level="ro"
+            ))
             db.commit()
 
         # Transient ORMs suffice (role + id are read in-memory); the upload
@@ -264,7 +276,8 @@ class TestAskAugmentation:
         )
         assert resp.status_code == 400
 
-    def test_too_many_attachment_ids_422(self, client):
+    def test_too_many_attachment_ids_422(self, client, isolated_db):
+        _seed(isolated_db)
         ids = [f"atch_{i}" for i in range(6)]
         resp = client.post(
             "/api/products/prod_1/ask",

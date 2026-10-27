@@ -13,6 +13,7 @@ import {
   GitBranch,
   Lightning,
   LinkSimple,
+  MagnifyingGlass,
   PencilSimple,
   Plus,
   SealCheck,
@@ -20,10 +21,12 @@ import {
   Trash,
 } from "@phosphor-icons/react";
 import { AppHeader } from "@/components/AppHeader";
+import { useAuth } from "@/contexts/AuthContext";
 import { useLanguage } from "@/contexts/LanguageContext";
 import { useNotifications } from "@/contexts/NotificationContext";
 import { VerifiedBadge, VerifiedButton } from "@/components/VerifiedBadge";
 import { MarkdownEditor, EditorSaveBar } from "@/components/MarkdownEditor";
+import { DetectChangesModal } from "@/components/DetectChangesModal";
 import { SpecViewer } from "@/components/SpecViewer";
 import { LinksViewer } from "@/components/LinksViewer";
 import { ProvenancePanel } from "@/components/ProvenancePanel";
@@ -48,6 +51,7 @@ import {
   type Codebase,
   type Database,
   type DocVersionDetail,
+  type DocVersionItem,
   type DocVersionList,
   type EntityKind,
   type Hld,
@@ -59,8 +63,10 @@ import {
   entityPath,
   normalizePages,
   parseLinksContent,
+  productAccess,
   serializeLinksContent,
 } from "@/lib/types";
+import { useIncrementalDocs } from "@/hooks/useIncrementalDocs";
 
 const Markdown = dynamic(() => import("@/components/Markdown"), {
   ssr: false,
@@ -71,11 +77,17 @@ const Markdown = dynamic(() => import("@/components/Markdown"), {
 const isPageTreeKind = (kind?: EntityKind) =>
   kind === "codebase" || kind === "database" || kind === "hld";
 
+// SPEC-012 version scope ("page" = delta snapshot); older payloads predate
+// the field, types.ts is shared — hence the loose cast.
+const scopeOf = (v: DocVersionItem | DocVersionDetail): "full" | "page" =>
+  (v as { scope?: string }).scope === "page" ? "page" : "full";
+
 export default function EntityDocsViewer() {
   const params = useParams<{ productId: string; artifactId: string }>();
   const { productId, artifactId } = params;
   const router = useRouter();
   const { notify } = useNotifications();
+  const { user } = useAuth();
   const { messages, fmt } = useLanguage();
   const t = messages?.artifact ?? {};
   const tc = messages?.common ?? {};
@@ -93,7 +105,6 @@ export default function EntityDocsViewer() {
   const [draftLinks, setDraftLinks] = useState<LinkItem[]>([]);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [deleting, setDeleting] = useState(false);
 
   // Doc versions (immutable history): list + selected archived version.
   const [versions, setVersions] = useState<DocVersionList | null>(null);
@@ -106,6 +117,9 @@ export default function EntityDocsViewer() {
   // Rollback confirm + in-flight restore.
   const [confirmRestore, setConfirmRestore] = useState<number | null>(null);
   const [restoring, setRestoring] = useState(false);
+  // SPEC-013: single-snapshot delete confirm + in-flight state.
+  const [confirmDeleteVersion, setConfirmDeleteVersion] = useState<number | null>(null);
+  const [deletingVersion, setDeletingVersion] = useState(false);
 
   // Lazy page body: product payloads are light (?light=1 strips page
   // content), so the OPEN page's content/provenance is fetched on demand —
@@ -117,7 +131,7 @@ export default function EntityDocsViewer() {
   const [detailTick, setDetailTick] = useState(0);
   const refetchPageDetail = useCallback(() => setDetailTick((t) => t + 1), []);
 
-  // Silences poller toasts once the viewer unmounts.
+  // Silences the per-page regen poller toasts once the viewer unmounts.
   const viewerAbortRef = useRef(false);
   useEffect(() => {
     viewerAbortRef.current = false;
@@ -209,6 +223,28 @@ export default function EntityDocsViewer() {
     setVersionDetail(null);
     fetchVersions();
   }, [fetchVersions]);
+
+  // SPEC-010 detect + incremental update — the shared polling hook (also
+  // used by SpecEditor); baseUrl turns non-empty once the entity kind
+  // resolves, until then the actions no-op.
+  const {
+    detectChecking,
+    detectResult,
+    setDetectResult,
+    updateStarting,
+    updateJob,
+    checkChanges: handleDetectChanges,
+    applyUpdate: handleIncrementalUpdate,
+  } = useIncrementalDocs({
+    baseUrl: kind ? `/api/products/${productId}/${entityPath(kind)}/${artifactId}` : "",
+    onApplied: async (outcome) => {
+      await fetchProduct();
+      if (outcome === "succeeded") {
+        await fetchVersions();
+        refetchPageDetail();
+      }
+    },
+  });
 
   // Archived snapshot (read-only): fetched on select, dropped on deselect.
   useEffect(() => {
@@ -448,8 +484,14 @@ export default function EntityDocsViewer() {
   // empty draft (saving it would wipe the stored content).
   const pageContentPending =
     Boolean(activePage) && (pageDetail === null || pageDetail.content === null);
+  // Access matrix (SPEC-001) from the product payload (grants included):
+  // docs = edit content / verify / regenerate; manage = rw (delete/rollback).
+  const access = productAccess(user, product);
+  const canManage = access === "manage";
+  const canDocs = canManage || access === "docs";
   // Archived versions are read-only — editing targets the current version.
   const canEdit =
+    canDocs &&
     !viewingArchive &&
     !pageContentPending &&
     ((isCodebase && hasDocs) ||
@@ -567,34 +609,6 @@ export default function EntityDocsViewer() {
     isSpec ? <FileText size={18} weight="regular" /> :
     <LinkSimple size={18} weight="regular" />;
 
-  const remove = async () => {
-    if (!kind || !product || deleting) return;
-    if (!confirm(t.deleteConfirm ?? "Delete this item?")) return;
-    setDeleting(true);
-    try {
-      const res = await fetch(
-        `/api/products/${productId}/${entityPath(kind)}/${artifactId}`,
-        { method: "DELETE", credentials: "include" },
-      );
-      if (res.status === 401) {
-        router.replace(
-          `/login?next=/products/${productId}/artifacts/${artifactId}`,
-        );
-        return;
-      }
-      if (!res.ok) throw new Error(`Delete failed (${res.status})`);
-      router.push(`/products/${productId}`);
-    } catch (e) {
-      notify({
-        tone: "error",
-        title: t.deleteFailedTitle ?? "Delete failed",
-        message: e instanceof Error ? e.message : "Delete failed",
-      });
-    } finally {
-      setDeleting(false);
-    }
-  };
-
   const empty = isPageTree ? !hasDocs : !hasRawContent;
 
   // Per-page regeneration: the forced page rides through the normal docgen
@@ -681,10 +695,10 @@ export default function EntityDocsViewer() {
     }
   };
 
-  // Cooperative cancel of the per-page regen job (the worker restores the
-  // current version — no new version is appended).
+  // Cooperative cancel of the per-page regen / incremental job (the worker
+  // restores the current version — no new version is appended).
   const handleCancelRegen = async () => {
-    if (!kind || !regenJob) return;
+    if (!kind || (!regenJob && !updateJob)) return;
     try {
       const res = await fetch(
         `/api/products/${productId}/${entityPath(kind)}/${artifactId}/generate/cancel`,
@@ -741,6 +755,49 @@ export default function EntityDocsViewer() {
       });
     } finally {
       setRestoring(false);
+    }
+  };
+
+  // SPEC-013: deletes ONE immutable snapshot row; the artifact itself, its
+  // docs and the memory chunks stay untouched (artifact deletion lives in
+  // the explicit danger context on the product page / spec editor).
+  const handleDeleteVersion = async (version: number) => {
+    if (!kind || deletingVersion) return;
+    setConfirmDeleteVersion(null);
+    setDeletingVersion(true);
+    try {
+      const res = await fetch(
+        `/api/products/${productId}/${entityPath(kind)}/${artifactId}/versions/${version}`,
+        { method: "DELETE", credentials: "include" },
+      );
+      if (res.status === 401) {
+        router.replace(
+          `/login?next=/products/${productId}/artifacts/${artifactId}`,
+        );
+        return;
+      }
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(
+          (body as { detail?: string }).detail || `Delete failed (${res.status})`,
+        );
+      }
+      setViewVersion(null);
+      notify({
+        tone: "success",
+        title: t.versionsTitle ?? "Versions",
+        message: t.versionDeleted ?? "Version deleted.",
+      });
+      await fetchVersions();
+    } catch (e) {
+      notify({
+        tone: "error",
+        title: t.versionsTitle ?? "Versions",
+        message:
+          e instanceof Error ? e.message : (t.deleteFailedTitle ?? "Delete failed"),
+      });
+    } finally {
+      setDeletingVersion(false);
     }
   };
 
@@ -820,7 +877,7 @@ export default function EntityDocsViewer() {
                       </option>
                       {versions.versions.map((v) => (
                         <option key={v.version} value={v.version}>
-                          {`v${v.version} · ${v.source}${v.created_at ? ` · ${new Date(v.created_at).toLocaleString()}` : ""}`}
+                          {`v${v.version} · ${v.source}${scopeOf(v) === "page" ? ` · ${t.versionScopePage ?? "страница"}` : ""}${v.created_at ? ` · ${new Date(v.created_at).toLocaleString()}` : ""}`}
                         </option>
                       ))}
                     </Select>
@@ -829,17 +886,32 @@ export default function EntityDocsViewer() {
                     <>
                       <Tag tone="yellow">
                         {fmt(t.archivedVersion ?? "Version v{n} (archived)", { n: String(viewVersion) })}
+                        {versionDetail && scopeOf(versionDetail) === "page" &&
+                          ` · ${t.versionScopePage ?? "страница"}`}
                       </Tag>
-                      <Button
-                        type="button"
-                        variant="subtle"
-                        size="sm"
-                        onClick={() => setConfirmRestore(viewVersion)}
-                        disabled={restoring}
-                      >
-                        <ArrowCounterClockwise size={14} weight="regular" />
-                        {t.rollback ?? "Rollback"}
-                      </Button>
+                      {canManage && (
+                        <Button
+                          type="button"
+                          variant="subtle"
+                          size="sm"
+                          onClick={() => setConfirmRestore(viewVersion)}
+                          disabled={restoring}
+                        >
+                          <ArrowCounterClockwise size={14} weight="regular" />
+                          {t.rollback ?? "Rollback"}
+                        </Button>
+                      )}
+                      {canManage && viewVersion !== versions?.current_version && (
+                        <IconButton
+                          type="button"
+                          aria-label={t.deleteVersion ?? "Delete version"}
+                          title={t.deleteVersion ?? "Delete version"}
+                          onClick={() => setConfirmDeleteVersion(viewVersion)}
+                          disabled={deletingVersion}
+                        >
+                          {deletingVersion ? <Spinner /> : <Trash size={14} weight="regular" />}
+                        </IconButton>
+                      )}
                     </>
                   )}
                   {canEdit && !editing && (
@@ -869,22 +941,12 @@ export default function EntityDocsViewer() {
                       verified={verified}
                       verifyUrl={`/api/products/${productId}/${entityPath(kind)}/${artifactId}/verify`}
                       ownerId={product?.owner_id ?? null}
+                      canVerify={canDocs}
                       onVerified={(next) => {
                         setVerified(next.verified);
                         setVerifiedBy(next.verified_by ?? null);
                       }}
                     />
-                  )}
-                  {!isHld && (
-                    <IconButton
-                      type="button"
-                      aria-label={t.delete ?? "Delete"}
-                      title={t.delete ?? "Delete"}
-                      onClick={remove}
-                      disabled={deleting}
-                    >
-                      {deleting ? <Spinner /> : <Trash size={14} weight="regular" />}
-                    </IconButton>
                   )}
                 </div>
               </div>
@@ -910,12 +972,12 @@ export default function EntityDocsViewer() {
                       <Link href={`/products/${productId}`}>
                         <Button>{t.generateOnProductPage ?? "Generate on product page"}</Button>
                       </Link>
-                    ) : (
+                    ) : canDocs ? (
                       <Button variant="subtle" size="sm" onClick={startEditing}>
                         <PencilSimple size={14} weight="regular" />
                         {t.edit ?? "Edit"}
                       </Button>
-                    )
+                    ) : undefined
                   }
                 />
               </div>
@@ -1033,7 +1095,7 @@ export default function EntityDocsViewer() {
                 fallback. HLD hides edit/regen — see the action row below. */}
             {!empty && isPageTree && (
               <div className="mt-8 grid grid-cols-1 gap-8 lg:grid-cols-[240px_1fr]">
-                <aside className="lg:sticky lg:top-20 lg:self-start">
+                <aside className="lg:sticky lg:top-20 lg:self-start lg:max-h-[calc(100vh-6rem)] lg:overflow-y-auto">
                   <SectionHeader title={t.pages ?? "Pages"} className="mb-3" />
                   {pages.length > 0 ? (
                     <nav className="flex flex-col gap-0.5">
@@ -1049,7 +1111,7 @@ export default function EntityDocsViewer() {
                 <div className="flex min-w-0 flex-col gap-8">
                   <div className="flex flex-col gap-4">
                     {isPageTree && !editing && (
-                      <div className="flex items-center justify-end gap-2">
+                      <div className="flex flex-wrap items-center justify-end gap-2">
                         {regenStarting || regenJob ? (
                           <>
                             <span className="flex items-center gap-2 font-mono text-xs text-muted">
@@ -1068,40 +1130,77 @@ export default function EntityDocsViewer() {
                               </Button>
                             )}
                           </>
+                        ) : detectChecking ? (
+                          <span className="flex items-center gap-2 font-mono text-xs text-muted">
+                            <Spinner className="h-3.5 w-3.5" />
+                            {t.detectRunning ?? "Checking changes…"}
+                          </span>
+                        ) : updateStarting || updateJob ? (
+                          <>
+                            <span className="flex items-center gap-2 font-mono text-xs text-muted">
+                              <Spinner className="h-3.5 w-3.5" />
+                              {t.updatingDocs ?? "Updating documentation…"}
+                            </span>
+                            {updateJob && (
+                              <Button
+                                type="button"
+                                variant="subtle"
+                                size="sm"
+                                onClick={handleCancelRegen}
+                              >
+                                <StopCircle size={14} weight="fill" />
+                                {t.stopGeneration ?? "Stop"}
+                              </Button>
+                            )}
+                          </>
                         ) : (
-                          activePage &&
-                          !viewingArchive && (
-                            <>
-                              <VerifiedButton
-                                verified={Boolean(activePage.verified)}
-                                verifyUrl={`/api/products/${productId}/${entityPath(kind)}/${artifactId}/pages/${encodeURIComponent(activePage.id)}/verify?light=1`}
-                                ownerId={product?.owner_id ?? null}
-                                mapResponse={(data) => {
-                                  const p = findPageInProduct(
-                                    data as Product,
-                                    artifactId,
-                                    activePage.id,
-                                  );
-                                  return {
-                                    verified: p?.verified ?? true,
-                                    verified_by: p?.verified_by ?? null,
-                                  };
-                                }}
-                                onResponse={(data) => setProduct(data as Product)}
-                              />
-                              {!isHld && (
-                                <Button
-                                  type="button"
-                                  variant="subtle"
-                                  size="sm"
-                                  onClick={() => setConfirmRegen(true)}
-                                >
-                                  <Lightning size={14} weight="fill" />
-                                  {t.regeneratePage ?? "Regenerate page"}
-                                </Button>
+                          <>
+                            {!isHld && canDocs && !viewingArchive && (
+                              <Button
+                                type="button"
+                                variant="subtle"
+                                size="sm"
+                                onClick={() => void handleDetectChanges()}
+                              >
+                                <MagnifyingGlass size={14} weight="regular" />
+                                {t.detectButton ?? "Check changes"}
+                              </Button>
+                            )}
+                            {activePage &&
+                              !viewingArchive && (
+                                <>
+                                  <VerifiedButton
+                                    verified={Boolean(activePage.verified)}
+                                    verifyUrl={`/api/products/${productId}/${entityPath(kind)}/${artifactId}/pages/${encodeURIComponent(activePage.id)}/verify?light=1`}
+                                    ownerId={product?.owner_id ?? null}
+                                    canVerify={canDocs}
+                                    mapResponse={(data) => {
+                                      const p = findPageInProduct(
+                                        data as Product,
+                                        artifactId,
+                                        activePage.id,
+                                      );
+                                      return {
+                                        verified: p?.verified ?? true,
+                                        verified_by: p?.verified_by ?? null,
+                                      };
+                                    }}
+                                    onResponse={(data) => setProduct(data as Product)}
+                                  />
+                                  {!isHld && canDocs && (
+                                    <Button
+                                      type="button"
+                                      variant="subtle"
+                                      size="sm"
+                                      onClick={() => setConfirmRegen(true)}
+                                    >
+                                      <Lightning size={14} weight="fill" />
+                                      {t.regeneratePage ?? "Regenerate page"}
+                                    </Button>
+                                  )}
+                                </>
                               )}
-                            </>
-                          )
+                          </>
                         )}
                       </div>
                     )}
@@ -1238,6 +1337,42 @@ export default function EntityDocsViewer() {
             </Button>
           </div>
         </Modal>
+
+        {/* SPEC-013: version deletion — removes only the snapshot row */}
+        <Modal
+          open={confirmDeleteVersion !== null}
+          onClose={() => setConfirmDeleteVersion(null)}
+          title={t.deleteVersionConfirmTitle ?? "Delete this version?"}
+          footer={null}
+        >
+          <p className="text-sm text-muted">
+            {t.deleteVersionConfirmText ??
+              "Only this snapshot is removed. The current documentation and the artifact itself stay untouched."}
+          </p>
+          <div className="mt-6 flex items-center justify-end gap-2">
+            <Button variant="ghost" onClick={() => setConfirmDeleteVersion(null)}>
+              {tc.cancel ?? "Cancel"}
+            </Button>
+            <Button
+              variant="danger"
+              onClick={() => {
+                if (confirmDeleteVersion !== null) void handleDeleteVersion(confirmDeleteVersion);
+              }}
+              disabled={deletingVersion}
+            >
+              {deletingVersion ? <Spinner /> : <Trash size={16} weight="regular" />}
+              {t.deleteVersion ?? "Delete version"}
+            </Button>
+          </div>
+        </Modal>
+
+        {/* SPEC-010: detect summary — the modal itself is the confirmation
+            for the incremental update */}
+        <DetectChangesModal
+          result={detectResult}
+          onClose={() => setDetectResult(null)}
+          onUpdate={() => void handleIncrementalUpdate()}
+        />
       </main>
     </div>
   );

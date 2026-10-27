@@ -8,14 +8,16 @@ Defines the product-centric data model:
 - ``CodebaseORM``      — git repository artifact (repo clone, page tree, generated docs)
 - ``SpecORM``          — OpenAPI/AsyncAPI spec artifact (single yaml/json)
 - ``LinksORM``         — curated external links (kv pairs)
+- ``DocgenScheduleORM`` — per-entity cron docgen schedule (SPEC-009)
 - ``DatabaseORM``      — reverse-engineered database artifact (masked DSN, MCP)
 - ``HldORM``           — high-level design (HLD) artifact, one per product
-- ``KnowledgeNodeORM`` — Confluence-like tree of knowledge pages per product
+- ``KnowledgeNodeORM`` — tree of knowledge pages per product
 - ``SettingORM``       — admin config key/value store (optionally encrypted)
 - ``ApiTokenORM``      — public API tokens for external integrations
 - ``ChatSessionORM``   — expert-agent chat session per product (Wave B)
 - ``ChatMessageORM``   — one transcript message of a chat session
 - ``KnowledgeChunkORM`` — embedded text chunks for the pgvector-direct memory
+- ``KnowledgeGraphORM`` — per-product knowledge graph (JSONB, SPEC-008)
 - ``McpServerORM``       — admin registry of external MCP servers (Wave C)
 - ``ProductMcpServerORM`` — per-product binding to an MCP server (Wave C)
 
@@ -107,6 +109,9 @@ SPEC_KINDS: tuple[str, ...] = ("openapi", "asyncapi")
 
 # Valid user roles (P0-2 role model) — see UserORM.role.
 USER_ROLES: tuple[str, ...] = ("user", "admin", "manager", "viewer_global")
+
+# Valid MCP server scopes (SPEC-028) — see McpServerORM.scopes.
+MCP_SCOPES: tuple[str, ...] = ("codebase", "database", "knowledge", "expert")
 
 
 class UserORM(Base):
@@ -239,6 +244,8 @@ class CodebaseORM(Base):
     # Active documentation version (productarium_doc_versions.version);
     # NULL until the first snapshot (pre-versioning legacy artifacts).
     current_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Server-owned incremental-update state (SPEC-010); stripped from clients.
+    source_state: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
     )
@@ -284,6 +291,8 @@ class SpecORM(Base):
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
     # Active documentation version (specs snapshot their single `content`).
     current_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Server-owned incremental-update state (SPEC-010); stripped from clients.
+    source_state: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
     )
@@ -399,6 +408,8 @@ class DatabaseORM(Base):
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
     # Active documentation version (productarium_doc_versions.version).
     current_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Server-owned incremental-update state (SPEC-010); stripped from clients.
+    source_state: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
     )
@@ -487,7 +498,10 @@ class DocVersionORM(Base):
     entity_type: Mapped[str] = mapped_column(String(16), nullable=False)
     entity_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False)
-    # baseline | generate | edit | rollback
+    # SPEC-012 delta chain parent: delta rows store ONLY the overridden pages
+    # and no generated_docs; NULL = full snapshot (pre-SPEC-012 rows too).
+    base_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # baseline | generate | edit | rollback | schedule
     source: Mapped[str] = mapped_column(String(16), nullable=False)
     model: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     job_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
@@ -499,8 +513,63 @@ class DocVersionORM(Base):
     )
 
 
+class DocgenScheduleORM(Base):
+    """ORM model for the ``docgen_schedules`` table — cron-driven docgen runs
+    (SPEC-009).
+
+    One row per (product, entity) for codebase|database artifacts. The
+    in-process scheduler (``api/docgen/scheduler.py``) fires due rows as
+    ordinary docgen jobs labelled ``source="schedule"``; ``last_result`` is
+    the outcome of the last scheduled trigger (submitted|ok|skipped_busy|
+    error|cancelled). Missed windows are never queued (spec: skip, don't
+    accumulate).
+    """
+
+    __tablename__ = "docgen_schedules"
+    __table_args__ = (
+        UniqueConstraint("product_id", "entity_id", name="uq_docgen_schedule_entity"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    product_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("products.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # codebase | database (spec/hld schedules are a later extension)
+    entity_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Standard 5-field cron expression, evaluated in server time (UTC).
+    cron_expr: Mapped[str] = mapped_column(String(64), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # submitted | ok | skipped_busy | error | cancelled
+    last_result: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    created_by: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey("productarium_users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return (
+            f"<DocgenScheduleORM id={self.id!r} product={self.product_id!r} "
+            f"entity={self.entity_type}:{self.entity_id!r} cron={self.cron_expr!r}>"
+        )
+
+
 class KnowledgeNodeORM(Base):
-    """Confluence-like tree node of knowledge pages scoped to a product."""
+    """Tree node of knowledge pages scoped to a product."""
 
     __tablename__ = "knowledge_nodes"
 
@@ -818,6 +887,9 @@ class McpServerORM(Base):
     preset_key: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     # 'http' | 'stdio'
     transport: Mapped[str] = mapped_column(String(16), nullable=False)
+    # JSON list[str] subset of MCP_SCOPES — where the server's tools are
+    # available (SPEC-028); preset rows carry ["database"].
+    scopes: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     command: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     args: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
@@ -996,4 +1068,49 @@ class KnowledgeChunkORM(Base):
         return (
             f"<KnowledgeChunkORM id={self.id!r} product_id={self.product_id!r} "
             f"source_type={self.source_type!r} chunk_index={self.chunk_index!r}>"
+        )
+
+
+class KnowledgeGraphORM(Base):
+    """ORM model for the ``knowledge_graphs`` table — one knowledge graph per
+    product (SPEC-008), stored as a single JSON document.
+
+    Graph shape (``graph`` JSON): ``{"nodes": {key: node}, "edges":
+    {key: edge}}`` where nodes are ``term`` (normalized term + description +
+    aliases) or ``page`` (artifact_type + artifact_id + page_id) keyed by a
+    STABLE key for upsert, and edges carry ``term→page`` (weight/context),
+    ``term—term`` (synonym/part_of/related) and ``page→page`` (depends_on,
+    reserved for SPEC-010 reuse). Size is bounded by the builder
+    (``api.memory.knowledge_graph``): caps on nodes/edges with LRU trimming
+    of weak edges.
+
+    Disambiguation invariant: a term and its pages exist only inside ONE
+    product's graph, so the same word (e.g. "RMS") can mean different things
+    in different products without collision — recall stays scoped by
+    ``product_id`` on both the graph and the vector namespace.
+    """
+
+    __tablename__ = "knowledge_graphs"
+
+    product_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("products.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    graph: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # Incremented on every persisted rebuild/merge (optimistic freshness).
+    version: Mapped[int] = mapped_column(nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        nodes = len((self.graph or {}).get("nodes") or {})
+        edges = len((self.graph or {}).get("edges") or {})
+        return (
+            f"<KnowledgeGraphORM product={self.product_id!r} v={self.version!r} "
+            f"nodes={nodes} edges={edges}>"
         )

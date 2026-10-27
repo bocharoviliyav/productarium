@@ -9,7 +9,7 @@ load_dotenv()
 
 # Bootstrap a stable SETTINGS_SECRET_KEY (persisted to ~/.adalflow when the
 # env var is unset) BEFORE any module reads the settings store. This keeps
-# encrypted admin settings (models.*/api_key, confluence.token) and JWT
+# encrypted admin settings (models.*/api_key) and JWT
 # session signing stable across restarts instead of using a new ephemeral
 # per-process key on each boot. Non-fatal; see api/settings_store.py.
 from api.config.settings import bootstrap_secret_key

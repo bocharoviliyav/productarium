@@ -43,7 +43,7 @@ All configuration is local. See `.env.example` in the project root for the full,
 | `LOCAL_OPENAI_BASE_URL` | Local OpenAI-compatible API URL | `http://localhost:1234/v1` |
 | `LOCAL_OPENAI_API_KEY` | API key for local OpenAI API | `not-needed` |
 | `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USERNAME` / `DB_PASSWORD` | Postgres connection | `localhost` / `5432` / `cognee_db` / `cognee` / `cognee` |
-| `RLM_MODEL_CONTEXT_WINDOW` | Context-window override (tokens) for prompt budgeting | (from live API metadata / model name) |
+| `PRODUCTARIUM_MODEL_CONTEXT_WINDOW` | Context-window override (tokens) for prompt budgeting | (from live API metadata / model name) |
 | `PORT` | API server port | `8001` |
 | `AUTH_PROVIDER` | Auth mode: `local` / `keycloak` / `both` / `none` | `local` |
 | `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD` | One-shot bootstrap admin | `admin` / `change-me` |
@@ -107,7 +107,7 @@ Scalable connector framework. Auto-discovered via `pkgutil`. Each connector impl
 Model Context Protocol in two directions:
 - **`manager.py`** — Outbound tool manager over langchain-mcp-adapters `MultiServerMCPClient`. Per-server clients + `tools/list` discovery results cached by config fingerprint (transport/url/command/args/headers/env ciphertext/updated_at); every connect is bounded by `MCP_DISCOVERY_TIMEOUT_SECONDS` (default 10 s). Applies the per-binding `allowed_tools` allowlist and dedupes tool names. `get_tools_for_product()` is best-effort: a failing server is skipped, never fatal to the expert agent.
 - **`secrets.py`** — Fernet encrypt/decrypt + masking for server `headers`/`env` (stored encrypted in `mcp_servers`, masked on every read).
-- **`inbound.py`** — Inbound MCP server (`mcp.server.fastmcp.FastMCP`, streamable HTTP) mounted at `/api/mcp`. Auth: Bearer API tokens (sha256 lookup in `api_tokens`, updates `last_used_at`). Tools: `list_products`, `get_product_knowledge`, `search_knowledge`, `ask_expert` (bounded by `MCP_ASK_TIMEOUT_SECONDS`, default 120 s).
+- **`inbound.py`** — Inbound MCP server (`mcp.server.fastmcp.FastMCP`, streamable HTTP) mounted at `/api/mcp`. Auth: Bearer API tokens (sha256 lookup in `api_tokens`, updates `last_used_at`). Tools: `list_products`, `get_product_knowledge`, `knowledge_search`, `knowledge_graph`, `ask_expert` (bounded by `MCP_ASK_TIMEOUT_SECONDS`, default 120 s).
 
 Expert agent integration: `build_expert_agent` receives the bound enabled servers' tools (after allowlist) as `extra_tools` — no separate endpoint.
 

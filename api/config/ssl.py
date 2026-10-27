@@ -203,7 +203,7 @@ def apply_ssl_env() -> None:
             # Per-call clients (requests/httpx) get verify=False directly.
             #
             # Suppress urllib3's per-request InsecureRequestWarning spam: with
-            # skip-verify ON, every unverified HTTPS call (Confluence/MCP/git /
+            # skip-verify ON, every unverified HTTPS call (MCP/git /
             # corporate gateway) logs a WARNING that floods the logs. The user
             # has explicitly opted into skip-verify via the admin panel/env, so
             # these warnings add no signal. Filtering here (at the first SSL

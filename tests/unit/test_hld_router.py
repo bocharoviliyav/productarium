@@ -228,7 +228,9 @@ class TestHldVerify:
             "/api/products/prod_1/hld/ghost/verify"
         ).status_code == 404
 
-    def test_non_owner_forbidden(self, isolated_db, monkeypatch):
+    def test_non_owner_invisible(self, isolated_db, monkeypatch):
+        # SPEC-001: a plain user with no grant does not see the product —
+        # verify 404s instead of leaking the product's existence.
         _seed(isolated_db)
         app, client = _client(isolated_db, monkeypatch)
         regular = UserORM(
@@ -238,7 +240,7 @@ class TestHldVerify:
 
         assert client.post(
             "/api/products/prod_1/hld/hld_prod_1/verify"
-        ).status_code == 403
+        ).status_code == 404
         assert client.post(
             "/api/products/prod_1/hld/hld_prod_1/pages/hld_overview/verify"
-        ).status_code == 403
+        ).status_code == 404

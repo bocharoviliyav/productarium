@@ -199,12 +199,14 @@ export interface Hld {
 /** One entry of the version list (desc order; `is_current` marks the live one). */
 export interface DocVersionItem {
   version: number;
-  /** baseline | generate | edit | rollback */
+  /** baseline | generate | schedule | edit | rollback */
   source: string;
   model?: string | null;
   job_id?: string | null;
   created_at?: string | null;
   is_current?: boolean;
+  /** SPEC-012: full snapshot or page-scoped delta (overrides on a base version). */
+  scope?: "full" | "page";
 }
 
 /** GET /{segment}/{id}/versions envelope. */
@@ -220,6 +222,53 @@ export interface DocVersionDetail extends DocVersionItem {
   generated_docs?: string | null;
   pages?: ArtifactPages;
   content?: string | null;
+}
+
+/* ------------------------------------------------------------------ */
+/* SPEC-009: scheduled docgen (cron autogeneration)                    */
+/* ------------------------------------------------------------------ */
+
+/** One row of GET/PUT /api/products/{id}/schedules (admin-only, SPEC-009). */
+export interface DocgenSchedule {
+  id: string;
+  product_id: string;
+  entity_type: "codebase" | "database";
+  entity_id: string;
+  cron_expr: string;
+  enabled: boolean;
+  last_run_at?: string | null;
+  /** submitted | ok | skipped_busy | error | cancelled | null. */
+  last_result?: string | null;
+  /** Server-computed next fire time (UTC ISO); null when disabled. */
+  next_run_at?: string | null;
+  created_by?: string | null;
+  updated_at?: string | null;
+}
+
+/* ------------------------------------------------------------------ */
+/* SPEC-010: change detection (detect job result)                      */
+/* ------------------------------------------------------------------ */
+
+/** One impacted page of a detect result; `new` = not documented yet. */
+export interface DetectImpactedPage {
+  id: string;
+  title: string;
+  new?: boolean;
+}
+
+/**
+ * Detect job `result` payload (POST …/detect → poll …/detect/status).
+ * `changed`: true = source moved, false = up to date, null = cannot verify.
+ */
+export interface DetectResult {
+  entity_type: string;
+  entity_id: string;
+  changed: boolean | null;
+  reason: string;
+  checked_at?: string;
+  impacted_pages: DetectImpactedPage[];
+  changed_files?: string[] | null;
+  changed_objects?: string[] | null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -272,6 +321,74 @@ export interface Product {
    * backends that do not serve the field yet.
    */
   hld?: Hld | null;
+  /** Per-user access grants (SPEC-001); absent on old payloads. */
+  grants?: ProductGrant[];
+}
+
+/**
+ * Effective access level of a user on a product (SPEC-001), mirroring
+ * api/auth/deps.py:product_access:
+ * - "manage" — rw (owner / rw grant / admin): CRUD + docs + user management;
+ * - "docs"   — any other access (ro grant, manager on any product): edit
+ *   documentation, verify, regenerate;
+ * - "read"   — viewer_global (pure RO, no docs rights; grants never apply);
+ * - "none"   — no access (the API hides such products entirely).
+ */
+export type ProductAccessLevel = "manage" | "docs" | "read" | "none";
+
+export function productAccess(
+  user: Pick<User, "id" | "role"> | null | undefined,
+  product: Pick<Product, "owner_id" | "grants"> | null | undefined,
+): ProductAccessLevel {
+  if (!user || !product) return "none";
+  if (user.role === "admin") return "manage";
+  // Mirrors resolve_product_access: viewer_global short-circuits to pure RO
+  // BEFORE grants — an rw grant must not unlock manage UI for a viewer.
+  if (user.role === "viewer_global") return "read";
+  const isOwner = product.owner_id === user.id;
+  const grant = product.grants?.find((g) => g.user_id === user.id);
+  if (isOwner || grant?.level === "rw") return "manage";
+  if (user.role === "manager") return "docs"; // ro on every product
+  return grant?.level === "ro" ? "docs" : "none";
+}
+
+/**
+ * SPEC-023 edit matrix: rename / re-describe / transfer ownership of a
+ * product — owner or admin ONLY (rw grants lose this right).
+ */
+export function canEditProduct(
+  user: Pick<User, "id" | "role"> | null | undefined,
+  product: Pick<Product, "owner_id"> | null | undefined,
+): boolean {
+  if (!user || !product) return false;
+  return user.role === "admin" || product.owner_id === user.id;
+}
+
+/**
+ * SPEC-023 configure matrix: schedules + product grants — owner, manager
+ * or admin; grants never confer it (mirrors api ProductAccess.can_configure).
+ */
+export function canConfigureProduct(
+  user: Pick<User, "id" | "role"> | null | undefined,
+  product: Pick<Product, "owner_id"> | null | undefined,
+): boolean {
+  if (!user || !product) return false;
+  return (
+    user.role === "admin" ||
+    user.role === "manager" ||
+    product.owner_id === user.id
+  );
+}
+
+/**
+ * Per-product access grant (SPEC-001): ro = read + docs rights, rw = manage.
+ * Served inside Product payloads; admins/owner carry implicit access and
+ * never appear here.
+ */
+export interface ProductGrant {
+  user_id: string;
+  level: "ro" | "rw";
+  granted_by?: string | null;
 }
 
 /**
@@ -303,7 +420,7 @@ export interface ProductListItem {
 }
 
 /* ------------------------------------------------------------------ */
-/* Knowledge tree (Confluence-like, item 2)                            */
+/* Knowledge tree (item 2)                                             */
 /* ------------------------------------------------------------------ */
 
 export type KnowledgeNodeType = "page" | "folder" | "branch";
@@ -314,6 +431,10 @@ export interface KnowledgeNode {
   parent_id?: string | null;
   title: string;
   slug: string;
+  /**
+   * Full node body. Served by GET /knowledge/nodes/{id} and node CRUD;
+   * tree payloads carry metadata only — fetch the node for its body.
+   */
   content_md?: string | null;
   node_type: KnowledgeNodeType;
   artifact_id?: string | null;
@@ -344,6 +465,13 @@ export interface User {
   created_at?: string | null;
   /** True when the user must change their password on next login (temp password). */
   must_change_password?: boolean;
+}
+
+/** GET /api/admin/users serves a bare array (or a legacy {users} envelope). */
+export function normalizeUsers(
+  data: User[] | { users?: User[] } | null | undefined,
+): User[] {
+  return Array.isArray(data) ? data : (data?.users ?? []);
 }
 
 /** First-run setup probe (GET /api/auth/setup-status). */
@@ -381,6 +509,20 @@ export interface SettingOut {
 export type McpTransport = "http" | "sse" | "stdio";
 export type McpServerStatus = "ok" | "error" | "unknown";
 
+/** Areas a server is exposed in (SPEC-028; mirrors api/models.MCP_SCOPES). */
+export const MCP_SCOPES = ["codebase", "database", "knowledge", "expert"] as const;
+export type McpScope = (typeof MCP_SCOPES)[number];
+
+/** i18n label for an MCP scope ("database" → common.scopeDatabase). */
+export function mcpScopeLabel(
+  scope: string,
+  common: Record<string, unknown> | null | undefined,
+): string {
+  const key = `scope${scope.charAt(0).toUpperCase()}${scope.slice(1)}`;
+  const value = common?.[key];
+  return typeof value === "string" ? value : scope;
+}
+
 /**
  * Registry entry served by the admin MCP registry
  * (GET/POST/PUT /api/admin/mcp/servers, POST .../test). Header and env
@@ -399,6 +541,8 @@ export interface McpServer {
   status: McpServerStatus;
   status_checked_at?: string | null;
   status_error?: string | null;
+  /** Areas the server is exposed in (SPEC-028); absent on legacy payloads. */
+  scopes?: McpScope[] | null;
   created_at?: string | null;
   updated_at?: string | null;
 }
@@ -464,6 +608,8 @@ export interface McpServerBinding {
   enabled: boolean;
   allowed_tools: string[] | null;
   status: McpServerStatus;
+  /** Areas the bound server is exposed in (SPEC-028). */
+  scopes?: McpScope[] | null;
 }
 
 /* ------------------------------------------------------------------ */

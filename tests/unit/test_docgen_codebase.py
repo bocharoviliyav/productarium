@@ -2,7 +2,7 @@
 
 Covers: _count_tokens, _build_file_blocks, _build_codebase_blob,
 _chunk_file_blocks, _build_file_tree, _build_file_analysis, _read_readme,
-_section_pages, _raise_if_all_sections_unavailable,
+_raise_if_all_sections_unavailable,
 generate_codebase_docs (standard-LLM path, error paths, orchestrated
 subagent path, diff regeneration), the Wave-F scaffolding (repo brief,
 router hints, section contracts, progress tracker, task-tool handler,
@@ -37,6 +37,19 @@ class FakeDoc:
     def __init__(self, text, file_path):
         self.text = text
         self.meta_data = {"file_path": file_path}
+
+
+def _gate_ok(body: str) -> str:
+    """Pad a short fixture body so it passes the SPEC-004 page gate
+    (>=200 meaningful chars + a heading/list structure), keeping the body
+    as the first line (opener-dedup fixtures rely on that)."""
+    return (
+        f"{body}\n\n## Детали\n\n"
+        "- Структура модулей, точки входа и связи между компонентами "
+        "подтверждены чтением исходников рабочей копии репозитория.\n"
+        "- Пограничные случаи, обработка ошибок и вспомогательные утилиты "
+        "проверены по файлам проекта и заметкам предыдущих юнитов запуска."
+    )
 
 
 @pytest.fixture
@@ -249,29 +262,6 @@ class TestReadReadme:
 
 
 # ============================================================================
-# _section_pages
-# ============================================================================
-class TestSectionPages:
-    def test_builds_pages_for_all_sections(self):
-        sections = {sid: f"content for {sid}" for sid in cb.SECTION_ORDER}
-        pages = cb._section_pages(sections, "ru")
-        assert len(pages) == 7
-        for sid in cb.SECTION_ORDER:
-            page_id = f"page_{sid}"
-            assert page_id in pages
-            assert pages[page_id]["content"] == f"content for {sid}"
-            assert pages[page_id]["title"]
-            assert pages[page_id]["filePaths"] == []
-            assert pages[page_id]["importance"] == "high"
-
-    def test_empty_sections(self):
-        pages = cb._section_pages({}, "ru")
-        assert len(pages) == 7
-        for page in pages.values():
-            assert page["content"] == ""
-
-
-# ============================================================================
 # _raise_if_all_sections_unavailable
 # ============================================================================
 class TestRaiseIfAllUnavailable:
@@ -396,11 +386,6 @@ class TestGenerateCodebaseDocs:
         monkeypatch.setattr(cb, "run_repair_loop", fake_repair)
         monkeypatch.setattr(cb, "_index_in_background", lambda *a, **kw: None)
 
-        import api.expert.knowledge as knowledge_mod
-        async def fake_knowledge(pid, query):
-            return ""
-        monkeypatch.setattr(knowledge_mod, "_retrieve_product_knowledge", fake_knowledge)
-
         result = asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
         assert "Документация по кодовой базе" in result
         assert fake_artifact.generated_docs is not None
@@ -455,10 +440,6 @@ class TestGenerateCodebaseDocs:
             return content, {}
         monkeypatch.setattr(cb, "run_repair_loop", fake_repair)
         monkeypatch.setattr(cb, "_index_in_background", lambda *a, **kw: None)
-        import api.expert.knowledge as knowledge_mod
-        async def fake_knowledge(pid, query):
-            return ""
-        monkeypatch.setattr(knowledge_mod, "_retrieve_product_knowledge", fake_knowledge)
 
         with pytest.raises(ValueError, match="Не удалось сгенерировать"):
             asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
@@ -474,7 +455,9 @@ class TestResolveChunkBudget:
 
     def test_budget_is_context_bounded(self):
         budget = cb._resolve_codebase_chunk_budget()
-        assert 3000 <= budget <= 200_000
+        # The budget is the resolved window minus reserves; the default
+        # qwen3 model catalog-resolves to 262144 -> 252048 (SPEC-005).
+        assert 3000 <= budget < 262_144
 
 
 # ============================================================================
@@ -677,98 +660,6 @@ class TestAgenticBottomUpDocgen:
         result = asyncio.run(cb._agentic_bottom_up_docgen("p", chunks, FakeLLM()))
         assert peak["max"] == 1  # strictly sequential
         assert result.count("file summary") == 4
-
-
-# ============================================================================
-# generate_codebase_docs — product knowledge enrichment path
-# ============================================================================
-class TestGenerateCodebaseProductKnowledge:
-    @pytest.fixture(autouse=True)
-    def _hermetic_agent_off(self, monkeypatch):
-        monkeypatch.setattr(cb, "_deepagents_available", lambda: False)
-        monkeypatch.setenv("DOCGEN_JUDGE_ENABLED", "false")
-
-    @pytest.fixture
-    def fake_repo_dir(self, tmp_path):
-        (tmp_path / "main.py").write_text("import os\nprint('hello')\n")
-        (tmp_path / "README.md").write_text("# Test Repo\nA test.\n")
-        return str(tmp_path)
-
-    @pytest.fixture
-    def fake_artifact(self):
-        class A:
-            repo_url = "https://github.com/owner/testrepo"
-            repo_type = "github"
-            token = None
-            name = "testrepo"
-            generated_docs = None
-            pages = None
-        return A()
-
-    @pytest.fixture
-    def fake_product(self):
-        class P:
-            id = "prod_kn"
-        return P()
-
-    def test_product_knowledge_enriches_readme(self, fake_artifact, fake_product, fake_repo_dir, monkeypatch):
-        class FakeDBManager:
-            repo_paths = {"save_repo_dir": fake_repo_dir}
-            def _create_repo(self, *a, **kw):
-                pass
-
-        import api.repositories.documents as docs_mod
-        monkeypatch.setattr(docs_mod, "DatabaseManager", FakeDBManager)
-        monkeypatch.setattr(docs_mod, "read_all_documents", lambda *a, **kw: [
-            FakeDoc("import os\nprint('hello')\n", "main.py"),
-            FakeDoc("# Test Repo\nA test.\n", "README.md"),
-        ])
-
-        class FakeLLM:
-            async def generate(self, prompt):
-                return "section content"
-        monkeypatch.setattr(cb, "_safe_build_llm", lambda *a, **kw: FakeLLM())
-        async def fake_repair(content, llm):
-            return content, {}
-        monkeypatch.setattr(cb, "run_repair_loop", fake_repair)
-        monkeypatch.setattr(cb, "_index_in_background", lambda *a, **kw: None)
-
-        import api.expert.knowledge as knowledge_mod
-        async def fake_knowledge(pid, query):
-            return "Confluence context here"
-        monkeypatch.setattr(knowledge_mod, "_retrieve_product_knowledge", fake_knowledge)
-
-        result = asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
-        assert "Документация по кодовой базе" in result
-
-    def test_product_knowledge_retrieval_fails_non_fatal(self, fake_artifact, fake_product, fake_repo_dir, monkeypatch):
-        class FakeDBManager:
-            repo_paths = {"save_repo_dir": fake_repo_dir}
-            def _create_repo(self, *a, **kw):
-                pass
-
-        import api.repositories.documents as docs_mod
-        monkeypatch.setattr(docs_mod, "DatabaseManager", FakeDBManager)
-        monkeypatch.setattr(docs_mod, "read_all_documents", lambda *a, **kw: [
-            FakeDoc("import os\n", "main.py"),
-        ])
-
-        class FakeLLM:
-            async def generate(self, prompt):
-                return "section content"
-        monkeypatch.setattr(cb, "_safe_build_llm", lambda *a, **kw: FakeLLM())
-        async def fake_repair(content, llm):
-            return content, {}
-        monkeypatch.setattr(cb, "run_repair_loop", fake_repair)
-        monkeypatch.setattr(cb, "_index_in_background", lambda *a, **kw: None)
-
-        import api.expert.knowledge as knowledge_mod
-        async def fake_knowledge(pid, query):
-            raise RuntimeError("knowledge retrieval failed")
-        monkeypatch.setattr(knowledge_mod, "_retrieve_product_knowledge", fake_knowledge)
-
-        result = asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
-        assert "Документация по кодовой базе" in result
 
 
 # ============================================================================
@@ -977,19 +868,102 @@ class TestAgentHelpers:
             async def ainvoke(self, payload, config=None):
                 raise RuntimeError("agent down")
 
-        text, files = asyncio.run(cb._run_agent_section(_Boom(), "task"))
-        assert text == "" and files == []
+        text, files, degraded = asyncio.run(cb._run_agent_section(
+            _Boom(), "task", title="Обзор",
+        ))
+        assert text == "" and files == [] and degraded is False
 
     def test_run_agent_section_returns_text_and_files(self):
+        from langchain_core.messages import AIMessage
+
         result = self._result()
+        result["messages"][-1] = AIMessage(
+            content=_gate_ok("## Final section text")
+        )
 
         class _Ok:
             async def ainvoke(self, payload, config=None):
                 return result
 
-        text, files = asyncio.run(cb._run_agent_section(_Ok(), "task"))
-        assert text == "## Final section text"
+        text, files, degraded = asyncio.run(cb._run_agent_section(
+            _Ok(), "task", title="Обзор",
+        ))
+        assert text == _gate_ok("## Final section text")
         assert files == ["main.py", "src/util.py"]
+        assert degraded is False
+
+    def test_run_agent_section_gate_retries_then_degrades(self):
+        """SPEC-004: persistent garbage text exhausts the gate (3 attempts)
+        and comes back sanitized + degraded."""
+        garbage = (
+            "<tool_call>{\"name\": \"repo_read_file\"}</tool_call>" * 6
+            + "<|im_start|>assistant<|im_end|>"
+        )
+        calls = {"n": 0}
+
+        class _Garbage:
+            async def ainvoke(self, payload, config=None):
+                calls["n"] += 1
+                return {"messages": [AIMessage(content=garbage)]}
+
+        from langchain_core.messages import AIMessage
+
+        text, files, degraded = asyncio.run(cb._run_agent_section(
+            _Garbage(), "task", title="Обзор",
+        ))
+        assert calls["n"] == 3  # 1 run + 2 gate retries
+        assert degraded is True
+        assert "<tool_call" not in text and "<|im_start|>" not in text
+
+    def test_run_agent_section_gate_retry_recovers(self):
+        """SPEC-004: the gate's violation feedback rides into the retry
+        prompt and the second attempt passes."""
+        from langchain_core.messages import AIMessage
+
+        prompts = []
+
+        class _Flaky:
+            def __init__(self):
+                self.n = 0
+
+            async def ainvoke(self, payload, config=None):
+                self.n += 1
+                prompts.append(payload["messages"][0].content)
+                content = "too short" if self.n == 1 else _gate_ok("Recovered page")
+                return {"messages": [AIMessage(content=content)]}
+
+        text, files, degraded = asyncio.run(cb._run_agent_section(
+            _Flaky(), "task", title="Обзор",
+        ))
+        assert degraded is False
+        assert "Recovered page" in text
+        assert len(prompts) == 2
+        assert "task" in prompts[0] and "<quality_gate>" in prompts[1]
+
+    def test_run_agent_section_watchdog_cancels_stall(self, monkeypatch):
+        """SPEC-015: a never-completing unit agent is cancelled by the
+        wall-clock budget; the run returns the empty fallback instead of
+        hanging the pipeline."""
+        from api.config import timeout as timeout_mod
+
+        cancelled = []
+
+        class _Stalled:
+            async def ainvoke(self, payload, config=None):
+                try:
+                    await asyncio.sleep(999)
+                except asyncio.CancelledError:
+                    cancelled.append(True)
+                    raise
+
+        monkeypatch.setattr(
+            timeout_mod, "resolve_docgen_unit_wall_clock", lambda: 0.05
+        )
+        text, files, degraded = asyncio.run(cb._run_agent_section(
+            _Stalled(), "task", title="Обзор",
+        ))
+        assert cancelled == [True]
+        assert text == "" and files == [] and degraded is False
 
 
 # ============================================================================
@@ -1476,6 +1450,7 @@ class TestDocgenAgentFlow:
     @pytest.fixture
     def fake_artifact(self):
         class A:
+            id = "cb_agent"
             repo_url = "https://github.com/owner/testrepo"
             repo_type = "github"
             token = None
@@ -1522,8 +1497,9 @@ class TestDocgenAgentFlow:
         monkeypatch.setattr(cb, "_notes_dir_for", lambda cid: None)
 
         async def default_parallel(chat, repo_dir, system_prompts, dispatches, tracker,
-                                   notes_dir=None, spec_tools=None):
-            return {}, {}
+                                   titles=None, progress=None, notes_dir=None,
+                                   spec_tools=None, mcp_tools=None):
+            return {}, {}, set()
         monkeypatch.setattr(cb, "_run_parallel_section_agents", parallel or default_parallel)
 
         def default_builder(chat, specs, system_prompt):
@@ -1541,15 +1517,11 @@ class TestDocgenAgentFlow:
             return content, {}
         monkeypatch.setattr(cb, "run_repair_loop", fake_repair)
         monkeypatch.setattr(cb, "_index_in_background", lambda *a, **kw: None)
-
-        import api.expert.knowledge as knowledge_mod
-        async def fake_knowledge(pid, query):
-            return ""
-        monkeypatch.setattr(knowledge_mod, "_retrieve_product_knowledge", fake_knowledge)
+        monkeypatch.setattr(cb, "_index_pages_in_background", lambda *a, **kw: None)
 
     def test_orchestrated_happy_path_provenance(self, fake_artifact, fake_product, fake_repo_dir, monkeypatch):
         orchestrator = _FakeOrchestrator({
-            sid: "Agent wrote this section about `main.py`."
+            sid: _gate_ok("Agent wrote this section about `main.py`.")
             for sid in cb.SECTION_ORDER
         })
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator)
@@ -1576,6 +1548,69 @@ class TestDocgenAgentFlow:
         assert "main.py" in prov["citations"]["resolved"]
         assert "judge" not in prov  # judge disabled -> key omitted
 
+    def test_quality_gate_filters_orchestrated_garbage(
+        self, fake_artifact, fake_product, fake_repo_dir, monkeypatch
+    ):
+        """SPEC-004: an orchestrated unit full of tool-call echo fails the
+        gate, is dropped, and the gated parallel fallback regenerates it;
+        nothing marker-like is persisted on any page."""
+        sections = {
+            sid: _gate_ok(f"Agent wrote this section about `main.py` — {sid}.")
+            for sid in cb.SECTION_ORDER
+        }
+        sections["overview"] = (
+            '<tool_call>{"name": "repo_read_file"}</tool_call>' * 8
+            + "<|im_start|>assistant\nFinal text that never comes.<|im_end|>"
+        )
+        orchestrator = _FakeOrchestrator(sections)
+        parallel_calls: Dict[str, Any] = {}
+
+        async def fake_parallel(chat, repo_dir, system_prompts, dispatches, tracker,
+                                titles=None, progress=None, notes_dir=None,
+                                spec_tools=None, mcp_tools=None):
+            parallel_calls["sids"] = list(system_prompts)
+            return (
+                {sid: _gate_ok(f"Parallel recovered {sid}") for sid in system_prompts},
+                {sid: ["main.py"] for sid in system_prompts},
+                set(),
+            )
+
+        self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator,
+                         parallel=fake_parallel)
+        asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
+
+        assert parallel_calls["sids"] == ["overview"]
+        for page in fake_artifact.pages.values():
+            assert "<tool_call" not in page["content"]
+            assert "<|im_start|>" not in page["content"]
+
+    def test_quality_gate_degraded_marks_provenance(
+        self, fake_artifact, fake_product, fake_repo_dir, monkeypatch
+    ):
+        """SPEC-004: a unit the gate gives up on (degraded set from the
+        parallel path) is saved with provenance['degraded'] = True; the
+        rest stay unmarked."""
+        orchestrator = _FakeOrchestrator({}, error=RuntimeError("down"))
+
+        async def fake_parallel(chat, repo_dir, system_prompts, dispatches, tracker,
+                                titles=None, progress=None, notes_dir=None,
+                                spec_tools=None, mcp_tools=None):
+            texts = {sid: _gate_ok(f"Parallel wrote {sid}") for sid in system_prompts}
+            files = {sid: ["main.py"] for sid in system_prompts}
+            for sid in system_prompts:
+                tracker.section_started(sid)
+                tracker.section_finished(sid)
+            return texts, files, {cb.SECTION_ORDER[0]}
+
+        self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator,
+                         parallel=fake_parallel)
+        asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
+
+        assert (
+            fake_artifact.pages["page_overview"]["provenance"]["degraded"] is True
+        )
+        assert "degraded" not in fake_artifact.pages["page_architecture"]["provenance"]
+
     def test_provenance_block_moves_to_report(
         self, fake_artifact, fake_product, fake_repo_dir, monkeypatch
     ):
@@ -1583,7 +1618,7 @@ class TestDocgenAgentFlow:
         extracted from the persisted text into provenance["report"] — the UI
         renders it inside the verification panel, never in the page body."""
         orchestrator = _FakeOrchestrator({
-            sid: (
+            sid: _gate_ok(
                 f"Agent wrote this section about `main.py`.\n\n"
                 "### Провенанс и проверка\n"
                 "Ключевые источники: `main.py`.\n\n"
@@ -1612,7 +1647,7 @@ class TestDocgenAgentFlow:
         the guard reports the duplicate in page provenance; no repair here
         (the hermetic patcher's repair seam is None), text stays verbatim."""
         orchestrator = _FakeOrchestrator({
-            sid: "Same opening line about `main.py`. Unique tail."
+            sid: _gate_ok("Same opening line about `main.py`. Unique tail.")
             for sid in cb.SECTION_ORDER
         })
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator)
@@ -1635,7 +1670,7 @@ class TestDocgenAgentFlow:
     ):
         monkeypatch.setenv("DOCGEN_OPENER_DEDUP", "false")
         orchestrator = _FakeOrchestrator({
-            sid: "Same opening line about `main.py`."
+            sid: _gate_ok("Same opening line about `main.py`.")
             for sid in cb.SECTION_ORDER
         })
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator)
@@ -1654,7 +1689,7 @@ class TestDocgenAgentFlow:
         persisted text and reported in provenance; the grounded sentence
         (the `main.py` citation) survives."""
         orchestrator = _FakeOrchestrator({
-            sid: (
+            sid: _gate_ok(
                 "Agent wrote this section about `main.py`. "
                 f"Ghost `GhostWidgetFactory` powers {sid}."
             )
@@ -1679,7 +1714,9 @@ class TestDocgenAgentFlow:
         def capture_builder(chat, specs, system_prompt):
             captured["specs"] = specs
             captured["system_prompt"] = system_prompt
-            return _FakeOrchestrator({sid: "text" for sid in cb.SECTION_ORDER})
+            return _FakeOrchestrator(
+                {sid: _gate_ok("text") for sid in cb.SECTION_ORDER}
+            )
 
         self._patch_flow(monkeypatch, fake_repo_dir, builder=capture_builder)
         asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
@@ -1699,19 +1736,23 @@ class TestDocgenAgentFlow:
         assert "(none)" in captured["system_prompt"]  # no reused sections
 
     def test_partial_orchestration_parallel_fallback(self, fake_artifact, fake_product, fake_repo_dir, monkeypatch):
-        orchestrated = dict.fromkeys(cb.SECTION_ORDER[:3], "Orchestrated section text")
+        orchestrated = dict.fromkeys(
+            cb.SECTION_ORDER[:3], _gate_ok("Orchestrated section text")
+        )
         orchestrator = _FakeOrchestrator(orchestrated)
 
         parallel_calls: Dict[str, Any] = {}
 
         async def fake_parallel(chat, repo_dir, system_prompts, dispatches, tracker,
-                                notes_dir=None, spec_tools=None):
+                                titles=None, progress=None, notes_dir=None,
+                                spec_tools=None, mcp_tools=None):
             parallel_calls["sids"] = list(system_prompts)
             parallel_calls["prompts"] = dict(system_prompts)
             parallel_calls["dispatches"] = dict(dispatches)
             return (
                 {sid: f"Parallel wrote {sid}" for sid in system_prompts},
                 {sid: ["src/parallel.py"] for sid in system_prompts},
+                set(),
             )
 
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator, parallel=fake_parallel)
@@ -1741,18 +1782,22 @@ class TestDocgenAgentFlow:
         heads for the failed tasks."""
         import logging
 
-        ok = dict.fromkeys(cb.SECTION_ORDER[:2], "Orchestrated section text")
+        ok = dict.fromkeys(
+            cb.SECTION_ORDER[:2], _gate_ok("Orchestrated section text")
+        )
         failed_sid = cb.SECTION_ORDER[2]
         ok[failed_sid] = "We cannot invoke subagent due to error: 429 rate limit"
         orchestrator = _FakeOrchestrator(ok)
         parallel_calls: Dict[str, Any] = {}
 
         async def fake_parallel(chat, repo_dir, system_prompts, dispatches, tracker,
-                                notes_dir=None, spec_tools=None):
+                                titles=None, progress=None, notes_dir=None,
+                                spec_tools=None, mcp_tools=None):
             parallel_calls["sids"] = list(system_prompts)
             return (
                 {sid: f"Parallel wrote {sid}" for sid in system_prompts},
                 {sid: ["main.py"] for sid in system_prompts},
+                set(),
             )
 
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator,
@@ -1789,13 +1834,14 @@ class TestDocgenAgentFlow:
         orchestrator = _FakeOrchestrator({}, error=RuntimeError("orchestrator exploded"))
 
         async def fake_parallel(chat, repo_dir, system_prompts, dispatches, tracker,
-                                notes_dir=None, spec_tools=None):
+                                titles=None, progress=None, notes_dir=None,
+                                spec_tools=None, mcp_tools=None):
             texts = {sid: f"Parallel wrote {sid}" for sid in system_prompts}
             files = {sid: ["main.py"] for sid in system_prompts}
             for sid in system_prompts:
                 tracker.section_started(sid)
                 tracker.section_finished(sid)
-            return texts, files
+            return texts, files, set()
 
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator, parallel=fake_parallel)
 
@@ -1832,7 +1878,9 @@ class TestDocgenAgentFlow:
 
         def capture_builder(chat, specs, system_prompt):
             captured["specs"] = specs
-            return _FakeOrchestrator({sid: "text" for sid in cb.SECTION_ORDER})
+            return _FakeOrchestrator(
+                {sid: _gate_ok("text") for sid in cb.SECTION_ORDER}
+            )
 
         self._patch_flow(monkeypatch, fake_repo_dir, builder=capture_builder)
         asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
@@ -1854,7 +1902,9 @@ class TestDocgenAgentFlow:
 
         def capture_builder(chat, specs, system_prompt):
             captured["specs"] = specs
-            return _FakeOrchestrator({sid: "text" for sid in cb.SECTION_ORDER})
+            return _FakeOrchestrator(
+                {sid: _gate_ok("text") for sid in cb.SECTION_ORDER}
+            )
 
         self._patch_flow(monkeypatch, fake_repo_dir, builder=capture_builder)
         asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
@@ -1871,20 +1921,96 @@ class TestDocgenAgentFlow:
         parallel_calls: Dict[str, Any] = {}
 
         async def fake_parallel(chat, repo_dir, system_prompts, dispatches, tracker,
-                                notes_dir=None, spec_tools=None):
+                                titles=None, progress=None, notes_dir=None,
+                                spec_tools=None, mcp_tools=None):
             parallel_calls["spec_tools"] = list(spec_tools or [])
             texts = {sid: f"Parallel wrote {sid}" for sid in system_prompts}
             files = {sid: ["main.py"] for sid in system_prompts}
             for sid in system_prompts:
                 tracker.section_started(sid)
                 tracker.section_finished(sid)
-            return texts, files
+            return texts, files, set()
 
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator,
                          parallel=fake_parallel)
         asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
 
         assert [t.name for t in parallel_calls["spec_tools"]] == ["spec_lookup"]
+
+    # --- SPEC-028: codebase-scoped MCP tools reach the unit agents --- #
+    def _probe_tool(self):
+        from langchain_core.tools import StructuredTool
+        from pydantic import BaseModel
+
+        class _NoArgs(BaseModel):
+            pass
+
+        return StructuredTool(
+            name="mcp_probe",
+            description="codebase-scoped MCP tool",
+            args_schema=_NoArgs,
+            func=lambda **kw: "x",
+        )
+
+    def test_mcp_tools_reach_unit_subagents(
+        self, fake_artifact, fake_product, fake_repo_dir, monkeypatch
+    ):
+        """SPEC-028: the product's codebase-scoped MCP tools (gathered with
+        scope='codebase', error-tolerant via plain_agent_tools) join every
+        unit subagent's toolset."""
+        from api.mcp import manager as mcp_manager_mod
+
+        gathered: Dict[str, Any] = {}
+
+        async def fake_gather(pid, session_factory=None, scope="expert"):
+            gathered["pid"], gathered["scope"] = pid, scope
+            return [self._probe_tool()]
+
+        monkeypatch.setattr(mcp_manager_mod, "gather_mcp_agent_tools", fake_gather)
+        captured: Dict[str, Any] = {}
+
+        def capture_builder(chat, specs, system_prompt):
+            captured["specs"] = specs
+            return _FakeOrchestrator(
+                {sid: _gate_ok("text") for sid in cb.SECTION_ORDER}
+            )
+
+        self._patch_flow(monkeypatch, fake_repo_dir, builder=capture_builder)
+        asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
+
+        assert gathered == {"pid": "prod_agent", "scope": "codebase"}
+        assert captured["specs"]
+        for spec in captured["specs"]:
+            assert any(t.name == "mcp_probe" for t in spec["tools"])
+
+    def test_mcp_tools_reach_parallel_fallback(
+        self, fake_artifact, fake_product, fake_repo_dir, monkeypatch
+    ):
+        from api.mcp import manager as mcp_manager_mod
+
+        async def fake_gather(pid, session_factory=None, scope="expert"):
+            return [self._probe_tool()]
+
+        monkeypatch.setattr(mcp_manager_mod, "gather_mcp_agent_tools", fake_gather)
+        orchestrator = _FakeOrchestrator({}, error=RuntimeError("down"))
+        parallel_calls: Dict[str, Any] = {}
+
+        async def fake_parallel(chat, repo_dir, system_prompts, dispatches, tracker,
+                                titles=None, progress=None, notes_dir=None,
+                                spec_tools=None, mcp_tools=None):
+            parallel_calls["mcp_tools"] = list(mcp_tools or [])
+            texts = {sid: f"Parallel wrote {sid}" for sid in system_prompts}
+            files = {sid: ["main.py"] for sid in system_prompts}
+            for sid in system_prompts:
+                tracker.section_started(sid)
+                tracker.section_finished(sid)
+            return texts, files, set()
+
+        self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator,
+                         parallel=fake_parallel)
+        asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
+
+        assert [t.name for t in parallel_calls["mcp_tools"]] == ["mcp_probe"]
 
     def test_all_agent_paths_fail_falls_back_to_standard_llm(
         self, fake_artifact, fake_product, fake_repo_dir, monkeypatch
@@ -1912,7 +2038,7 @@ class TestDocgenAgentFlow:
         # non-empty provenance.source_files (extracted from citations), so a
         # citation-less text would store no source set and never reuse.
         orchestrator1 = _FakeOrchestrator(
-            {sid: "FIRST RUN CONTENT `main.py`" for sid in cb.SECTION_ORDER}
+            {sid: _gate_ok("FIRST RUN CONTENT `main.py`") for sid in cb.SECTION_ORDER}
         )
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator1)
         result1 = asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
@@ -1941,7 +2067,7 @@ class TestDocgenAgentFlow:
         """Reused units are re-healed: a page persisted before the preamble
         strip / truncation heal existed loses its defects on diff-regen."""
         orchestrator1 = _FakeOrchestrator(
-            {sid: "FIRST RUN CONTENT `main.py`" for sid in cb.SECTION_ORDER}
+            {sid: _gate_ok("FIRST RUN CONTENT `main.py`") for sid in cb.SECTION_ORDER}
         )
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator1)
         asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
@@ -1982,7 +2108,7 @@ class TestDocgenAgentFlow:
         # Citation so run 1 stores main.py in provenance.source_files — the
         # second run then re-fingerprints it and sees the content hash change.
         orchestrator1 = _FakeOrchestrator(
-            {sid: "BEFORE CHANGE `main.py`" for sid in cb.SECTION_ORDER}
+            {sid: _gate_ok("BEFORE CHANGE `main.py`") for sid in cb.SECTION_ORDER}
         )
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator1)
         asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
@@ -1991,7 +2117,7 @@ class TestDocgenAgentFlow:
             f.write("# changed\n")
 
         orchestrator2 = _FakeOrchestrator(
-            {sid: "AFTER CHANGE" for sid in cb.SECTION_ORDER}
+            {sid: _gate_ok("AFTER CHANGE") for sid in cb.SECTION_ORDER}
         )
         monkeypatch.setattr(
             cb, "_build_orchestrator_agent",
@@ -2010,7 +2136,7 @@ class TestDocgenAgentFlow:
         """A second run where SOME sections are reused only dispatches the
         rest; the orchestrator prompt lists the reused ones."""
         orchestrator1 = _FakeOrchestrator(
-            {sid: "FIRST RUN CONTENT" for sid in cb.SECTION_ORDER}
+            {sid: _gate_ok("FIRST RUN CONTENT") for sid in cb.SECTION_ORDER}
         )
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator1)
         asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
@@ -2025,7 +2151,7 @@ class TestDocgenAgentFlow:
         def capture_builder(chat, specs, system_prompt):
             captured["specs"] = specs
             captured["system_prompt"] = system_prompt
-            return _FakeOrchestrator({"overview": "REGENERATED OVERVIEW"})
+            return _FakeOrchestrator({"overview": _gate_ok("REGENERATED OVERVIEW")})
 
         monkeypatch.setattr(cb, "_build_orchestrator_agent", capture_builder)
 
@@ -2052,7 +2178,7 @@ class TestDocgenAgentFlow:
     def test_progress_events_complete_run(self, fake_artifact, fake_product, fake_repo_dir, monkeypatch):
         events, progress_cb = _collector()
         orchestrator = _FakeOrchestrator(
-            {sid: "section body" for sid in cb.SECTION_ORDER}
+            {sid: _gate_ok("section body") for sid in cb.SECTION_ORDER}
         )
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator)
 
@@ -2080,23 +2206,27 @@ class TestDocgenAgentFlow:
     def test_generated_docs_indexed_not_repo_path(
         self, fake_artifact, fake_product, fake_repo_dir, monkeypatch
     ):
-        """The generated MARKDOWN is indexed, not the clone path string."""
-        orchestrator = _FakeOrchestrator({sid: "Indexed content here" for sid in cb.SECTION_ORDER})
+        """Pages are indexed page-granular, never the clone path string."""
+        orchestrator = _FakeOrchestrator({
+            sid: _gate_ok("Indexed content here") for sid in cb.SECTION_ORDER
+        })
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator)
 
         indexed = []
 
-        def track_index(content, dataset, **kw):
-            indexed.append((content, dataset, kw))
-        monkeypatch.setattr(cb, "_index_in_background", track_index)
+        def track_index(pages, dataset, **kw):
+            indexed.append((pages, dataset, kw))
+        monkeypatch.setattr(cb, "_index_pages_in_background", track_index)
 
         asyncio.run(cb.generate_codebase_docs(fake_artifact, fake_product))
         assert len(indexed) == 1
-        content, dataset, kw = indexed[0]
-        assert content != fake_repo_dir
-        assert "Indexed content here" in content
+        pages, dataset, kw = indexed[0]
+        assert "page_overview" in pages
+        assert fake_repo_dir not in str(pages)
+        assert "Indexed content here" in pages["page_overview"]["content"]
         assert dataset == "prod_prod_agent"
         assert kw.get("source_type") == "codebase"
+        assert kw.get("source_id") == "cb_agent"
 
 
 # ============================================================================
@@ -2143,7 +2273,7 @@ class TestDeepagentsSmoke:
                     "id": "call_1",
                 }],
             ),
-            AIMessage(content="Final smoke section text"),
+            AIMessage(content=_gate_ok("Final smoke section text")),
         ])
         rules = cb._section_writer_rules("en")
         contract = cb._build_section_contract(
@@ -2160,9 +2290,12 @@ class TestDeepagentsSmoke:
             tools=cb.build_repo_tools(str(tmp_path)),
             system_prompt=cb._build_section_agent_system_prompt(rules, contract),
         )
-        text, files = asyncio.run(cb._run_agent_section(agent, "document this repo"))
-        assert text == "Final smoke section text"
+        text, files, degraded = asyncio.run(cb._run_agent_section(
+            agent, "document this repo", title="Overview",
+        ))
+        assert text == _gate_ok("Final smoke section text")
         assert files == ["main.py"]
+        assert degraded is False
 
     def test_orchestrator_agent_constructs_with_specs(self, tmp_path):
         """The orchestrator builds against the real create_deep_agent with
@@ -2321,7 +2454,7 @@ class TestRepoBriefExtraContext:
         brief = self._brief(monkeypatch, [
             "### Контракт-контекст продукта (спецификации API)\n- **API** (openapi)",
             "### Контекст баз данных продукта\n- **Core** (schemas: public)",
-            "### Дополнительный контекст продукта (Confluence / База знаний):\nзаметки",
+            "### Дополнительный контекст продукта (База знаний):\nзаметки",
         ])
         assert "Контракт-контекст продукта" in brief
         assert "Контекст баз данных продукта" in brief
@@ -2485,7 +2618,7 @@ class TestSectionCheckpoints:
         isolated_db = seeded_row
         entity = self._load_detached(isolated_db)
         orchestrator1 = _FakeOrchestrator({
-            sid: f"RUN ONE section body citing `main.py` — {sid}"
+            sid: _gate_ok(f"RUN ONE section body citing `main.py` — {sid}")
             for sid in cb.SECTION_ORDER
         })
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator1)
@@ -2529,7 +2662,8 @@ class TestSectionCheckpoints:
         # Повторный прогон: свежая сессия (как новый job), источник — БД.
         entity2 = self._load_detached(isolated_db)
         orchestrator2 = _FakeOrchestrator({
-            sid: f"RUN TWO REGENERATED — {sid}" for sid in cb.SECTION_ORDER
+            sid: _gate_ok(f"RUN TWO REGENERATED — {sid}")
+            for sid in cb.SECTION_ORDER
         })
         monkeypatch.setattr(cb, "build_section_provenance", real_provenance)
         monkeypatch.setattr(
@@ -2564,7 +2698,7 @@ class TestSectionCheckpoints:
         isolated_db = seeded_row
         entity = self._load_detached(isolated_db)
         orchestrator = _FakeOrchestrator({
-            sid: f"BODY `main.py` — {sid}" for sid in cb.SECTION_ORDER
+            sid: _gate_ok(f"BODY `main.py` — {sid}") for sid in cb.SECTION_ORDER
         })
         self._patch_flow(monkeypatch, fake_repo_dir, orchestrator=orchestrator)
 
@@ -2795,12 +2929,6 @@ class TestUnitsPagesAndMarkdown:
         assert ppage["relatedPages"] == ["page_functional__auth"]
         assert ppage["importance"] == "high"
 
-    def test_section_pages_wrapper_is_legacy_shape(self):
-        sections = {sid: "x" for sid in cb.SECTION_ORDER}
-        pages = cb._section_pages(sections, "ru")
-        assert len(pages) == 7
-        assert all("parent" not in p and p["importance"] == "high" for p in pages.values())
-
     def test_assemble_markdown_renders_children_under_parent(self):
         child, parent, contents = self._family()
         md = cb._assemble_markdown("repo", contents, "en", units=[child, parent])
@@ -2984,10 +3112,14 @@ class TestUnitsAgentFlow:
     @staticmethod
     def _texts(parent_body="PARENT {sid} citing `main.py`.",
                child_body="CHILD {uid} citing `main.py`.", include_children=True):
-        texts = {sid: parent_body.format(sid=sid) for sid in cb.SECTION_ORDER}
+        texts = {
+            sid: _gate_ok(parent_body.format(sid=sid))
+            for sid in cb.SECTION_ORDER
+        }
         if include_children:
             texts.update({
-                uid: child_body.format(uid=uid) for uid in TestUnitsAgentFlow._CHILD_IDS
+                uid: _gate_ok(child_body.format(uid=uid))
+                for uid in TestUnitsAgentFlow._CHILD_IDS
             })
         return texts
 

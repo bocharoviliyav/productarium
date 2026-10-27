@@ -12,6 +12,7 @@ import {
   CaretUp,
   Database as DatabaseIcon,
   FileText,
+  Gear,
   GitBranch,
   Lightning,
   LinkSimple,
@@ -22,10 +23,13 @@ import {
   Trash,
 } from "@phosphor-icons/react";
 import { AppHeader } from "@/components/AppHeader";
+import { useAuth } from "@/contexts/AuthContext";
 import { ExpertChat } from "@/components/ExpertChat";
 import { SummaryBlock } from "@/components/SummaryBlock";
 import { KnowledgeTree } from "@/components/knowledge/KnowledgeTree";
 import { McpServersPanel } from "@/components/mcp/McpServersPanel";
+import { ProductUsersPanel } from "@/components/ProductUsersPanel";
+import { ProductSchedulesPanel } from "@/components/ProductSchedulesPanel";
 import { useLanguage } from "@/contexts/LanguageContext";
 import {
   Button,
@@ -40,21 +44,36 @@ import {
   Select,
   Spinner,
   Tag,
+  Textarea,
   cn,
 } from "@/components/ui";
 import {
   type Codebase,
   type Database,
   type DbPreset,
+  type McpServerBinding,
   type Product,
   type Spec,
+  type User,
+  canConfigureProduct,
+  canEditProduct,
   entityPath,
   generateId,
   normalizePages,
+  normalizeUsers,
   parseLinksContent,
+  productAccess,
   serializeLinksContent,
 } from "@/lib/types";
 import { safeExternalHref } from "@/lib/links";
+import {
+  ApiError,
+  deleteJson,
+  getJson,
+  onApiError,
+  patchJson,
+  postJson,
+} from "@/lib/api";
 import { useNotifications } from "@/contexts/NotificationContext";
 
 type DeleteType = "codebase" | "spec" | "links" | "database";
@@ -75,6 +94,22 @@ type DocgenJob = {
   jobId: string | null;
   type: GenerateType;
   progress: DocgenProgress | null;
+};
+
+// GET .../generate/status payload (subset this page reads).
+type DocgenJobStatus = {
+  status?: string;
+  error?: string;
+  indexing_message?: string;
+  progress?: DocgenProgress | null;
+};
+
+// GET /docgen/active payload row (restored in-flight jobs).
+type ActiveDocgenJob = {
+  job_id?: string;
+  entity_type?: string;
+  entity_id?: string;
+  progress?: DocgenProgress | null;
 };
 
 function withoutKey<T>(record: Record<string, T>, key: string): Record<string, T> {
@@ -103,6 +138,18 @@ export default function ProductDetailPage() {
   const [cbToken, setCbToken] = useState("");
   const [isSaving, setIsSaving] = useState(false);
 
+  // Product edit modal (SPEC-002/024): name/description always, owner
+  // transfer too — the modal is only reachable with the SPEC-023 edit
+  // right (owner || admin).
+  const [editOpen, setEditOpen] = useState(false);
+  const [editName, setEditName] = useState("");
+  const [editDesc, setEditDesc] = useState("");
+  const [editOwner, setEditOwner] = useState("");
+  const [isPatching, setIsPatching] = useState(false);
+  // null = not loaded (or not an admin) — non-admins get a raw user-id input
+  // because the users listing endpoint is admin-only.
+  const [ownerCandidates, setOwnerCandidates] = useState<User[] | null>(null);
+
   // In-place link add form (inside the Links spoiler).
   const [addLinkOpen, setAddLinkOpen] = useState(false);
   const [linkName, setLinkName] = useState("");
@@ -123,6 +170,12 @@ export default function ProductDetailPage() {
   // Preset catalog — static, fetched once on mount. null = not loaded yet;
   // [] = endpoint unavailable (the modal shows a hint and blocks submit).
   const [dbPresets, setDbPresets] = useState<DbPreset[] | null>(null);
+  // Connection source (SPEC-028): built-in preset DSN, or an MCP server
+  // bound to this product with the "database" scope (bindings list from
+  // GET /api/products/{id}/mcp; re-fetched each time the modal opens).
+  const [dbSource, setDbSource] = useState<"dsn" | "mcp">("dsn");
+  const [dbMcpServerId, setDbMcpServerId] = useState("");
+  const [dbBindings, setDbBindings] = useState<McpServerBinding[] | null>(null);
 
   // In-flight docgen jobs keyed by entity id — replaces the single
   // `generatingId` so several entities can generate at once and the state
@@ -133,9 +186,24 @@ export default function ProductDetailPage() {
   // Pending "Generate" confirmation — set by the card buttons, executed by
   // the confirm modal (avoids accidental expensive regenerations).
   const [confirmGen, setConfirmGen] = useState<{ type: GenerateType; entityId: string } | null>(null);
+  // Product settings modal (SPEC-024): schedules + users + MCP servers,
+  // opened from the header gear (canConfigure).
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const { notify } = useNotifications();
+  const { user } = useAuth();
   const { messages, fmt } = useLanguage();
+  // Access matrix (SPEC-001), derived from role + owner_id + grants riding
+  // the product payload: manage = rw (CRUD, user management);
+  // docs = any other access (edit documentation, verify, generate). The API
+  // stays the authority — a forbidden save surfaces as an error toast.
+  const access = productAccess(user, product);
+  const canManage = access === "manage";
+  const canDocs = canManage || access === "docs";
+  // SPEC-023 matrix: edit (name/description/owner) = owner || admin;
+  // configure (settings modal) = owner || manager || admin.
+  const canEdit = canEditProduct(user, product);
+  const canConfigure = canConfigureProduct(user, product);
   const t = messages?.product ?? {};
   const tc = messages?.common ?? {};
   const tArt = messages?.artifactTypes ?? {};
@@ -157,22 +225,16 @@ export default function ProductDetailPage() {
     setIsLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/products/${productId}?light=1`, {
-        credentials: "include",
-        cache: "no-store",
-      });
-      if (res.status === 401) {
-        router.replace(`/login?next=/products/${productId}`);
-        return;
-      }
-      if (res.status === 404) {
+      setProduct(
+        await getJson<Product>(`/api/products/${productId}?light=1`),
+      );
+    } catch (e) {
+      if (onApiError(e, router)) return;
+      if (e instanceof ApiError && e.status === 404) {
         setError(t.notFound ?? "Product not found.");
         setProduct(null);
         return;
       }
-      if (!res.ok) throw new Error(`Failed to load product (${res.status})`);
-      setProduct((await res.json()) as Product);
-    } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to load product.";
       if (!productRef.current) {
         setError(msg);
@@ -203,21 +265,25 @@ export default function ProductDetailPage() {
         if (generateAbortRef.current) return;
         // The status routes live under the PLURAL segment — route the
         // segment through entityPath() (see src/lib/types.ts).
-        const stRes = await fetch(
-          `/api/products/${productId}/${entityPath(type)}/${entityId}/generate/status?job_id=${encodeURIComponent(jobId)}`,
-          { credentials: "include", cache: "no-store" },
-        );
-        if (stRes.status === 404) {
-          throw new Error(t.genJobNotFound ?? "Generation job not found.");
+        let st: DocgenJobStatus;
+        try {
+          st = await getJson<DocgenJobStatus>(
+            `/api/products/${productId}/${entityPath(type)}/${entityId}/generate/status?job_id=${encodeURIComponent(jobId)}`,
+          );
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 404) {
+            throw new Error(t.genJobNotFound ?? "Generation job not found.");
+          }
+          if (e instanceof ApiError && e.status !== null) {
+            throw new Error(fmt(t.genStatusFailed, { status: String(e.status) }));
+          }
+          throw e; // network/timeout — runDocgenJob's toast reports it
         }
-        if (!stRes.ok) {
-          throw new Error(fmt(t.genStatusFailed, { status: String(stRes.status) }));
-        }
-        const st = await stRes.json().catch(() => ({}));
         if (st.progress) {
+          const progress = st.progress;
           setGenerating((g) =>
             g[entityId]?.jobId === jobId
-              ? { ...g, [entityId]: { ...g[entityId], progress: st.progress } }
+              ? { ...g, [entityId]: { ...g[entityId], progress } }
               : g,
           );
         }
@@ -284,12 +350,9 @@ export default function ProductDetailPage() {
     let cancelled = false;
     void (async () => {
       try {
-        const res = await fetch(`/api/products/${productId}/docgen/active`, {
-          credentials: "include",
-          cache: "no-store",
-        });
-        if (!res.ok) return;
-        const jobs = await res.json();
+        const jobs = await getJson<ActiveDocgenJob[]>(
+          `/api/products/${productId}/docgen/active`,
+        );
         if (!Array.isArray(jobs) || cancelled) return;
         for (const job of jobs) {
           const { job_id: jobId, entity_type: type, entity_id: entityId, progress } = job ?? {};
@@ -320,13 +383,8 @@ export default function ProductDetailPage() {
     let cancelled = false;
     void (async () => {
       try {
-        const res = await fetch("/api/db-presets", {
-          credentials: "include",
-          cache: "no-store",
-        });
-        if (!res.ok) throw new Error(String(res.status));
-        const data = await res.json();
-        if (!cancelled && Array.isArray(data)) setDbPresets(data as DbPreset[]);
+        const data = await getJson<DbPreset[]>("/api/db-presets");
+        if (!cancelled && Array.isArray(data)) setDbPresets(data);
       } catch {
         if (!cancelled) setDbPresets([]);
       }
@@ -342,6 +400,28 @@ export default function ProductDetailPage() {
   }, [dbPresets, dbType]);
 
   const selectedDbPreset = dbPresets?.find((p) => p.key === dbType) ?? null;
+
+  // Database-scoped MCP servers bound+enabled to this product (SPEC-028) —
+  // fetched on each modal open; failures degrade to the plain DSN flow.
+  const dbMcpCandidates = (dbBindings ?? []).filter(
+    (b) => b.enabled && (b.scopes ?? []).includes("database"),
+  );
+
+  useEffect(() => {
+    if (!showDatabaseModal) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const rows = await getJson<McpServerBinding[]>(`/api/products/${productId}/mcp`);
+        if (!cancelled) setDbBindings(Array.isArray(rows) ? rows : []);
+      } catch {
+        if (!cancelled) setDbBindings([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [showDatabaseModal, productId]);
 
   const resetCodebaseForm = () => {
     setCbName("");
@@ -359,37 +439,47 @@ export default function ProductDetailPage() {
   const resetDatabaseForm = () => {
     setDbName("");
     setDbDsn("");
+    setDbMcpServerId("");
+    setDbSource("dsn");
     // `dbType` deliberately persists across opens — the user's preferred
     // engine is sticky; it is re-defaulted only before the first pick.
   };
 
-  // Add a database via the section-header modal (the hardcoded preset
-  // flow): type (from GET /api/db-presets) + visible DSN + name. The POST
-  // runs the real MCP connection check server-side and can take a while —
-  // the submit button switches to a "checking connection" state.
+  // Add a database via the section-header modal. DSN mode (the hardcoded
+  // preset flow): type + visible DSN + name; the POST runs the real MCP
+  // connection check server-side. MCP mode (SPEC-028): pick a bound
+  // database-scoped server — no DSN, the connection already lives in the
+  // server's config.
   const handleAddDatabase = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!product || !dbName.trim() || !dbDsn.trim() || !dbType || isSaving) return;
+    if (!product || !dbName.trim() || isSaving) return;
+    const useMcp = dbSource === "mcp" && dbMcpCandidates.length > 0;
+    if (useMcp ? !dbMcpServerId : !dbDsn.trim() || !dbType) return;
     setIsSaving(true);
     try {
-      const body = {
-        id: generateId("db"),
-        name: dbName.trim(),
-        db_type: dbType,
-        dsn: dbDsn.trim(),
-        source: "manual" as const,
-      };
-      const res = await fetch(`/api/products/${product.id}/databases?light=1`, {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || `Failed to add (${res.status})`);
-      }
-      setProduct((await res.json()) as Product);
+      const body = useMcp
+        ? {
+            id: generateId("db"),
+            name: dbName.trim(),
+            mcp_server_id: dbMcpServerId,
+            source: "manual" as const,
+          }
+        : {
+            id: generateId("db"),
+            name: dbName.trim(),
+            db_type: dbType,
+            dsn: dbDsn.trim(),
+            source: "manual" as const,
+          };
+      // The server-side MCP connection check (DSN mode) can take a while —
+      // extend the client's per-request timeout for this one call.
+      setProduct(
+        await postJson<Product>(
+          `/api/products/${product.id}/databases?light=1`,
+          body,
+          { timeoutMs: 60_000 },
+        ),
+      );
       resetDatabaseForm();
       setShowDatabaseModal(false);
     } catch (e) {
@@ -417,17 +507,12 @@ export default function ProductDetailPage() {
         ...(cbToken.trim() ? { token: cbToken.trim() } : {}),
         source: "manual" as const,
       };
-      const res = await fetch(`/api/products/${product.id}/codebases?light=1`, {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || `Failed to add (${res.status})`);
-      }
-      setProduct((await res.json()) as Product);
+      setProduct(
+        await postJson<Product>(
+          `/api/products/${product.id}/codebases?light=1`,
+          body,
+        ),
+      );
       resetCodebaseForm();
       setShowCodebaseModal(false);
     } catch (e) {
@@ -452,17 +537,12 @@ export default function ProductDetailPage() {
         content: serializeLinksContent([item]) || null,
         source: "manual" as const,
       };
-      const res = await fetch(`/api/products/${product.id}/links?light=1`, {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || `Failed to add (${res.status})`);
-      }
-      setProduct((await res.json()) as Product);
+      setProduct(
+        await postJson<Product>(
+          `/api/products/${product.id}/links?light=1`,
+          body,
+        ),
+      );
       resetLinkForm();
       setAddLinkOpen(false);
     } catch (e) {
@@ -470,6 +550,56 @@ export default function ProductDetailPage() {
       notify({ tone: "error", title: t.addArtifactFailedTitle ?? "Add", message: msg });
     } finally {
       setIsSaving(false);
+    }
+  };
+
+  const openProductEdit = () => {
+    if (!product) return;
+    setEditName(product.name);
+    setEditDesc(product.description ?? "");
+    setEditOwner(product.owner_id ?? "");
+    setEditOpen(true);
+    // Username picker for admins (GET /api/admin/users is admin-only);
+    // everyone else keeps the raw user-id input.
+    if (user?.role === "admin" && ownerCandidates === null) {
+      void (async () => {
+        try {
+          setOwnerCandidates(normalizeUsers(await getJson("/api/admin/users")));
+        } catch {
+          // Keep the raw-id fallback.
+        }
+      })();
+    }
+  };
+
+  // PATCH partial update: absent fields stay unchanged server-side, so
+  // sending name+description (and owner_id only when visible + changed) is
+  // safe and never wipes anything.
+  const handlePatchProduct = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!product || isPatching) return;
+    const name = editName.trim();
+    if (!name) return;
+    setIsPatching(true);
+    try {
+      const body: Record<string, string> = { name, description: editDesc };
+      const owner = editOwner.trim();
+      if (owner && owner !== product.owner_id) body.owner_id = owner;
+      // Errors — incl. 409 EntityBusyError detail — ride ApiError.message.
+      setProduct(
+        await patchJson<Product>(`/api/products/${product.id}?light=1`, body),
+      );
+      setEditOpen(false);
+      notify({
+        tone: "success",
+        title: t.editSavedTitle ?? "Saved",
+        message: t.editSavedMsg ?? "Product updated.",
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Failed to save.";
+      notify({ tone: "error", title: t.editFailedTitle ?? "Save failed", message: msg });
+    } finally {
+      setIsPatching(false);
     }
   };
 
@@ -481,12 +611,11 @@ export default function ProductDetailPage() {
       // Route the segment through entityPath(): the FastAPI routers register
       // the PLURAL segments (codebases/specs/links/databases) while `type` is
       // the singular form-state value — raw interpolation produces a 404.
-      const res = await fetch(
-        `/api/products/${product.id}/${entityPath(type)}/${entityId}?light=1`,
-        { method: "DELETE", credentials: "include" },
+      setProduct(
+        await deleteJson<Product>(
+          `/api/products/${product.id}/${entityPath(type)}/${entityId}?light=1`,
+        ),
       );
-      if (!res.ok) throw new Error(`Failed to delete (${res.status})`);
-      setProduct((await res.json()) as Product);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to delete.";
       notify({ tone: "error", title: t.deleteArtifactFailedTitle ?? "Delete", message: msg });
@@ -508,23 +637,18 @@ export default function ProductDetailPage() {
       // segment through entityPath() (see src/lib/types.ts). HLD is the one
       // exception: its generate route has no {id} segment — the run creates
       // and updates the single hld_{productId} row itself.
-      const res = await fetch(
+      // Generation language is governed by the admin `generation.language`
+      // setting (resolved at job start) — no per-request override.
+      const data = await postJson<{
+        job_id?: string | null;
+        message?: string;
+        status?: string;
+      }>(
         type === "hld"
           ? `/api/products/${product.id}/hld/generate`
           : `/api/products/${product.id}/${entityPath(type)}/${entityId}/generate`,
-        {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          // Generation language is governed by the admin `generation.language`
-          // setting (resolved at job start) — no per-request override.
-          body: JSON.stringify({}),
-        },
+        {},
       );
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data.detail || `Generation failed (${res.status})`);
-      }
       jobId = data.job_id ?? null;
       if (!jobId) {
         notify({ tone: "info", title: t.genTitle ?? "Generation", message: data.message || data.status || (t.genTriggered ?? "Generation triggered.") });
@@ -551,16 +675,10 @@ export default function ProductDetailPage() {
   const handleCancelGenerate = async (type: GenerateType, entityId: string) => {
     if (!product) return;
     try {
-      const res = await fetch(
+      await postJson(
         `/api/products/${product.id}/${entityPath(type)}/${entityId}/generate/cancel`,
-        {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        },
+        {},
       );
-      if (!res.ok) throw new Error(`Failed to cancel (${res.status})`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : (t.cancelFailed ?? "Failed to cancel.");
       notify({ tone: "error", title: t.genTitle ?? "Generation", message: msg });
@@ -655,9 +773,35 @@ export default function ProductDetailPage() {
                   <span className="font-mono text-xs text-muted">
                     {product.id}
                   </span>
-                  <h1 className="mt-2 font-editorial text-3xl tracking-tight text-ink">
-                    {product.name}
-                  </h1>
+                  <div className="flex items-start justify-between gap-3">
+                    <h1 className="mt-2 font-editorial text-3xl tracking-tight text-ink">
+                      {product.name}
+                    </h1>
+                    {(canEdit || canConfigure) && (
+                      <div className="mt-1.5 flex shrink-0 items-center gap-1.5">
+                        {canConfigure && (
+                          <IconButton
+                            aria-label={t.settingsTitle ?? "Product settings"}
+                            title={t.settingsTitle ?? "Product settings"}
+                            className="h-8 w-8"
+                            onClick={() => setSettingsOpen(true)}
+                          >
+                            <Gear size={14} weight="regular" />
+                          </IconButton>
+                        )}
+                        {canEdit && (
+                          <IconButton
+                            aria-label={tc.edit ?? "Edit"}
+                            title={tc.edit ?? "Edit"}
+                            className="h-8 w-8"
+                            onClick={openProductEdit}
+                          >
+                            <PencilSimple size={14} weight="regular" />
+                          </IconButton>
+                        )}
+                      </div>
+                    )}
+                  </div>
                   <p className="mt-2 max-w-2xl text-sm text-muted">
                     {product.description || (t.noDescription ?? "No description provided.")}
                   </p>
@@ -719,25 +863,27 @@ export default function ProductDetailPage() {
                                     {l.name}
                                   </span>
                                 )}
-                                <div className="flex shrink-0 items-center gap-1.5">
-                                  <IconButton
-                                    aria-label={tc.edit ?? "Edit"}
-                                    title={tc.edit ?? "Edit"}
-                                    onClick={() =>
-                                      router.push(`/products/${product.id}/artifacts/${l.id}`)
-                                    }
-                                  >
-                                    <PencilSimple size={14} weight="regular" />
-                                  </IconButton>
-                                  <IconButton
-                                    aria-label={t.deleteArtifact ?? "Delete"}
-                                    title={t.deleteArtifact ?? "Delete"}
-                                    onClick={() => handleDelete("links", l.id)}
-                                    disabled={isDeleting}
-                                  >
-                                    {isDeleting ? <Spinner /> : <Trash size={14} weight="regular" />}
-                                  </IconButton>
-                                </div>
+                                {canManage && (
+                                  <div className="flex shrink-0 items-center gap-1.5">
+                                    <IconButton
+                                      aria-label={tc.edit ?? "Edit"}
+                                      title={tc.edit ?? "Edit"}
+                                      onClick={() =>
+                                        router.push(`/products/${product.id}/artifacts/${l.id}`)
+                                      }
+                                    >
+                                      <PencilSimple size={14} weight="regular" />
+                                    </IconButton>
+                                    <IconButton
+                                      aria-label={t.deleteArtifact ?? "Delete"}
+                                      title={t.deleteArtifact ?? "Delete"}
+                                      onClick={() => handleDelete("links", l.id)}
+                                      disabled={isDeleting}
+                                    >
+                                      {isDeleting ? <Spinner /> : <Trash size={14} weight="regular" />}
+                                    </IconButton>
+                                  </div>
+                                )}
                               </div>
                               {items.length > 0 && (
                                 <ul className="mt-2 flex flex-col gap-1.5">
@@ -806,12 +952,12 @@ export default function ProductDetailPage() {
                           </Button>
                         </div>
                       </form>
-                    ) : (
+                    ) : canManage ? (
                       <Button type="button" variant="subtle" size="sm" onClick={() => setAddLinkOpen(true)}>
                         <Plus size={14} weight="bold" />
                         {t.addLink ?? "Add link"}
                       </Button>
-                    )}
+                    ) : null}
                   </div>
                 )}
               </div>
@@ -880,10 +1026,12 @@ export default function ProductDetailPage() {
               </form>
             </Modal>
 
-            {/* Database add modal — the hardcoded preset flow. Type (from
-                GET /api/db-presets) drives the DSN example/hint; the DSN is
-                visible (type="text") so typos can be caught, and is sent
-                exactly once. */}
+            {/* Database add modal. DSN mode: the hardcoded preset flow —
+                type (from GET /api/db-presets) drives the DSN example/hint;
+                the DSN is visible (type="text") so typos can be caught, and is
+                sent exactly once. MCP mode (SPEC-028): a database-scoped
+                server bound to the product — no DSN, POST sends
+                mcp_server_id. The toggle appears only when candidates exist. */}
             <Modal
               open={showDatabaseModal}
               onClose={() => setShowDatabaseModal(false)}
@@ -891,46 +1039,112 @@ export default function ProductDetailPage() {
               footer={null}
             >
               <form onSubmit={handleAddDatabase} className="grid gap-5">
-                <div>
-                  <Label>{t.dbType ?? "Database type"}</Label>
-                  <Select
-                    value={dbType}
-                    onChange={(e) => setDbType(e.target.value)}
-                    disabled={!dbPresets?.length}
-                  >
-                    {(dbPresets ?? []).map((p) => (
-                      <option key={p.key} value={p.key}>
-                        {p.label}
-                      </option>
-                    ))}
-                  </Select>
-                  {dbPresets !== null && dbPresets.length === 0 && (
+                {dbMcpCandidates.length > 0 && (
+                  <div className="flex gap-1 rounded-md border border-divider bg-surface-2 p-1">
+                    <button
+                      type="button"
+                      onClick={() => setDbSource("dsn")}
+                      className={cn(
+                        "flex-1 rounded px-3 py-1.5 text-sm transition-colors",
+                        dbSource === "dsn"
+                          ? "bg-surface text-ink shadow-sm"
+                          : "text-muted hover:text-ink",
+                      )}
+                    >
+                      {t.dbSourceDsn ?? "Built-in (DSN)"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDbSource("mcp")}
+                      className={cn(
+                        "flex-1 rounded px-3 py-1.5 text-sm transition-colors",
+                        dbSource === "mcp"
+                          ? "bg-surface text-ink shadow-sm"
+                          : "text-muted hover:text-ink",
+                      )}
+                    >
+                      {t.dbSourceMcp ?? "MCP server"}
+                    </button>
+                  </div>
+                )}
+
+                {dbSource === "mcp" && dbMcpCandidates.length > 0 ? (
+                  <div>
+                    <Label>{t.dbSourceMcp ?? "MCP server"}</Label>
+                    <Select
+                      value={dbMcpServerId}
+                      onChange={(e) => setDbMcpServerId(e.target.value)}
+                      required
+                    >
+                      <option value="">{t.dbMcpPickServer ?? "—"}</option>
+                      {dbMcpCandidates.map((b) => (
+                        <option key={b.id} value={b.mcp_server_id}>
+                          {b.name}
+                        </option>
+                      ))}
+                    </Select>
                     <p className="mt-1.5 text-xs text-muted">
-                      {t.dbPresetsFailed ?? ""}
+                      {t.dbMcpHint ?? ""}
                     </p>
-                  )}
-                </div>
-                <div>
-                  <Label>{t.dsn ?? "DSN"}</Label>
-                  <Input
-                    type="text"
-                    value={dbDsn}
-                    onChange={(e) => setDbDsn(e.target.value)}
-                    placeholder={selectedDbPreset?.dsn_example ?? ""}
-                    required
-                    autoComplete="off"
-                    spellCheck={false}
-                    className="font-mono"
-                  />
-                  {selectedDbPreset?.dsn_hint && (
-                    <p className="mt-1.5 font-mono text-xs text-muted">
-                      {selectedDbPreset.dsn_hint}
-                    </p>
-                  )}
-                  <p className="mt-1 text-xs text-muted">
-                    {t.dsnOnceNote ?? ""}
-                  </p>
-                </div>
+                  </div>
+                ) : (
+                  <>
+                    <div>
+                      <Label>{t.dbType ?? "Database type"}</Label>
+                      <Select
+                        value={dbType}
+                        onChange={(e) => setDbType(e.target.value)}
+                        disabled={!dbPresets?.length}
+                      >
+                        {(dbPresets ?? []).map((p) => (
+                          <option key={p.key} value={p.key}>
+                            {p.label}
+                          </option>
+                        ))}
+                      </Select>
+                      {dbPresets !== null && dbPresets.length === 0 && (
+                        <p className="mt-1.5 text-xs text-muted">
+                          {t.dbPresetsFailed ?? ""}
+                        </p>
+                      )}
+                    </div>
+                    <div>
+                      <Label>{t.dsn ?? "DSN"}</Label>
+                      <Input
+                        type="text"
+                        value={dbDsn}
+                        onChange={(e) => setDbDsn(e.target.value)}
+                        placeholder={selectedDbPreset?.dsn_example ?? ""}
+                        required
+                        autoComplete="off"
+                        spellCheck={false}
+                        className="font-mono"
+                      />
+                      {selectedDbPreset?.dsn_hint && (
+                        <p className="mt-1.5 font-mono text-xs text-muted">
+                          {selectedDbPreset.dsn_hint}
+                        </p>
+                      )}
+                      <p className="mt-1 text-xs text-muted">
+                        {t.dsnOnceNote ?? ""}
+                      </p>
+                    </div>
+                    {selectedDbPreset && (
+                      <p className="text-xs text-muted">
+                        {t.dbPresetPoweredBy ?? "Built-in MCP server:"}{" "}
+                        <a
+                          href={selectedDbPreset.server.homepage}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="underline decoration-divider underline-offset-2 transition-colors hover:text-ink"
+                        >
+                          {selectedDbPreset.server.name}
+                        </a>{" "}
+                        · {selectedDbPreset.server.license}
+                      </p>
+                    )}
+                  </>
+                )}
                 <div>
                   <Label>{t.databaseName ?? "Database name"}</Label>
                   <Input
@@ -940,27 +1154,19 @@ export default function ProductDetailPage() {
                     required
                   />
                 </div>
-                {selectedDbPreset && (
-                  <p className="text-xs text-muted">
-                    {t.dbPresetPoweredBy ?? "Built-in MCP server:"}{" "}
-                    <a
-                      href={selectedDbPreset.server.homepage}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="underline decoration-divider underline-offset-2 transition-colors hover:text-ink"
-                    >
-                      {selectedDbPreset.server.name}
-                    </a>{" "}
-                    · {selectedDbPreset.server.license}
-                  </p>
-                )}
                 <div className="flex items-center justify-end gap-2">
                   <Button type="button" variant="ghost" onClick={() => setShowDatabaseModal(false)}>
                     {tc.cancel ?? "Cancel"}
                   </Button>
                   <Button
                     type="submit"
-                    disabled={isSaving || !dbType || !dbName.trim() || !dbDsn.trim()}
+                    disabled={
+                      isSaving ||
+                      !dbName.trim() ||
+                      (dbSource === "mcp" && dbMcpCandidates.length > 0
+                        ? !dbMcpServerId
+                        : !dbType || !dbDsn.trim())
+                    }
                   >
                     {isSaving ? <Spinner /> : <Plus size={16} weight="bold" />}
                     {isSaving
@@ -998,6 +1204,93 @@ export default function ProductDetailPage() {
               </div>
             </Modal>
 
+            {/* Product edit (SPEC-024) — owner/admin only, opened from the
+                header pencil. Owner transfer included (SPEC-023 edit right). */}
+            <Modal
+              open={editOpen}
+              onClose={() => setEditOpen(false)}
+              title={t.editTitle ?? "Edit product"}
+              footer={null}
+            >
+              <form onSubmit={handlePatchProduct} className="grid gap-5">
+                <div>
+                  <Label>{t.editNameLabel ?? "Name"}</Label>
+                  <Input
+                    value={editName}
+                    onChange={(e) => setEditName(e.target.value)}
+                    required
+                    autoFocus
+                  />
+                </div>
+                <div>
+                  <Label>{t.editDescLabel ?? "Description"}</Label>
+                  <Textarea
+                    value={editDesc}
+                    onChange={(e) => setEditDesc(e.target.value)}
+                    rows={3}
+                    placeholder={t.editDescPlaceholder ?? ""}
+                  />
+                </div>
+                <div>
+                  <Label>{t.editOwnerLabel ?? "Owner"}</Label>
+                  {ownerCandidates ? (
+                    <Select
+                      value={editOwner}
+                      onChange={(e) => setEditOwner(e.target.value)}
+                    >
+                      {ownerCandidates.map((u) => (
+                        <option key={u.id} value={u.id}>
+                          {u.username}
+                        </option>
+                      ))}
+                    </Select>
+                  ) : (
+                    <Input
+                      value={editOwner}
+                      onChange={(e) => setEditOwner(e.target.value)}
+                      placeholder={t.editOwnerPlaceholder ?? "User id"}
+                      className="font-mono"
+                      autoComplete="off"
+                    />
+                  )}
+                </div>
+                <div className="flex items-center justify-end gap-2">
+                  <Button type="button" variant="ghost" onClick={() => setEditOpen(false)}>
+                    {tc.cancel ?? "Cancel"}
+                  </Button>
+                  <Button type="submit" disabled={isPatching || !editName.trim()}>
+                    {isPatching ? <Spinner /> : null}
+                    {tc.save ?? "Save"}
+                  </Button>
+                </div>
+              </form>
+            </Modal>
+
+            {/* Product settings (SPEC-024) — owner/manager/admin, opened from
+                the header gear: autodoc schedules + product users + MCP
+                servers in one dialog. */}
+            {canConfigure && (
+              <Modal
+                open={settingsOpen}
+                onClose={() => setSettingsOpen(false)}
+                title={t.settingsTitle ?? "Product settings"}
+                size="xl"
+                footer={null}
+              >
+                <div className="flex flex-col gap-8">
+                  <ProductSchedulesPanel
+                    productId={product.id}
+                    entities={[
+                      ...codebases.map((c) => ({ id: c.id, name: c.name, kind: "codebase" as const })),
+                      ...databases.map((d) => ({ id: d.id, name: d.name, kind: "database" as const })),
+                    ]}
+                  />
+                  <ProductUsersPanel productId={product.id} />
+                  <McpServersPanel productId={product.id} />
+                </div>
+              </Modal>
+            )}
+
             {/* Two-column: (specs + knowledge tree) | main content */}
             <div className="mt-12 grid grid-cols-1 gap-8 lg:grid-cols-[320px_1fr]">
               <aside className="lg:sticky lg:top-20 lg:self-start">
@@ -1008,7 +1301,7 @@ export default function ProductDetailPage() {
                       <h3 className="text-xs font-medium uppercase tracking-wide text-muted">
                         {t.hldCardTitle ?? "HLD · High Level Design"}
                       </h3>
-                      {hld && !hldGen && (
+                      {hld && !hldGen && canDocs && (
                         <IconButton
                           aria-label={t.hldRegenerate ?? "Regenerate HLD"}
                           title={t.hldRegenerate ?? "Regenerate HLD"}
@@ -1047,14 +1340,16 @@ export default function ProductDetailPage() {
                         <p className="mb-3 text-xs text-muted">
                           {t.hldEmptyDesc ?? ""}
                         </p>
-                        <Button
-                          size="sm"
-                          variant="subtle"
-                          onClick={() => setConfirmGen({ type: "hld", entityId: hldId })}
-                        >
-                          <Lightning size={14} weight="fill" />
-                          {t.hldGenerate ?? "Generate HLD"}
-                        </Button>
+                        {canDocs && (
+                          <Button
+                            size="sm"
+                            variant="subtle"
+                            onClick={() => setConfirmGen({ type: "hld", entityId: hldId })}
+                          >
+                            <Lightning size={14} weight="fill" />
+                            {t.hldGenerate ?? "Generate HLD"}
+                          </Button>
+                        )}
                       </div>
                     ) : null}
                     {hldGen && (
@@ -1063,15 +1358,17 @@ export default function ProductDetailPage() {
                           <Spinner className="h-3.5 w-3.5" />
                           <span className="truncate">{genProgressText(hldGen)}</span>
                         </span>
-                        <Button
-                          size="sm"
-                          variant="subtle"
-                          onClick={() => handleCancelGenerate("hld", hldId)}
-                          disabled={!hldGen.jobId}
-                        >
-                          <StopCircle size={14} weight="fill" />
-                          {t.stopGeneration ?? "Stop"}
-                        </Button>
+                        {canDocs && (
+                          <Button
+                            size="sm"
+                            variant="subtle"
+                            onClick={() => handleCancelGenerate("hld", hldId)}
+                            disabled={!hldGen.jobId}
+                          >
+                            <StopCircle size={14} weight="fill" />
+                            {t.stopGeneration ?? "Stop"}
+                          </Button>
+                        )}
                       </div>
                     )}
                   </Card>
@@ -1084,14 +1381,16 @@ export default function ProductDetailPage() {
                       <h3 className="text-xs font-medium uppercase tracking-wide text-muted">
                         {tArt?.spec?.label ?? "Specs"}
                       </h3>
-                      <IconButton
-                        aria-label={t.addSpec ?? "Add spec"}
-                        title={t.addSpec ?? "Add spec"}
-                        className="h-7 w-7"
-                        onClick={() => router.push(`/products/${product.id}/specs/new`)}
-                      >
-                        <Plus size={14} weight="bold" />
-                      </IconButton>
+                      {canManage && (
+                        <IconButton
+                          aria-label={t.addSpec ?? "Add spec"}
+                          title={t.addSpec ?? "Add spec"}
+                          className="h-7 w-7"
+                          onClick={() => router.push(`/products/${product.id}/specs/new`)}
+                        >
+                          <Plus size={14} weight="bold" />
+                        </IconButton>
+                      )}
                     </div>
                     {specs.length === 0 ? (
                       <div className="rounded-md border border-dashed border-divider bg-surface-2 px-3 py-6 text-center text-xs text-muted">
@@ -1139,14 +1438,16 @@ export default function ProductDetailPage() {
                         : (t.artifactsEmptySubtitle ?? "")
                     }
                     action={
-                      <Button
-                        variant="primary"
-                        size="sm"
-                        onClick={() => setShowCodebaseModal(true)}
-                      >
-                        <Plus size={14} weight="bold" />
-                        {t.addService ?? "Add service"}
-                      </Button>
+                      canManage ? (
+                        <Button
+                          variant="primary"
+                          size="sm"
+                          onClick={() => setShowCodebaseModal(true)}
+                        >
+                          <Plus size={14} weight="bold" />
+                          {t.addService ?? "Add service"}
+                        </Button>
+                      ) : undefined
                     }
                   />
 
@@ -1157,10 +1458,12 @@ export default function ProductDetailPage() {
                         title={t.noArtifactsTitle ?? "No codebases yet"}
                         description={t.noArtifactsDesc ?? ""}
                         action={
-                          <Button onClick={() => setShowCodebaseModal(true)}>
-                            <Plus size={16} weight="bold" />
-                            {t.addService ?? "Add service"}
-                          </Button>
+                          canManage ? (
+                            <Button onClick={() => setShowCodebaseModal(true)}>
+                              <Plus size={16} weight="bold" />
+                              {t.addService ?? "Add service"}
+                            </Button>
+                          ) : undefined
                         }
                       />
                     ) : (
@@ -1205,15 +1508,17 @@ export default function ProductDetailPage() {
                                       </div>
                                     </div>
                                   </div>
-                                  <IconButton
-                                    aria-label={t.deleteArtifact ?? "Delete"}
-                                    title={t.deleteArtifact ?? "Delete"}
-                                    onClick={() => handleDelete("codebase", c.id)}
-                                    disabled={isDeleting}
-                                    className="opacity-0 transition-opacity group-hover:opacity-100"
-                                  >
-                                    {isDeleting ? <Spinner /> : <Trash size={16} weight="regular" />}
-                                  </IconButton>
+                                  {canManage && (
+                                    <IconButton
+                                      aria-label={t.deleteArtifact ?? "Delete"}
+                                      title={t.deleteArtifact ?? "Delete"}
+                                      onClick={() => handleDelete("codebase", c.id)}
+                                      disabled={isDeleting}
+                                      className="opacity-0 transition-opacity group-hover:opacity-100"
+                                    >
+                                      {isDeleting ? <Spinner /> : <Trash size={16} weight="regular" />}
+                                    </IconButton>
+                                  )}
                                 </div>
 
                                 {isGenerating && (
@@ -1250,16 +1555,18 @@ export default function ProductDetailPage() {
                                     <ArrowRight size={14} weight="bold" />
                                   </button>
                                   {isGenerating ? (
-                                    <Button
-                                      size="sm"
-                                      variant="subtle"
-                                      onClick={() => handleCancelGenerate("codebase", c.id)}
-                                      disabled={!gen?.jobId}
-                                    >
-                                      <StopCircle size={14} weight="fill" />
-                                      {t.stopGeneration ?? "Stop"}
-                                    </Button>
-                                  ) : (
+                                    canDocs && (
+                                      <Button
+                                        size="sm"
+                                        variant="subtle"
+                                        onClick={() => handleCancelGenerate("codebase", c.id)}
+                                        disabled={!gen?.jobId}
+                                      >
+                                        <StopCircle size={14} weight="fill" />
+                                        {t.stopGeneration ?? "Stop"}
+                                      </Button>
+                                    )
+                                  ) : canDocs ? (
                                     <Button
                                       size="sm"
                                       variant="subtle"
@@ -1268,7 +1575,7 @@ export default function ProductDetailPage() {
                                       <Lightning size={14} weight="fill" />
                                       {t.generate ?? "Generate"}
                                     </Button>
-                                  )}
+                                  ) : null}
                                 </div>
                               </Card>
                             </Reveal>
@@ -1289,14 +1596,16 @@ export default function ProductDetailPage() {
                         : (t.dbEmptySubtitle ?? "")
                     }
                     action={
-                      <Button
-                        variant="primary"
-                        size="sm"
-                        onClick={() => setShowDatabaseModal(true)}
-                      >
-                        <Plus size={14} weight="bold" />
-                        {t.addDatabase ?? "Add database"}
-                      </Button>
+                      canManage ? (
+                        <Button
+                          variant="primary"
+                          size="sm"
+                          onClick={() => setShowDatabaseModal(true)}
+                        >
+                          <Plus size={14} weight="bold" />
+                          {t.addDatabase ?? "Add database"}
+                        </Button>
+                      ) : undefined
                     }
                   />
 
@@ -1307,10 +1616,12 @@ export default function ProductDetailPage() {
                         title={t.noDatabasesTitle ?? "No databases yet"}
                         description={t.noDatabasesDesc ?? ""}
                         action={
-                          <Button onClick={() => setShowDatabaseModal(true)}>
-                            <Plus size={16} weight="bold" />
-                            {t.addDatabase ?? "Add database"}
-                          </Button>
+                          canManage ? (
+                            <Button onClick={() => setShowDatabaseModal(true)}>
+                              <Plus size={16} weight="bold" />
+                              {t.addDatabase ?? "Add database"}
+                            </Button>
+                          ) : undefined
                         }
                       />
                     ) : (
@@ -1358,15 +1669,17 @@ export default function ProductDetailPage() {
                                       </div>
                                     </div>
                                   </div>
-                                  <IconButton
-                                    aria-label={t.deleteArtifact ?? "Delete"}
-                                    title={t.deleteArtifact ?? "Delete"}
-                                    onClick={() => handleDelete("database", d.id)}
-                                    disabled={isDeleting}
-                                    className="opacity-0 transition-opacity group-hover:opacity-100"
-                                  >
-                                    {isDeleting ? <Spinner /> : <Trash size={16} weight="regular" />}
-                                  </IconButton>
+                                  {canManage && (
+                                    <IconButton
+                                      aria-label={t.deleteArtifact ?? "Delete"}
+                                      title={t.deleteArtifact ?? "Delete"}
+                                      onClick={() => handleDelete("database", d.id)}
+                                      disabled={isDeleting}
+                                      className="opacity-0 transition-opacity group-hover:opacity-100"
+                                    >
+                                      {isDeleting ? <Spinner /> : <Trash size={16} weight="regular" />}
+                                    </IconButton>
+                                  )}
                                 </div>
 
                                 {isGenerating && (
@@ -1397,16 +1710,18 @@ export default function ProductDetailPage() {
                                     <ArrowRight size={14} weight="bold" />
                                   </button>
                                   {isGenerating ? (
-                                    <Button
-                                      size="sm"
-                                      variant="subtle"
-                                      onClick={() => handleCancelGenerate("database", d.id)}
-                                      disabled={!gen?.jobId}
-                                    >
-                                      <StopCircle size={14} weight="fill" />
-                                      {t.stopGeneration ?? "Stop"}
-                                    </Button>
-                                  ) : (
+                                    canDocs && (
+                                      <Button
+                                        size="sm"
+                                        variant="subtle"
+                                        onClick={() => handleCancelGenerate("database", d.id)}
+                                        disabled={!gen?.jobId}
+                                      >
+                                        <StopCircle size={14} weight="fill" />
+                                        {t.stopGeneration ?? "Stop"}
+                                      </Button>
+                                    )
+                                  ) : canDocs ? (
                                     <Button
                                       size="sm"
                                       variant="subtle"
@@ -1415,7 +1730,7 @@ export default function ProductDetailPage() {
                                       <Lightning size={14} weight="fill" />
                                       {t.generate ?? "Generate"}
                                     </Button>
-                                  )}
+                                  ) : null}
                                 </div>
                               </Card>
                             </Reveal>
@@ -1447,10 +1762,6 @@ export default function ProductDetailPage() {
                   </Reveal>
                 </section>
 
-                {/* MCP servers bound to this product (tools for the expert agent) */}
-                <Reveal>
-                  <McpServersPanel productId={product.id} />
-                </Reveal>
               </div>
             </div>
           </>

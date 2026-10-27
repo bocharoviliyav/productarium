@@ -1,14 +1,19 @@
 """Doc version router — immutable documentation version history (Vault KV-v2).
 
 Endpoints (prefix ``/api/products``, tags ``doc-versions``):
-- ``GET  /{product_id}/{segment}/{entity_id}/versions``          (list)
-- ``GET  /{product_id}/{segment}/{entity_id}/versions/{version}`` (read-only view)
-- ``POST /{product_id}/{segment}/{entity_id}/versions/{version}/restore``
+- ``GET    /{product_id}/{segment}/{entity_id}/versions``          (list)
+- ``GET    /{product_id}/{segment}/{entity_id}/versions/{version}`` (read-only view)
+- ``POST   /{product_id}/{segment}/{entity_id}/versions/{version}/restore``
+- ``DELETE /{product_id}/{segment}/{entity_id}/versions/{version}`` (manage)
 
 ``segment`` ∈ codebases|specs|databases. Restore writes the old snapshot back
 onto the artifact AND appends a new ``rollback`` version (history is never
 rewritten), then re-indexes the restored text so the vector memory always
-holds only the current version.
+holds only the current version. SPEC-012: page-scoped versions are deltas
+(``scope="page"``) resolved through their base on read. SPEC-013: delete
+removes ONE snapshot row; the current, the only and the referenced-base
+versions are refused with 409, unknown with 404 — the artifact itself,
+its memory chunks and ``current_version`` are never touched.
 """
 
 from __future__ import annotations
@@ -21,7 +26,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from api.auth.deps import get_current_user, require_product_access
+from api.auth.deps import (
+    get_current_user,
+    require_product_access,
+    require_product_permission,
+)
 from api.db import get_db
 from api.docgen.jobs import EntityBusyError, lock_for_entity
 from api.models import ProductORM
@@ -54,6 +63,7 @@ class DocVersionItem(BaseModel):
     job_id: Optional[str] = None
     created_at: Optional[datetime] = None
     is_current: bool = False
+    scope: str = "full"  # "page" = delta (SPEC-012), "full" = complete snapshot
 
 
 class DocVersionList(BaseModel):
@@ -76,13 +86,7 @@ def _load_entity(db: Session, product_id: str, segment: str, entity_id: str):
     p_orm = product_repo.load_product_orm(db, product_id)
     if p_orm is None:
         raise HTTPException(status_code=404, detail="Product not found")
-    collection = {
-        "codebase": p_orm.codebases,
-        "spec": p_orm.specs,
-        "database": p_orm.databases,
-        "hld": [p_orm.hld] if p_orm.hld else [],
-    }[entity_type]
-    entity = next((e for e in collection if e.id == entity_id), None)
+    entity = product_repo.find_entity(p_orm, entity_type, entity_id)
     if entity is None:
         raise HTTPException(status_code=404, detail=f"{entity_type.capitalize()} not found")
     return p_orm, entity_type, entity
@@ -111,6 +115,7 @@ async def list_doc_versions(
                 job_id=r.job_id,
                 created_at=r.created_at,
                 is_current=(r.version == current),
+                scope="page" if r.base_version is not None else "full",
             )
             for r in rows
         ],
@@ -142,6 +147,7 @@ async def get_doc_version(
         job_id=row.job_id,
         created_at=row.created_at,
         is_current=(row.version == entity.current_version),
+        scope="page" if row.base_version is not None else "full",
         generated_docs=generated_docs,
         pages=pages,
         content=row.content,
@@ -172,8 +178,46 @@ async def restore_doc_version(
             db.refresh(p_orm)
     except EntityBusyError as e:
         raise HTTPException(status_code=409, detail=str(e))
-    _reindex(product_id, indexed_text, entity_id, source_type=entity_type)
+    # SPEC-010: restored page-bearing docs re-index per page (matching
+    # generation); spec content stays artifact-level.
+    reindex_kwargs = {"source_type": entity_type}
+    if entity_type in ("codebase", "database") and isinstance(entity.pages, dict):
+        reindex_kwargs["pages"] = entity.pages
+    _reindex(product_id, indexed_text, entity_id, **reindex_kwargs)
     return _maybe_light(product_repo.orm_to_product(p_orm), light)
+
+
+# SPEC-013 reason → (status, client message). Only the snapshot row dies;
+# the artifact, its memory chunks and current_version stay untouched.
+_DELETE_REASONS = {
+    "current": (409, "Cannot delete the current version"),
+    "single": (409, "Cannot delete the only version — delete the artifact instead"),
+    "base": (409, "Cannot delete a version another version is based on"),
+}
+
+
+@router.delete(
+    "/{product_id}/{segment}/{entity_id}/versions/{version:int}",
+    status_code=204,
+)
+async def delete_doc_version(
+    product_id: str, segment: str, entity_id: str, version: int,
+    db: Session = Depends(get_db),
+    _product: ProductORM = Depends(require_product_permission("manage")),
+):
+    """Delete ONE snapshot row (history pruning, not artifact deletion)."""
+    _, entity_type, entity = _load_entity(db, product_id, segment, entity_id)
+    try:
+        with lock_for_entity(entity_type, entity_id):
+            reason = doc_version_repo.delete_version(db, entity_type, entity, version)
+            if reason == "not_found":
+                raise HTTPException(status_code=404, detail="Version not found")
+            if reason:
+                status, detail = _DELETE_REASONS[reason]
+                raise HTTPException(status_code=status, detail=detail)
+            db.commit()
+    except EntityBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 __all__ = ["router"]

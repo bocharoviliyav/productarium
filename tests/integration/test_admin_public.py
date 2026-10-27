@@ -424,7 +424,7 @@ class TestPublicAskPush501:
         try:
             resp = client.post(
                 "/api/public/products/prod_1/push",
-                json={"target": "confluence"},
+                json={"target": "github"},
             )
             assert resp.status_code == 501
             assert "Integrations are not available" in resp.json()["detail"]

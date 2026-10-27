@@ -21,16 +21,15 @@ from datetime import datetime
 from typing import Any, List, Optional, Tuple
 
 from sqlalchemy import func
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, object_session, selectinload
 
 from api.config.settings import decrypt_secret, encrypt_secret, is_encrypted_secret
-from api.db import get_db  # re-exported so routers import it from the repo
 from api.models import (
     CodebaseORM,
     DatabaseORM,
     DocVersionORM,
-    HldORM,
     LinksORM,
+    ProductGrantORM,
     ProductORM,
     SpecORM,
 )
@@ -38,7 +37,16 @@ from api.repositories.doc_version_repo import (
     append_version,
     ensure_baseline_version,
 )
-from api.schemas import Codebase, Database, Hld, Links, Product, ProductListItem, Spec
+from api.schemas import (
+    Codebase,
+    Database,
+    Hld,
+    Links,
+    Product,
+    ProductGrantOut,
+    ProductListItem,
+    Spec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +205,27 @@ def _database_orm_from_pydantic(d: Database) -> DatabaseORM:
     )
 
 
+def _grants_payload(p_orm: ProductORM) -> List[ProductGrantOut]:
+    """Server-owned grant list for the product payload (SPEC-001).
+
+    Loaded through the ORM instance's own session, so no signature churn for
+    the many ``orm_to_product`` callers; a detached instance (not expected on
+    the request path) yields an empty list.
+    """
+    sess = object_session(p_orm)
+    if sess is None:
+        return []
+    rows = (
+        sess.query(ProductGrantORM)
+        .filter(ProductGrantORM.product_id == p_orm.id)
+        .all()
+    )
+    return [
+        ProductGrantOut(user_id=g.user_id, level=g.level, granted_by=g.granted_by)
+        for g in rows
+    ]
+
+
 def orm_to_product(p_orm: ProductORM) -> Product:
     """Convert a ProductORM (with children eagerly loaded) to the Pydantic Product."""
     return Product(
@@ -205,6 +234,7 @@ def orm_to_product(p_orm: ProductORM) -> Product:
         description=p_orm.description,
         summary=p_orm.summary,
         owner_id=p_orm.owner_id,
+        grants=_grants_payload(p_orm),
         codebases=[
             Codebase(
                 id=c.id,
@@ -605,6 +635,8 @@ def _upsert_product_locked(db: Session, product: Product) -> ProductORM:
                 "token": row.token if model is CodebaseORM else None,
                 # Version pointer is server-owned (doc_versions history).
                 "current_version": getattr(row, "current_version", None),
+                # Source baseline for incremental updates (SPEC-010).
+                "source_state": getattr(row, "source_state", None),
             }
 
     # Verified state is server-owned (review #4): capture the STORED
@@ -617,6 +649,9 @@ def _upsert_product_locked(db: Session, product: Product) -> ProductORM:
         for d in p_orm.databases
     }
     prev_db_version = {d.id: d.current_version for d in p_orm.databases}
+    prev_db_source_state = {
+        d.id: getattr(d, "source_state", None) for d in p_orm.databases
+    }
 
     for model in (CodebaseORM, SpecORM, LinksORM, DatabaseORM):
         db.query(model).filter(model.product_id == product.id).delete(
@@ -655,9 +690,37 @@ def _upsert_product_locked(db: Session, product: Product) -> ProductORM:
             verified, verified_by, verified_at,
         )
         orm.current_version = prev_db_version.get(d.id)
+        orm.source_state = prev_db_source_state.get(d.id)
         orm.product_id = product.id
         db.add(orm)
 
+    db.commit()
+    db.refresh(p_orm)
+    return p_orm
+
+
+def patch_product(
+    db: Session,
+    product_id: str,
+    *,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    owner_id: Optional[str] = None,
+) -> ProductORM:
+    """Partial product update (SPEC-002): only provided fields change.
+
+    Scalar fields only — children and server-owned state are untouched, so
+    no entity locks are needed. Raises ValueError when the product is missing.
+    """
+    p_orm = load_product_orm(db, product_id)
+    if p_orm is None:
+        raise ValueError("Product not found")
+    if name is not None:
+        p_orm.name = name
+    if description is not None:
+        p_orm.description = description
+    if owner_id is not None:
+        p_orm.owner_id = owner_id
     db.commit()
     db.refresh(p_orm)
     return p_orm
@@ -690,12 +753,16 @@ def _restore_server_state(orm, prev) -> None:
         orm.verified_at = prev.get("verified_at")
         if hasattr(orm, "current_version"):
             orm.current_version = prev.get("current_version")
+        if hasattr(orm, "source_state"):
+            orm.source_state = prev.get("source_state")
     else:
         orm.verified = prev.verified
         orm.verified_by = prev.verified_by
         orm.verified_at = prev.verified_at
         if hasattr(orm, "current_version"):
             orm.current_version = getattr(prev, "current_version", None)
+        if hasattr(orm, "source_state"):
+            orm.source_state = getattr(prev, "source_state", None)
 
 
 # --- Per-type add / delete --------------------------------------------------
@@ -1006,11 +1073,31 @@ def update_database_meta(
 
 
 # --- Verification (item 5) --------------------------------------------------
+# Singular docgen entity type -> the collection name ``_find_child`` takes
+# (``hld`` is the scalar pseudo-collection). Single mapping point for the
+# docgen jobs/schedules/routers (S-5); types outside docgen (links) raise.
+_ENTITY_COLLECTION_BY_TYPE = {
+    "codebase": "codebases",
+    "spec": "specs",
+    "database": "databases",
+    "hld": "hld",
+}
+
+
 def _find_child(p_orm: ProductORM, collection: str, entity_id: str):
     """Child row by id — ``hld`` is a scalar (one row per product), not a list."""
     if collection == "hld":
         return p_orm.hld if p_orm.hld is not None and p_orm.hld.id == entity_id else None
     return next((x for x in getattr(p_orm, collection) if x.id == entity_id), None)
+
+
+def find_entity(p_orm: ProductORM, entity_type: str, entity_id: str) -> Optional[Any]:
+    """Child row by singular docgen entity type (codebase|spec|database|hld).
+
+    Wraps :func:`_find_child`; raises ``KeyError`` for types outside the
+    docgen entity space.
+    """
+    return _find_child(p_orm, _ENTITY_COLLECTION_BY_TYPE[entity_type], entity_id)
 
 
 def verify_child(

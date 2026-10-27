@@ -242,6 +242,9 @@ class TestBuildPrompt:
             knowledge="k",
             history=big_history,
             query="q",
+            # Deterministic small budget: the default window resolution
+            # (env/admin/catalog) is environment-dependent and large.
+            ctx_win=8192,
         )
         assert "ранняя история обрезана" in prompt
         # The clamped history must be much smaller than the input.
@@ -255,6 +258,8 @@ class TestBuildPrompt:
             knowledge=big_knowledge,
             history="",
             query="q",
+            # Deterministic small budget: see test_history_clamped_when_too_large.
+            ctx_win=8192,
         )
         assert "часть знаний обрезана" in prompt
         assert big_knowledge not in prompt

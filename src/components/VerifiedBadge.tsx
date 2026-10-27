@@ -30,15 +30,16 @@ export function VerifiedBadge({
 }
 
 /**
- * Verified toggle button. POSTs to `verifyUrl` to flip the flag. Only
- * owner/admin may verify — `canVerify` is derived from the current user role
- * (admin always; owner when `ownerId` matches). When disabled, renders the
- * badge only (no button).
+ * Verified toggle button. POSTs to `verifyUrl` to flip the flag. Verify is a
+ * docs-level action (SPEC-001): pass `canVerify` derived from
+ * productAccess(); the legacy fallback is admin/owner. When not allowed,
+ * renders the badge only (no button).
  */
 export function VerifiedButton({
   verified,
   verifyUrl,
   ownerId,
+  canVerify,
   onVerified,
   size = "sm",
   mapResponse,
@@ -47,6 +48,8 @@ export function VerifiedButton({
   verified?: boolean;
   verifyUrl: string;
   ownerId?: string | null;
+  /** Override for the legacy admin/owner derivation (docs access, SPEC-001). */
+  canVerify?: boolean;
   onVerified?: (next: { verified: boolean; verified_by?: string | null }) => void;
   size?: "sm" | "md";
   /** Map a non-default response body (e.g. the per-page endpoint returns the whole Product). */
@@ -63,9 +66,9 @@ export function VerifiedButton({
 
   const isAdmin = user?.role === "admin";
   const isOwner = !!user && !!ownerId && user.id === ownerId;
-  const canVerify = isAdmin || isOwner;
+  const allowed = canVerify ?? (isAdmin || isOwner);
 
-  if (!canVerify) {
+  if (!allowed) {
     return verified ? <VerifiedBadge verified={verified} /> : null;
   }
 

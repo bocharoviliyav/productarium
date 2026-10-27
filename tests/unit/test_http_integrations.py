@@ -451,6 +451,7 @@ class TestSseMcpTransport:
                 "name": "legacy-sse",
                 "transport": "sse",
                 "url": "http://localhost:9000/sse",
+                "scopes": ["expert"],
             },
         )
         assert r.status_code == 200, r.text
@@ -465,6 +466,7 @@ class TestSseMcpTransport:
                 "transport": "sse",
                 "url": "http://localhost:9000/sse",
                 "command": "/bin/x",
+                "scopes": ["expert"],
             },
         )
         assert r.status_code == 400

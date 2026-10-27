@@ -1,7 +1,7 @@
 """Scalable integrations framework for Productarium (plan section G).
 
 A connector is a thin adapter that knows how to talk to an external source of
-knowledge (a Git host, Confluence, an MCP server, ...). Every connector lives
+knowledge (a Git host, an MCP server, ...). Every connector lives
 in its own module under ``api/integrations/`` and subclasses
 :class:`api.integrations.base.IntegrationConnector`.
 

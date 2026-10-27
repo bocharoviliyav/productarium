@@ -35,6 +35,8 @@ _INTERPRETER_BASENAMES = frozenset(
         # generic runners / process trampolines
         "env", "nohup", "timeout", "stdbuf", "setsid", "script", "xargs",
         "sed", "awk", "gawk",
+        # container / remote-exec trampolines (validated args become payloads)
+        "docker", "podman", "nerdctl", "kubectl", "ssh",
         # package/script runners
         "node", "nodejs", "deno", "bun", "npx", "uvx", "make", "cargo", "go",
     }
@@ -66,13 +68,22 @@ def stdio_command_error(command: Any) -> Optional[str]:
     ``None`` means "no objection". The HTTP-level shape checks
     (metacharacters, ``..``, control chars) stay in the router — this module
     is transport-policy only and never raises.
+
+    Sole interpreter carve-out (SPEC-014): the node BINARY referenced by
+    ABSOLUTE path may spawn a stdio MCP server whose entrypoint ships as JS
+    (the REA preset). The absolute path pins the exact binary the admin
+    vetted; bare ``node``/``npx`` (PATH resolution) and every other
+    interpreter — absolute or not — stay blocked.
     """
-    base = os.path.basename(str(command or "").strip()).lower()
+    text = str(command or "").strip()
+    base = os.path.basename(text).lower()
     if not base:
         return "stdio command is required"
     if any(ch.isspace() for ch in base):
         return "stdio command must be a single executable path (no whitespace)"
     if base in _INTERPRETER_BASENAMES or base.startswith(_INTERPRETER_PREFIXES):
+        if base == "node" and os.path.isabs(text):
+            return None
         return (
             f"stdio command {base!r} is a shell/interpreter/runner and is not "
             "allowed — spawn the MCP server binary directly (no -c/npx/uvx wrappers)"

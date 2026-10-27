@@ -58,6 +58,8 @@ python-multipart = ">=0.0.6"
 markitdown = ">=0.0.1"
 # tqdm: TTY progress bar for docgen jobs (disable=None -> no-op when piped).
 tqdm = ">=4.66"
+# APScheduler: in-process AsyncIOScheduler for SPEC-009 cron docgen runs.
+apscheduler = "^3.10"
 
 
 [build-system]

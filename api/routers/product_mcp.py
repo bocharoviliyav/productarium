@@ -1,6 +1,8 @@
 """Product ↔ MCP server bindings router (Wave C, contract 2).
 
-Authenticated (any logged-in user) endpoints under ``/api/products``:
+Product-scoped endpoints under ``/api/products`` (RBAC, P-2): reading the
+bindings requires product access (``ro``); binding mutations require the
+``manage`` permission. Unknown/invisible products are a plain 404.
 
 - ``GET    /api/products/{product_id}/mcp``             — list bindings
 - ``POST   /api/products/{product_id}/mcp``             — bind a server
@@ -26,9 +28,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from api.auth.deps import get_current_user
+from api.auth.deps import (
+    get_current_user,
+    require_product_access,
+    require_product_permission,
+)
 from api.db import get_db
-from api.models import McpServerORM, ProductMcpServerORM, ProductORM
+from api.models import McpServerORM, ProductMcpServerORM
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +63,8 @@ class McpBindingOut(BaseModel):
     enabled: bool
     allowed_tools: Optional[List[str]] = None
     status: str
+    # Server scopes (SPEC-028) — UI tags + database-add server choice.
+    scopes: List[str] = []
 
 
 def _validate_allowed_tools(tools: Optional[List[str]]) -> Optional[List[str]]:
@@ -75,13 +83,6 @@ def _validate_allowed_tools(tools: Optional[List[str]]) -> Optional[List[str]]:
             )
         out.append(t)
     return out
-
-
-def _load_product(db: Session, product_id: str) -> ProductORM:
-    product = db.query(ProductORM).filter(ProductORM.id == product_id).first()
-    if product is None:
-        raise HTTPException(status_code=404, detail="Product not found")
-    return product
 
 
 def _load_binding(db: Session, product_id: str, binding_id: str) -> ProductMcpServerORM:
@@ -108,16 +109,20 @@ def _binding_out(db: Session, b: ProductMcpServerORM) -> McpBindingOut:
         enabled=bool(b.enabled),
         allowed_tools=list(b.allowed_tools) if isinstance(b.allowed_tools, list) else None,
         status=(server.status if server else "error") or "unknown",
+        scopes=(list(server.scopes) if server and isinstance(server.scopes, list) else []),
     )
 
 
-@router.get("/{product_id}/mcp", response_model=List[McpBindingOut])
+@router.get(
+    "/{product_id}/mcp",
+    response_model=List[McpBindingOut],
+    dependencies=[Depends(require_product_access("ro"))],
+)
 async def list_product_mcp_bindings(
     product_id: str,
     db: Session = Depends(get_db),
     _user: Any = Depends(get_current_user),
 ):
-    _load_product(db, product_id)
     bindings = (
         db.query(ProductMcpServerORM)
         .filter(ProductMcpServerORM.product_id == product_id)
@@ -127,14 +132,17 @@ async def list_product_mcp_bindings(
     return [_binding_out(db, b) for b in bindings]
 
 
-@router.post("/{product_id}/mcp", response_model=McpBindingOut)
+@router.post(
+    "/{product_id}/mcp",
+    response_model=McpBindingOut,
+    dependencies=[Depends(require_product_permission("manage"))],
+)
 async def create_product_mcp_binding(
     product_id: str,
     body: McpBindingCreate,
     db: Session = Depends(get_db),
     _user: Any = Depends(get_current_user),
 ):
-    _load_product(db, product_id)
     server = (
         db.query(McpServerORM).filter(McpServerORM.id == body.mcp_server_id).first()
     )
@@ -170,7 +178,11 @@ async def create_product_mcp_binding(
     return _binding_out(db, binding)
 
 
-@router.put("/{product_id}/mcp/{binding_id}", response_model=McpBindingOut)
+@router.put(
+    "/{product_id}/mcp/{binding_id}",
+    response_model=McpBindingOut,
+    dependencies=[Depends(require_product_permission("manage"))],
+)
 async def update_product_mcp_binding(
     product_id: str,
     binding_id: str,
@@ -178,7 +190,6 @@ async def update_product_mcp_binding(
     db: Session = Depends(get_db),
     _user: Any = Depends(get_current_user),
 ):
-    _load_product(db, product_id)
     binding = _load_binding(db, product_id, binding_id)
     fields = body.model_fields_set
     if "enabled" in fields and body.enabled is not None:
@@ -195,14 +206,16 @@ async def update_product_mcp_binding(
     return _binding_out(db, binding)
 
 
-@router.delete("/{product_id}/mcp/{binding_id}")
+@router.delete(
+    "/{product_id}/mcp/{binding_id}",
+    dependencies=[Depends(require_product_permission("manage"))],
+)
 async def delete_product_mcp_binding(
     product_id: str,
     binding_id: str,
     db: Session = Depends(get_db),
     _user: Any = Depends(get_current_user),
 ):
-    _load_product(db, product_id)
     binding = _load_binding(db, product_id, binding_id)
     db.delete(binding)
     try:

@@ -49,8 +49,11 @@ Idle subscriber waits emit ``: ping`` SSE comments (heartbeats) so proxies
 with idle timeouts (e.g. the Next.js rewrite proxy) do not reap the stream.
 
 All endpoints require an authenticated session (``get_current_user``). The
-agent machinery lives in ``api.agents.expert``; this router only does request
-parsing, turn wiring, and session persistence.
+``/ask`` family additionally requires product visibility
+(``require_product_access("ro")``, P-1): an unknown or invisible product is
+a plain 404 before any turn/session work. The agent machinery lives in
+``api.agents.expert``; this router only does request parsing, turn wiring, and
+session persistence.
 ``run_agent_chat_stream`` is imported as a module attribute so tests can
 monkeypatch it on this module (the runner is passed into ``start_turn``
 BY VALUE at request time, so the seam holds).
@@ -87,7 +90,7 @@ from api.expert.attachments import (
     upload_max_bytes,
 )
 from api.expert.deep_research import run_deep_research_stream
-from api.auth.deps import get_current_user
+from api.auth.deps import get_current_user, require_product_access
 from api.db import get_db
 from api.expert.turns import (
     MAX_QUERY_CHARS,
@@ -147,9 +150,9 @@ class ExpertAskRequest(BaseModel):
         default_factory=list, max_length=MAX_ATTACHMENTS_PER_ASK
     )
 
-    # Backward-compat: older clients may still send ``use_rlm``. The field is
-    # accepted (and ignored) so those clients keep working after the RLM
-    # removal; the engine choice is server-side now.
+    # Backward-compat: unknown fields from older clients (e.g. the former
+    # engine-choice toggle) are accepted and ignored so they keep working;
+    # the engine choice is server-side now.
     model_config = {"extra": "ignore"}
 
 
@@ -338,7 +341,7 @@ def _turn_or_404(turn_id: str, product_id: str, user_id: Optional[str]) -> Activ
     return turn
 
 
-@router.post("/{product_id}/ask")
+@router.post("/{product_id}/ask", dependencies=[Depends(require_product_access("ro"))])
 async def expert_ask(
     product_id: str,
     body: ExpertAskRequest,
@@ -346,7 +349,8 @@ async def expert_ask(
 ):
     """Start a detached expert turn and stream it as SSE (issue #9).
 
-    Requires login. The generation runs as a background task registered in
+    Requires login plus product visibility (P-1: unknown/invisible product
+    → 404). The generation runs as a background task registered in
     ``api.expert.turns`` — a client disconnect (navigation, proxy timeout)
     no longer cancels it; the answer is persisted to the session transcript
     either way. The first SSE frame announces the ``turn_id`` (the re-attach
@@ -355,8 +359,6 @@ async def expert_ask(
     announced via ``data: {"session_id": ...}`` + the ``X-Session-Id``
     header. A second ask into a session with a RUNNING turn → 409 with the
     running turn id in ``X-Turn-Id`` (the client re-attaches instead).
-    For an unknown product the request still streams (legacy behavior: no
-    404) but runs statelessly with no session and no persistence.
     """
     # P1-17: per-user token bucket (30/min default) on the expert chat —
     # checked before any prompt/cognee work.
@@ -441,7 +443,10 @@ async def expert_ask(
     )
 
 
-@router.get("/{product_id}/ask/stream/{turn_id}")
+@router.get(
+    "/{product_id}/ask/stream/{turn_id}",
+    dependencies=[Depends(require_product_access("ro"))],
+)
 async def expert_ask_stream(
     product_id: str,
     turn_id: str,
@@ -467,7 +472,10 @@ async def expert_ask_stream(
     )
 
 
-@router.post("/{product_id}/ask/{turn_id}/cancel")
+@router.post(
+    "/{product_id}/ask/{turn_id}/cancel",
+    dependencies=[Depends(require_product_access("ro"))],
+)
 async def expert_ask_cancel(
     product_id: str,
     turn_id: str,
@@ -484,7 +492,10 @@ async def expert_ask_cancel(
     return {"turn_id": turn_id, "status": status}
 
 
-@router.post("/{product_id}/ask/attachments")
+@router.post(
+    "/{product_id}/ask/attachments",
+    dependencies=[Depends(require_product_access("ro"))],
+)
 async def upload_chat_attachments(
     product_id: str,
     request: Request,
@@ -569,7 +580,10 @@ async def upload_chat_attachments(
     return out
 
 
-@router.get("/{product_id}/ask/attachments/{attachment_id}")
+@router.get(
+    "/{product_id}/ask/attachments/{attachment_id}",
+    dependencies=[Depends(require_product_access("ro"))],
+)
 def download_chat_attachment(
     product_id: str,
     attachment_id: str,

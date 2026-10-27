@@ -2,12 +2,14 @@
 
 Covers:
 - ``get_model_context_window``:
-  * Env var override (``RLM_MODEL_CONTEXT_WINDOW``).
+  * Env var overrides (``PRODUCTARIUM_MODEL_CONTEXT_WINDOW`` and the
+    deprecated legacy alias).
   * Admin setting override (``models.<task>.max_prompt_tokens``).
   * Cache hit (within TTL).
   * Live API query (OpenAI-compatible ``/v1/models`` with ``max_model_len``).
   * Live API query with various context keys (``context_window``, ``max_tokens``, etc.).
-  * Fallback default (8192) on exception / non-200 / no matching model.
+  * Known-model catalog (qwen3 / deepseek / llama-3 / gemini / gpt-4o / gpt-5 / claude).
+  * Fallback default (200000) on exception / non-200 / no matching model.
   * URL normalization (appends ``/v1``).
   * Authorization header when api_key is set.
 - ``_count_tokens``:
@@ -45,6 +47,13 @@ def _clear_cache():
 
 
 @pytest.fixture(autouse=True)
+def _clean_context_env(monkeypatch):
+    """Both context-window env names start clean in every test."""
+    monkeypatch.delenv("PRODUCTARIUM_MODEL_CONTEXT_WINDOW", raising=False)
+    monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _block_unmocked_post(monkeypatch):
     """Hermetic guard: the Ollama /api/show context probe POSTs; unless a
     test mocks ``requests.post`` explicitly, refuse fast instead of touching
@@ -60,26 +69,42 @@ def _block_unmocked_post(monkeypatch):
 # ---------------------------------------------------------------------------
 
 class TestEnvVarOverride:
-    def test_rlm_model_context_window_env(self, monkeypatch):
+    def test_productarium_env(self, monkeypatch):
+        monkeypatch.setenv("PRODUCTARIUM_MODEL_CONTEXT_WINDOW", "65536")
+        assert get_model_context_window() == 65536
+
+    def test_productarium_env_outranks_legacy_env(self, monkeypatch):
+        monkeypatch.setenv("PRODUCTARIUM_MODEL_CONTEXT_WINDOW", "65536")
+        monkeypatch.setenv("RLM_MODEL_CONTEXT_WINDOW", "32768")
+        assert get_model_context_window() == 65536
+
+    def test_legacy_model_context_window_env(self, monkeypatch):
         monkeypatch.setenv("RLM_MODEL_CONTEXT_WINDOW", "32768")
         assert get_model_context_window() == 32768
 
+    def test_legacy_env_logs_deprecation_warning(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("RLM_MODEL_CONTEXT_WINDOW", "32768")
+        with caplog.at_level(logging.WARNING, logger="api.utils.llm_tokens"):
+            assert get_model_context_window() == 32768
+        assert any("deprecated" in r.getMessage() for r in caplog.records)
+
     def test_invalid_env_ignored(self, monkeypatch):
         monkeypatch.setenv("RLM_MODEL_CONTEXT_WINDOW", "not-a-number")
-        # Falls through to live API query / default
-        # With no live API (requests not mocked), returns default 8192
+        # Falls through; the default model name catalog-matches qwen3
         monkeypatch.setattr("requests.get", lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("x")))
-        assert get_model_context_window() == 8192
+        assert get_model_context_window() == 262144
 
     def test_zero_env_ignored(self, monkeypatch):
         monkeypatch.setenv("RLM_MODEL_CONTEXT_WINDOW", "0")
         monkeypatch.setattr("requests.get", lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("x")))
-        assert get_model_context_window() == 8192
+        assert get_model_context_window() == 262144
 
     def test_negative_env_ignored(self, monkeypatch):
         monkeypatch.setenv("RLM_MODEL_CONTEXT_WINDOW", "-100")
         monkeypatch.setattr("requests.get", lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("x")))
-        assert get_model_context_window() == 8192
+        assert get_model_context_window() == 262144
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +115,6 @@ class TestAdminSettingOverride:
     def test_admin_max_prompt_tokens(self, monkeypatch, isolated_db):
         from api.config import settings
 
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
         settings.set_setting("models.docgen.max_prompt_tokens", "16384", encrypt=False)
         assert get_model_context_window(task="docgen") == 16384
 
@@ -102,22 +126,28 @@ class TestAdminSettingOverride:
         # Env var wins over admin setting
         assert get_model_context_window(task="expert") == 99999
 
+    def test_admin_overrides_catalog(self, monkeypatch, isolated_db):
+        from api.config import settings
+
+        settings.set_setting("models.docgen.max_prompt_tokens", "16384", encrypt=False)
+        assert get_model_context_window(
+            task="docgen", model_name="qwen3-family-model",
+        ) == 16384
+
     def test_invalid_admin_setting_ignored(self, monkeypatch, isolated_db):
         from api.config import settings
 
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
         settings.set_setting("models.docgen.max_prompt_tokens", "garbage", encrypt=False)
         monkeypatch.setattr("requests.get", lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("x")))
-        # Falls through to default
-        assert get_model_context_window(task="docgen") == 8192
+        # Falls through; the admin-configured default model catalog-matches qwen3
+        assert get_model_context_window(task="docgen") == 262144
 
     def test_zero_admin_setting_ignored(self, monkeypatch, isolated_db):
         from api.config import settings
 
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
         settings.set_setting("models.docgen.max_prompt_tokens", "0", encrypt=False)
         monkeypatch.setattr("requests.get", lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("x")))
-        assert get_model_context_window(task="docgen") == 8192
+        assert get_model_context_window(task="docgen") == 262144
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +161,6 @@ class TestCache:
         model = "test-model"
         cache_key = (url.rstrip("/"), model)
         _MODEL_CTX_CACHE[cache_key] = (time.time(), 99999)
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
         assert get_model_context_window(base_url=url, model_name=model) == 99999
 
     def test_cache_expired(self, monkeypatch):
@@ -140,10 +169,9 @@ class TestCache:
         cache_key = (url.rstrip("/"), model)
         # Set cache entry with old timestamp
         _MODEL_CTX_CACHE[cache_key] = (time.time() - _CACHE_TTL_SECONDS - 1, 99999)
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
         # Expired -> falls through to live API (mocked to fail) -> default
         monkeypatch.setattr("requests.get", lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("x")))
-        assert get_model_context_window(base_url=url, model_name=model) == 8192
+        assert get_model_context_window(base_url=url, model_name=model) == 200000
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +180,6 @@ class TestCache:
 
 class TestLiveApiQuery:
     def test_max_model_len_key(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -170,7 +197,6 @@ class TestLiveApiQuery:
         assert result == 131072
 
     def test_context_window_key(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -188,7 +214,6 @@ class TestLiveApiQuery:
         assert result == 32768
 
     def test_max_tokens_key(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -206,7 +231,6 @@ class TestLiveApiQuery:
         assert result == 8192
 
     def test_max_context_length_key(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -224,7 +248,6 @@ class TestLiveApiQuery:
         assert result == 65536
 
     def test_n_ctx_key(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -242,7 +265,6 @@ class TestLiveApiQuery:
         assert result == 4096
 
     def test_name_field_match(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -260,7 +282,6 @@ class TestLiveApiQuery:
         assert result == 16384
 
     def test_non_200_returns_default(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
 
         fake_resp = types.SimpleNamespace(status_code=500, json=lambda: {})
         monkeypatch.setattr("requests.get", lambda *a, **kw: fake_resp)
@@ -268,10 +289,9 @@ class TestLiveApiQuery:
             base_url="http://localhost:8080/v1",
             model_name="my-model",
         )
-        assert result == 8192
+        assert result == 200000
 
     def test_no_matching_model_returns_default(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -282,10 +302,9 @@ class TestLiveApiQuery:
             base_url="http://localhost:8080/v1",
             model_name="my-model",
         )
-        assert result == 8192
+        assert result == 200000
 
     def test_connection_error_returns_default(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
 
         def boom(*a, **kw):
             raise ConnectionError("refused")
@@ -295,10 +314,9 @@ class TestLiveApiQuery:
             base_url="http://localhost:8080/v1",
             model_name="my-model",
         )
-        assert result == 8192
+        assert result == 200000
 
     def test_result_cached_after_live_query(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
 
         call_count = {"n": 0}
 
@@ -321,7 +339,6 @@ class TestLiveApiQuery:
         assert call_count["n"] == 1
 
     def test_url_normalization_appends_v1(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
         urls = []
 
         def fake_get(url, **kw):
@@ -336,7 +353,6 @@ class TestLiveApiQuery:
         assert urls[0] == "http://localhost:8080/v1/models"
 
     def test_authorization_header_sent(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
         captured = {}
 
         def fake_get(url, **kw):
@@ -352,7 +368,6 @@ class TestLiveApiQuery:
         assert captured["headers"]["Authorization"] == "Bearer sk-test-key"
 
     def test_no_auth_header_for_not_needed(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
         captured = {}
 
         def fake_get(url, **kw):
@@ -368,7 +383,6 @@ class TestLiveApiQuery:
         assert "Authorization" not in captured["headers"]
 
     def test_float_context_value(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
 
         fake_resp = types.SimpleNamespace(
             status_code=200,
@@ -386,7 +400,6 @@ class TestLiveApiQuery:
         assert result == 131072
 
     def test_default_model_name(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
         captured = {}
 
         def fake_get(url, **kw):
@@ -394,9 +407,9 @@ class TestLiveApiQuery:
             return types.SimpleNamespace(status_code=200, json=lambda: {"data": []})
 
         monkeypatch.setattr("requests.get", fake_get)
-        # No model_name -> should use default
+        # No model_name -> default model, which catalog-matches qwen3
         result = get_model_context_window()
-        assert result == 8192
+        assert result == 262144
 
 
 # ---------------------------------------------------------------------------
@@ -424,30 +437,29 @@ class TestServerNativeProbes:
         monkeypatch.setattr("requests.get", fake_get)
 
     def test_lmstudio_max_context_length(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
+        # Non-catalog model: the qwen3 catalog would short-circuit the probe.
         self._dispatch(monkeypatch, {
-            "/v1/models": {"data": [{"id": "qwen/qwen3.6-27b"}]},
+            "/v1/models": {"data": [{"id": "mistral/mistral-small"}]},
             "/api/v0/models": {"data": [
-                {"id": "qwen/qwen3.6-27b", "maxContextLength": 262144},
+                {"id": "mistral/mistral-small", "maxContextLength": 262144},
             ]},
         })
         assert get_model_context_window(
             base_url="http://localhost:1234/v1",
-            model_name="qwen/qwen3.6-27b",
+            model_name="mistral/mistral-small",
         ) == 262144
 
     def test_llamacpp_props_n_ctx(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
+        # Non-catalog model: the llama-3 catalog would short-circuit the probe.
         self._dispatch(monkeypatch, {
-            "/v1/models": {"data": [{"id": "llama-3"}]},
+            "/v1/models": {"data": [{"id": "mistral-large"}]},
             "/props": {"default_generation_settings": {"n_ctx": 131072}},
         })
         assert get_model_context_window(
-            base_url="http://localhost:8080/v1", model_name="llama-3",
+            base_url="http://localhost:8080/v1", model_name="mistral-large",
         ) == 131072
 
     def test_ollama_show_context_length(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
         self._dispatch(monkeypatch, {
             "/v1/models": {"data": [{"id": "qwen2.5:7b"}]},
         })
@@ -460,7 +472,6 @@ class TestServerNativeProbes:
         ) == 32768
 
     def test_openai_models_wins_over_native_probes(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
         urls = []
 
         def fake_get(url, **kw):
@@ -482,19 +493,18 @@ class TestServerNativeProbes:
         assert all(not u.endswith("/api/v0/models") for u in urls)
 
     def test_case_insensitive_model_id_match(self, monkeypatch):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
+        # Non-catalog model: the qwen3 catalog would short-circuit the probe.
         self._dispatch(monkeypatch, {
             "/v1/models": {
-                "data": [{"id": "Qwen/Qwen3.6-27B", "max_model_len": 262144}],
+                "data": [{"id": "My-Model", "max_model_len": 262144}],
             },
         })
         assert get_model_context_window(
             base_url="http://localhost:8080/v1",
-            model_name="qwen/qwen3.6-27b",
+            model_name="my-model",
         ) == 262144
 
     def test_all_probes_fail_warns_and_falls_back(self, monkeypatch, caplog):
-        monkeypatch.delenv("RLM_MODEL_CONTEXT_WINDOW", raising=False)
         monkeypatch.setattr(
             "requests.get",
             lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("refused")),
@@ -505,13 +515,89 @@ class TestServerNativeProbes:
             result = get_model_context_window(
                 base_url="http://localhost:8080/v1", model_name="m",
             )
-        assert result == 8192
+        assert result == 200000
         warnings = [
             r for r in caplog.records
             if r.levelno == logging.WARNING
-            and "falling back to 8192" in r.getMessage()
+            and "falling back to 200000" in r.getMessage()
+            and "PRODUCTARIUM_MODEL_CONTEXT_WINDOW" in r.getMessage()
         ]
         assert warnings, "expected the actionable fallback warning"
+
+
+class TestKnownModelCatalog:
+    """Static catalog resolves known families with zero network probes."""
+
+    @staticmethod
+    def _no_probes(monkeypatch):
+        def _refuse(*a, **kw):
+            raise AssertionError("catalog must resolve without live probes")
+
+        monkeypatch.setattr("requests.get", _refuse)
+
+    def test_catalog_by_name(self, monkeypatch):
+        self._no_probes(monkeypatch)
+        assert get_model_context_window(
+            base_url="http://localhost:8080/v1", model_name="Qwen/Qwen3-32B",
+        ) == 262144
+
+    def test_catalog_case_insensitive(self, monkeypatch):
+        self._no_probes(monkeypatch)
+        assert get_model_context_window(
+            base_url="http://localhost:8080/v1", model_name="GPT-4o-mini",
+        ) == 128000
+
+    def test_catalog_outranks_live_probes(self, monkeypatch):
+        fake_resp = types.SimpleNamespace(
+            status_code=200,
+            json=lambda: {"data": [{"id": "claude", "max_model_len": 999999}]},
+        )
+        monkeypatch.setattr("requests.get", lambda *a, **kw: fake_resp)
+        assert get_model_context_window(
+            base_url="http://localhost:8080/v1", model_name="claude",
+        ) == 200000
+
+    def test_unknown_model_not_in_catalog(self):
+        assert llm_tokens._catalog_context_window("my-model") is None
+        assert llm_tokens._catalog_context_window("") is None
+
+
+class TestProbeFreeResolution:
+    """``allow_probes=False``: offline resolution for the admin panel."""
+
+    def test_no_probes_no_cache_write(self, monkeypatch, caplog):
+        import logging
+
+        def _refuse(*a, **kw):
+            raise AssertionError("allow_probes=False must not touch the network")
+
+        monkeypatch.setattr("requests.get", _refuse)
+        with caplog.at_level(logging.WARNING, logger="api.utils.llm_tokens"):
+            result = get_model_context_window(
+                base_url="http://localhost:8080/v1",
+                model_name="my-model",
+                allow_probes=False,
+            )
+        assert result == 200000
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert not _MODEL_CTX_CACHE  # fallback must not poison the runtime cache
+
+    def test_fallback_logs_resolved_window_info(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setattr(
+            "requests.get",
+            lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("refused")),
+        )
+        with caplog.at_level(logging.INFO, logger="api.utils.llm_tokens"):
+            result = get_model_context_window(
+                base_url="http://localhost:8080/v1", model_name="m",
+            )
+        assert result == 200000
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            "Resolved model context window" in m and "200000" in m for m in infos
+        )
 
 
 # ---------------------------------------------------------------------------

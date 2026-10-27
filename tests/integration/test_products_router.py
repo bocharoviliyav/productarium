@@ -616,13 +616,14 @@ class TestVerifyEndpoints:
         assert r.status_code == 200
         assert r.json()["specs"][0]["verified"] is True
 
-    def test_non_owner_non_admin_403(self, isolated_db):
+    def test_user_without_access_404(self, isolated_db):
         _seed_product(isolated_db, owner_id="someone_else")
         _seed_codebase(isolated_db)
         user = UserORM(id="user_regular", username="regular", role="user", provider="local", created_at=datetime.utcnow())
         app, client = self._client_with_user(isolated_db, user)
+        # SPEC-001: a user with no grant cannot even see the product.
         r = client.post("/api/products/prod_1/codebases/cb_1/verify")
-        assert r.status_code == 403
+        assert r.status_code == 404
 
     def test_verify_missing_product_404(self, isolated_db, admin_user):
         app, client = self._client_with_user(isolated_db, admin_user)
